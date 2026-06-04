@@ -5,37 +5,28 @@
     Cost           : ZERO Azure cost, ZERO network. `az` and `Invoke-RestMethod`
                      are mocked; no real deployment or HTTP call is ever made.
 
-    Scope (Plan 01-01, Wave 0 scaffold):
-      - Password generation entropy/length  -> LIVE today (tests the standalone
-        cryptographic generation expression inline; at least one live assertion).
-      - Dev public-IP detection (ipify shape) -> SKIPPED until Plan 04 ships
-        infra/manage-env.ps1 (mock Invoke-RestMethod).
-      - `az deployment group create` param wiring (adminPassword=, allowedSourceIp=)
-        -> SKIPPED until Plan 04 (mock az).
-      - `-AllowedSourceIp` override bypasses ipify -> SKIPPED until Plan 04.
-
-    Tests that depend on infra/manage-env.ps1 dot-source it behind a guard and are
-    marked -Skip with a reason referencing Plan 04 so this file runs GREEN now and
-    becomes active once Plan 04 lands.
+    Scope (activated in Plan 01-04 — infra/manage-env.ps1 now exists):
+      - Password generation entropy/length            -> LIVE (standalone expr).
+      - Dev public-IP detection (ipify shape)          -> LIVE (mock Invoke-RestMethod).
+      - `az deployment group create` param wiring       -> LIVE (mock az).
+      - `-AllowedSourceIp` override bypasses ipify       -> LIVE (mock az + IRM).
+      - CSE-script publish: blob upload + non-empty scriptUri wiring -> LIVE.
 
     SECURITY: never write a real/generated password to test output. Assertions are
-    on length and character-class coverage only.
+    on length and character-class coverage only; the deployment-param assertion
+    matches on the presence of `adminPassword=`, never the value.
 #>
 
-# Evaluated at Pester DISCOVERY time (top-level script body) so the -Skip conditions on
-# `It` resolve correctly — `BeforeAll` runs at the later run phase and is too late for -Skip.
+# Evaluated at Pester DISCOVERY time (top-level script body) so any -Skip conditions on
+# `It` resolve correctly — BeforeAll runs at the later run phase and is too late for -Skip.
 $script:ManageEnvScript = Join-Path $PSScriptRoot '..' 'manage-env.ps1'
-$script:SkipUntilPlan04  = -not (Test-Path $script:ManageEnvScript)
-$script:Plan04Reason     = 'infra/manage-env.ps1 created in Plan 04'
 
 BeforeAll {
-    # Re-resolve inside run phase too (BeforeAll variables are what It bodies see at run time).
     $script:ManageEnvScript = Join-Path $PSScriptRoot '..' 'manage-env.ps1'
 
-    # Standalone cryptographic password generator — mirrors the generation expression
-    # Plan 04's manage-env.ps1 will use. Tested LIVE here so at least one assertion is
-    # active today. Uses System.Security.Cryptography (crypto RNG), NOT a hand-rolled
-    # char-shuffler (RESEARCH.md "Don't Hand-Roll").
+    # Standalone cryptographic password generator — mirrors the generation
+    # expression manage-env.ps1 uses. Tested LIVE here. Uses
+    # System.Security.Cryptography (crypto RNG), NOT a hand-rolled char-shuffler.
     function New-TestAdminPassword {
         param([int]$Length = 24)
         $lower  = 'abcdefghijkmnopqrstuvwxyz'
@@ -44,7 +35,6 @@ BeforeAll {
         $symbol = '!@#$%^&*()-_=+'
         $all    = ($lower + $upper + $digit + $symbol).ToCharArray()
 
-        # Guarantee one of each class, then fill the rest from the full set, all via crypto RNG.
         $chars = @(
             $lower[(Get-Random -Maximum $lower.Length)]
             $upper[(Get-Random -Maximum $upper.Length)]
@@ -55,9 +45,32 @@ BeforeAll {
             $idx = [System.Security.Cryptography.RandomNumberGenerator]::GetInt32($all.Length)
             $chars += $all[$idx]
         }
-        # Crypto shuffle so the guaranteed-class chars are not always first.
         $shuffled = $chars | Sort-Object { [System.Security.Cryptography.RandomNumberGenerator]::GetInt32([int]::MaxValue) }
         -join $shuffled
+    }
+
+    # Shared `az` mock body — returns a non-empty tsv-ish value for the queries
+    # the driver reads back (storage key, SAS URI, public IP), and leaves
+    # $LASTEXITCODE = 0 so the `az account show` pre-flight passes. NO real az
+    # process is ever spawned. Each test re-declares Mock az so per-test
+    # Assert-MockCalled scoping is clean; this is the canonical body.
+    function script:Invoke-AzMock {
+        $line = ($args -join ' ')
+        # Simulate a successful native `az` call: reset the native exit code so the
+        # driver's `az account show` pre-flight (which checks $LASTEXITCODE) passes.
+        $global:LASTEXITCODE = 0
+        # Emit values for the read-back queries so the driver proceeds.
+        if ($line -match 'account show') { return }
+        if ($line -match 'storage account keys list') { return 'fake-storage-key==' }
+        if ($line -match 'generate-sas') {
+            if ($line -match 'Configure-Target\.ps1') {
+                return 'https://fake.blob.core.windows.net/cse/Configure-Target.ps1?sig=READONLY'
+            }
+            return 'https://fake.blob.core.windows.net/cse/Delete-ResourceGroup.ps1?sig=READONLY'
+        }
+        if ($line -match 'deployment group show') { return '203.0.113.55' }
+        if ($line -match 'public-ip list') { return '203.0.113.55' }
+        return
     }
 }
 
@@ -76,7 +89,6 @@ Describe 'Password generation (LIVE)' {
     }
 
     It 'uses a cryptographic source (RandomNumberGenerator) producing distinct values' {
-        # Two independent generations must differ — a deterministic/constant source would collide.
         $a = New-TestAdminPassword -Length 24
         $b = New-TestAdminPassword -Length 24
         $a | Should -Not -Be $b
@@ -84,21 +96,20 @@ Describe 'Password generation (LIVE)' {
 }
 
 Describe 'Dev public-IP detection' {
-    It 'parses the { "ip": "x.x.x.x" } shape from the ipify response' -Skip:$script:SkipUntilPlan04 -ForEach @(@{ Reason = $script:Plan04Reason }) {
-        # Activated by Plan 04. Mock the HTTP call so no network access occurs.
+    It 'parses the { "ip": "x.x.x.x" } shape from the ipify response' {
+        Mock az { script:Invoke-AzMock @args }
         Mock Invoke-RestMethod { @{ ip = '203.0.113.7' } }
-        . $script:ManageEnvScript -Action up -WhatIf 4>$null
-        # Plan 04's driver must surface the detected IP; assert the parsed value.
+        # -WhatIf short-circuits after IP detection: no deploy, but ipify is hit once.
+        . $script:ManageEnvScript -Action up -WhatIf 4>$null 6>$null
         Assert-MockCalled Invoke-RestMethod -Times 1 -Scope It
     }
 }
 
 Describe 'az deployment param wiring' {
-    It 'invokes `az deployment group create` with adminPassword= and allowedSourceIp=' -Skip:$script:SkipUntilPlan04 -ForEach @(@{ Reason = $script:Plan04Reason }) {
-        # Activated by Plan 04. Mock az so no real Azure deployment occurs.
-        Mock az { }
+    It 'invokes `az deployment group create` with adminPassword= and allowedSourceIp=' {
+        Mock az { script:Invoke-AzMock @args }
         Mock Invoke-RestMethod { @{ ip = '203.0.113.7' } }
-        . $script:ManageEnvScript -Action up 4>$null
+        . $script:ManageEnvScript -Action up 4>$null 6>$null
         Assert-MockCalled az -ParameterFilter {
             ($args -join ' ') -match 'deployment group create' -and
             ($args -join ' ') -match 'adminPassword=' -and
@@ -108,11 +119,56 @@ Describe 'az deployment param wiring' {
 }
 
 Describe '-AllowedSourceIp override' {
-    It 'bypasses the ipify lookup when -AllowedSourceIp is supplied' -Skip:$script:SkipUntilPlan04 -ForEach @(@{ Reason = $script:Plan04Reason }) {
-        # Activated by Plan 04. With an explicit IP, Invoke-RestMethod must NOT be called.
-        Mock az { }
+    It 'bypasses the ipify lookup when -AllowedSourceIp is supplied' {
+        Mock az { script:Invoke-AzMock @args }
         Mock Invoke-RestMethod { @{ ip = '203.0.113.7' } }
-        . $script:ManageEnvScript -Action up -AllowedSourceIp '198.51.100.42' 4>$null
+        . $script:ManageEnvScript -Action up -AllowedSourceIp '198.51.100.42' 4>$null 6>$null
         Assert-MockCalled Invoke-RestMethod -Times 0 -Scope It
+    }
+}
+
+Describe 'CSE-script publish (scriptUri wiring)' {
+    It 'uploads Configure-Target.ps1 and feeds a non-empty scriptUri to the deployment' {
+        Mock az { script:Invoke-AzMock @args }
+        Mock Invoke-RestMethod { @{ ip = '203.0.113.7' } }
+        . $script:ManageEnvScript -Action up 4>$null 6>$null
+
+        # The CSE script is uploaded as a blob...
+        Assert-MockCalled az -ParameterFilter {
+            ($args -join ' ') -match 'storage blob upload' -and
+            ($args -join ' ') -match 'Configure-Target\.ps1'
+        } -Scope It
+
+        # ...a read-only SAS is minted for it...
+        Assert-MockCalled az -ParameterFilter {
+            ($args -join ' ') -match 'generate-sas' -and
+            ($args -join ' ') -match 'Configure-Target\.ps1'
+        } -Scope It
+
+        # ...and a NON-EMPTY scriptUri= is fed to the deployment (never empty/placeholder).
+        Assert-MockCalled az -ParameterFilter {
+            $joined = ($args -join ' ')
+            ($joined -match 'deployment group create') -and
+            ($joined -match 'scriptUri=\S+')
+        } -Scope It
+    }
+
+    It 'mints the blob upload + SAS BEFORE the deployment (publish precedes deploy)' {
+        $script:callOrder = [System.Collections.Generic.List[string]]::new()
+        Mock az {
+            $line = ($args -join ' ')
+            if ($line -match 'storage blob upload') { $script:callOrder.Add('upload') }
+            if ($line -match 'generate-sas') { $script:callOrder.Add('sas') }
+            if ($line -match 'deployment group create') { $script:callOrder.Add('deploy') }
+            script:Invoke-AzMock @args
+        }
+        Mock Invoke-RestMethod { @{ ip = '203.0.113.7' } }
+        . $script:ManageEnvScript -Action up 4>$null 6>$null
+
+        $deployIdx = $script:callOrder.IndexOf('deploy')
+        $uploadIdx = $script:callOrder.IndexOf('upload')
+        $sasIdx    = $script:callOrder.IndexOf('sas')
+        $deployIdx | Should -BeGreaterThan $uploadIdx
+        $deployIdx | Should -BeGreaterThan $sasIdx
     }
 }
