@@ -4,10 +4,21 @@
 //   VNet + subnet, NSG (RDP 3389 + WinRM 5986 scoped to the dev IP),
 //   Standard/Static public IP, NIC, and a WS2022 Datacenter Gen2 Desktop VM.
 //
-// All API versions are pinned explicitly (no "latest" API). Resource graph only —
-// the auto-destroy Automation account + runbook are owned by Plan 04, not here.
+// All API versions are pinned explicitly (no "latest" API).
 //
-// Scope: resourceGroup (default for `az deployment group create`).
+// AUTO-DESTROY TOPOLOGY (ENV-03): SEPARATE-MANAGEMENT (Task 1 decision).
+// The Automation Account + runbook + daily schedule live in a PERSISTENT
+// management resource group that OUTLIVES the disposable TEST RG. Its
+// system-assigned managed identity is granted Contributor over the TEST RG
+// ONLY (tightest least-privilege — never the full-access subscription role).
+// Because the
+// deleter is not inside the RG it deletes, the job host survives the delete
+// and the final job status reports cleanly (avoids self-delete caveat,
+// RESEARCH.md Pitfall 4). The management RG is NOT torn down by `down`.
+//
+// Scope: resourceGroup (default for `az deployment group create`). This template
+// is deployed INTO the TEST RG; the management-RG resources are declared via a
+// module scoped to the management RG (see below).
 targetScope = 'resourceGroup'
 
 // ---------------------------------------------------------------------------
@@ -32,6 +43,22 @@ param location string = resourceGroup().location
 
 @description('Public URL where Configure-Target.ps1 is published at deploy time (raw URL or storage-blob URL). Supplied by manage-env.ps1 in Plan 04; consumed by the CustomScriptExtension fileUris.')
 param scriptUri string
+
+// ---------------------------------------------------------------------------
+// Auto-destroy parameters (ENV-03, separate-management topology)
+// ---------------------------------------------------------------------------
+
+@description('Name of the PERSISTENT management resource group that holds the auto-destroy Automation Account + runbook. This RG is NOT torn down by `down`; it outlives the disposable TEST RG. Created/managed by manage-env.ps1.')
+param managementResourceGroupName string = 'rdpilot-mgmt'
+
+@description('Name of the Automation Account (in the management RG) that runs the auto-destroy runbook.')
+param automationAccountName string = 'rdpilot-autodestroy'
+
+@description('Daily auto-destroy fire time (TTL). ISO-8601 datetime for the FIRST schedule occurrence; the schedule then recurs every 1 day. Must be in the future at deploy time. Defaults to ~1 day after deployment.')
+param autoDestroyStartTime string = dateTimeAdd(utcNow(), 'P1D')
+
+@description('Read-only SAS blob URI of the published Delete-ResourceGroup.ps1 (the auto-destroy runbook body). Minted per-deploy by manage-env.ps1 from the in-repo source, so the runbook is pinned to the repo rather than fetched from "latest" off the internet. Only needs to be reachable during deployment (Automation imports the content at publish time).')
+param deleteRunbookContentUri string
 
 // ---------------------------------------------------------------------------
 // Networking
@@ -206,6 +233,46 @@ resource configureTarget 'Microsoft.Compute/virtualMachines/extensions@2024-07-0
     protectedSettings: {
       commandToExecute: 'powershell -ExecutionPolicy Unrestricted -File Configure-Target.ps1'
     }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Auto-destroy (ENV-03) — SEPARATE-MANAGEMENT topology.
+//
+// The Automation Account + runbook + daily schedule are declared in the
+// PERSISTENT management RG via a module scoped to that RG (it outlives the TEST
+// RG, so the deleter survives the delete and reports clean job status —
+// RESEARCH.md Pitfall 4). The role assignment below grants that account's
+// managed identity Contributor over the TEST RG (this deployment's scope) ONLY
+// — the tightest least-privilege grant. NEVER the subscription full-access role.
+// ---------------------------------------------------------------------------
+
+// Built-in role definition: Contributor (can manage/delete resources, but NOT
+// grant access). Referenced by its well-known GUID, scoped to the TEST RG.
+var contributorRoleId = subscriptionResourceId(
+  'Microsoft.Authorization/roleDefinitions',
+  'b24988ac-6180-42a0-ab88-20f7382dd24c'
+)
+
+module autoDestroy 'modules/autodestroy.bicep' = {
+  name: 'autodestroy'
+  scope: resourceGroup(managementResourceGroupName)
+  params: {
+    automationAccountName: automationAccountName
+    location: location
+    targetResourceGroupName: resourceGroup().name
+    autoDestroyStartTime: autoDestroyStartTime
+    deleteRunbookContentUri: deleteRunbookContentUri
+  }
+}
+
+// Contributor scoped to THIS (TEST) resource group only — tightest privilege.
+resource autoDestroyRoleAssignment 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(resourceGroup().id, automationAccountName, 'Contributor')
+  properties: {
+    roleDefinitionId: contributorRoleId
+    principalId: autoDestroy.outputs.principalId
+    principalType: 'ServicePrincipal'
   }
 }
 
