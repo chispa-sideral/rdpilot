@@ -44,7 +44,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 
 **Wave 2** *(blocked on Wave 1 completion)*
 
-  - [ ] 01-02-PLAN.md — Core infra Bicep: network + NSG (IP-scoped 3389/5986) + WS2022 VM + CustomScriptExtension
+  - [x] 01-02-PLAN.md — Core infra Bicep: network + NSG (IP-scoped 3389/5986) + WS2022 VM + CustomScriptExtension
   - [ ] 01-03-PLAN.md — In-guest Configure-Target.ps1: WinRM HTTPS, default-hive DPI + SuppressWhenMinimized, SHA-verified 7-Zip
 
 **Wave 3** *(blocked on Wave 2 completion)*
@@ -171,7 +171,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8 →
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Test Environment | 1/4 | In progress | - |
+| 1. Test Environment | 2/4 | In progress | - |
 | 2. RDP Session + Framebuffer Core | 0/? | Not started | - |
 | 3. Input Injection | 0/? | Not started | - |
 | 4. DVC Transport Channel | 0/? | Not started | - |

@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-stopped_at: Completed 01-01-PLAN.md (infra baseline + validation harness)
-last_updated: "2026-06-04T22:55:00.000Z"
-last_activity: 2026-06-04 — Executed Phase 1 Plan 01 (Wave 0 scaffold): .gitignore, infra/ layout, Pester + Validate-Target skeleton
+stopped_at: Completed 01-02-PLAN.md (core infra Bicep — network + VM + NSG + CSE)
+last_updated: "2026-06-04T23:20:00.000Z"
+last_activity: 2026-06-04 — Executed Phase 1 Plan 02 (Wave 2): infra/main.bicep (VNet/NSG/PIP/NIC/WS2022 VM + CustomScriptExtension), compiles clean
 progress:
   total_phases: 9
   completed_phases: 0
-  total_plans: 1
-  completed_plans: 1
-  percent: 3
+  total_plans: 2
+  completed_plans: 2
+  percent: 6
 ---
 
 # Project State
@@ -26,25 +26,25 @@ See: .planning/PROJECT.md (updated 2026-06-04)
 ## Current Position
 
 Phase: 1 of 9 (Test Environment)
-Plan: 1 of 4 in current phase (01-01 complete; next: 01-02)
+Plan: 2 of 4 in current phase (01-01, 01-02 complete; next: 01-03)
 Status: Executing
-Last activity: 2026-06-04 — Executed Phase 1 Plan 01 (Wave 0 scaffold)
+Last activity: 2026-06-04 — Executed Phase 1 Plan 02 (Wave 2 core infra Bicep)
 
-Progress: [░░░░░░░░░░] 3%
+Progress: [█░░░░░░░░░] 6%
 
 ## Performance Metrics
 
 **Velocity:**
 
-- Total plans completed: 1
-- Average duration: ~12 min
-- Total execution time: ~0.2 hours
+- Total plans completed: 2
+- Average duration: ~11 min
+- Total execution time: ~0.4 hours
 
 **By Phase:**
 
 | Phase | Plans | Total | Avg/Plan |
 |-------|-------|-------|----------|
-| 1 | 1 | ~12 min | ~12 min |
+| 1 | 2 | ~22 min | ~11 min |
 
 **Recent Trend:**
 
@@ -70,6 +70,8 @@ Recent decisions affecting current work:
 - `.secrets/connection.json` is the only credential location; `.gitignore` excludes `.secrets/` and `.env` from the start (Pitfall 7)
 - Cargo.lock commit policy deferred to Phase 2 (Plan 01 .gitignore only excludes /target/ + *.rs.bk)
 - Pester 5.7.1 is the PowerShell test framework; per-commit gate is no-Azure-cost (az + network mocked)
+- main.bicep: single RG, subnet-level NSG association, StandardSSD_LRS OS disk, NLA left at Azure default (verified later); CSE invokes Configure-Target.ps1 via scriptUri param (Plan 03/04 fill the contract)
+- Compiled Bicep ARM output (infra/*.json) is gitignored — source of truth is the .bicep
 
 ### Pending Todos
 
@@ -90,6 +92,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-06-04T22:55:00.000Z
-Stopped at: Completed 01-01-PLAN.md
-Resume file: .planning/phases/01-test-environment/01-02-PLAN.md
+Last session: 2026-06-04T23:20:00.000Z
+Stopped at: Completed 01-02-PLAN.md
+Resume file: .planning/phases/01-test-environment/01-03-PLAN.md
