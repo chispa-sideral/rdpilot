@@ -7,6 +7,10 @@
 # Test output artifacts (Pester -CI writes NUnit XML to the cwd)
 testResults.xml
 
+# Compiled Bicep ARM output (`az bicep build` emits main.json next to main.bicep —
+# transient compile artifact, source of truth is the .bicep)
+infra/*.json
+
 # Rust / Cargo build output (SDK work begins Phase 2; Cargo.lock policy decided then)
 /target/
 **/*.rs.bk
