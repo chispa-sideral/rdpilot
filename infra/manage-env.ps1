@@ -37,7 +37,17 @@ param(
 
     [string]$ManagementRg = 'rdpilot-mgmt',
 
-    [string]$AutomationAccountName = 'rdpilot-autodestroy'
+    [string]$AutomationAccountName = 'rdpilot-autodestroy',
+
+    # VM size for the test target. Must be available + unrestricted in $Location
+    # (verified by the up-preflight before any deploy). Override when the default is
+    # capacity-restricted in the region (e.g. -VmSize Standard_B2s_v2).
+    [string]$VmSize = 'Standard_B2ms',
+
+    # down only: when set, fire the RG delete async (--no-wait) and return
+    # immediately. Default (omitted) BLOCKS until the RG is fully deleted, so a
+    # subsequent `up` never collides with an in-flight deprovisioning.
+    [switch]$NoWait
 )
 
 $ErrorActionPreference = 'Stop'
@@ -114,29 +124,150 @@ function Get-DevPublicIp {
     return $ip
 }
 
+function Get-RgProvisioningState {
+    <#
+        Returns the provisioningState of $Name ('Succeeded', 'Deleting', etc.), or
+        $null if the RG does not exist. Read-only; never throws on a missing RG.
+    #>
+    param([Parameter(Mandatory)][string]$Name)
+    $state = az group show -n $Name --query 'properties.provisioningState' -o tsv 2>$null
+    if ($LASTEXITCODE -ne 0 -or -not $state) { return $null }
+    return $state.Trim()
+}
+
+function Get-ViableVmSizes {
+    <#
+        Returns up to 6 VM sizes available + UNRESTRICTED (no 'Location' restriction)
+        in $Location, as alternatives to a restricted choice. A 'Zone'-only
+        restriction is fine (the deployment is non-zonal). Read-only az query.
+        Prefers small B-series then Dxs_v5/v3 so the user stays in-region (EU).
+    #>
+    param([Parameter(Mandatory)][string]$Location)
+
+    $json = az vm list-skus -l $Location --resource-type virtualMachines --all -o json 2>$null
+    if ($LASTEXITCODE -ne 0 -or -not $json) { return @() }
+    $skus = $json | ConvertFrom-Json
+
+    $prefer = '^Standard_(B2s_v2|B2ls_v2|B2ts_v2|B2|B1|D2s_v5|D2as_v5|D2s_v3|D2as_v4)'
+    $skus |
+        Where-Object {
+            $_.name -match $prefer -and
+            -not ($_.restrictions | Where-Object { $_.type -eq 'Location' })
+        } |
+        Select-Object -ExpandProperty name -Unique |
+        Sort-Object |
+        Select-Object -First 6
+}
+
+function Test-VmSizeAvailable {
+    <#
+        Returns $true if $VmSize is offered in $Location with NO 'Location'
+        restriction (a 'Zone'-only restriction is acceptable for a non-zonal VM).
+        Read-only az query. Returns $false if the size is absent or Location-restricted.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$VmSize,
+        [Parameter(Mandatory)][string]$Location
+    )
+    $json = az vm list-skus -l $Location --resource-type virtualMachines --size $VmSize --all -o json 2>$null
+    if ($LASTEXITCODE -ne 0 -or -not $json) { return $false }
+    $skus = $json | ConvertFrom-Json
+    $match = $skus | Where-Object { $_.name -eq $VmSize }
+    if (-not $match) { return $false }
+    # Available unless there is a hard Location restriction in the region.
+    return -not ($match.restrictions | Where-Object { $_.type -eq 'Location' })
+}
+
 # ---------------------------------------------------------------------------
 # down — tear down the TEST RG (cascades). Management RG is left in place.
 # ---------------------------------------------------------------------------
 
 if ($Action -eq 'down') {
     Write-Host "Deleting TEST resource group '$Rg' (the management RG '$ManagementRg' is left in place)..."
-    az group delete -n $Rg --yes --no-wait | Out-Null
-    Write-Host "Teardown requested for '$Rg'. (--no-wait: deletion continues in the background.)"
-    return
+
+    if ($NoWait) {
+        # Async: fire and return. The next `up` may collide with the in-flight delete —
+        # use the default (blocking) mode if you intend to re-provision immediately.
+        az group delete -n $Rg --yes --no-wait | Out-Null
+        Write-Host "Teardown started for '$Rg' (async, --no-wait). Deletion continues in the background."
+        return
+    }
+
+    # Default: BLOCK until the RG is fully gone, so a subsequent `up` never hits a
+    # 'ResourceGroupBeingDeleted' deprovisioning collision. `az group delete` (without
+    # --no-wait) already blocks server-side; we then poll to confirm and show progress.
+    Write-Host "Waiting for deletion to complete (this can take several minutes)..."
+    az group delete -n $Rg --yes | Out-Null
+
+    # Confirm the RG is actually gone (poll provisioningState until absent).
+    for ($i = 0; $i -lt 60; $i++) {
+        $state = Get-RgProvisioningState -Name $Rg
+        if (-not $state) {
+            Write-Host "Resource group '$Rg' is fully deleted."
+            return
+        }
+        Write-Host "  ... still deleting (state: $state)"
+        Start-Sleep -Seconds 10
+    }
+    throw "Timed out waiting for '$Rg' to delete. Check the Azure portal; re-run -Action down when ready."
 }
 
 # ---------------------------------------------------------------------------
 # up — provision the TEST environment.
 # ---------------------------------------------------------------------------
 
-# Pre-flight: an authenticated az session against the caller's active subscription
-# is required (Assumption A7). We check the exit code rather than the output so a
-# logged-out session fails fast with a clear message. (No subscription is ever
-# hard-coded — whatever `az account show` reports is what we deploy into.)
-az account show --output none 2>$null
-if ($LASTEXITCODE -ne 0) {
-    throw "Not authenticated to Azure. Run 'az login' (and 'az account set --subscription <id>' if needed) before 'up'."
+# =============================================================================
+# UP-PREFLIGHT — all checks run BEFORE any resource is created. Any failure aborts
+# with a clear, actionable message and a non-zero exit (so no money is spent and no
+# false "is up" is printed). Order: auth -> RG-state guard -> VM-SKU capacity ->
+# (light) provider registration.
+# =============================================================================
+
+Write-Host "=== Preflight checks for '$Action' ==="
+
+# (P1) Authenticated az session against the caller's active subscription (A7). Check
+# the exit code, not the output, so a logged-out session fails fast. No subscription
+# is ever hard-coded — whatever `az account show` reports is what we deploy into.
+$acct = az account show --query '{name:name,id:id}' -o json 2>$null
+if ($LASTEXITCODE -ne 0 -or -not $acct) {
+    throw "Not logged in — run 'az login' (and 'az account set --subscription <id>' if needed) before 'up'."
 }
+$acctObj = $acct | ConvertFrom-Json
+Write-Host "  [OK]  Authenticated. Subscription: $($acctObj.name) ($($acctObj.id))"
+Write-Host "  Target region: '$Location' | Test RG: '$Rg' | Management RG: '$ManagementRg' | VM size: '$VmSize'"
+
+# (P2) RG-state guard. Deploying into an RG that is mid-delete fails with
+# 'ResourceGroupBeingDeleted'. A leftover 'Succeeded' RG should be torn down first
+# rather than silently re-used (it may hold stale resources / an old NSG scope).
+$rgState = Get-RgProvisioningState -Name $Rg
+if ($rgState -and $rgState -match 'Delet|deprovision') {
+    throw "RG '$Rg' is being deleted (state: $rgState). Wait for deletion to finish, or run '-Action down' (default WAITs) first, then re-run 'up'."
+}
+if ($rgState -eq 'Succeeded') {
+    throw "RG '$Rg' already exists (state: Succeeded). Run '-Action down' to remove the leftover environment first, then re-run 'up' (re-using a dirty RG is not supported)."
+}
+Write-Host "  [OK]  Test RG '$Rg' is clear (no conflicting environment)."
+
+# (P3) VM-SKU capacity preflight. westeurope frequently 'Location'-restricts the
+# default Standard_B2ms for a subscription ('SkuNotAvailable' at deploy time). Catch
+# it BEFORE wasting a deploy and suggest in-region alternatives.
+if (-not (Test-VmSizeAvailable -VmSize $VmSize -Location $Location)) {
+    $alts = Get-ViableVmSizes -Location $Location
+    $altMsg = if ($alts) { ($alts -join ', ') } else { '(none found — try another region)' }
+    throw "VM size '$VmSize' is unavailable/restricted in '$Location' (SkuNotAvailable). Re-run with one of these available sizes: $altMsg`n  e.g. -VmSize $($alts | Select-Object -First 1)"
+}
+Write-Host "  [OK]  VM size '$VmSize' is available in '$Location'."
+
+# (P4) Light provider-registration check. A non-registered provider fails the deploy
+# late; warn (don't block) so the user can register and retry.
+$requiredProviders = @('Microsoft.Compute', 'Microsoft.Network', 'Microsoft.Storage', 'Microsoft.Automation')
+foreach ($ns in $requiredProviders) {
+    $regState = az provider show -n $ns --query 'registrationState' -o tsv 2>$null
+    if ($LASTEXITCODE -eq 0 -and $regState -and $regState -ne 'Registered') {
+        Write-Warning "Resource provider '$ns' is '$regState' (not Registered). Run 'az provider register -n $ns' if the deploy fails."
+    }
+}
+Write-Host "=== Preflight passed ==="
 
 # Detect the dev IP (or use the override) BEFORE generating secrets / deploying.
 $devIp = Get-DevPublicIp -Override $AllowedSourceIp
@@ -144,7 +275,7 @@ $devIp = Get-DevPublicIp -Override $AllowedSourceIp
 # -WhatIf short-circuit: stop here after IP detection without creating resources,
 # generating secrets, or deploying. Lets the env be validated cheaply / in tests.
 if ($WhatIfPreference -or -not $PSCmdlet.ShouldProcess($Rg, 'provision rdpilot test environment')) {
-    Write-Host "[WhatIf] Would provision RG '$Rg' in '$Location' scoped to source IP '$devIp'. No resources created."
+    Write-Host "[WhatIf] Would provision RG '$Rg' in '$Location' (VM size '$VmSize') scoped to source IP '$devIp'. No resources created."
     return
 }
 
@@ -153,6 +284,7 @@ $adminPwd = New-StrongPassword -Length 24
 
 # Ensure both resource groups exist. The management RG is PERSISTENT (not torn
 # down by `down`); the TEST RG is disposable.
+Write-Host "Creating resource groups in '$Location' ('$ManagementRg' [persistent], '$Rg' [test])..."
 az group create -n $ManagementRg -l $Location | Out-Null
 az group create -n $Rg -l $Location | Out-Null
 
@@ -167,6 +299,7 @@ az group create -n $Rg -l $Location | Out-Null
 # everything else. The SAS tokens are credentials — never echoed.
 # -----------------------------------------------------------------------------
 
+Write-Host "Publishing CSE + runbook scripts to a private blob (read-only SAS)..."
 $rand = -join ((1..8) | ForEach-Object { '0123456789abcdefghijklmnopqrstuvwxyz'[[System.Security.Cryptography.RandomNumberGenerator]::GetInt32(36)] })
 $storageAccount = "rdpilotcse$rand"
 $container = 'cse'
@@ -270,6 +403,7 @@ $armParams = [ordered]@{
         deleteRunbookContentUri     = @{ value = $runbookUri }
         managementResourceGroupName = @{ value = $ManagementRg }
         automationAccountName       = @{ value = $AutomationAccountName }
+        vmSize                      = @{ value = $VmSize }
     }
 }
 
@@ -278,6 +412,7 @@ try {
     # so it is created in the per-user temp dir and removed immediately after deploy.
     $armParams | ConvertTo-Json -Depth 5 | Set-Content -Path $paramsFile -Encoding UTF8
 
+    Write-Host "Deploying VM size '$VmSize' into '$Rg' (this typically takes ~5-10 min)..."
     az deployment group create `
         -g $Rg `
         -n $deployName `
@@ -285,8 +420,11 @@ try {
         --parameters "@$paramsFile" | Out-Null
 
     if ($LASTEXITCODE -ne 0) {
-        throw "az deployment group create failed (exit $LASTEXITCODE). The TEST RG '$Rg' may be partially provisioned; run 'down' to clean up."
+        # Surface a real failure: no false "is up". The RG is likely partially
+        # provisioned, so direct the user to clean it before retrying.
+        throw "az deployment group create FAILED (exit $LASTEXITCODE). The TEST RG '$Rg' may be partially provisioned — run 'pwsh infra/manage-env.ps1 -Action down' to clean it up before retrying."
     }
+    Write-Host "Deployment '$deployName' succeeded."
 }
 finally {
     # The params file carries credentials — always remove it, even on failure.
@@ -301,10 +439,12 @@ if (-not $publicIp) {
 if (-not $publicIp) {
     throw "Deployment '$deployName' completed but no public IP could be read from outputs or the RG. The connection file would be unusable; aborting before writing it."
 }
+Write-Host "Deployment succeeded, public IP $publicIp."
 
 # -----------------------------------------------------------------------------
 # Write the gitignored connection file (D-06). The password lands ONLY here.
 # -----------------------------------------------------------------------------
+Write-Host "Writing connection file..."
 
 $secretsDir = Join-Path (Split-Path $InfraRoot -Parent) '.secrets'
 New-Item -ItemType Directory -Force -Path $secretsDir | Out-Null
