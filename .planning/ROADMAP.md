@@ -49,7 +49,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 
 **Wave 3** *(blocked on Wave 2 completion)*
 
-  - [ ] 01-04-PLAN.md — Auto-destroy (runbook + schedule + RBAC) + manage-env.ps1 up/down + phase-gate live run
+  - [ ] 01-04-PLAN.md — Auto-destroy (runbook + schedule + RBAC) + manage-env.ps1 up/down + phase-gate live run *(T1-T3 authored + committed; live phase-gate Task 4 PENDING a human run — see 01-04-SUMMARY.md)*
 
 ### Phase 2: RDP Session + Framebuffer Core
 
@@ -171,7 +171,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8 →
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Test Environment | 3/4 | In progress | - |
+| 1. Test Environment | 3/4 | In progress (01-04 authored; live phase-gate pending) | - |
 | 2. RDP Session + Framebuffer Core | 0/? | Not started | - |
 | 3. Input Injection | 0/? | Not started | - |
 | 4. DVC Transport Channel | 0/? | Not started | - |

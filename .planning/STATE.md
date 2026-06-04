@@ -3,9 +3,9 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-stopped_at: Completed 01-03-PLAN.md (in-guest Configure-Target.ps1 — WinRM HTTPS, default-hive DPI + SuppressWhenMinimized, SHA-verified 7-Zip)
-last_updated: "2026-06-04T21:01:00.000Z"
-last_activity: 2026-06-04 — Executed Phase 1 Plan 03 (Wave 2): infra/scripts/Configure-Target.ps1 (idempotent in-guest hardening; 7-Zip 26.01 pinned via blocking human-verify checkpoint)
+stopped_at: 01-04 Tasks 1-3 authored + committed (auto-destroy Bicep/runbook + manage-env.ps1, Pester green mocked). Task 4 LIVE PHASE-GATE PENDING a human-run deployment — Phase 1 NOT yet fully verified.
+last_updated: "2026-06-04T21:35:00.000Z"
+last_activity: 2026-06-04 — Executed Phase 1 Plan 04 Tasks 1-3 (Wave 3): separate-management auto-destroy (Automation Account + managed-identity runbook + daily schedule + RG-scoped Contributor) + manage-env.ps1 up/down (CSE/runbook SAS publish, crypto password, gitignored connection file); Pester 8/8 green mocked. Task 4 (live up→validate→down) DEFERRED by user.
 progress:
   total_phases: 9
   completed_phases: 0
@@ -26,9 +26,9 @@ See: .planning/PROJECT.md (updated 2026-06-04)
 ## Current Position
 
 Phase: 1 of 9 (Test Environment)
-Plan: 3 of 4 in current phase (01-01, 01-02, 01-03 complete; next: 01-04)
-Status: Executing
-Last activity: 2026-06-04 — Executed Phase 1 Plan 03 (Wave 2 in-guest hardening script)
+Plan: 4 of 4 in current phase — 01-04 authoring (Tasks 1-3) COMPLETE; the live phase-gate (Task 4) is PENDING a human-run `up`→`Validate-Target.ps1`→`down`. Phase 1 is NOT yet fully verified/complete.
+Status: Executing (Phase 1 awaiting the deferred live phase-gate)
+Last activity: 2026-06-04 — Executed Phase 1 Plan 04 Tasks 1-3 (Wave 3 auto-destroy + manage-env.ps1; Pester green mocked). Task 4 deferred by user.
 
 Progress: [█░░░░░░░░░] 8%
 
@@ -74,7 +74,9 @@ Recent decisions affecting current work:
 - Compiled Bicep ARM output (infra/*.json) is gitignored — source of truth is the .bicep
 - 7-Zip pinned to 26.01 via blocking human-verify checkpoint: URL github.com/ip7z/7zip/releases/download/26.01/7z2601-x64.exe, SHA-256 d64a0468...94377d (computed == GitHub release asset digest); Configure-Target.ps1 throws on hash mismatch before install
 - Configure-Target.ps1: per-user settings (96 DPI + SuppressWhenMinimized) go to the DEFAULT user hive via reg load/unload, never the current-user hive (Pitfall 1); no reboot; every mutation idempotent
-- Forbidden-token verify gates match literals anywhere in a file (incl. comments) — keep rationale prose token-free (HKCU, 0.0.0.0/0, deploymentScripts)
+- Forbidden-token verify gates match literals anywhere in a file (incl. comments) — keep rationale prose token-free (HKCU, 0.0.0.0/0, deploymentScripts, Owner)
+- Auto-destroy topology = separate-management (user decision): persistent management RG (rdpilot-mgmt) holds the Automation Account; its managed identity = Contributor over the TEST RG (rdpilot-test) ONLY; West Europe; subscription = caller's active az sub (never hard-coded)
+- manage-env.ps1 publishes BOTH Configure-Target.ps1 (CSE) and Delete-ResourceGroup.ps1 (runbook publishContentLink) to a per-up private blob + short-lived read-only single-blob SAS; storage account lives in the TEST RG so `down` cascades it; `down` leaves the management RG in place
 
 ### Pending Todos
 
@@ -91,10 +93,10 @@ None yet.
 
 | Category | Item | Status | Deferred At |
 |----------|------|--------|-------------|
-| *(none)* | | | |
+| Phase gate | 01-04 Task 4 — live `up`→`Validate-Target.ps1`→`down` cycle (real Azure cost) proving ENV-01/02/03 against a live target | PENDING human run | 2026-06-04 (user decision) |
 
 ## Session Continuity
 
-Last session: 2026-06-04T21:01:00.000Z
-Stopped at: Completed 01-03-PLAN.md
-Resume file: .planning/phases/01-test-environment/01-04-PLAN.md
+Last session: 2026-06-04T21:35:00.000Z
+Stopped at: 01-04 Tasks 1-3 authored + committed; Task 4 live phase-gate PENDING human run (see 01-04-SUMMARY.md "DEFERRED: Task 4" for the exact command sequence). Phase 1 NOT complete.
+Resume file: .planning/phases/01-test-environment/01-04-SUMMARY.md
