@@ -40,7 +40,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 
 **Wave 1**
 
-  - [ ] 01-01-PLAN.md — Repo baseline (.gitignore) + validation scaffolding (Pester, Validate-Target skeleton)
+  - [x] 01-01-PLAN.md — Repo baseline (.gitignore) + validation scaffolding (Pester, Validate-Target skeleton)
 
 **Wave 2** *(blocked on Wave 1 completion)*
 
@@ -171,7 +171,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8 →
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Test Environment | 0/4 | Planned | - |
+| 1. Test Environment | 1/4 | In progress | - |
 | 2. RDP Session + Framebuffer Core | 0/? | Not started | - |
 | 3. Input Injection | 0/? | Not started | - |
 | 4. DVC Transport Channel | 0/? | Not started | - |
