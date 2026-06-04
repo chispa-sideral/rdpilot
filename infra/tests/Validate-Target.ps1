@@ -23,7 +23,12 @@
 #>
 [CmdletBinding()]
 param(
-    [string]$ConnectionFile = '.secrets/connection.json'
+    [string]$ConnectionFile = '.secrets/connection.json',
+
+    # Explicit target override. When supplied, takes precedence over the host in the
+    # connection file (useful for ad-hoc validation of a known IP). Validated as IPv4.
+    [Alias('TargetIp')]
+    [string]$PublicIp
 )
 
 $ErrorActionPreference = 'Stop'
@@ -38,9 +43,11 @@ $env01Checks = @(
     'Sample program 7-Zip File Manager present (7zFM.exe)'
 )
 
-if (-not (Test-Path $ConnectionFile)) {
+# SKELETON MODE only applies when there is NEITHER an explicit -PublicIp NOR a
+# connection file. With -PublicIp we run live against that target regardless.
+if (-not $PublicIp -and -not (Test-Path $ConnectionFile)) {
     # ---- SKELETON MODE: no live target yet. Emit PENDING per check and exit 0. ----
-    Write-Host "Validate-Target.ps1 — SKELETON MODE (no '$ConnectionFile' found)."
+    Write-Host "Validate-Target.ps1 — SKELETON MODE (no '$ConnectionFile' found and no -PublicIp)."
     Write-Host "Run 'manage-env.ps1 -Action up' first to provision a live target, then re-run."
     foreach ($check in $env01Checks) {
         Write-Host "  [PENDING] $check — requires live target from manage-env.ps1 up"
@@ -48,18 +55,41 @@ if (-not (Test-Path $ConnectionFile)) {
     exit 0
 }
 
-# ---- LIVE MODE: a connection file exists. Run the real ENV-01 assertions. ----------
+# ---- LIVE MODE: an explicit -PublicIp or a connection file exists. -----------------
 # Activated by Plan 04's phase gate. The connection file shape (written by manage-env.ps1):
 #   { "host": "...", "user": "...", "password": "...", "rdpPort": 3389, "winrmPort": 5986 }
-$conn      = Get-Content $ConnectionFile -Raw | ConvertFrom-Json
-$targetHost = $conn.host
-$rdpPort   = if ($conn.rdpPort)   { $conn.rdpPort }   else { 3389 }
-$winrmPort = if ($conn.winrmPort) { $conn.winrmPort } else { 5986 }
+$conn = $null
+if (Test-Path $ConnectionFile) {
+    $conn = Get-Content $ConnectionFile -Raw | ConvertFrom-Json
+}
 
-# Build a WinRM credential WITHOUT echoing the password.
-$securePwd = ConvertTo-SecureString $conn.password -AsPlainText -Force
-$cred      = [System.Management.Automation.PSCredential]::new($conn.user, $securePwd)
-Remove-Variable securePwd
+# Resolve the target host: explicit -PublicIp wins, else the connection file's host.
+$targetHost = if ($PublicIp) { $PublicIp } else { $conn.host }
+$rdpPort   = if ($conn -and $conn.rdpPort)   { $conn.rdpPort }   else { 3389 }
+$winrmPort = if ($conn -and $conn.winrmPort) { $conn.winrmPort } else { 5986 }
+
+# FAIL-FAST on a missing/empty target. Without this guard, Test-NetConnection with an
+# empty host silently enumerates LOCAL adapters (fe80::, 192.168.x, 100.x, etc.) and
+# reports nonsense — this is exactly the cascade from a deploy that never captured an
+# IP. Refuse to probe anything but a real, well-formed remote IPv4.
+if (-not $targetHost) {
+    throw "No target IP — is the env up? '$ConnectionFile' has an empty 'host' and no -PublicIp was supplied. Run 'manage-env.ps1 -Action up' (and confirm it captured a public IP), or pass -PublicIp <remote-ip>."
+}
+if ($targetHost -notmatch '^(\d{1,3}\.){3}\d{1,3}$') {
+    throw "Target host '$targetHost' is not a valid remote IPv4 address. Refusing to probe (this guards against falling back to local interfaces). Check '$ConnectionFile' or pass -PublicIp <remote-ip>."
+}
+
+Write-Host "Validating REMOTE target $targetHost (RDP $rdpPort, WinRM $winrmPort)..."
+
+# Build a WinRM credential WITHOUT echoing the password. Only possible when a
+# connection file with user+password is present; with -PublicIp alone we can still
+# run the TCP reachability checks but the in-guest WinRM assertions are skipped.
+$cred = $null
+if ($conn -and $conn.password) {
+    $securePwd = ConvertTo-SecureString $conn.password -AsPlainText -Force
+    $cred      = [System.Management.Automation.PSCredential]::new($conn.user, $securePwd)
+    Remove-Variable securePwd
+}
 
 # Self-signed cert on the target (Pitfall 3): skip CA/CN validation, use SSL.
 $soPss = New-PSSessionOption -SkipCACheck -SkipCNCheck
@@ -86,7 +116,15 @@ Assert-Env01 'WinRM reachable (TCP 5986)' {
     (Test-NetConnection $targetHost -Port $winrmPort).TcpTestSucceeded
 }
 
-# Single WinRM session for all in-guest registry / filesystem assertions.
+# Single WinRM session for all in-guest registry / filesystem assertions. Requires a
+# credential; without one (e.g. -PublicIp only) the in-guest checks cannot run.
+if (-not $cred) {
+    Write-Host ""
+    Write-Host "No credential available (ran with -PublicIp but no connection file): skipping in-guest WinRM assertions (NLA/DPI/SuppressWhenMinimized/7-Zip)."
+    if ($failures.Count -gt 0) { exit 1 }
+    exit 0
+}
+
 $session = New-PSSession -ComputerName $targetHost -Port $winrmPort -UseSSL `
     -Credential $cred -SessionOption $soPss -Authentication Negotiate
 
