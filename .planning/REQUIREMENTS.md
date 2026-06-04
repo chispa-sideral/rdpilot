@@ -4,7 +4,15 @@ Milestone: v1 — Windows-only RDP computer-use SDK, optimized for read/inspect,
 
 Stack (from research): IronRDP 0.14 (Rust) client core + primary language; C# .NET 8 NativeAOT sensor helper; DVC transport (WinRM as bootstrap fallback). See `.planning/research/SUMMARY.md`.
 
+20 total v1 requirements.
+
 ## v1 Requirements
+
+### Environment
+
+- [ ] **ENV-01**: A Bicep template provisions an Azure Windows VM configured for RDP automation — RDP/NLA reachable, WinRM enabled, `RemoteDesktop_SuppressWhenMinimized=2` set, display forced to 96 DPI (100%) for the automation user, and a sample remote-only Windows program installed to test against
+- [ ] **ENV-02**: A PowerShell (`.ps1`) script brings the test environment up and tears it down on demand
+- [ ] **ENV-03**: A scheduled auto-destroy safeguard automatically tears down the VM / resource group to prevent runaway cost if teardown is forgotten
 
 ### Session
 
@@ -65,4 +73,25 @@ Stack (from research): IronRDP 0.14 (Rust) client core + primary language; C# .N
 
 ## Traceability
 
-(Filled by roadmap — maps each requirement to its phase.)
+| Requirement | Phase | Status |
+|-------------|-------|--------|
+| ENV-01 | Phase 1: Test Environment | Pending |
+| ENV-02 | Phase 1: Test Environment | Pending |
+| ENV-03 | Phase 1: Test Environment | Pending |
+| SESS-01 | Phase 2: RDP Session + Framebuffer Core | Pending |
+| SESS-02 | Phase 2: RDP Session + Framebuffer Core | Pending |
+| CAP-01 | Phase 2: RDP Session + Framebuffer Core | Pending |
+| CAP-02 | Phase 6: Window + Process Perception | Pending |
+| INPUT-01 | Phase 3: Input Injection | Pending |
+| INPUT-02 | Phase 3: Input Injection | Pending |
+| SENSOR-03 | Phase 4: DVC Transport Channel | Pending |
+| SENSOR-01 | Phase 5: Sensor Bootstrap + Deployment | Pending |
+| SENSOR-02 | Phase 5: Sensor Bootstrap + Deployment | Pending |
+| PERC-01 | Phase 6: Window + Process Perception | Pending |
+| PERC-02 | Phase 6: Window + Process Perception | Pending |
+| PERC-04 | Phase 6: Window + Process Perception | Pending |
+| PROC-01 | Phase 6: Window + Process Perception | Pending |
+| PERC-03 | Phase 7: UIA Tree Module | Pending |
+| API-01 | Phase 8: Public SDK API + WorldState | Pending |
+| API-02 | Phase 8: Public SDK API + WorldState | Pending |
+| PROOF-01 | Phase 9: Scripted Proof Harness | Pending |
