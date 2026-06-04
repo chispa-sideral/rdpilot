@@ -62,7 +62,8 @@ A local AI agent can connect to a remote Windows desktop over RDP and **read/ins
 | A thin remote "sensor" helper is permitted on the target | Only viable way to get structured perception (process/UIA tree) over RDP; it is a dumb sensor, not the agent | — Pending |
 | Windows-only for v1 | Lets the SDK use Windows-native APIs (UI Automation, WinRM, WMI, RAIL, pwsh) instead of lowest-common-denominator pixel scraping | — Pending |
 | Pixels + structured perception (not vision-only) | Richer grounding for the agent than screenshots alone | — Pending |
-| RDP stack and implementation language deferred to research | Tradeoffs of IronRDP (Rust) vs FreeRDP (C) vs Microsoft's own stack are unknown and decide the language | — Pending |
+| **Primary language: Rust + IronRDP** | IronRDP is the only actively-maintained library giving programmatic framebuffer + input injection + custom DVC cleanly, with zero FFI on the hot path. FreeRDP rejected (stale Rust bindings, unsafe C, painful Windows builds); MS ActiveX rejected (rendering control only — headless framebuffer + custom DVC + input are inadequate for an SDK). Rust surface kept thin; typed consumer API exposed later via PyO3/Python or JSON-RPC socket. | ✅ Decided (2026-06-04) |
+| **Sensor language: C# .NET 8 NativeAOT vs all-Rust** | C# NativeAOT: most ergonomic UIA, self-contained native exe, no runtime on target; cost: 2nd language + .NET SDK in build. All-Rust (`windows` crate + `uiautomation-rs`): one toolchain, no .NET dependency; cost: rougher UIA/COM code. DVC channel (Phase 4) and sensor (Phase 5) are several phases out — best decided with hands-on context. | ⏳ Deferred — decide during Phase 4/5 |
 | v1 "done" = scripted proof, no live LLM | Isolates the genuinely hard problem (RDP perception fidelity) from agent/packaging work | — Pending |
 
 ## Evolution
