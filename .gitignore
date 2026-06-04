@@ -1,0 +1,16 @@
+# Secrets — generated connection details and credentials live here only (D-06).
+# Created in Phase 1 Plan 01 (Pitfall 7) BEFORE any `manage-env.ps1 up` runs so
+# .secrets/connection.json can never be staged. Never commit credentials.
+.secrets/
+.env
+
+# Rust / Cargo build output (SDK work begins Phase 2; Cargo.lock policy decided then)
+/target/
+**/*.rs.bk
+
+# Editor / OS noise
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+.DS_Store
