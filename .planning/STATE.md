@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-stopped_at: Completed 01-02-PLAN.md (core infra Bicep — network + VM + NSG + CSE)
-last_updated: "2026-06-04T23:20:00.000Z"
-last_activity: 2026-06-04 — Executed Phase 1 Plan 02 (Wave 2): infra/main.bicep (VNet/NSG/PIP/NIC/WS2022 VM + CustomScriptExtension), compiles clean
+stopped_at: Completed 01-03-PLAN.md (in-guest Configure-Target.ps1 — WinRM HTTPS, default-hive DPI + SuppressWhenMinimized, SHA-verified 7-Zip)
+last_updated: "2026-06-04T21:01:00.000Z"
+last_activity: 2026-06-04 — Executed Phase 1 Plan 03 (Wave 2): infra/scripts/Configure-Target.ps1 (idempotent in-guest hardening; 7-Zip 26.01 pinned via blocking human-verify checkpoint)
 progress:
   total_phases: 9
   completed_phases: 0
-  total_plans: 2
-  completed_plans: 2
-  percent: 6
+  total_plans: 3
+  completed_plans: 3
+  percent: 8
 ---
 
 # Project State
@@ -26,25 +26,25 @@ See: .planning/PROJECT.md (updated 2026-06-04)
 ## Current Position
 
 Phase: 1 of 9 (Test Environment)
-Plan: 2 of 4 in current phase (01-01, 01-02 complete; next: 01-03)
+Plan: 3 of 4 in current phase (01-01, 01-02, 01-03 complete; next: 01-04)
 Status: Executing
-Last activity: 2026-06-04 — Executed Phase 1 Plan 02 (Wave 2 core infra Bicep)
+Last activity: 2026-06-04 — Executed Phase 1 Plan 03 (Wave 2 in-guest hardening script)
 
-Progress: [█░░░░░░░░░] 6%
+Progress: [█░░░░░░░░░] 8%
 
 ## Performance Metrics
 
 **Velocity:**
 
-- Total plans completed: 2
-- Average duration: ~11 min
+- Total plans completed: 3
+- Average duration: ~8 min
 - Total execution time: ~0.4 hours
 
 **By Phase:**
 
 | Phase | Plans | Total | Avg/Plan |
 |-------|-------|-------|----------|
-| 1 | 2 | ~22 min | ~11 min |
+| 1 | 3 | ~24 min | ~8 min |
 
 **Recent Trend:**
 
@@ -72,6 +72,9 @@ Recent decisions affecting current work:
 - Pester 5.7.1 is the PowerShell test framework; per-commit gate is no-Azure-cost (az + network mocked)
 - main.bicep: single RG, subnet-level NSG association, StandardSSD_LRS OS disk, NLA left at Azure default (verified later); CSE invokes Configure-Target.ps1 via scriptUri param (Plan 03/04 fill the contract)
 - Compiled Bicep ARM output (infra/*.json) is gitignored — source of truth is the .bicep
+- 7-Zip pinned to 26.01 via blocking human-verify checkpoint: URL github.com/ip7z/7zip/releases/download/26.01/7z2601-x64.exe, SHA-256 d64a0468...94377d (computed == GitHub release asset digest); Configure-Target.ps1 throws on hash mismatch before install
+- Configure-Target.ps1: per-user settings (96 DPI + SuppressWhenMinimized) go to the DEFAULT user hive via reg load/unload, never the current-user hive (Pitfall 1); no reboot; every mutation idempotent
+- Forbidden-token verify gates match literals anywhere in a file (incl. comments) — keep rationale prose token-free (HKCU, 0.0.0.0/0, deploymentScripts)
 
 ### Pending Todos
 
@@ -92,6 +95,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-06-04T23:20:00.000Z
-Stopped at: Completed 01-02-PLAN.md
-Resume file: .planning/phases/01-test-environment/01-03-PLAN.md
+Last session: 2026-06-04T21:01:00.000Z
+Stopped at: Completed 01-03-PLAN.md
+Resume file: .planning/phases/01-test-environment/01-04-PLAN.md
