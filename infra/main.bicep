@@ -30,6 +30,9 @@ param vmSize string = 'Standard_B2ms'
 @description('Azure region. Defaults to the resource group location.')
 param location string = resourceGroup().location
 
+@description('Public URL where Configure-Target.ps1 is published at deploy time (raw URL or storage-blob URL). Supplied by manage-env.ps1 in Plan 04; consumed by the CustomScriptExtension fileUris.')
+param scriptUri string
+
 // ---------------------------------------------------------------------------
 // Networking
 // ---------------------------------------------------------------------------
@@ -166,6 +169,42 @@ resource vm 'Microsoft.Compute/virtualMachines@2024-07-01' = {
           id: nic.id
         }
       ]
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// In-guest configuration — one CustomScriptExtension runs one idempotent script.
+//
+// The script body lives in infra/scripts/Configure-Target.ps1 (authored in Plan 03,
+// not here). It performs ALL in-guest hardening in a single idempotent pass:
+// WinRM HTTPS listener + firewall rule, default-user-hive 96 DPI (LogPixels=96 /
+// Win8DpiScaling=1) + RemoteDesktop_SuppressWhenMinimized, HKLM SuppressWhenMinimized,
+// and a SHA-256-verified 7-Zip install — with no reboot.
+//
+// CSE is used deliberately over the deployment-script resource type: that type
+// runs in a managed container and CANNOT touch the guest registry/WinRM, so it is
+// the wrong tool for in-guest config (RESEARCH.md L93). The `scriptUri` is
+// set at deploy time by manage-env.ps1 (Plan 04). This resource DEFINES the
+// CSE -> script contract that Plan 03 implements (filename, no-arg invocation).
+// ---------------------------------------------------------------------------
+
+resource configureTarget 'Microsoft.Compute/virtualMachines/extensions@2024-07-01' = {
+  parent: vm
+  name: 'Configure-Target'
+  location: location
+  properties: {
+    publisher: 'Microsoft.Compute'
+    type: 'CustomScriptExtension'
+    typeHandlerVersion: '1.10'
+    autoUpgradeMinorVersion: true
+    settings: {
+      fileUris: [
+        scriptUri
+      ]
+    }
+    protectedSettings: {
+      commandToExecute: 'powershell -ExecutionPolicy Unrestricted -File Configure-Target.ps1'
     }
   }
 }
