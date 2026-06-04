@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-stopped_at: 01-04 Tasks 1-3 authored + committed (auto-destroy Bicep/runbook + manage-env.ps1, Pester green mocked). Task 4 LIVE PHASE-GATE PENDING a human-run deployment — Phase 1 NOT yet fully verified.
-last_updated: "2026-06-04T21:35:00.000Z"
-last_activity: 2026-06-04 — Executed Phase 1 Plan 04 Tasks 1-3 (Wave 3): separate-management auto-destroy (Automation Account + managed-identity runbook + daily schedule + RG-scoped Contributor) + manage-env.ps1 up/down (CSE/runbook SAS publish, crypto password, gitignored connection file); Pester 8/8 green mocked. Task 4 (live up→validate→down) DEFERRED by user.
+stopped_at: Phase 1 complete. Ready to begin Phase 2 (RDP Session + Framebuffer Core).
+last_updated: "2026-06-04T00:00:00.000Z"
+last_activity: 2026-06-04 — Phase 1 fully verified via live phase-gate. manage-env.ps1 -Action up -VmSize Standard_B2s_v2 deployed to 52.157.72.209; Validate-Target.ps1 all six ENV-01 assertions green; -Action down tore down cleanly. ENV-01/02/03 satisfied. Phase 1 COMPLETE.
 progress:
   total_phases: 9
-  completed_phases: 0
-  total_plans: 3
-  completed_plans: 3
-  percent: 8
+  completed_phases: 1
+  total_plans: 4
+  completed_plans: 4
+  percent: 11
 ---
 
 # Project State
@@ -21,30 +21,30 @@ progress:
 See: .planning/PROJECT.md (updated 2026-06-04)
 
 **Core value:** A local AI agent can connect to a remote Windows desktop over RDP and read/inspect a program that is only reachable via RDP — using both screenshots and structured accessibility data, without installing or running the agent itself on the remote machine.
-**Current focus:** Phase 1 — Test Environment
+**Current focus:** Phase 2 — RDP Session + Framebuffer Core
 
 ## Current Position
 
-Phase: 1 of 9 (Test Environment)
-Plan: 4 of 4 in current phase — 01-04 authoring (Tasks 1-3) COMPLETE; the live phase-gate (Task 4) is PENDING a human-run `up`→`Validate-Target.ps1`→`down`. Phase 1 is NOT yet fully verified/complete.
-Status: Executing (Phase 1 awaiting the deferred live phase-gate)
-Last activity: 2026-06-04 — Executed Phase 1 Plan 04 Tasks 1-3 (Wave 3 auto-destroy + manage-env.ps1; Pester green mocked). Task 4 deferred by user.
+Phase: 2 of 9 (RDP Session + Framebuffer Core) — not yet started
+Plan: Phase 1 complete (4/4 plans, all tasks done); ENV-01/02/03 satisfied via live gate (2026-06-04)
+Status: Executing (Phase 1 complete; Phase 2 ready to begin)
+Last activity: 2026-06-04 — Phase 1 live phase-gate passed. All ENV-01 checks green, clean teardown. Phase 1 COMPLETE.
 
-Progress: [█░░░░░░░░░] 8%
+Progress: [██░░░░░░░░] 11%
 
 ## Performance Metrics
 
 **Velocity:**
 
-- Total plans completed: 3
+- Total plans completed: 4
 - Average duration: ~8 min
-- Total execution time: ~0.4 hours
+- Total execution time: ~0.5 hours
 
 **By Phase:**
 
 | Phase | Plans | Total | Avg/Plan |
 |-------|-------|-------|----------|
-| 1 | 3 | ~24 min | ~8 min |
+| 1 | 4 | ~25+ min | ~8 min |
 
 **Recent Trend:**
 
@@ -91,12 +91,10 @@ None yet.
 
 ## Deferred Items
 
-| Category | Item | Status | Deferred At |
-|----------|------|--------|-------------|
-| Phase gate | 01-04 Task 4 — live `up`→`Validate-Target.ps1`→`down` cycle (real Azure cost) proving ENV-01/02/03 against a live target | PENDING human run | 2026-06-04 (user decision) |
+None. Phase 1 live gate passed 2026-06-04 — all ENV-01/02/03 proven.
 
 ## Session Continuity
 
-Last session: 2026-06-04T21:35:00.000Z
-Stopped at: 01-04 Tasks 1-3 authored + committed; Task 4 live phase-gate PENDING human run (see 01-04-SUMMARY.md "DEFERRED: Task 4" for the exact command sequence). Phase 1 NOT complete.
-Resume file: .planning/phases/01-test-environment/01-04-SUMMARY.md
+Last session: 2026-06-04T00:00:00.000Z
+Stopped at: Phase 1 complete — live gate passed, ENV-01/02/03 satisfied, planning artifacts updated. Next: begin Phase 2 planning (RDP Session + Framebuffer Core).
+Resume file: .planning/ROADMAP.md (Phase 2)

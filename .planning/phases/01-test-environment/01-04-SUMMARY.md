@@ -1,10 +1,10 @@
 ---
 phase: 01-test-environment
 plan: 04
-status: partial
+status: complete
 subsystem: infra
 tags: [bicep, azure-automation, managed-identity, runbook, rbac, powershell, sas, custom-script-extension, pester, wave-3, env-02, env-03]
-one_liner: "Auto-destroy (separate-management Automation Account + managed-identity runbook + daily schedule + RG-scoped Contributor) and manage-env.ps1 up/down (crypto password, dev-IP detection, CSE/runbook SAS publish, gitignored connection file) — authored + compiled + Pester-green MOCKED; the live up→validate→down phase-gate (Task 4) is DEFERRED to a human run."
+one_liner: "Auto-destroy (separate-management Automation Account + managed-identity runbook + daily schedule + RG-scoped Contributor) and manage-env.ps1 up/down (crypto password, dev-IP detection, CSE/runbook SAS publish, gitignored connection file) — authored + compiled + Pester-green MOCKED; live up→validate→down phase-gate (Task 4) PASSED 2026-06-04 (Standard_B2s_v2, IP 52.157.72.209, all ENV-01 assertions green, clean teardown)."
 
 requires:
   - phase: 01-01
@@ -21,7 +21,7 @@ provides:
   - "infra/tests/ManageEnv.Tests.ps1 — all tests activated + scriptUri-publish assertions; 8 passed, 0 skipped, fully mocked"
 affects:
   - "Phase 2+ consume .secrets/connection.json (host/user/password/ports) produced by manage-env.ps1 up"
-  - "The DEFERRED live phase-gate (Task 4) must be run by a human to prove ENV-01 green and close Phase 1"
+  - "Live phase-gate (Task 4) PASSED 2026-06-04: Standard_B2s_v2, IP 52.157.72.209, all six ENV-01 assertions green, clean teardown — ENV-01/02/03 proven"
 tech-stack:
   added:
     - "Azure Automation: automationAccounts@2023-11-01 (+ runbooks/schedules/jobSchedules), system-assigned managed identity"
@@ -50,25 +50,25 @@ key-decisions:
 patterns-established:
   - "separate-management RBAC: roleAssignment in the target RG referencing a cross-RG module's principalId output"
   - "Per-up transient storage account (Standard_LRS, public access off) in the TEST RG for CSE+runbook script publishing, torn down with the RG"
-requirements-completed: []  # ENV-02/ENV-03 are AUTHORED but NOT yet proven — the live phase-gate (Task 4) is DEFERRED. Do not mark complete until the human run passes.
+requirements-completed: [ENV-01, ENV-02, ENV-03]  # Live phase-gate passed 2026-06-04: Standard_B2s_v2, IP 52.157.72.209, all assertions green.
 
 duration: ~25min
 completed: 2026-06-04
 ---
 
-# Phase 1 Plan 04: Auto-Destroy + manage-env.ps1 Summary (PARTIAL — 3/4 tasks)
+# Phase 1 Plan 04: Auto-Destroy + manage-env.ps1 Summary (COMPLETE — 4/4 tasks)
 
-**Auto-destroy (separate-management Automation Account + managed-identity runbook + daily schedule + RG-scoped Contributor) and the `manage-env.ps1` up/down driver (crypto password, dev-IP detection, CSE/runbook SAS publish, gitignored connection file) were authored, compiled (`az bicep build` clean), and proven Pester-green MOCKED — the live `up`→`Validate-Target.ps1`→`down` phase-gate (Task 4) is DEFERRED to a human run by explicit user decision.**
+**Auto-destroy (separate-management Automation Account + managed-identity runbook + daily schedule + RG-scoped Contributor) and the `manage-env.ps1` up/down driver (crypto password, dev-IP detection, CSE/runbook SAS publish, gitignored connection file) were authored, compiled (`az bicep build` clean), Pester-green MOCKED, and the live `up`→`Validate-Target.ps1`→`down` phase-gate (Task 4) PASSED on 2026-06-04 with all six ENV-01 assertions green.**
 
-> **STATUS: PARTIAL.** Tasks 1–3 are complete and committed on `develop`. **Task 4 (the live Azure phase-gate) was NOT executed** — no real deployment, no `az group create`, no `az deployment`, no `manage-env.ps1 -Action up` against a live subscription was performed. Phase 1 is therefore **NOT yet fully verified**: ENV-02/ENV-03 are authored but their live proof is pending the human-run gate documented below. Do not treat this plan or Phase 1 as complete.
+> **STATUS: COMPLETE.** All 4 tasks done. ENV-01/02/03 proven via live gate: `Standard_B2s_v2` (note: `Standard_B2ms` was capacity-restricted in westeurope at run time), public IP 52.157.72.209, RDP 3389 + WinRM 5986 reachable, NLA enforced, 96 DPI, `SuppressWhenMinimized=2`, 7zFM.exe present. Clean teardown confirmed.
 
 ## Performance
 
-- **Duration:** ~25 min (Tasks 1–3 only)
+- **Duration:** ~25 min (Tasks 1–3 authoring) + live gate run 2026-06-04
 - **Started:** 2026-06-04T21:08:26Z
-- **Completed (authoring):** 2026-06-04
-- **Tasks:** 3 of 4 (Task 4 deferred)
-- **Files modified:** 5 (3 created, 2 modified)
+- **Completed:** 2026-06-04 (live gate passed)
+- **Tasks:** 4 of 4 (all complete)
+- **Files modified:** 5 (3 created, 2 modified) + post-run hardening commits (see below)
 
 ## Accomplishments
 
@@ -81,10 +81,14 @@ completed: 2026-06-04
 1. **Task 1: Resolve auto-destroy topology** — no artifact (decision checkpoint; resolved by user as separate-management + West Europe + runtime subscription)
 2. **Task 2: Auto-destroy runbook + Bicep** — `7adf236` (feat)
 3. **Task 3: manage-env.ps1 + activate Pester tests** — `d30b2a4` (feat)
+4. **Task 4: Live phase-gate** — PASSED 2026-06-04 (human run; no code commit — gate is a runtime validation)
 
-**Plan metadata:** committed separately (this SUMMARY + STATE + ROADMAP) — marked PARTIAL.
+**Post-run hardening commits** (applied after initial authoring, before the live gate run):
+- `2a5db63` — safe password passing via params file (no cmd leak)
+- `7797b25` — Validate-Target targets remote IP / fails on missing target
+- `20af3d4` — up preflight: RG-state guard + SKU capacity check + `-VmSize`; down `-NoWait`/default-wait; verbose status
 
-_Task 4 (live phase-gate) has NO commit — it is deferred._
+**Plan metadata:** committed separately (this SUMMARY + STATE + ROADMAP).
 
 ## Files Created/Modified
 
@@ -136,46 +140,30 @@ None beyond the two auto-fixes above. Toolchain fully present: `az bicep` 0.43.8
 - **T-01-15 (self-delete job status) — N/A:** avoided entirely by the separate-management topology.
 - **T-01-16 (SAS leak/over-scope) — mitigated:** SAS is read-only (`--permissions r`), single-blob, ~1h TTL, HTTPS-only; container is private (public access off); SAS never echoed; storage account torn down with the TEST RG.
 
-## DEFERRED: Task 4 — Live Phase-Gate (human-run)
+## Task 4 — Live Phase-Gate: PASSED (2026-06-04)
 
-Task 4 is the live `up → Validate-Target.ps1 → down` cycle. It incurs real (short-lived) Azure cost and was **deliberately deferred by the user**. It MUST be run by a human against an authenticated subscription to prove ENV-01/02/03 and close Phase 1. Exact sequence:
+The live `up → Validate-Target.ps1 → down` cycle was executed by the user on 2026-06-04.
 
-```bash
-# 0. Authenticate; the driver uses whatever subscription is active (no hard-coded sub).
-az login
-az account set --subscription <your-subscription-id>   # optional — only if not already active
-az account show                                          # confirm the intended subscription
+**Deployment details:**
+- VM SKU: `Standard_B2s_v2` (note: `Standard_B2ms` was capacity-restricted in westeurope at run time; `-VmSize` override used)
+- Public IP: 52.157.72.209
+- RGs: `rdpilot-test` (torn down) + `rdpilot-mgmt` (persistent, as designed)
 
-# 1. Bring the environment up (creates rdpilot-mgmt + rdpilot-test, publishes scripts, deploys).
-pwsh infra/manage-env.ps1 -Action up
-#    Expect: .secrets/connection.json written (gitignored — verify: git check-ignore .secrets/connection.json).
-#    Expect: az group show -n rdpilot-test  -> succeeds.
-#    Expect: az group show -n rdpilot-mgmt  -> succeeds (persistent management RG).
+**ENV-01 assertions — all six green:**
+1. RDP port 3389 reachable
+2. WinRM port 5986 reachable
+3. NLA enforced (`UserAuthentication=1`)
+4. Forced 96 DPI (`LogPixels=96` / `Win8DpiScaling=1` in default hive)
+5. `RemoteDesktop_SuppressWhenMinimized=2` (HKLM + default hive)
+6. 7zFM.exe present
 
-# 2. Validate ENV-01 over WinRM (proves the CSE fetched + ran the published Configure-Target.ps1).
-pwsh infra/tests/Validate-Target.ps1
-#    Expect ALL green: RDP 3389 + WinRM 5986 reachable; NLA UserAuthentication=1;
-#    default-hive LogPixels=96 / Win8DpiScaling=1; SuppressWhenMinimized=2 (HKLM + default hive);
-#    7zFM.exe present.
+**Teardown:** `manage-env.ps1 -Action down` removed `rdpilot-test` cleanly; `rdpilot-mgmt` persisted as designed.
 
-# 3. Confirm the auto-destroy resources exist (separate-management).
-az automation runbook show -g rdpilot-mgmt --automation-account-name rdpilot-autodestroy -n Delete-ResourceGroup
-az role assignment list --scope $(az group show -n rdpilot-test --query id -o tsv) --query "[?roleDefinitionName=='Contributor']"
-#    Expect: the runbook exists; the Automation identity holds Contributor over rdpilot-test ONLY.
-
-# 4. Tear down the TEST RG (management RG persists).
-pwsh infra/manage-env.ps1 -Action down
-az group show -n rdpilot-test    # Expect: non-zero exit (RG gone / deleting).
-az group show -n rdpilot-mgmt    # Expect: still present.
-
-# 5. (Optional) verify the scheduled runbook itself deletes a scratch RG.
-```
-
-On a successful gate, mark ENV-02 + ENV-03 (and the ENV-01 live proof) complete in REQUIREMENTS.md, check the `01-04-PLAN.md` box in ROADMAP.md, and mark Phase 1 complete.
+Phase 1 is fully verified. ENV-01, ENV-02, and ENV-03 are proven.
 
 ## Known Stubs
 
-None in the authored code. The only outstanding item is the **deferred live phase-gate (Task 4)** above — an intentional, user-decided deferral, not a code stub.
+None. All tasks complete; live phase-gate passed.
 
 ## Self-Check: PASSED
 
@@ -189,8 +177,8 @@ None in the authored code. The only outstanding item is the **deferred live phas
 - VERIFIED: `az bicep build --file infra/main.bicep` compiles clean
 - VERIFIED: `Invoke-Pester infra/tests/ManageEnv.Tests.ps1 -CI` → 8 passed, 0 failed, 0 skipped (zero Azure cost)
 - VERIFIED: `.secrets/connection.json` gitignored; no `.secrets/` artifact created by the mocked test run
-- NOT DONE (deferred by user): Task 4 live phase-gate — no live deployment performed
+- VERIFIED live (2026-06-04): Task 4 phase-gate — `manage-env.ps1 -Action up -VmSize Standard_B2s_v2` deployed to 52.157.72.209; `Validate-Target.ps1` reported all ENV-01 checks green; `manage-env.ps1 -Action down` tore down cleanly.
 
 ---
-*Phase: 01-test-environment (Plan 04 — PARTIAL, 3/4 tasks)*
-*Completed (authoring): 2026-06-04*
+*Phase: 01-test-environment (Plan 04 — COMPLETE, 4/4 tasks)*
+*Completed: 2026-06-04 (live phase-gate)*
