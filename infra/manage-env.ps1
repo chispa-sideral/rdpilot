@@ -249,21 +249,57 @@ if (-not $runbookUri) {
 # URI + management-RG params wire the auto-destroy. Never echo the password/SAS.
 # -----------------------------------------------------------------------------
 
-az deployment group create `
-    -g $Rg `
-    --template-file $TemplateFile `
-    --parameters `
-        adminPassword=$adminPwd `
-        allowedSourceIp=$devIp `
-        scriptUri=$scriptUri `
-        deleteRunbookContentUri=$runbookUri `
-        managementResourceGroupName=$ManagementRg `
-        automationAccountName=$AutomationAccountName | Out-Null
+# SAFE parameter passing (Pitfall: the password — and any value with cmd-special
+# chars like & | < > ( ) ^ or spaces — must NEVER reach a command line). `az` on
+# Windows is a .cmd batch shim, so a bareword `adminPassword=$adminPwd` is re-parsed
+# by cmd.exe and breaks on special chars ("No se esperaba X en este momento"); it
+# also exposes the secret in the process command line. Instead we serialise ALL
+# parameters into an ARM parameters JSON file (PowerShell ConvertTo-Json — no shell
+# interpolation, no cmd re-parsing) and pass it with `--parameters @file`. The temp
+# file lives under .secrets-adjacent temp and is deleted in `finally`.
+$deployName = 'main'
+$paramsFile = Join-Path ([System.IO.Path]::GetTempPath()) ("rdpilot-deploy-{0}.json" -f ([guid]::NewGuid().ToString('N')))
+
+$armParams = [ordered]@{
+    '$schema'        = 'https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#'
+    contentVersion = '1.0.0.0'
+    parameters     = [ordered]@{
+        adminPassword               = @{ value = $adminPwd }
+        allowedSourceIp             = @{ value = $devIp }
+        scriptUri                   = @{ value = $scriptUri }
+        deleteRunbookContentUri     = @{ value = $runbookUri }
+        managementResourceGroupName = @{ value = $ManagementRg }
+        automationAccountName       = @{ value = $AutomationAccountName }
+    }
+}
+
+try {
+    # Write the params file with restrictive defaults; it carries the password + SAS,
+    # so it is created in the per-user temp dir and removed immediately after deploy.
+    $armParams | ConvertTo-Json -Depth 5 | Set-Content -Path $paramsFile -Encoding UTF8
+
+    az deployment group create `
+        -g $Rg `
+        -n $deployName `
+        --template-file $TemplateFile `
+        --parameters "@$paramsFile" | Out-Null
+
+    if ($LASTEXITCODE -ne 0) {
+        throw "az deployment group create failed (exit $LASTEXITCODE). The TEST RG '$Rg' may be partially provisioned; run 'down' to clean up."
+    }
+}
+finally {
+    # The params file carries credentials — always remove it, even on failure.
+    if (Test-Path $paramsFile) { Remove-Item $paramsFile -Force -ErrorAction SilentlyContinue }
+}
 
 # Read the deployment outputs for the connection file.
-$publicIp = az deployment group show -g $Rg -n main --query "properties.outputs.publicIp.value" -o tsv 2>$null
+$publicIp = az deployment group show -g $Rg -n $deployName --query "properties.outputs.publicIp.value" -o tsv 2>$null
 if (-not $publicIp) {
     $publicIp = az network public-ip list -g $Rg --query "[0].ipAddress" -o tsv
+}
+if (-not $publicIp) {
+    throw "Deployment '$deployName' completed but no public IP could be read from outputs or the RG. The connection file would be unusable; aborting before writing it."
 }
 
 # -----------------------------------------------------------------------------
