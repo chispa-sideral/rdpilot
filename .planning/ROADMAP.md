@@ -34,7 +34,11 @@ Decimal phases appear between their surrounding integers in numeric order.
   3. Automation prerequisites are verified on the VM: `RemoteDesktop_SuppressWhenMinimized=2`, 96 DPI for the automation user, WinRM enabled/reachable, sample remote-only program present
   4. The `.ps1` teardown removes all provisioned resources cleanly
   5. The scheduled auto-destroy fires and removes the resource group without manual action
-**Plans**: TBD
+**Plans**: 4 plans
+  - [ ] 01-01-PLAN.md — Repo baseline (.gitignore) + validation scaffolding (Pester, Validate-Target skeleton)
+  - [ ] 01-02-PLAN.md — Core infra Bicep: network + NSG (IP-scoped 3389/5986) + WS2022 VM + CustomScriptExtension
+  - [ ] 01-03-PLAN.md — In-guest Configure-Target.ps1: WinRM HTTPS, default-hive DPI + SuppressWhenMinimized, SHA-verified 7-Zip
+  - [ ] 01-04-PLAN.md — Auto-destroy (runbook + schedule + RBAC) + manage-env.ps1 up/down + phase-gate live run
 
 ### Phase 2: RDP Session + Framebuffer Core
 **Goal**: A working IronRDP session produces live screenshots of the remote desktop and stays rendered while the local window is minimized or hidden
@@ -132,7 +136,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8 →
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Test Environment | 0/? | Not started | - |
+| 1. Test Environment | 0/4 | Planned | - |
 | 2. RDP Session + Framebuffer Core | 0/? | Not started | - |
 | 3. Input Injection | 0/? | Not started | - |
 | 4. DVC Transport Channel | 0/? | Not started | - |
