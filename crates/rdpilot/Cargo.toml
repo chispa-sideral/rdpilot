@@ -1,0 +1,34 @@
+[package]
+name = "rdpilot"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.78"
+license = "LGPL-3.0-or-later"
+description = "SDK that opens and manages an RDP session to a remote Windows machine and exposes it as a controllable, perceivable surface."
+repository = "https://github.com/marcfargas/rdpilot"
+
+[dependencies]
+# IronRDP: umbrella facade at 0.15, member crates at their independent versions.
+# Uniform "0.14" pins will NOT resolve (member crates are at 0.9/0.8/0.6/0.2).
+# Versions verified against the crates.io sparse index 2026-06-05 (see 02-RESEARCH.md).
+ironrdp = "0.15"
+ironrdp-tokio = "0.9"
+# `ironrdp-tls` requires exactly one TLS backend feature; select `rustls` to
+# match the hand-built rustls ClientConfig path (D-15 custom cert verifier).
+ironrdp-tls = { version = "0.2", default-features = false, features = ["rustls"] }
+ironrdp-dvc = "0.6"
+ironrdp-input = "0.6"
+ironrdp-pdu = "0.8"
+tokio = { version = "1", features = ["full"] }
+tokio-rustls = "0.26"
+rustls = "0.23"
+sspi = "0.21"
+image = "0.25"
+thiserror = "2"
+tracing = "0.1"
+x509-cert = "0.2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+serde_json = "1"
+serial_test = "3"
