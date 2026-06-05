@@ -204,3 +204,12 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8 →
 Plans:
 
 - [ ] TBD (promote with /gsd-review-backlog when ready)
+
+### Phase 999.2: subagent tool grants — ensure file-producing agents have Write (BACKLOG)
+
+**Goal:** Audit GSD subagent definitions so agents expected to produce files (researchers, planners, doc-writers, etc.) are granted Write/Edit tools. Observed failure: a researcher subagent burned ~6 turns trying to write a file via fs/bash/pwsh/python workarounds because it lacked Write().
+**Requirements:** TBD
+**Plans:** 0 plans
+
+Plans:
+- [ ] TBD (promote with /gsd-review-backlog when ready)
