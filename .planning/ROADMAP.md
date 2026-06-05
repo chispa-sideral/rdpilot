@@ -184,7 +184,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8 →
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 1. Test Environment | 4/4 | Complete | 2026-06-05 |
-| 2. RDP Session + Framebuffer Core | 2/3 | In Progress|  |
+| 2. RDP Session + Framebuffer Core | 3/3 | Complete    | 2026-06-05 |
 | 3. Input Injection | 0/? | Not started | - |
 | 4. DVC Transport Channel | 0/? | Not started | - |
 | 5. Sensor Bootstrap + Deployment | 0/? | Not started | - |
@@ -199,7 +199,8 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8 →
 
 **Goal:** Replace fixed-time settles / blank-frame tolerances in the live integration suite with deterministic frame-readiness signals (poll-until-shell-ready, wait-for-first-real-paint), reducing flakiness like the screenshot_is_rgb_correct failure observed during Phase 2 live validation (fixed in commit 03302a0 as a band-aid).
 **Requirements:** TBD
-**Plans:** 0 plans
+**Plans:** 3/3 plans complete
 
 Plans:
+
 - [ ] TBD (promote with /gsd-review-backlog when ready)

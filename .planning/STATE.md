@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-stopped_at: Completed 02-03-PLAN.md (live validation suite — phase 2 proven end-to-end)
-last_updated: "2026-06-05T16:40:00.000Z"
-last_activity: Phase 2 Plan 03 complete — example + gated 5-criterion live suite; canonical run on a real Azure VM passed 5/5 with the full 10-min idle (SESS-01/SESS-02/CAP-01); VM torn down.
+stopped_at: Completed 02-03-PLAN.md (live validation suite — Phase 2 proven end-to-end, 5/5 live criteria)
+last_updated: "2026-06-05T14:51:41.656Z"
+last_activity: 2026-06-05
 progress:
-  total_phases: 9
+  total_phases: 10
   completed_phases: 2
   total_plans: 7
   completed_plans: 7
-  percent: 100
+  percent: 20
 ---
 
 # Project State
@@ -25,10 +25,10 @@ See: .planning/PROJECT.md (updated 2026-06-04)
 
 ## Current Position
 
-Phase: 2 of 9 (RDP Session + Framebuffer Core) — COMPLETE (3/3 plans). All five ROADMAP success criteria proven end-to-end against a real Azure Windows RDP target.
-Plan: Phase 2 Plan 03 complete. Added the public-API-only example (examples/screenshot.rs → PNG) and the gated 5-criterion live suite (tests/live_session.rs + tests/common/mod.rs), #[ignore]'d + skip-when-absent so default cargo test stays green (21 unit + 5 ignored). Canonical run on a freshly-provisioned Azure VM (Standard_B2s_v2, westeurope) passed 5/5 with the FULL 10-min idle: connect/auth, RGB-correct screenshot (not YUV-grey), crop, stays-rendered-windowless-idle, 10-min keepalive. Assumption A1 resolved — zero-delta keepalive sufficient (no ±1px fallback needed). VM torn down (no Azure cost). SESS-01/SESS-02/CAP-01 complete. Next: Phase 3 (Input Injection).
+Phase: 3 of 9 (input injection)
+Plan: Not started
 Status: Executing (Phase 2 COMPLETE — ready for Phase 3 planning)
-Last activity: Phase 2 Plan 03 complete — gated live suite; canonical 5/5 pass on a real VM with the full 10-min idle; VM torn down.
+Last activity: 2026-06-05
 
 Progress: [██████████] 100% (Phase 2 complete — 7/7 plans)
 
@@ -36,7 +36,7 @@ Progress: [██████████] 100% (Phase 2 complete — 7/7 plans)
 
 **Velocity:**
 
-- Total plans completed: 7
+- Total plans completed: 10
 - Average duration: ~17 min
 - Total execution time: ~2.6 hours
 
@@ -46,6 +46,7 @@ Progress: [██████████] 100% (Phase 2 complete — 7/7 plans)
 |-------|-------|-------|----------|
 | 1 | 4 | ~25+ min | ~8 min |
 | 2 | 3/3 | ~160 min | ~53 min |
+| 02 | 3 | - | - |
 
 **Recent Trend:**
 
