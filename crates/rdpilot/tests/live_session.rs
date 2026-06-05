@@ -124,8 +124,12 @@ fn screenshot_is_rgb_correct() {
 
     block_on(async {
         let session = rdpilot::Session::connect(&cfg).await.expect("connect");
-        // Allow the first graphics update(s) to arrive before capturing.
-        let shot = capture_when_ready(&session).await;
+        // Allow the first graphics update(s) to arrive, then give the shell a
+        // brief moment to paint before capturing. The very first frame can be a
+        // solid desktop-background fill before any window content renders.
+        let _ = capture_when_ready(&session).await;
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        let shot = session.screenshot().await.expect("framebuffer available");
         session.close().await.expect("close");
 
         // Dimensions match the requested desktop size.
@@ -137,16 +141,18 @@ fn screenshot_is_rgb_correct() {
             "RGBA buffer is tightly packed w*h*4"
         );
 
-        // Concrete RGB acceptance: a fully-opaque, colored desktop — NOT the
-        // flat YUV-grey field a broken decode produces (Pitfall 1, criterion #2).
-        // Alpha of the top-left pixel must be the opaque 0xFF the RgbA32 path
-        // emits (a known, concrete channel value).
+        // Concrete RGB acceptance (criterion #2): a fully-opaque, correctly-colored
+        // desktop — NOT the flat YUV-grey field a broken decode produces (Pitfall 1).
+        // The alpha of the top-left pixel must be the opaque 0xFF the RgbA32 path
+        // emits (a known, concrete channel value), and the sampled grid must not be
+        // uniform mid-grey. (Content-richness / non-blank after settle is the
+        // domain of `stays_rendered_while_idle`; a uniform solid desktop background
+        // is still correct RGB, so it is NOT asserted blank here.)
         assert_eq!(shot.rgba[3], 255, "top-left pixel alpha is opaque (0xFF), proving RGBA32 layout");
         assert!(
             !is_uniform_grey(&shot),
             "screenshot is uniform mid-grey — the YUV-grey decode pitfall (criterion #2 fails)"
         );
-        assert!(!is_blank(&shot), "screenshot is a single flat color (blank surface)");
     });
 }
 
