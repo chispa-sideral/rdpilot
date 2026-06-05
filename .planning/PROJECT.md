@@ -29,12 +29,13 @@ A local AI agent can connect to a remote Windows desktop over RDP and **read/ins
 
 ### Validated
 
-(None yet — ship to validate)
+- [x] **SESS-01** Connect to and authenticate (NLA / credentials) an RDP session to a Windows target — *Validated in Phase 2: rdp-session-framebuffer-core*
+- [x] **SESS-02** Manage the session lifecycle (open, keepalive, teardown); keep session rendered so perception stays live — *Validated in Phase 2: rdp-session-framebuffer-core*
+- [x] **CAP-01** Capture a full-desktop screenshot from the RDP framebuffer — *Validated in Phase 2: rdp-session-framebuffer-core*
 
 ### Active
 
-- [ ] Connect to and authenticate an RDP session to a Windows target; manage session lifecycle (open, keepalive, teardown)
-- [ ] Capture screenshots of the full remote desktop and of an individual remote window
+- [ ] Capture a per-window cropped screenshot
 - [ ] Inject mouse and keyboard input mapped to remote desktop/window coordinates
 - [ ] Enumerate the remote process tree
 - [ ] Enumerate remote windows (list, titles, geometry, foreground/z-order)
@@ -83,5 +84,9 @@ This document evolves at phase transitions and milestone boundaries.
 3. Audit Out of Scope — reasons still valid?
 4. Update Context with current state
 
+## Current State
+
+Phase 2 complete — live RDP session + framebuffer core proven end-to-end (5/5 live tests). IronRDP async session loop, NLA authentication, framebuffer decoding, and PNG screenshot capture all verified against a real Windows target. Next: Phase 3 (input-injection).
+
 ---
-*Last updated: 2026-06-04 after initialization*
+*Last updated: 2026-06-05 after Phase 2 completion*
