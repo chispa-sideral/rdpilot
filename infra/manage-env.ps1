@@ -442,6 +442,39 @@ if (-not $publicIp) {
 Write-Host "Deployment succeeded, public IP $publicIp."
 
 # -----------------------------------------------------------------------------
+# PUBLISH the auto-destroy runbook (ENV-03). The Bicep runbook resource carries a
+# publishContentLink (the read-only SAS to Delete-ResourceGroup.ps1), but ARM does
+# not reliably promote that imported content to the Published state — the runbook
+# can land as a DRAFT, so the daily schedule would fire jobs against unpublished
+# content (no-op/failure). Explicitly publishing here guarantees the runbook ends
+# up Published with the deployed content on EVERY up. This is idempotent: publishing
+# an already-published / unchanged runbook is a harmless no-op, so it never hard-fails
+# a re-run. The runbook name MUST match the one in autodestroy.bicep.
+# -----------------------------------------------------------------------------
+$runbookName = 'Delete-ResourceGroup'
+Write-Host "Publishing auto-destroy runbook '$runbookName' in '$AutomationAccountName'..."
+az automation runbook publish `
+    --automation-account-name $AutomationAccountName `
+    --resource-group $ManagementRg `
+    --name $runbookName | Out-Null
+if ($LASTEXITCODE -ne 0) {
+    # Verify whether it is already Published before treating this as fatal (the publish
+    # CLI can return non-zero when there is no new draft to promote). az automation
+    # runbook show returns `state` at the TOP level (not under .properties).
+    $rbState = az automation runbook show `
+        --automation-account-name $AutomationAccountName `
+        --resource-group $ManagementRg `
+        --name $runbookName `
+        --query 'state' -o tsv 2>$null
+    if ($rbState -ne 'Published') {
+        throw "Failed to publish auto-destroy runbook '$runbookName' (state: '$rbState'). The daily schedule would fire against an unpublished runbook. Re-run 'up' or publish manually: az automation runbook publish --automation-account-name $AutomationAccountName --resource-group $ManagementRg --name $runbookName"
+    }
+    Write-Host "  Runbook '$runbookName' is already Published (nothing to promote)."
+} else {
+    Write-Host "  Runbook '$runbookName' published."
+}
+
+# -----------------------------------------------------------------------------
 # Write the gitignored connection file (D-06). The password lands ONLY here.
 # -----------------------------------------------------------------------------
 Write-Host "Writing connection file..."

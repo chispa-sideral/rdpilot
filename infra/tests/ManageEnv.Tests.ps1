@@ -88,6 +88,10 @@ BeforeAll {
         }
         if ($line -match 'deployment group show') { return '203.0.113.55' }
         if ($line -match 'public-ip list') { return '203.0.113.55' }
+        # ENV-03: publishing the auto-destroy runbook succeeds (exit 0). A `show`
+        # fallback (only reached if publish returns non-zero) reports Published.
+        if ($line -match 'automation runbook publish') { return }
+        if ($line -match 'automation runbook show') { return 'Published' }
         return
     }
 }
@@ -274,6 +278,46 @@ Describe 'down: wait vs -NoWait' {
         Assert-MockCalled az -Times 0 -Scope It -ParameterFilter {
             ($args -join ' ') -match 'group show'
         }
+    }
+}
+
+Describe 'ENV-03 auto-destroy runbook publish' {
+    It 'publishes the Delete-ResourceGroup runbook AFTER a successful deploy' {
+        $script:order = [System.Collections.Generic.List[string]]::new()
+        Mock az {
+            $line = ($args -join ' ')
+            if ($line -match 'deployment group create')  { $script:order.Add('deploy') }
+            if ($line -match 'automation runbook publish'){ $script:order.Add('publish') }
+            script:Invoke-AzMock @args
+        }
+        Mock Invoke-RestMethod { @{ ip = '203.0.113.7' } }
+        . $script:ManageEnvScript -Action up 4>$null 6>$null
+
+        # The runbook is published with the expected name, account and management RG.
+        Assert-MockCalled az -Times 1 -Scope It -ParameterFilter {
+            $joined = ($args -join ' ')
+            ($joined -match 'automation runbook publish') -and
+            ($joined -match 'Delete-ResourceGroup') -and
+            ($joined -match 'rdpilot-autodestroy') -and
+            ($joined -match 'rdpilot-mgmt')
+        }
+        # Publish must happen AFTER the deploy (the runbook must exist first).
+        $script:order.IndexOf('publish') | Should -BeGreaterThan ($script:order.IndexOf('deploy'))
+    }
+
+    It 'does NOT hard-fail when publish returns non-zero but the runbook is already Published (idempotent)' {
+        Mock az {
+            $line = ($args -join ' ')
+            $global:LASTEXITCODE = 0
+            if ($line -match 'account show') { return '{"name":"Test Sub","id":"00000000-0000-0000-0000-000000000000"}' }
+            if ($line -match 'group show') { $global:LASTEXITCODE = 3; return }
+            if ($line -match 'automation runbook publish') { $global:LASTEXITCODE = 1; return }   # no new draft to promote
+            if ($line -match 'automation runbook show') { $global:LASTEXITCODE = 0; return 'Published' }
+            return script:Invoke-AzMock @args
+        }
+        Mock Invoke-RestMethod { @{ ip = '203.0.113.7' } }
+
+        { . $script:ManageEnvScript -Action up 4>$null 6>$null } | Should -Not -Throw
     }
 }
 

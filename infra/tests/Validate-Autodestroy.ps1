@@ -193,11 +193,15 @@ try {
         Write-Host "Run 'pwsh infra/manage-env.ps1 -Action up' to (re)deploy the runbook."
         exit 1
     }
+    # `az automation runbook show` returns `state` at the TOP level of the JSON, NOT
+    # nested under `.properties`. Reading `.properties.state` always yields $null, which
+    # made this preflight report an "empty"/unpublished runbook even when it was Published.
     $rb = $rbJson | ConvertFrom-Json
-    if ($rb.properties.state -ne 'Published') {
-        Write-Fail "Runbook '$RunbookName' is Published (current state: $($rb.properties.state))"
+    $rbState = $rb.state
+    if ($rbState -ne 'Published') {
+        Write-Fail "Runbook '$RunbookName' is Published (current state: $rbState)"
         Write-Host ""
-        Write-Host "Runbook '$RunbookName' is in state '$($rb.properties.state)' (must be Published)."
+        Write-Host "Runbook '$RunbookName' is in state '$rbState' (must be Published)."
         Write-Host "Re-run 'pwsh infra/manage-env.ps1 -Action up' to re-publish the runbook."
         exit 1
     }
