@@ -228,15 +228,15 @@ index.crates.io → ironrdp=0.15.0  ironrdp-connector=0.9.0  ironrdp-session=0.9
     └── rdpilot/
         ├── Cargo.toml
         ├── src/
-        │   ├── lib.rs         # pub use of Session, ConnectionConfig, Screenshot, Rect, Error
-        │   ├── config.rs      # ConnectionConfig (+ optional env/file loaders, D-12/D-13)
-        │   ├── error.rs       # thiserror enum (API-01)
-        │   ├── connect.rs     # connect_begin → TLS → connect_finalize; cert policy (D-15)
-        │   ├── session.rs     # Session handle, spawn task, close(), Drop guard (D-04/D-07)
-        │   ├── loop.rs        # active_session: tokio::select! pump (mirrors ironrdp-client)
-        │   ├── framebuffer.rs # shared latest DecodedImage snapshot
-        │   ├── screenshot.rs  # Screenshot type: to_png(), crop() (D-09/D-11)
-        │   └── keepalive.rs   # synthetic FastPathInputEvent emitter (D-06)
+        │   ├── lib.rs            # pub use of Session, ConnectionConfig, Screenshot, Rect, Error
+        │   ├── config.rs         # ConnectionConfig (+ optional env/file loaders, D-12/D-13)
+        │   ├── error.rs          # thiserror enum (API-01)
+        │   ├── connect.rs        # connect_begin → TLS → connect_finalize; cert policy (D-15)
+        │   ├── session.rs        # Session handle, spawn task, close(), Drop guard (D-04/D-07)
+        │   ├── session_loop.rs   # active_session: tokio::select! pump (mirrors ironrdp-client; named session_loop because `loop` is a Rust keyword)
+        │   ├── framebuffer.rs    # shared latest DecodedImage snapshot
+        │   ├── screenshot.rs     # Screenshot type: to_png(), crop() (D-09/D-11)
+        │   └── keepalive.rs      # synthetic FastPathInputEvent emitter (D-06)
         ├── examples/
         │   └── screenshot.rs  # tiny binary: load .secrets/connection.json → connect → save png
         └── tests/
@@ -479,22 +479,25 @@ fn crop(rgba: &[u8], w: u32, r: Rect) -> Vec<u8> {
 | A4 | `x509-cert` 0.2.x DER decode path is still how the public key is extracted in the current example | Code Examples | If IronRDP added a helper that does this, our code is merely more verbose, not wrong |
 | A5 | `ironrdp-tls` can be skipped in favor of hand-building the rustls config | Standard Stack / Alternatives | None functional — both work; hand-building is needed for the D-15 custom verifier regardless |
 
-## Open Questions
+## Open Questions (RESOLVED)
 
 1. **Does the lab VM expose an idle timeout at all?**
    - What we know: Phase 1 provisioned the VM; STATE.md does not mention an idle-timeout policy.
    - What's unclear: whether criterion #5 (10-min keepalive) is exercising a real timeout or a no-op.
    - Recommendation: Keepalive runs unconditionally (D-06) regardless; the test still asserts the session is alive after 10 min. If the VM has no idle timeout, the test proves keepalive does no harm and the session survives — still a valid pass. Optionally have Phase 1 set a short idle timeout to make the test meaningful (out of Phase 2 scope; note for the planner).
+   - RESOLVED: keepalive runs unconditionally; the 10-min live test (Plan 03) asserts liveness regardless of whether the VM enforces a timeout. Absorbed into Plan 02 (keepalive) + Plan 03 (live suite).
 
 2. **`enable_server_pointer: false` vs. handling Pointer* outputs.**
    - What we know: the screenshot example sets `enable_server_pointer: false` (no GUI, no cursor needed).
    - What's unclear: whether a visible remote cursor must appear in screenshots for downstream phases.
    - Recommendation: keep `enable_server_pointer: false` for Phase 2 (simpler, matches the example). Revisit when an AI consumer needs to see the cursor.
+   - RESOLVED: keep `enable_server_pointer: false` for Phase 2. Absorbed into Plan 02 Task 1 (connect config) and the config.rs pattern.
 
 3. **Exact async `connect_finalize` signature in `ironrdp-tokio` 0.9.**
    - What we know: `ironrdp-client/src/rdp.rs` calls `ironrdp_tokio::connect_finalize(...)` with the upgraded framed + network client + server name + public key.
    - What's unclear: argument order vs. the blocking variant.
    - Recommendation: confirm against `docs.rs/ironrdp-tokio/0.9` when wiring connect.rs (the planner should add a "verify signature" sub-step, not a research blocker).
+   - RESOLVED: verify the signature against `docs.rs/ironrdp-tokio/0.9` at implementation time — captured as a Plan 02 Task 1 sub-step (not a research blocker).
 
 ## Environment Availability
 

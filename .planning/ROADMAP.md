@@ -61,7 +61,7 @@ Decimal phases appear between their surrounding integers in numeric order.
   1. The SDK connects and authenticates (NLA/CredSSP) to a Windows target and the session reaches an active, interactive state
   2. A screenshot PNG of the full remote desktop is produced from the IronRDP DecodedImage framebuffer with correct colors (RGB, not YUV-grey)
   3. A per-window cropped screenshot is produced by cropping the framebuffer to a given bounding rect
-  4. The session remains fully rendered with screenshots at the correct resolution when the client process has no visible window (RemoteDesktop_SuppressWhenMinimized=2 is applied and verified)
+  4. The session stays full-resolution and non-blank with no visible client window, verified behaviorally (RemoteDesktop_SuppressWhenMinimized is mstsc-only and does not apply to a headless IronRDP client, so this is satisfied by construction)
   5. Session keepalive prevents idle-timeout disconnection during a 10-minute idle period
 
 **Plans**: 3 plans
