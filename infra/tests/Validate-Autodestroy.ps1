@@ -100,6 +100,7 @@ function Invoke-Az {
 $tempScheduleName    = $null   # set in ARRANGE; used in CLEANUP
 $tempJobScheduleId   = $null   # set in ARRANGE; used in CLEANUP
 $scheduleCreatedAt   = $null   # UTC datetime — used to filter jobs by create time
+$script:scheduleCreated = $false  # true ONLY after a successful schedule create; gates cleanup
 $passed              = $false
 
 # ---------------------------------------------------------------------------
@@ -238,20 +239,23 @@ try {
     Write-Host "  Fire time (UTC): $fireTimeIso  (~$leadDisplay min from now)"
 
     # Create the one-time schedule.
-    # az automation schedule create requires --frequency and --interval; OneTime = frequency Day, interval 0
-    # but the CLI uses --frequency OneTime directly in newer versions. Use the explicit flag.
+    # az MANDATES --interval even for --frequency OneTime (omitting it fails with
+    # "the following arguments are required: --interval"). --interval 1 is inert for a
+    # OneTime schedule (it fires once at --start-time and never recurs).
     $schedJson = az automation schedule create `
-        -g $ManagementResourceGroup `
+        --resource-group $ManagementResourceGroup `
         --automation-account-name $AutomationAccount `
         -n $tempScheduleName `
         --start-time $fireTimeIso `
         --frequency OneTime `
+        --interval 1 `
         --description "Temporary one-time schedule created by Validate-Autodestroy.ps1 for ENV-03 validation. Safe to delete." `
         -o json 2>&1
 
     if ($LASTEXITCODE -ne 0) {
         throw "Failed to create one-time schedule '$tempScheduleName': $schedJson"
     }
+    $script:scheduleCreated = $true
     Write-Pass "One-time schedule '$tempScheduleName' created"
 
     # Create the jobSchedule link: schedule → runbook with -ResourceGroupName parameter.
@@ -456,34 +460,42 @@ try {
     #    Never touch the production 'daily-autodestroy' schedule.
     # =======================================================================
 
-    Write-Step ""
-    Write-Step "--- Cleanup: removing temporary schedule '$tempScheduleName' ---"
+    # Only run cleanup if this run actually CREATED the temp schedule. If creation
+    # failed (or never ran), the schedule never existed — attempting to delete it
+    # would print a misleading "failed to remove" warning. Skip silently in that case.
+    if (-not $script:scheduleCreated) {
+        Write-Step ""
+        Write-Step "--- Cleanup: nothing to remove (temp schedule was never created) ---"
+    } else {
+        Write-Step ""
+        Write-Step "--- Cleanup: removing temporary schedule '$tempScheduleName' ---"
 
-    if ($tempJobScheduleId) {
-        $jsDelRaw = az automation job-schedule delete `
-            -g $ManagementResourceGroup `
-            --automation-account-name $AutomationAccount `
-            --job-schedule-id $tempJobScheduleId `
-            --yes 2>&1
-        if ($LASTEXITCODE -eq 0) {
-            Write-Host "  Removed jobSchedule link (id: $tempJobScheduleId)"
-        } else {
-            Write-Host "  Warning: failed to remove jobSchedule link $tempJobScheduleId — clean up manually:"
-            Write-Host "    az automation job-schedule delete -g $ManagementResourceGroup --automation-account-name $AutomationAccount --job-schedule-id $tempJobScheduleId --yes"
+        if ($tempJobScheduleId) {
+            $jsDelRaw = az automation job-schedule delete `
+                -g $ManagementResourceGroup `
+                --automation-account-name $AutomationAccount `
+                --job-schedule-id $tempJobScheduleId `
+                --yes 2>&1
+            if ($LASTEXITCODE -eq 0) {
+                Write-Host "  Removed jobSchedule link (id: $tempJobScheduleId)"
+            } else {
+                Write-Host "  Warning: failed to remove jobSchedule link $tempJobScheduleId — clean up manually:"
+                Write-Host "    az automation job-schedule delete -g $ManagementResourceGroup --automation-account-name $AutomationAccount --job-schedule-id $tempJobScheduleId --yes"
+            }
         }
-    }
 
-    if ($tempScheduleName) {
-        $schedDelRaw = az automation schedule delete `
-            -g $ManagementResourceGroup `
-            --automation-account-name $AutomationAccount `
-            -n $tempScheduleName `
-            --yes 2>&1
-        if ($LASTEXITCODE -eq 0) {
-            Write-Host "  Removed one-time schedule '$tempScheduleName'"
-        } else {
-            Write-Host "  Warning: failed to remove schedule '$tempScheduleName' — clean up manually:"
-            Write-Host "    az automation schedule delete -g $ManagementResourceGroup --automation-account-name $AutomationAccount -n $tempScheduleName --yes"
+        if ($tempScheduleName) {
+            $schedDelRaw = az automation schedule delete `
+                -g $ManagementResourceGroup `
+                --automation-account-name $AutomationAccount `
+                -n $tempScheduleName `
+                --yes 2>&1
+            if ($LASTEXITCODE -eq 0) {
+                Write-Host "  Removed one-time schedule '$tempScheduleName'"
+            } else {
+                Write-Host "  Warning: failed to remove schedule '$tempScheduleName' — clean up manually:"
+                Write-Host "    az automation schedule delete -g $ManagementResourceGroup --automation-account-name $AutomationAccount -n $tempScheduleName --yes"
+            }
         }
     }
 

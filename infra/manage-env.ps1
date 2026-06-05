@@ -452,25 +452,37 @@ Write-Host "Deployment succeeded, public IP $publicIp."
 # a re-run. The runbook name MUST match the one in autodestroy.bicep.
 # -----------------------------------------------------------------------------
 $runbookName = 'Delete-ResourceGroup'
-Write-Host "Publishing auto-destroy runbook '$runbookName' in '$AutomationAccountName'..."
-az automation runbook publish `
+Write-Host "Checking auto-destroy runbook '$runbookName' in '$AutomationAccountName'..."
+
+# Query the live state FIRST. `az automation runbook show` returns `state` at the TOP
+# level (NOT under .properties). Only call publish when the runbook is genuinely not
+# Published — calling publish on an already-Published runbook (no draft in edit state)
+# prints "ERROR: (BadRequest) Runbook draft is not in edit state", which is noise.
+$rbState = az automation runbook show `
     --automation-account-name $AutomationAccountName `
     --resource-group $ManagementRg `
-    --name $runbookName | Out-Null
-if ($LASTEXITCODE -ne 0) {
-    # Verify whether it is already Published before treating this as fatal (the publish
-    # CLI can return non-zero when there is no new draft to promote). az automation
-    # runbook show returns `state` at the TOP level (not under .properties).
-    $rbState = az automation runbook show `
+    --name $runbookName `
+    --query 'state' -o tsv 2>$null
+
+if ($rbState -eq 'Published') {
+    Write-Host "  Runbook '$runbookName' already Published (no draft to promote)."
+} else {
+    Write-Host "  Runbook '$runbookName' state is '$rbState' — publishing..."
+    az automation runbook publish `
         --automation-account-name $AutomationAccountName `
         --resource-group $ManagementRg `
-        --name $runbookName `
-        --query 'state' -o tsv 2>$null
-    if ($rbState -ne 'Published') {
-        throw "Failed to publish auto-destroy runbook '$runbookName' (state: '$rbState'). The daily schedule would fire against an unpublished runbook. Re-run 'up' or publish manually: az automation runbook publish --automation-account-name $AutomationAccountName --resource-group $ManagementRg --name $runbookName"
+        --name $runbookName | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        # Re-check: a benign race (already promoted) still leaves it Published.
+        $rbState = az automation runbook show `
+            --automation-account-name $AutomationAccountName `
+            --resource-group $ManagementRg `
+            --name $runbookName `
+            --query 'state' -o tsv 2>$null
+        if ($rbState -ne 'Published') {
+            throw "Failed to publish auto-destroy runbook '$runbookName' (state: '$rbState'). The daily schedule would fire against an unpublished runbook. Re-run 'up' or publish manually: az automation runbook publish --automation-account-name $AutomationAccountName --resource-group $ManagementRg --name $runbookName"
+        }
     }
-    Write-Host "  Runbook '$runbookName' is already Published (nothing to promote)."
-} else {
     Write-Host "  Runbook '$runbookName' published."
 }
 

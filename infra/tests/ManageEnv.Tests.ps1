@@ -282,13 +282,18 @@ Describe 'down: wait vs -NoWait' {
 }
 
 Describe 'ENV-03 auto-destroy runbook publish' {
-    It 'publishes the Delete-ResourceGroup runbook AFTER a successful deploy' {
+    It 'publishes the Delete-ResourceGroup runbook AFTER deploy when it is NOT yet Published' {
         $script:order = [System.Collections.Generic.List[string]]::new()
         Mock az {
             $line = ($args -join ' ')
-            if ($line -match 'deployment group create')  { $script:order.Add('deploy') }
-            if ($line -match 'automation runbook publish'){ $script:order.Add('publish') }
-            script:Invoke-AzMock @args
+            $global:LASTEXITCODE = 0
+            if ($line -match 'account show') { return '{"name":"Test Sub","id":"00000000-0000-0000-0000-000000000000"}' }
+            if ($line -match 'group show') { $global:LASTEXITCODE = 3; return }
+            if ($line -match 'deployment group create')   { $script:order.Add('deploy') }
+            # Runbook landed as a draft (not Published) — publish IS required.
+            if ($line -match 'automation runbook show')    { return 'New' }
+            if ($line -match 'automation runbook publish')  { $script:order.Add('publish'); return }
+            return script:Invoke-AzMock @args
         }
         Mock Invoke-RestMethod { @{ ip = '203.0.113.7' } }
         . $script:ManageEnvScript -Action up 4>$null 6>$null
@@ -305,19 +310,76 @@ Describe 'ENV-03 auto-destroy runbook publish' {
         $script:order.IndexOf('publish') | Should -BeGreaterThan ($script:order.IndexOf('deploy'))
     }
 
-    It 'does NOT hard-fail when publish returns non-zero but the runbook is already Published (idempotent)' {
+    It 'SKIPS the publish call entirely (no ERROR noise) when the runbook is already Published' {
         Mock az {
             $line = ($args -join ' ')
             $global:LASTEXITCODE = 0
             if ($line -match 'account show') { return '{"name":"Test Sub","id":"00000000-0000-0000-0000-000000000000"}' }
             if ($line -match 'group show') { $global:LASTEXITCODE = 3; return }
-            if ($line -match 'automation runbook publish') { $global:LASTEXITCODE = 1; return }   # no new draft to promote
-            if ($line -match 'automation runbook show') { $global:LASTEXITCODE = 0; return 'Published' }
+            # Runbook is already Published — publish must NOT be called.
+            if ($line -match 'automation runbook show') { return 'Published' }
             return script:Invoke-AzMock @args
         }
         Mock Invoke-RestMethod { @{ ip = '203.0.113.7' } }
 
         { . $script:ManageEnvScript -Action up 4>$null 6>$null } | Should -Not -Throw
+        Assert-MockCalled az -Times 0 -Scope It -ParameterFilter {
+            ($args -join ' ') -match 'automation runbook publish'
+        }
+    }
+
+    It 'does NOT hard-fail when publish returns non-zero but the runbook ends up Published (idempotent)' {
+        Mock az {
+            $line = ($args -join ' ')
+            $global:LASTEXITCODE = 0
+            if ($line -match 'account show') { return '{"name":"Test Sub","id":"00000000-0000-0000-0000-000000000000"}' }
+            if ($line -match 'group show') { $global:LASTEXITCODE = 3; return }
+            # First show => draft (triggers publish); publish fails; re-check => Published.
+            if ($line -match 'automation runbook show') { return 'New' }
+            if ($line -match 'automation runbook publish') { $global:LASTEXITCODE = 1; return }
+            return script:Invoke-AzMock @args
+        }
+        Mock Invoke-RestMethod { @{ ip = '203.0.113.7' } }
+
+        # Re-check after the failed publish must report Published; the second `show` call
+        # in the script reads the same mock branch — return Published on that path too by
+        # making `show` always Published once publish has been attempted is awkward in a
+        # stateless mock, so use a counter: first show=New, subsequent=Published.
+        $script:showCount = 0
+        Mock az {
+            $line = ($args -join ' ')
+            $global:LASTEXITCODE = 0
+            if ($line -match 'account show') { return '{"name":"Test Sub","id":"00000000-0000-0000-0000-000000000000"}' }
+            if ($line -match 'group show') { $global:LASTEXITCODE = 3; return }
+            if ($line -match 'automation runbook show') {
+                $script:showCount++
+                if ($script:showCount -eq 1) { return 'New' } else { return 'Published' }
+            }
+            if ($line -match 'automation runbook publish') { $global:LASTEXITCODE = 1; return }
+            return script:Invoke-AzMock @args
+        }
+
+        { . $script:ManageEnvScript -Action up 4>$null 6>$null } | Should -Not -Throw
+    }
+}
+
+Describe 'main.bicep: VM is provisioned AFTER the kill-switch is armed' {
+    # Compiles the Bicep to ARM JSON (offline, zero Azure cost) and asserts the VM's
+    # dependsOn references the auto-destroy module deployment AND the Contributor role
+    # assignment — so ARM arms the reaper before the billable VM exists.
+    It 'has the VM dependsOn the autodestroy module and the role assignment' {
+        $bicep = Join-Path $PSScriptRoot '..' 'main.bicep'
+        $json = az bicep build --file $bicep --stdout 2>$null
+        if ($LASTEXITCODE -ne 0 -or -not $json) {
+            Set-ItResult -Skipped -Because 'az bicep build unavailable in this environment'
+            return
+        }
+        $arm = $json | ConvertFrom-Json
+        $vm = $arm.resources | Where-Object { $_.type -eq 'Microsoft.Compute/virtualMachines' }
+        $vm | Should -Not -BeNullOrEmpty
+        $deps = ($vm.dependsOn -join ' ')
+        $deps | Should -Match "Microsoft.Resources/deployments', 'autodestroy'"
+        $deps | Should -Match "Microsoft.Authorization/roleAssignments"
     }
 }
 

@@ -198,6 +198,17 @@ resource vm 'Microsoft.Compute/virtualMachines@2024-07-01' = {
       ]
     }
   }
+  // ARM the kill-switch BEFORE the billable VM exists. Without this, ARM may create
+  // the VM before the auto-destroy module + role assignment, leaving a window where a
+  // billing VM exists with no reaper armed (orphaned-VM risk if `up` crashes mid-deploy).
+  // Force the VM to provision ONLY AFTER: (a) the auto-destroy module (Automation
+  // Account + runbook + schedule + jobSchedule in the mgmt RG), AND (b) the Contributor
+  // role assignment scoped to this TEST RG. No cycle: the role assignment depends on the
+  // module's principalId output; the module depends on neither the VM nor the role.
+  dependsOn: [
+    autoDestroy
+    autoDestroyRoleAssignment
+  ]
 }
 
 // ---------------------------------------------------------------------------
