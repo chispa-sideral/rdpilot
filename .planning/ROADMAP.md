@@ -65,10 +65,17 @@ Decimal phases appear between their surrounding integers in numeric order.
   5. Session keepalive prevents idle-timeout disconnection during a 10-minute idle period
 
 **Plans**: 3 plans
-
 Plans:
+**Wave 1**
+
 - [ ] 02-01-PLAN.md — Toolchain + workspace scaffold + no-VM foundation types (Error, ConnectionConfig, Screenshot/crop)
+
+**Wave 2** *(blocked on Wave 1 completion)*
+
 - [ ] 02-02-PLAN.md — Connect/auth (TLS/CredSSP, DVC seam) + SDK-owned session loop + framebuffer snapshot + keepalive + Session handle
+
+**Wave 3** *(blocked on Wave 2 completion)*
+
 - [ ] 02-03-PLAN.md — Example binary + gated 5-criteria integration suite + canonical live validation run
 
 ### Phase 3: Input Injection
