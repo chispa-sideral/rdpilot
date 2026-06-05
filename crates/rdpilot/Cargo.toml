@@ -11,8 +11,21 @@ repository = "https://github.com/marcfargas/rdpilot"
 # IronRDP: umbrella facade at 0.15, member crates at their independent versions.
 # Uniform "0.14" pins will NOT resolve (member crates are at 0.9/0.8/0.6/0.2).
 # Versions verified against the crates.io sparse index 2026-06-05 (see 02-RESEARCH.md).
-ironrdp = "0.15"
-ironrdp-tokio = "0.9"
+# The umbrella defaults to only `core`+`pdu`; the connect path / active session loop
+# need the connector state machine, the session (`ActiveStage`/`ActiveStageOutput`),
+# graphics (`DecodedImage`/`PixelFormat`), input, and the DVC seam — enable them here.
+ironrdp = { version = "0.15", features = [
+    "connector",
+    "session",
+    "graphics",
+    "input",
+    "dvc",
+    "svc",
+] }
+# The `reqwest` feature provides `ReqwestNetworkClient`, the CredSSP/KDC network
+# client `connect_finalize` requires (the umbrella `sspi` does not expose it
+# without its own `network_client` feature; the tokio crate is the supported seam).
+ironrdp-tokio = { version = "0.9", features = ["reqwest"] }
 # `ironrdp-tls` requires exactly one TLS backend feature; select `rustls` to
 # match the hand-built rustls ClientConfig path (D-15 custom cert verifier).
 ironrdp-tls = { version = "0.2", default-features = false, features = ["rustls"] }
@@ -27,6 +40,7 @@ image = "0.25"
 thiserror = "2"
 tracing = "0.1"
 x509-cert = "0.2"
+rustls-native-certs = "0.8.4"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
