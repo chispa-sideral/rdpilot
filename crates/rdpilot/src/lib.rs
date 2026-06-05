@@ -17,6 +17,14 @@
 //! crate [`Result`] alias. There are no `unwrap`/`expect`/`panic!` calls in
 //! non-test code.
 
+mod config;
+mod error;
+mod screenshot;
+
+pub use config::ConnectionConfig;
+pub use error::{Error, Result};
+pub use screenshot::{Rect, Screenshot};
+
 // The remaining public surface (`Session`, framebuffer wiring, the connect path)
 // is introduced by later plans in this phase. This plan establishes the
 // workspace, the dependency baseline, and the no-live-target types.
