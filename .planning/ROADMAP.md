@@ -64,7 +64,12 @@ Decimal phases appear between their surrounding integers in numeric order.
   4. The session remains fully rendered with screenshots at the correct resolution when the client process has no visible window (RemoteDesktop_SuppressWhenMinimized=2 is applied and verified)
   5. Session keepalive prevents idle-timeout disconnection during a 10-minute idle period
 
-**Plans**: TBD
+**Plans**: 3 plans
+
+Plans:
+- [ ] 02-01-PLAN.md — Toolchain + workspace scaffold + no-VM foundation types (Error, ConnectionConfig, Screenshot/crop)
+- [ ] 02-02-PLAN.md — Connect/auth (TLS/CredSSP, DVC seam) + SDK-owned session loop + framebuffer snapshot + keepalive + Session handle
+- [ ] 02-03-PLAN.md — Example binary + gated 5-criteria integration suite + canonical live validation run
 
 ### Phase 3: Input Injection
 
