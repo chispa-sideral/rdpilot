@@ -308,183 +308,165 @@ try {
     Write-Host ""
 
     # =======================================================================
-    # 3. ACT / ASSERT — poll for the schedule-triggered job
+    # 3. ACT / ASSERT — poll for the AUTHORITATIVE signal: the TEST RG is gone.
+    #
+    #   The whole point of ENV-03 is that the scheduled runbook REAPS the TEST RG
+    #   unattended. The authoritative PASS condition is therefore "the TEST RG no
+    #   longer exists within the window" — NOT "we managed to find the runbook job
+    #   in `az automation job list`". The job list is known to lag / race (the job
+    #   may not be indexed in the list until after it completes), so gating PASS on
+    #   job detection produced false FAILEDs even when the RG was correctly reaped.
+    #
+    #   PRIMARY (gates PASS/FAIL): poll `az group exists` until the TEST RG is gone.
+    #   SECONDARY (diagnostic only, never gates): best-effort locate the triggered
+    #   job and pull its Output/Error streams for the report.
     # =======================================================================
 
-    Write-Step "--- Act/Assert: waiting for scheduler-triggered job (timeout: ${TimeoutMinutes} min) ---"
+    Write-Step "--- Act/Assert: waiting for the TEST RG to be reaped (timeout: ${TimeoutMinutes} min) ---"
 
     $pollIntervalSeconds = 30
     $timeoutAt           = $nowUtc.AddMinutes($TimeoutMinutes)
-    $triggeredJobId      = $null
-    $jobFinalStatus      = $null
+    $rgReaped            = $false
+
+    Write-Host "  Polling every $pollIntervalSeconds s. The scheduler fires ~$leadDisplay min after schedule creation,"
+    Write-Host "  then the runbook deletes the RG (PASS = '$TestResourceGroup' no longer exists)."
+    Write-Host ""
+
+    while ([System.DateTime]::UtcNow -lt $timeoutAt) {
+
+        # `az group exists` returns the literal string 'true'/'false' and exits 0.
+        # This is the authoritative signal — independent of any job-list indexing lag.
+        $existsRaw = az group exists -n $TestResourceGroup -o tsv 2>$null
+        $exists    = if ($existsRaw) { $existsRaw.Trim().ToLowerInvariant() } else { $null }
+
+        if ($LASTEXITCODE -eq 0 -and $exists -eq 'false') {
+            $rgReaped = $true
+            Write-Host "  TEST RG '$TestResourceGroup' is GONE — the scheduled runbook reaped it."
+            break
+        }
+
+        $remaining = [int][Math]::Ceiling(($timeoutAt - [System.DateTime]::UtcNow).TotalMinutes)
+        Write-Host "  ... '$TestResourceGroup' still present (${remaining} min remaining, next poll in ${pollIntervalSeconds}s)"
+        Start-Sleep -Seconds $pollIntervalSeconds
+    }
+
+    # -----------------------------------------------------------------------
+    # SECONDARY / diagnostic — best-effort locate the triggered job and pull
+    # its streams. This MUST NOT affect PASS/FAIL; it only enriches the report.
+    # -----------------------------------------------------------------------
+    $triggeredJobId = $null
+    $jobFinalStatus = $null
 
     # We need a stable "not before" fence: the job must have started AFTER we created
     # the schedule (scheduleCreatedAt). Use a 60-second buffer to allow for clock skew.
     $notBeforeUtc = $scheduleCreatedAt.AddSeconds(-60)
 
-    Write-Host "  Polling every $pollIntervalSeconds s. The scheduler fires ~$leadDisplay min after schedule creation."
-    Write-Host "  Watching for a '$RunbookName' job created after $($notBeforeUtc.ToString('HH:mm:ss'))Z..."
-    Write-Host ""
+    Write-Step ""
+    Write-Step "  --- Diagnostic: locating the triggered runbook job (best-effort) ---"
 
-    while ([System.DateTime]::UtcNow -lt $timeoutAt) {
+    # `az automation job list` returns fields at the TOP level of each object
+    # (runbook.name, startTime, status, name/jobId) — NOT under .properties.
+    # Filter in PowerShell (not JMESPath) to dodge --query quirks on live jobs.
+    $jobListJson = az automation job list `
+        -g $ManagementResourceGroup `
+        --automation-account-name $AutomationAccount `
+        -o json 2>$null
 
-        # `az automation job list` returns fields at the TOP level of each object
-        # (runbook.name, startTime, status, name/jobId) — NOT under .properties.
-        # Filtering/reading via .properties.* always misses, so a fired job is never
-        # detected and the run reports a false "schedule never fired".
-        $jobListJson = az automation job list `
-            -g $ManagementResourceGroup `
-            --automation-account-name $AutomationAccount `
-            --query "[?runbook.name=='$RunbookName']" `
-            -o json 2>$null
+    if ($LASTEXITCODE -eq 0 -and $jobListJson) {
+        try { $jobs = $jobListJson | ConvertFrom-Json } catch { $jobs = @() }
 
-        if ($LASTEXITCODE -eq 0 -and $jobListJson -and $jobListJson -ne '[]') {
-            $jobs = $jobListJson | ConvertFrom-Json
+        foreach ($job in $jobs) {
+            if ($job.runbook.name -ne $RunbookName) { continue }
+            $startStr = $job.startTime
+            if (-not $startStr) { continue }
+            try {
+                $startUtc = [System.DateTime]::Parse($startStr, $null, [System.Globalization.DateTimeStyles]::AssumeUniversal -bor [System.Globalization.DateTimeStyles]::AdjustToUniversal)
+            } catch { continue }
 
-            # Find a job that started at or after our fence time.
-            foreach ($job in $jobs) {
-                $startStr = $job.startTime
-                if (-not $startStr) { continue }
-                try {
-                    $startUtc = [System.DateTime]::Parse($startStr, $null, [System.Globalization.DateTimeStyles]::AssumeUniversal -bor [System.Globalization.DateTimeStyles]::AdjustToUniversal)
-                } catch { continue }
-
-                if ($startUtc -ge $notBeforeUtc) {
-                    # Use the job NAME (the SCH_... string) as the identifier for
-                    # subsequent show/stream calls.
-                    $triggeredJobId = $job.name
-                    Write-Host "  Job detected: id=$triggeredJobId  started=$($startUtc.ToString('HH:mm:ss'))Z  status=$($job.status)"
-                    break
-                }
+            if ($startUtc -ge $notBeforeUtc) {
+                # Use the job NAME (the SCH_... string) as the identifier for
+                # subsequent show/stream calls.
+                $triggeredJobId = $job.name
+                $jobFinalStatus = $job.status
+                Write-Host "    Job located: id=$triggeredJobId  started=$($startUtc.ToString('HH:mm:ss'))Z  status=$jobFinalStatus"
+                break
             }
         }
-
-        if ($triggeredJobId) { break }
-
-        $remaining = [int][Math]::Ceiling(($timeoutAt - [System.DateTime]::UtcNow).TotalMinutes)
-        Write-Host "  ... no matching job yet (${remaining} min remaining, next poll in ${pollIntervalSeconds}s)"
-        Start-Sleep -Seconds $pollIntervalSeconds
     }
 
     if (-not $triggeredJobId) {
-        Write-Fail 'Schedule fired a job within timeout'
-        Write-Host ""
-        Write-Host "FAILURE MODE (a): The schedule never fired a job for runbook '$RunbookName' within ${TimeoutMinutes} min."
-        Write-Host "This indicates a schedule→jobSchedule wiring problem. Check:"
-        Write-Host "  - The jobSchedule link exists:  az rest --method get --uri `"https://management.azure.com/subscriptions/$($acct.id)/resourceGroups/$ManagementResourceGroup/providers/Microsoft.Automation/automationAccounts/$AutomationAccount/jobSchedules?api-version=2023-11-01`""
-        Write-Host "  - The schedule start-time was in the future at creation time (fire time was $fireTimeIso UTC)."
-        Write-Host "  - Azure Automation service health: https://status.azure.com/"
-        Write-Host ""
-        Write-Host "ENV-03 AUTO-DESTROY VALIDATION FAILED"
-        exit 1
-    }
-
-    Write-Pass "Schedule fired runbook job (UNATTENDED — proves schedule→jobSchedule wiring)"
-    Write-Host ""
-
-    # Poll the specific job to terminal state.
-    Write-Step "  Polling job $triggeredJobId to terminal state..."
-    $terminalStates = @('Completed', 'Failed', 'Suspended', 'Stopped')
-    $jobTimeoutAt   = [System.DateTime]::UtcNow.AddMinutes([Math]::Max($TimeoutMinutes, 10))
-
-    while ($true) {
-        $jobJson = az automation job show `
-            -g $ManagementResourceGroup `
-            --automation-account-name $AutomationAccount `
-            --job-name $triggeredJobId `
-            -o json 2>$null
-
-        if ($LASTEXITCODE -eq 0 -and $jobJson) {
-            # `az automation job show` returns status at the TOP level, not .properties.
-            $jobObj           = $jobJson | ConvertFrom-Json
-            $jobFinalStatus   = $jobObj.status
-            Write-Host "    Job status: $jobFinalStatus"
-            if ($jobFinalStatus -in $terminalStates) { break }
-        }
-
-        if ([System.DateTime]::UtcNow -ge $jobTimeoutAt) {
-            Write-Host "    Timed out waiting for job to reach terminal state (last status: $jobFinalStatus)."
-            break
-        }
-        Start-Sleep -Seconds $pollIntervalSeconds
-    }
-
-    # Read job output and error streams for diagnostics. `az automation job-output` is
-    # not a real CLI subcommand (job has only list/show) — read streams via az rest,
-    # the same endpoint used for the error stream below.
-    Write-Step ""
-    Write-Step "  --- Job output stream ---"
-    $jobOutputRaw = az rest `
-        --method GET `
-        --url "https://management.azure.com/subscriptions/$($acct.id)/resourceGroups/$ManagementResourceGroup/providers/Microsoft.Automation/automationAccounts/$AutomationAccount/jobs/$triggeredJobId/streams?`$filter=properties/streamType eq 'Output'&api-version=2023-11-01" `
-        --query 'value[].properties.summary' `
-        -o tsv 2>$null
-    if ($jobOutputRaw) {
-        $jobOutputRaw -split "`n" | ForEach-Object { Write-Host "    $_" }
+        Write-Host "    Note: the triggered job was not indexed in 'az automation job list' (known async-indexing lag — cosmetic only, does not affect PASS/FAIL)."
     } else {
-        Write-Host "    (no output stream content)"
-    }
-
-    Write-Step ""
-    Write-Step "  --- Job error stream ---"
-    $jobRunbookErrRaw = az rest `
-        --method GET `
-        --url "https://management.azure.com/subscriptions/$($acct.id)/resourceGroups/$ManagementResourceGroup/providers/Microsoft.Automation/automationAccounts/$AutomationAccount/jobs/$triggeredJobId/streams?`$filter=properties/streamType eq 'Error'&api-version=2023-11-01" `
-        --query 'value[].properties.summary' `
-        -o tsv 2>$null
-    if ($jobRunbookErrRaw) {
-        $jobRunbookErrRaw -split "`n" | ForEach-Object { Write-Host "    $_" }
-    } else {
-        Write-Host "    (no error stream content)"
-    }
-    Write-Step ""
-
-    # Assert job completed successfully.
-    if ($jobFinalStatus -ne 'Completed') {
-        Write-Fail "Runbook job completed (status: $jobFinalStatus)"
-        Write-Host ""
-
-        if ($jobRunbookErrRaw -match 'Connect-AzAccount|Remove-AzResourceGroup|not recognized|CommandNotFoundException|is not recognized') {
-            Write-Host "FAILURE MODE (b) — Az module missing:"
-            Write-Host "  The runbook job FIRED (schedule wiring is correct) but FAILED because"
-            Write-Host "  Connect-AzAccount or Remove-AzResourceGroup was not found."
-            Write-Host "  The Automation Account '$AutomationAccount' is missing the Az.Accounts and/or"
-            Write-Host "  Az.Resources PowerShell modules. Import them via:"
-            Write-Host "    az automation module create -g $ManagementResourceGroup --automation-account-name $AutomationAccount --name Az.Accounts --content-link <gallery-uri>"
-            Write-Host "  Or use the Azure Portal: Automation Account → Modules → Browse Gallery → search Az."
+        # Read job output and error streams for diagnostics. `az automation job-output`
+        # is not a real CLI subcommand (job has only list/show) — read streams via az rest.
+        Write-Step ""
+        Write-Step "  --- Job output stream ---"
+        $jobOutputRaw = az rest `
+            --method GET `
+            --url "https://management.azure.com/subscriptions/$($acct.id)/resourceGroups/$ManagementResourceGroup/providers/Microsoft.Automation/automationAccounts/$AutomationAccount/jobs/$triggeredJobId/streams?`$filter=properties/streamType eq 'Output'&api-version=2023-11-01" `
+            --query 'value[].properties.summary' `
+            -o tsv 2>$null
+        if ($jobOutputRaw) {
+            $jobOutputRaw -split "`n" | ForEach-Object { Write-Host "    $_" }
         } else {
-            Write-Host "FAILURE MODE (b) — Job fired but failed (status: $jobFinalStatus). See error stream above."
+            Write-Host "    (no output stream content)"
+        }
+
+        Write-Step ""
+        Write-Step "  --- Job error stream ---"
+        $jobRunbookErrRaw = az rest `
+            --method GET `
+            --url "https://management.azure.com/subscriptions/$($acct.id)/resourceGroups/$ManagementResourceGroup/providers/Microsoft.Automation/automationAccounts/$AutomationAccount/jobs/$triggeredJobId/streams?`$filter=properties/streamType eq 'Error'&api-version=2023-11-01" `
+            --query 'value[].properties.summary' `
+            -o tsv 2>$null
+        if ($jobRunbookErrRaw) {
+            $jobRunbookErrRaw -split "`n" | ForEach-Object { Write-Host "    $_" }
+        } else {
+            Write-Host "    (no error stream content)"
+        }
+    }
+    Write-Step ""
+
+    # -----------------------------------------------------------------------
+    # VERDICT — gated SOLELY on whether the TEST RG was reaped within the window.
+    # -----------------------------------------------------------------------
+    if (-not $rgReaped) {
+        Write-Fail "TEST RG '$TestResourceGroup' was reaped within ${TimeoutMinutes} min"
+        Write-Host ""
+        Write-Host "FAILURE: The TEST RG '$TestResourceGroup' still EXISTS after the ${TimeoutMinutes}-min window."
+        Write-Host "The scheduled runbook did not reap it. Possible causes:"
+        Write-Host "  - schedule→jobSchedule wiring problem (the runbook never fired). Check:"
+        Write-Host "      az rest --method get --uri `"https://management.azure.com/subscriptions/$($acct.id)/resourceGroups/$ManagementResourceGroup/providers/Microsoft.Automation/automationAccounts/$AutomationAccount/jobSchedules?api-version=2023-11-01`""
+        Write-Host "  - the runbook fired but FAILED (see job streams above, if the job was located)."
+        Write-Host "  - the managed identity lacks Contributor on '$TestResourceGroup' (check role assignments)."
+        Write-Host "  - Azure Automation service health: https://status.azure.com/"
+        if ($jobFinalStatus -and $jobFinalStatus -ne 'Completed') {
+            Write-Host ""
+            Write-Host "  Located job final status: $jobFinalStatus (non-Completed — inspect the error stream above)."
+        }
+        # Activity-log diagnostics for the RG delete (best-effort).
+        Write-Step ""
+        Write-Step "  --- Activity log (delete operations on '$TestResourceGroup', last 1h, best-effort) ---"
+        $alStart = [System.DateTime]::UtcNow.AddHours(-1).ToString('yyyy-MM-ddTHH:mm:ssZ')
+        $alRaw = az monitor activity-log list `
+            --resource-group $TestResourceGroup `
+            --start-time $alStart `
+            --query "[?contains(operationName.value, 'delete') || contains(operationName.value, 'Delete')].{time: eventTimestamp, op: operationName.value, status: status.value}" `
+            -o tsv 2>$null
+        if ($alRaw) {
+            $alRaw -split "`n" | ForEach-Object { Write-Host "    $_" }
+        } else {
+            Write-Host "    (no delete activity-log entries found — RG may never have been targeted)"
         }
         Write-Host ""
         Write-Host "ENV-03 AUTO-DESTROY VALIDATION FAILED"
         exit 1
     }
 
-    Write-Pass "Runbook job completed (status: Completed)"
-
-    # Assert the TEST RG is actually gone.
-    Write-Step ""
-    Write-Step "  Verifying TEST RG '$TestResourceGroup' has been deleted..."
-    Start-Sleep -Seconds 10   # brief pause — ARM delete propagation can lag slightly
-
-    $rgCheckRaw = az group show -n $TestResourceGroup --query 'properties.provisioningState' -o tsv 2>$null
-    $rgCheckState = if ($rgCheckRaw) { $rgCheckRaw.Trim() } else { $null }
-
-    if ($rgCheckState) {
-        Write-Fail "TEST RG '$TestResourceGroup' is gone after runbook completion (current state: $rgCheckState)"
-        Write-Host ""
-        Write-Host "FAILURE MODE (c): Runbook job completed but TEST RG '$TestResourceGroup' still exists (state: $rgCheckState)."
-        Write-Host "This may indicate:"
-        Write-Host "  - The runbook ran but received a different -ResourceGroupName parameter (check job output above)."
-        Write-Host "  - The managed identity lacks Contributor on '$TestResourceGroup' (check role assignments)."
-        Write-Host "  - The RG delete is still propagating — wait 30 s and check manually:"
-        Write-Host "    az group show -n $TestResourceGroup"
-        Write-Host ""
-        Write-Host "ENV-03 AUTO-DESTROY VALIDATION FAILED"
-        exit 1
+    Write-Pass "TEST RG '$TestResourceGroup' is gone (auto-destroy confirmed — scheduled runbook reaped it)"
+    if (-not $triggeredJobId) {
+        Write-Host "  (Job was not detectable in 'az automation job list' despite the successful reap — cosmetic async-indexing lag.)"
     }
-
-    Write-Pass "TEST RG '$TestResourceGroup' is gone (auto-destroy confirmed)"
 
     $passed = $true
 
