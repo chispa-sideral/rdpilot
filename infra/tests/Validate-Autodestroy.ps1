@@ -274,7 +274,10 @@ try {
     # name is a client-generated GUID. Body is written to a temp file and passed with
     # --body @file to avoid Windows inline-JSON quoting issues.
     $jobScheduleId = (New-Guid).Guid
-    $jsUri = "https://management.azure.com/subscriptions/$($acct.id)/resourceGroups/$ManagementResourceGroup/providers/Microsoft.Automation/automationAccounts/$AutomationAccount/jobSchedules/$jobScheduleId?api-version=2023-11-01"
+    # Build the URI by concatenation so the ?api-version query is unambiguous (an
+    # interpolated "...$jobScheduleId?api-version=..." can drop the query on PUT).
+    $jsBase = "https://management.azure.com/subscriptions/$($acct.id)/resourceGroups/$ManagementResourceGroup/providers/Microsoft.Automation/automationAccounts/$AutomationAccount/jobSchedules/$jobScheduleId"
+    $jsUri  = $jsBase + '?api-version=2023-11-01'
 
     $jsBodyObj = @{
         properties = @{
@@ -499,7 +502,7 @@ try {
         # jobSchedule first (it links the schedule to the runbook). DELETE via az rest —
         # `az automation job-schedule` is not a real CLI subgroup.
         if ($script:jobScheduleCreated -and $jobScheduleId) {
-            $jsDelUri = "https://management.azure.com/subscriptions/$($acct.id)/resourceGroups/$ManagementResourceGroup/providers/Microsoft.Automation/automationAccounts/$AutomationAccount/jobSchedules/$jobScheduleId?api-version=2023-11-01"
+            $jsDelUri = "https://management.azure.com/subscriptions/$($acct.id)/resourceGroups/$ManagementResourceGroup/providers/Microsoft.Automation/automationAccounts/$AutomationAccount/jobSchedules/$jobScheduleId" + '?api-version=2023-11-01'
             $jsDelRaw = az rest --method delete --uri $jsDelUri -o json 2>&1
             if ($LASTEXITCODE -eq 0) {
                 Write-Host "  Removed jobSchedule link (id: $jobScheduleId)"
