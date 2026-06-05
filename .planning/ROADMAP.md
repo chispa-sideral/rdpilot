@@ -192,3 +192,14 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8 →
 | 7. UIA Tree Module | 0/? | Not started | - |
 | 8. Public SDK API + WorldState | 0/? | Not started | - |
 | 9. Scripted Proof Harness | 0/? | Not started | - |
+
+## Backlog
+
+### Phase 999.1: Harden live RDP test suite against frame-timing races (BACKLOG)
+
+**Goal:** Replace fixed-time settles / blank-frame tolerances in the live integration suite with deterministic frame-readiness signals (poll-until-shell-ready, wait-for-first-real-paint), reducing flakiness like the screenshot_is_rgb_correct failure observed during Phase 2 live validation (fixed in commit 03302a0 as a band-aid).
+**Requirements:** TBD
+**Plans:** 0 plans
+
+Plans:
+- [ ] TBD (promote with /gsd-review-backlog when ready)
