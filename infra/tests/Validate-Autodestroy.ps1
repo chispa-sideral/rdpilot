@@ -41,11 +41,14 @@ param(
     [string]$AutomationAccount       = 'rdpilot-autodestroy',
     [string]$RunbookName             = 'Delete-ResourceGroup',
 
-    # Minutes in the future to schedule the one-time trigger.
-    # Enforced floor of 5 — Azure Automation rejects schedules < ~5 min out.
-    [int]$LeadMinutes    = 6,
+    # Minutes in the future to schedule the one-time trigger. Azure Automation
+    # enforces a HARD 5-minute minimum; default 10 (and the floor clamp below is 7)
+    # so clock skew + the latency between computing UtcNow and the actual create call
+    # cannot erode the effective lead below Azure's minimum.
+    [int]$LeadMinutes    = 10,
 
     # Maximum minutes to wait for the schedule-triggered job to appear and complete.
+    # Comfortably exceeds LeadMinutes (10) + expected job runtime (a few min).
     [int]$TimeoutMinutes = 20
 )
 
@@ -218,24 +221,29 @@ try {
 
     Write-Step "--- Arrange: creating one-time schedule in '$AutomationAccount' ---"
 
-    # Enforce floor of 5 minutes (Azure rejects schedules < ~5 min out).
-    $effectiveLeadMinutes = [Math]::Max($LeadMinutes, 5)
+    # Enforce a floor of 7 minutes (Azure's hard minimum is 5; 7 leaves headroom for
+    # clock skew + create-call latency).
+    $effectiveLeadMinutes = [Math]::Max($LeadMinutes, 7)
     if ($effectiveLeadMinutes -ne $LeadMinutes) {
-        Write-Host "  Note: -LeadMinutes $LeadMinutes is below the 5-minute Azure floor — using $effectiveLeadMinutes."
+        Write-Host "  Note: -LeadMinutes $LeadMinutes is below the 7-minute safety floor — using $effectiveLeadMinutes."
     }
 
     # Unique schedule name using a compact UTC timestamp (avoids collisions on re-runs).
+    # $scheduleCreatedAt is the job-filter fence (jobs must start at/after this).
     $nowUtc             = [System.DateTime]::UtcNow
     $scheduleCreatedAt  = $nowUtc
     $ts                 = $nowUtc.ToString('yyyyMMddHHmmss')
     $tempScheduleName   = "validate-env03-$ts"
-
-    # Fire time = now + effectiveLeadMinutes, formatted as ISO-8601 Z required by the CLI.
-    $fireTime           = $nowUtc.AddMinutes($effectiveLeadMinutes)
-    $fireTimeIso        = $fireTime.ToString('yyyy-MM-ddTHH:mm:ssZ')
     $leadDisplay        = $effectiveLeadMinutes
 
     Write-Host "  Schedule name : $tempScheduleName"
+
+    # Compute the start time IMMEDIATELY before the create call so preflight latency /
+    # clock skew cannot erode the lead below Azure's 5-min minimum. Format as an
+    # explicit UTC ISO-8601 string and pin --time-zone UTC (belt-and-suspenders against
+    # any server-side timezone reinterpretation).
+    $startUtc    = [System.DateTime]::UtcNow.AddMinutes($effectiveLeadMinutes)
+    $fireTimeIso = $startUtc.ToString('yyyy-MM-ddTHH:mm:ssZ')
     Write-Host "  Fire time (UTC): $fireTimeIso  (~$leadDisplay min from now)"
 
     # Create the one-time schedule.
@@ -247,6 +255,7 @@ try {
         --automation-account-name $AutomationAccount `
         -n $tempScheduleName `
         --start-time $fireTimeIso `
+        --time-zone UTC `
         --frequency OneTime `
         --interval 1 `
         --description "Temporary one-time schedule created by Validate-Autodestroy.ps1 for ENV-03 validation. Safe to delete." `
@@ -277,8 +286,9 @@ try {
 
     Write-Pass "jobSchedule link created (id: $tempJobScheduleId)"
     Write-Host ""
-    Write-Host "  Scheduled one-time auto-destroy trigger for $fireTimeIso UTC (~$leadDisplay min)."
+    Write-Host "  Scheduled one-time auto-destroy trigger for $fireTimeIso UTC (~$leadDisplay min from now)."
     Write-Host "  Waiting for the SCHEDULE to fire the runbook UNATTENDED — not triggering it manually."
+    Write-Host "  Expect ~$leadDisplay min of silence before the job appears; this is NORMAL (within the ${TimeoutMinutes}-min timeout)."
     Write-Host ""
 
     # =======================================================================
