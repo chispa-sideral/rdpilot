@@ -20,7 +20,10 @@
 mod config;
 mod connect;
 mod error;
+mod framebuffer;
+mod keepalive;
 mod screenshot;
+mod session_loop;
 
 pub use config::ConnectionConfig;
 pub use error::{Error, Result};
