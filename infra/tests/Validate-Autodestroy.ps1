@@ -328,10 +328,14 @@ try {
 
     while ([System.DateTime]::UtcNow -lt $timeoutAt) {
 
+        # `az automation job list` returns fields at the TOP level of each object
+        # (runbook.name, startTime, status, name/jobId) — NOT under .properties.
+        # Filtering/reading via .properties.* always misses, so a fired job is never
+        # detected and the run reports a false "schedule never fired".
         $jobListJson = az automation job list `
             -g $ManagementResourceGroup `
             --automation-account-name $AutomationAccount `
-            --query "[?properties.runbook.name=='$RunbookName']" `
+            --query "[?runbook.name=='$RunbookName']" `
             -o json 2>$null
 
         if ($LASTEXITCODE -eq 0 -and $jobListJson -and $jobListJson -ne '[]') {
@@ -339,15 +343,17 @@ try {
 
             # Find a job that started at or after our fence time.
             foreach ($job in $jobs) {
-                $startStr = $job.properties.startTime
+                $startStr = $job.startTime
                 if (-not $startStr) { continue }
                 try {
                     $startUtc = [System.DateTime]::Parse($startStr, $null, [System.Globalization.DateTimeStyles]::AssumeUniversal -bor [System.Globalization.DateTimeStyles]::AdjustToUniversal)
                 } catch { continue }
 
                 if ($startUtc -ge $notBeforeUtc) {
-                    $triggeredJobId = $job.properties.jobId
-                    Write-Host "  Job detected: id=$triggeredJobId  started=$($startUtc.ToString('HH:mm:ss'))Z  status=$($job.properties.status)"
+                    # Use the job NAME (the SCH_... string) as the identifier for
+                    # subsequent show/stream calls.
+                    $triggeredJobId = $job.name
+                    Write-Host "  Job detected: id=$triggeredJobId  started=$($startUtc.ToString('HH:mm:ss'))Z  status=$($job.status)"
                     break
                 }
             }
@@ -389,8 +395,9 @@ try {
             -o json 2>$null
 
         if ($LASTEXITCODE -eq 0 -and $jobJson) {
+            # `az automation job show` returns status at the TOP level, not .properties.
             $jobObj           = $jobJson | ConvertFrom-Json
-            $jobFinalStatus   = $jobObj.properties.status
+            $jobFinalStatus   = $jobObj.status
             Write-Host "    Job status: $jobFinalStatus"
             if ($jobFinalStatus -in $terminalStates) { break }
         }
