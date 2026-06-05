@@ -64,9 +64,8 @@ fn connection_file() -> PathBuf {
 /// the produced config (D-15). This opt-out is test-only and risk-named.
 pub fn load_config() -> Option<ConnectionConfig> {
     // Gate 1: explicit opt-in. Unset -> skip (default `cargo test` stays green).
-    if std::env::var_os(LIVE_ENV).is_none() {
-        return None;
-    }
+    // `?` returns `None` early when the var is absent.
+    std::env::var_os(LIVE_ENV)?;
 
     // Gate 2: secrets file presence. Absent -> skip (no target provisioned).
     let path = connection_file();
