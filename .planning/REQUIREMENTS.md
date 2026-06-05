@@ -17,7 +17,7 @@ Stack (from research): IronRDP 0.14 (Rust) client core + primary language; C# .N
 ### Session
 
 - [x] **SESS-01**: User can connect to and authenticate (NLA / credentials) an RDP session to a Windows target
-- [ ] **SESS-02**: User can manage the session lifecycle (open, keepalive, teardown) and keep the session rendered so perception stays live (apply `RemoteDesktop_SuppressWhenMinimized=2`, prevent lock/minimize stalls)
+- [x] **SESS-02**: User can manage the session lifecycle (open, keepalive, teardown) and keep the session rendered so perception stays live (apply `RemoteDesktop_SuppressWhenMinimized=2`, prevent lock/minimize stalls)
 
 ### Capture
 
@@ -79,7 +79,7 @@ Stack (from research): IronRDP 0.14 (Rust) client core + primary language; C# .N
 | ENV-02 | Phase 1: Test Environment | Pending |
 | ENV-03 | Phase 1: Test Environment | Pending |
 | SESS-01 | Phase 2: RDP Session + Framebuffer Core | Complete |
-| SESS-02 | Phase 2: RDP Session + Framebuffer Core | Pending |
+| SESS-02 | Phase 2: RDP Session + Framebuffer Core | Complete |
 | CAP-01 | Phase 2: RDP Session + Framebuffer Core | Complete |
 | CAP-02 | Phase 6: Window + Process Perception | Pending |
 | INPUT-01 | Phase 3: Input Injection | Pending |

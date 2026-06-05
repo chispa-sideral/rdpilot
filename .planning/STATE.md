@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-stopped_at: Completed 02-01-PLAN.md (workspace + no-VM types)
-last_updated: "2026-06-05T00:00:00.000Z"
-last_activity: Phase 2 Plan 01 complete — cargo workspace + rdpilot crate build green via GNU x86_64 toolchain; owned no-VM types (Error/ConnectionConfig/Screenshot) with 8 passing offline tests.
+stopped_at: Completed 02-02-PLAN.md (live session + framebuffer core)
+last_updated: "2026-06-05T13:27:20.356Z"
+last_activity: Phase 2 Plan 02 complete — connect path + session loop + framebuffer snapshot + keepalive + Session handle; 21 offline tests green.
 progress:
   total_phases: 9
   completed_phases: 1
   total_plans: 7
-  completed_plans: 5
-  percent: 16
+  completed_plans: 6
+  percent: 86
 ---
 
 # Project State
@@ -26,31 +26,31 @@ See: .planning/PROJECT.md (updated 2026-06-04)
 ## Current Position
 
 Phase: 2 of 9 (RDP Session + Framebuffer Core) — in progress
-Plan: Phase 2 Plan 01 complete (1/3 plans done). First Rust code in the repo: Cargo workspace + rdpilot crate building via the GNU x86_64 toolchain; owned no-VM types (Error/ConnectionConfig/Screenshot/Rect) with to_png + bounds-checked crop, 8 offline tests green. SESS-01 + CAP-01 advanced (transport baseline + screenshot type). Next: Plan 02 (connect path + SDK-owned session loop).
-Status: Executing (Phase 2 — Plan 01 done, Plans 02–03 pending)
-Last activity: Phase 2 Plan 01 complete — workspace + corrected IronRDP 0.15 deps + owned types; GNU toolchain adopted (host has no MSVC).
+Plan: Phase 2 Plan 02 complete (2/3 plans done). The live RDP machinery: async connect (TCP → connect_begin → tokio-rustls TLS upgrade, resumption disabled, D-15 cert policy → connect_finalize) with the RDPILOT_SENSOR DVC seam; SDK-owned active-session loop (tokio::select! pump, RgbA32 DecodedImage, snapshot-on-GraphicsUpdate, DeactivateAll reactivation) on a dedicated thread; automatic 60s zero-delta keepalive; Session handle (connect/screenshot/close + Drop guard). 21 offline tests green; SESS-01/SESS-02/CAP-01 advanced. Next: Plan 03 (wire Screenshot to the live framebuffer + gated live integration suite).
+Status: Executing (Phase 2 — Plans 01–02 done, Plan 03 pending)
+Last activity: Phase 2 Plan 02 complete — connect path + session loop + framebuffer snapshot + keepalive + Session handle; 21 offline tests green.
 
-Progress: [██░░░░░░░░] 16% (Phase 2 Plan 01 complete)
+Progress: [██████████] 86% (Phase 2 Plan 02 complete — 6/7 plans)
 
 ## Performance Metrics
 
 **Velocity:**
 
-- Total plans completed: 4
-- Average duration: ~8 min
-- Total execution time: ~0.5 hours
+- Total plans completed: 6
+- Average duration: ~16 min
+- Total execution time: ~1.6 hours
 
 **By Phase:**
 
 | Phase | Plans | Total | Avg/Plan |
 |-------|-------|-------|----------|
 | 1 | 4 | ~25+ min | ~8 min |
-| 2 | 1/3 | ~35 min | ~35 min |
+| 2 | 2/3 | ~105 min | ~52 min |
 
 **Recent Trend:**
 
-- Last plan: 02-01 (~35 min, 3 tasks, 9 files) — toolchain blocker resolved (GNU x86_64), workspace + owned types
-- Trend: —
+- Last plan: 02-02 (~70 min, 3 tasks, 8 files) — live session machinery: connect/loop/framebuffer/keepalive/Session
+- Prior: 02-01 (~35 min, 3 tasks, 9 files) — toolchain blocker resolved (GNU x86_64), workspace + owned types
 
 *Updated after each plan completion*
 
@@ -65,7 +65,9 @@ Recent decisions affecting current work:
 - **Build toolchain (Phase 2 Plan 01 architectural decision, checkpoint-approved):** build target is `x86_64-pc-windows-gnu` (MinGW-w64 gcc), NOT `*-msvc`. Host is ARM64 Windows with no MSVC/Windows SDK and VS was declined; x64 artifacts run under Windows-on-ARM x64 emulation. Toolchain pinned via `rust-toolchain.toml`; gcc linker pinned via `.cargo/config.toml`. Functionally equivalent for a pure-Rust RDP client.
 - `ironrdp-tls` requires exactly one TLS backend feature — `rustls` selected (matches the planned hand-built rustls ClientConfig / D-15 custom verifier path).
 - Public API exposes only owned SDK types (Error/ConnectionConfig/Screenshot/Rect); image/ironrdp/rustls/anyhow stay internal (D-09). No unwrap/expect/panic in library code (API-01). ConnectionConfig Debug redacts the password (D-14).
-- DVC channel (RDPILOT_SENSOR) must be registered before connector.connect() completes — hard IronRDP constraint
+- DVC channel (RDPILOT_SENSOR) must be registered before connector.connect() completes — hard IronRDP constraint. **Implemented at Phase 2 Plan 02:** DrdynvcClient registered on the connector before connect_begin as the empty seam; Phase 4 adds the sensor processor via with_dynamic_channel.
+- **Phase 2 Plan 02:** enabled ironrdp umbrella features (connector/session/graphics/input/dvc/svc — facade defaults to only core+pdu) and the ironrdp-tokio `reqwest` feature for ReqwestNetworkClient; added rustls-native-certs for the default validating cert path.
+- **Phase 2 Plan 02 (structural):** the SDK-owned session loop runs on a dedicated OS thread with a current-thread Tokio runtime, NOT tokio::spawn — the reactivation step holds a Sequence::next_pdu_hint() -> Option<&dyn PduHint> borrow across .await, which the compiler cannot prove Send (HRTB limitation). Fully contained inside Session; public async API unchanged.
 - RemoteDesktop_SuppressWhenMinimized=2 is a Phase 2 prerequisite, baked into Phase 1 VM provisioning
 - Force 96 DPI on remote session; sensor sets DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2; emit both coordinate spaces
 - v1 done = scripted harness proves end-to-end, no live LLM required
@@ -84,8 +86,7 @@ Recent decisions affecting current work:
 
 ### Pending Todos
 
-- Phase 2 Plan 02: connect path (TLS/CredSSP, D-15 cert policy) + SDK-owned async session loop + keepalive + teardown.
-- Phase 2 Plan 03: wire Screenshot to the live framebuffer snapshot + the gated live integration suite (D-16/D-17/D-18).
+- Phase 2 Plan 03: wire Screenshot to the live framebuffer snapshot + the gated live integration suite (D-16/D-17/D-18). Validate A1 (zero-delta keepalive) during the 10-min idle test; switch to the ±1px fallback if needed.
 - Future agents on this machine must export the scoop rustup env (RUSTUP_HOME / CARGO_HOME / CARGO_HOME\bin on PATH) and have MinGW gcc on PATH for cargo to link.
 
 ### Blockers/Concerns
@@ -98,9 +99,10 @@ Recent decisions affecting current work:
 ## Deferred Items
 
 None outstanding for Phase 1. All ENV-01/02/03 requirements satisfied.
+Phase 2 Plan 02: pre-existing rustdoc intra-doc-link warnings in config.rs (Wave 1) logged in `.planning/phases/02-rdp-session-framebuffer-core/deferred-items.md` — out of scope, cargo doc still exits 0.
 
 ## Session Continuity
 
-Last session: 2026-06-05
-Stopped at: Completed 02-01-PLAN.md (workspace + no-VM types)
-Resume file: None — ready for 02-02-PLAN.md
+Last session: 2026-06-05T13:27:20.350Z
+Stopped at: Completed 02-02-PLAN.md (live session + framebuffer core)
+Resume file: None — ready for 02-03-PLAN.md
