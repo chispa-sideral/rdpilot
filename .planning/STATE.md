@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-stopped_at: Completed 02-02-PLAN.md (live session + framebuffer core)
-last_updated: "2026-06-05T13:27:20.356Z"
-last_activity: Phase 2 Plan 02 complete — connect path + session loop + framebuffer snapshot + keepalive + Session handle; 21 offline tests green.
+stopped_at: Completed 02-03-PLAN.md (live validation suite — phase 2 proven end-to-end)
+last_updated: "2026-06-05T16:40:00.000Z"
+last_activity: Phase 2 Plan 03 complete — example + gated 5-criterion live suite; canonical run on a real Azure VM passed 5/5 with the full 10-min idle (SESS-01/SESS-02/CAP-01); VM torn down.
 progress:
   total_phases: 9
-  completed_phases: 1
+  completed_phases: 2
   total_plans: 7
-  completed_plans: 6
-  percent: 86
+  completed_plans: 7
+  percent: 100
 ---
 
 # Project State
@@ -25,32 +25,32 @@ See: .planning/PROJECT.md (updated 2026-06-04)
 
 ## Current Position
 
-Phase: 2 of 9 (RDP Session + Framebuffer Core) — in progress
-Plan: Phase 2 Plan 02 complete (2/3 plans done). The live RDP machinery: async connect (TCP → connect_begin → tokio-rustls TLS upgrade, resumption disabled, D-15 cert policy → connect_finalize) with the RDPILOT_SENSOR DVC seam; SDK-owned active-session loop (tokio::select! pump, RgbA32 DecodedImage, snapshot-on-GraphicsUpdate, DeactivateAll reactivation) on a dedicated thread; automatic 60s zero-delta keepalive; Session handle (connect/screenshot/close + Drop guard). 21 offline tests green; SESS-01/SESS-02/CAP-01 advanced. Next: Plan 03 (wire Screenshot to the live framebuffer + gated live integration suite).
-Status: Executing (Phase 2 — Plans 01–02 done, Plan 03 pending)
-Last activity: Phase 2 Plan 02 complete — connect path + session loop + framebuffer snapshot + keepalive + Session handle; 21 offline tests green.
+Phase: 2 of 9 (RDP Session + Framebuffer Core) — COMPLETE (3/3 plans). All five ROADMAP success criteria proven end-to-end against a real Azure Windows RDP target.
+Plan: Phase 2 Plan 03 complete. Added the public-API-only example (examples/screenshot.rs → PNG) and the gated 5-criterion live suite (tests/live_session.rs + tests/common/mod.rs), #[ignore]'d + skip-when-absent so default cargo test stays green (21 unit + 5 ignored). Canonical run on a freshly-provisioned Azure VM (Standard_B2s_v2, westeurope) passed 5/5 with the FULL 10-min idle: connect/auth, RGB-correct screenshot (not YUV-grey), crop, stays-rendered-windowless-idle, 10-min keepalive. Assumption A1 resolved — zero-delta keepalive sufficient (no ±1px fallback needed). VM torn down (no Azure cost). SESS-01/SESS-02/CAP-01 complete. Next: Phase 3 (Input Injection).
+Status: Executing (Phase 2 COMPLETE — ready for Phase 3 planning)
+Last activity: Phase 2 Plan 03 complete — gated live suite; canonical 5/5 pass on a real VM with the full 10-min idle; VM torn down.
 
-Progress: [██████████] 86% (Phase 2 Plan 02 complete — 6/7 plans)
+Progress: [██████████] 100% (Phase 2 complete — 7/7 plans)
 
 ## Performance Metrics
 
 **Velocity:**
 
-- Total plans completed: 6
-- Average duration: ~16 min
-- Total execution time: ~1.6 hours
+- Total plans completed: 7
+- Average duration: ~17 min
+- Total execution time: ~2.6 hours
 
 **By Phase:**
 
 | Phase | Plans | Total | Avg/Plan |
 |-------|-------|-------|----------|
 | 1 | 4 | ~25+ min | ~8 min |
-| 2 | 2/3 | ~105 min | ~52 min |
+| 2 | 3/3 | ~160 min | ~53 min |
 
 **Recent Trend:**
 
-- Last plan: 02-02 (~70 min, 3 tasks, 8 files) — live session machinery: connect/loop/framebuffer/keepalive/Session
-- Prior: 02-01 (~35 min, 3 tasks, 9 files) — toolchain blocker resolved (GNU x86_64), workspace + owned types
+- Last plan: 02-03 (~55 min incl. ~20-min canonical idle run, 3 tasks, 3 files) — example + gated live suite; 5/5 live pass at full 10-min idle; VM torn down
+- Prior: 02-02 (~70 min, 3 tasks, 8 files) — live session machinery: connect/loop/framebuffer/keepalive/Session
 
 *Updated after each plan completion*
 
@@ -86,7 +86,8 @@ Recent decisions affecting current work:
 
 ### Pending Todos
 
-- Phase 2 Plan 03: wire Screenshot to the live framebuffer snapshot + the gated live integration suite (D-16/D-17/D-18). Validate A1 (zero-delta keepalive) during the 10-min idle test; switch to the ±1px fallback if needed.
+- Phase 3 (Input Injection): plan + execute. Build on the validated Session loop + RdpInputEvent seam; reuse the gated-live-test pattern (tests/common::load_config, RDPILOT_* env gating).
+- When re-running the canonical Phase 2 validation: default VM size Standard_B2ms is SkuNotAvailable in westeurope — use `-VmSize Standard_B2s_v2` (or another preflight-listed size).
 - Future agents on this machine must export the scoop rustup env (RUSTUP_HOME / CARGO_HOME / CARGO_HOME\bin on PATH) and have MinGW gcc on PATH for cargo to link.
 
 ### Blockers/Concerns
@@ -103,6 +104,6 @@ Phase 2 Plan 02: pre-existing rustdoc intra-doc-link warnings in config.rs (Wave
 
 ## Session Continuity
 
-Last session: 2026-06-05T13:27:20.350Z
-Stopped at: Completed 02-02-PLAN.md (live session + framebuffer core)
-Resume file: None — ready for 02-03-PLAN.md
+Last session: 2026-06-05T16:40:00.000Z
+Stopped at: Completed 02-03-PLAN.md (live validation suite — Phase 2 proven end-to-end, 5/5 live criteria)
+Resume file: None — Phase 2 complete; ready for Phase 3 planning

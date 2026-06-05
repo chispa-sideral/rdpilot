@@ -14,7 +14,7 @@ Nine dependency-ordered phases build rdpilot from the ground up: a disposable Az
 Decimal phases appear between their surrounding integers in numeric order.
 
 - [x] **Phase 1: Test Environment** - Provision a disposable Azure Windows VM pre-configured for RDP automation, with up/down script and scheduled auto-destroy — ENV-01/02/03 all verified (ENV-01/02 live gate 2026-06-04; ENV-03 auto-destroy validated 2026-06-05)
-- [ ] **Phase 2: RDP Session + Framebuffer Core** - Connect, authenticate, keep session rendered, and produce full-desktop screenshots
+- [x] **Phase 2: RDP Session + Framebuffer Core** - Connect, authenticate, keep session rendered, and produce full-desktop screenshots — all 5 success criteria proven live (canonical run 5/5 pass on a real Azure VM with the full 10-min idle, 2026-06-05; SESS-01/SESS-02/CAP-01)
 - [ ] **Phase 3: Input Injection** - Inject mouse and keyboard actions at remote coordinates with a locked DPI contract
 - [ ] **Phase 4: DVC Transport Channel** - Establish and verify the RDPILOT_SENSOR dynamic virtual channel before any sensor modules exist
 - [ ] **Phase 5: Sensor Bootstrap + Deployment** - Build the C# NativeAOT sensor helper and deploy it onto a real target via drive redirection or WinRM
@@ -76,7 +76,7 @@ Plans:
 
 **Wave 3** *(blocked on Wave 2 completion)*
 
-- [ ] 02-03-PLAN.md — Example binary + gated 5-criteria integration suite + canonical live validation run
+- [x] 02-03-PLAN.md — Example binary + gated 5-criteria integration suite + canonical live validation run *(complete; canonical run on a fresh Azure VM passed 5/5 with the full 10-min idle 2026-06-05; A1 zero-delta keepalive sufficient; VM torn down)*
 
 ### Phase 3: Input Injection
 
