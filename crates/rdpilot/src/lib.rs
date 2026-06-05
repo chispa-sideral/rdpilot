@@ -23,13 +23,15 @@ mod error;
 mod framebuffer;
 mod keepalive;
 mod screenshot;
+mod session;
 mod session_loop;
 
 pub use config::ConnectionConfig;
 pub use error::{Error, Result};
 pub use screenshot::{Rect, Screenshot};
+pub use session::Session;
 
-// `connect` is internal — the connect path is an implementation detail driven by
-// `Session::connect`; it is never part of the public surface. The remaining
-// public surface (`Session`, framebuffer wiring) is introduced by the later
-// tasks/plans in this phase.
+// `connect`, `framebuffer`, `keepalive`, and `session_loop` are internal — they
+// are implementation details driven by `Session`, never part of the public
+// surface. The public API is exactly: `Session`, `ConnectionConfig`,
+// `Screenshot`, `Rect`, `Error`, `Result` (owned SDK types only, D-09).

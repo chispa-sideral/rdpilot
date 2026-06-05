@@ -125,7 +125,7 @@ mod tests {
     fn latest_write_wins() {
         let frame = SharedFrame::new();
         frame.write(2, 2, vec![1; 2 * 2 * 4]);
-        frame.write(1, 1, vec![9; 1 * 1 * 4]);
+        frame.write(1, 1, vec![9; 4]);
 
         let snap = frame.read();
         assert_eq!(snap.width, 1);

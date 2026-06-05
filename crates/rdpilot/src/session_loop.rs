@@ -20,7 +20,6 @@
 use ironrdp::connector::connection_activation::{ConnectionActivationSequence, ConnectionActivationState};
 use ironrdp::core::WriteBuf;
 use ironrdp::graphics::image_processing::PixelFormat;
-use ironrdp::pdu::input::fast_path::FastPathInputEvent;
 use ironrdp::session::fast_path;
 use ironrdp::session::image::DecodedImage;
 use ironrdp::session::{ActiveStage, ActiveStageOutput};
@@ -35,9 +34,12 @@ use crate::framebuffer::SharedFrame;
 use crate::keepalive::{null_input_event, KEEPALIVE_INTERVAL};
 
 /// Control/input events the [`Session`](crate::Session) sends into the loop.
+///
+/// Phase 2 only needs `Close`; the keepalive is emitted from its own `select!`
+/// arm (no self-send through the channel). Phase 3 (input injection) will add a
+/// `FastPath(Vec<FastPathInputEvent>)` variant that the consumer sends here and
+/// the loop forwards to `process_fastpath_input`.
 pub(crate) enum RdpInputEvent {
-    /// Inject one or more fast-path input events (e.g. the keepalive null move).
-    FastPath(Vec<FastPathInputEvent>),
     /// Begin a graceful client-side shutdown (sent by `Session::close`).
     Close,
 }
@@ -84,9 +86,6 @@ pub(crate) async fn run(
             }
             event = input_rx.recv() => {
                 match event {
-                    Some(RdpInputEvent::FastPath(events)) => active_stage
-                        .process_fastpath_input(&mut image, &events)
-                        .map_err(|e| Error::Session(format!("process input failed: {e}")))?,
                     Some(RdpInputEvent::Close) => {
                         debug!("graceful shutdown requested");
                         active_stage
@@ -131,7 +130,7 @@ pub(crate) async fn run(
                     // Server resize / share change: run the reactivation sequence
                     // and rebuild the framebuffer at the new size, or screenshots
                     // go stale / wrong-size (Pitfall 2, criterion #4).
-                    reactivate(&mut reader, &mut writer, &mut active_stage, &mut image, &mut *activation)
+                    reactivate(&mut reader, &mut writer, &mut active_stage, &mut image, &mut activation)
                         .await?;
                 }
                 ActiveStageOutput::Terminate(reason) => {
@@ -222,14 +221,14 @@ async fn reactivate(
 mod tests {
     use super::*;
 
-    /// `RdpInputEvent::FastPath` carries the events verbatim (sanity on the
-    /// control enum the Session uses to drive the loop, no VM).
+    /// The keepalive event the loop emits is a well-formed null pointer move
+    /// (sanity that the loop's keepalive source is the no-op input, no VM).
     #[test]
-    fn fastpath_event_carries_inputs() {
-        let ev = RdpInputEvent::FastPath(vec![null_input_event()]);
-        match ev {
-            RdpInputEvent::FastPath(events) => assert_eq!(events.len(), 1),
-            RdpInputEvent::Close => panic!("expected FastPath"),
-        }
+    fn keepalive_source_is_null_input() {
+        let ev = null_input_event();
+        assert!(matches!(
+            ev,
+            ironrdp::pdu::input::fast_path::FastPathInputEvent::MouseEvent(_)
+        ));
     }
 }
