@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-stopped_at: Phase 1 partially verified — ENV-01/02 confirmed, ENV-03 auto-destroy deployed but NOT yet validated. Validate ENV-03 before advancing to Phase 2.
+stopped_at: Phase 1 complete — ENV-01/02/03 all validated. Routing to Phase 2 (RDP Session + Framebuffer Core).
 last_updated: "2026-06-05T00:00:00.000Z"
-last_activity: 2026-06-05 — CORRECTION: Phase 1 live gate proved ENV-01 (all six assertions green) and ENV-02 (up/down driver works). ENV-03 auto-destroy resources DEPLOYED but the scheduled runbook delete path is UNVALIDATED; manual down does not exercise it. Phase 1 is NOT fully verified.
+last_activity: Phase 1 complete — auto-destroy (ENV-03) validated live 2026-06-05; routing to Phase 2.
 progress:
   total_phases: 9
-  completed_phases: 0
+  completed_phases: 1
   total_plans: 4
   completed_plans: 4
-  percent: 9
+  percent: 11
 ---
 
 # Project State
@@ -21,16 +21,16 @@ progress:
 See: .planning/PROJECT.md (updated 2026-06-04)
 
 **Core value:** A local AI agent can connect to a remote Windows desktop over RDP and read/inspect a program that is only reachable via RDP — using both screenshots and structured accessibility data, without installing or running the agent itself on the remote machine.
-**Current focus:** Phase 1: validate auto-destroy (ENV-03)
+**Current focus:** Phase 2: RDP Session + Framebuffer Core
 
 ## Current Position
 
-Phase: 1 of 9 (Test Environment) — ENV-03 auto-destroy validation outstanding
-Plan: Phase 1 plans authored (4/4 plans done); ENV-01 satisfied via live gate (2026-06-04); ENV-02 satisfied via live gate; ENV-03 DEPLOYED but NOT YET VALIDATED (runbook + schedule + RBAC deployed; scheduled-trigger delete path unproven)
-Status: Executing (Phase 1 in-progress — blocked on ENV-03 validation)
-Last activity: 2026-06-05 — CORRECTION applied: ENV-03 auto-destroy resources DEPLOYED but the scheduled runbook delete path is UNVALIDATED; manual down does not exercise it. Phase 1 is NOT fully verified.
+Phase: 2 of 9 (RDP Session + Framebuffer Core) — Phase 1 complete
+Plan: Phase 1 complete (4/4 plans done); ENV-01 satisfied via live gate (2026-06-04); ENV-02 satisfied via live gate (2026-06-04); ENV-03 validated live 2026-06-05 (schedule fired runbook unattended; MI reaped rdpilot-test; transient 403 absorbed by retry; activity log confirms MI completed the delete)
+Status: Executing (Phase 2 not yet started)
+Last activity: Phase 1 complete — auto-destroy (ENV-03) validated live 2026-06-05; routing to Phase 2.
 
-Progress: [█░░░░░░░░░] 9% (Phase 1 in-progress — ENV-03 unvalidated)
+Progress: [█░░░░░░░░░] 11% (Phase 1 complete — advancing to Phase 2)
 
 ## Performance Metrics
 
@@ -80,7 +80,7 @@ Recent decisions affecting current work:
 
 ### Pending Todos
 
-- ENV-03: validate auto-destroy — prove the scheduled runbook actually fires and deletes rdpilot-test unattended (on-demand trigger test, then scheduled-trigger test).
+- Begin Phase 2: RDP Session + Framebuffer Core (plan and execute IronRDP session + live screenshot capability).
 
 ### Blockers/Concerns
 
@@ -91,10 +91,10 @@ Recent decisions affecting current work:
 
 ## Deferred Items
 
-- **ENV-03 (auto-destroy):** Runbook, schedule, jobSchedule, and Contributor role assignment all DEPLOYED. The on-demand and scheduled-trigger delete paths have NOT been exercised. Phase 1 cannot be marked complete until this is proven. See validation procedure in 01-04-SUMMARY.md.
+None outstanding for Phase 1. All ENV-01/02/03 requirements satisfied.
 
 ## Session Continuity
 
 Last session: 2026-06-05T00:00:00.000Z
-Stopped at: Phase 1 in-progress — CORRECTION applied: ENV-03 auto-destroy deployed but NOT validated. Must prove scheduled runbook delete path before Phase 1 is complete. Next: run ENV-03 validation (on-demand trigger, then scheduled-trigger test).
-Resume file: .planning/phases/01-test-environment/01-04-SUMMARY.md (ENV-03 validation outstanding)
+Stopped at: Phase 1 complete — ENV-03 auto-destroy validated live 2026-06-05. Next: plan and execute Phase 2 (RDP Session + Framebuffer Core).
+Resume file: .planning/ROADMAP.md (Phase 2 is next)

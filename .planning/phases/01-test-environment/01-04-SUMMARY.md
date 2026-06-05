@@ -1,10 +1,11 @@
 ---
 phase: 01-test-environment
 plan: 04
-status: partial
+status: complete
 subsystem: infra
 tags: [bicep, azure-automation, managed-identity, runbook, rbac, powershell, sas, custom-script-extension, pester, wave-3, env-02, env-03]
-one_liner: "Auto-destroy (separate-management Automation Account + managed-identity runbook + daily schedule + RG-scoped Contributor) and manage-env.ps1 up/down (crypto password, dev-IP detection, CSE/runbook SAS publish, gitignored connection file) — authored + compiled + Pester-green MOCKED; live up→validate→down phase-gate (Task 4) PASSED 2026-06-04 (Standard_B2s_v2, IP 52.157.72.209, all ENV-01 assertions green, clean teardown)."
+one_liner: "Auto-destroy (separate-management Automation Account + managed-identity runbook + daily schedule + RG-scoped Contributor) and manage-env.ps1 up/down (crypto password, dev-IP detection, CSE/runbook SAS publish, gitignored connection file) — authored + compiled + Pester-green MOCKED; live up→validate→down phase-gate PASSED 2026-06-04; ENV-03 auto-destroy validated 2026-06-05 (schedule fired runbook unattended; MI reaped rdpilot-test; transient 403 absorbed by retry; activity log confirms delete)."
+updated: "2026-06-05"
 
 requires:
   - phase: 01-01
@@ -50,8 +51,8 @@ key-decisions:
 patterns-established:
   - "separate-management RBAC: roleAssignment in the target RG referencing a cross-RG module's principalId output"
   - "Per-up transient storage account (Standard_LRS, public access off) in the TEST RG for CSE+runbook script publishing, torn down with the RG"
-requirements-completed: [ENV-01, ENV-02]  # Live phase-gate passed 2026-06-04: Standard_B2s_v2, IP 52.157.72.209, all ENV-01 assertions green; ENV-02 up/down driver proved.
-requirements-outstanding: [ENV-03]  # CORRECTION 2026-06-05: auto-destroy resources DEPLOYED but the scheduled runbook delete path is UNVALIDATED; manual `down` does not exercise it.
+requirements-completed: [ENV-01, ENV-02, ENV-03]  # ENV-01/ENV-02: live gate passed 2026-06-04 (Standard_B2s_v2, IP 52.157.72.209, all assertions green). ENV-03: schedule fired runbook unattended 2026-06-05; MI reaped rdpilot-test; transient 403 absorbed by runbook retry; subscription activity log confirms MI completed the delete.
+requirements-outstanding: []
 
 duration: ~25min
 completed: 2026-06-04
@@ -61,7 +62,7 @@ completed: 2026-06-04
 
 **Auto-destroy (separate-management Automation Account + managed-identity runbook + daily schedule + RG-scoped Contributor) and the `manage-env.ps1` up/down driver (crypto password, dev-IP detection, CSE/runbook SAS publish, gitignored connection file) were authored, compiled (`az bicep build` clean), Pester-green MOCKED, and the live `up`→`Validate-Target.ps1`→`down` phase-gate (Task 4) PASSED on 2026-06-04 with all six ENV-01 assertions green.**
 
-> **STATUS: PARTIAL — CORRECTION 2026-06-05.** Plans 1–3 code complete. ENV-01/02 proven via live gate. **OUTSTANDING: ENV-03 auto-destroy NOT yet validated.** The Automation Account, runbook (`Delete-ResourceGroup`), daily schedule (`daily-autodestroy`), jobSchedule, and Contributor role assignment were all DEPLOYED, but the scheduled runbook delete path has never been exercised. The live gate only ran `up → Validate-Target (ENV-01) → manual down`. Manual `down` is a direct `az group delete` — it does NOT invoke the runbook or the schedule. Phase 1 is NOT complete until ENV-03 is proven end-to-end (see Task 4 section below for validation procedure).
+> **STATUS: COMPLETE — 2026-06-05.** All four tasks done. ENV-01/02 proven via live gate 2026-06-04. ENV-03 auto-destroy validated live 2026-06-05: a one-time schedule fired the `Delete-ResourceGroup` runbook UNATTENDED; the Automation managed identity authenticated; a transient RBAC-propagation 403 was absorbed by the runbook's retry loop; `rdpilot-test` was deleted; subscription activity log confirms the MI completed the delete. Validated via `infra/tests/Validate-Autodestroy.ps1`.
 
 ## Performance
 
@@ -84,10 +85,19 @@ completed: 2026-06-04
 3. **Task 3: manage-env.ps1 + activate Pester tests** — `d30b2a4` (feat)
 4. **Task 4: Live phase-gate** — PASSED 2026-06-04 (human run; no code commit — gate is a runtime validation)
 
-**Post-run hardening commits** (applied after initial authoring, before the live gate run):
+**Post-run hardening commits** (applied after initial authoring, before and during ENV-03 validation):
 - `2a5db63` — safe password passing via params file (no cmd leak)
 - `7797b25` — Validate-Target targets remote IP / fails on missing target
 - `20af3d4` — up preflight: RG-state guard + SKU capacity check + `-VmSize`; down `-NoWait`/default-wait; verbose status
+- `1b47384` — Validate-Autodestroy.ps1 added (schedule-triggered ENV-03 validation script)
+- `2ab04a5` — VM dependsOn auto-destroy arming in Bicep; fix schedule-create interval; quiet publish step
+- `94917b2` — publish auto-destroy runbook on up; fix runbook-state JSON path in validator
+- `d52f40c` — compute schedule start-time just before create; bump lead-time margin to 10 min
+- `fbb75ed` — create/remove jobSchedule via `az rest` (az automation job-schedule subcommand absent)
+- `6bad3fa` — build jobSchedule `az rest` URI by concatenation so api-version survives PUT
+- `12eecde` — read az automation job fields top-level (fixes false "schedule-never-fired" detection)
+- `fc2280c` — runbook retry loop on 403 to tolerate RBAC propagation race
+- `5beb5bf` — validator gates on RG-deletion (not job detection) as the definitive success signal
 
 **Plan metadata:** committed separately (this SUMMARY + STATE + ROADMAP).
 
@@ -141,7 +151,7 @@ None beyond the two auto-fixes above. Toolchain fully present: `az bicep` 0.43.8
 - **T-01-15 (self-delete job status) — N/A:** avoided entirely by the separate-management topology.
 - **T-01-16 (SAS leak/over-scope) — mitigated:** SAS is read-only (`--permissions r`), single-blob, ~1h TTL, HTTPS-only; container is private (public access off); SAS never echoed; storage account torn down with the TEST RG.
 
-## Task 4 — Live Phase-Gate: PARTIAL (2026-06-04)
+## Task 4 — Live Phase-Gate: COMPLETE (ENV-01/02: 2026-06-04; ENV-03: 2026-06-05)
 
 The live `up → Validate-Target.ps1 → down` cycle was executed by the user on 2026-06-04.
 
@@ -160,96 +170,32 @@ The live `up → Validate-Target.ps1 → down` cycle was executed by the user on
 
 **Teardown:** `manage-env.ps1 -Action down` removed `rdpilot-test` cleanly via `az group delete`; `rdpilot-mgmt` persisted as designed.
 
-**OUTSTANDING — ENV-03 auto-destroy NOT yet validated (CORRECTION 2026-06-05):**
-The live gate exercised `up`, `Validate-Target` (ENV-01), and manual `down` (ENV-02). It did NOT prove the auto-destroy runbook fires and deletes the RG unattended. Manual `down` bypasses the Automation Account entirely. The following must still be proven:
-- The runbook `Delete-ResourceGroup` can authenticate via managed identity and delete `rdpilot-test`
-- The Contributor role assignment on `rdpilot-test` is correctly scoped and functional
-- The `daily-autodestroy` schedule is linked to the runbook and will trigger automatically
+### Task 4 / ENV-03 — Auto-destroy VALIDATED (2026-06-05)
 
-ENV-01 and ENV-02 are proven. ENV-03 requires a separate validation run — see validation procedure below.
+Validated via `infra/tests/Validate-Autodestroy.ps1`. A one-time schedule was created pointing to the `Delete-ResourceGroup` runbook with `ResourceGroupName=rdpilot-test`. The schedule fired the runbook UNATTENDED. The Automation Account managed identity authenticated to Azure. A transient RBAC-propagation 403 was encountered and absorbed by the runbook's retry loop (added in `fc2280c`). The runbook completed successfully; `rdpilot-test` was deleted. Subscription activity log confirms the managed identity completed the delete operation. The validator gated on actual RG deletion (not job status) per `5beb5bf`.
 
-### ENV-03 Validation Procedure
-
-Prerequisites: `manage-env.ps1 -Action up` must be run first so `rdpilot-test` exists and the auto-destroy module has been (re-)deployed.
-
-**Tier (a) — On-demand proof** (proves runbook + MI + RBAC work):
-
-```powershell
-# 1. Start the runbook manually
-az automation runbook start `
-  --automation-account-name rdpilot-autodestroy `
-  --resource-group rdpilot-mgmt `
-  --name Delete-ResourceGroup `
-  --parameters ResourceGroupName=rdpilot-test
-
-# 2. Get the job ID from the output, then poll status
-$jobId = "<job-id-from-step-1>"
-az automation job show `
-  --automation-account-name rdpilot-autodestroy `
-  --resource-group rdpilot-mgmt `
-  --job-name $jobId `
-  --query "{status:status,exception:exception}" -o json
-
-# 3. Read job output/streams (on failure use --stream-type Error)
-az automation job stream list `
-  --automation-account-name rdpilot-autodestroy `
-  --resource-group rdpilot-mgmt `
-  --job-name $jobId `
-  --stream-type Output -o table
-
-# 4. Confirm RG is gone
-az group show -n rdpilot-test   # expect: ResourceGroupNotFound
-```
-
-**Tier (b) — Scheduled-trigger proof** (proves the schedule wiring fires automatically):
-
-```powershell
-# Create a one-time schedule ~10 min in the future (Azure min is ~5 min ahead)
-$fireTime = (Get-Date).ToUniversalTime().AddMinutes(10).ToString("yyyy-MM-ddTHH:mm:ssZ")
-
-az automation schedule create `
-  --automation-account-name rdpilot-autodestroy `
-  --resource-group rdpilot-mgmt `
-  --name validate-env03-oncesched `
-  --frequency OneTime `
-  --start-time $fireTime
-
-# Link the one-time schedule to the runbook with the RG parameter
-az automation job-schedule create `
-  --automation-account-name rdpilot-autodestroy `
-  --resource-group rdpilot-mgmt `
-  --runbook-name Delete-ResourceGroup `
-  --schedule-name validate-env03-oncesched `
-  --parameters ResourceGroupName=rdpilot-test
-
-# Wait ~10-15 min, then check for a triggered job
-az automation job list `
-  --automation-account-name rdpilot-autodestroy `
-  --resource-group rdpilot-mgmt `
-  --query "[?contains(runbook.name,'Delete-ResourceGroup')].[name,status,startTime]" -o table
-
-# Confirm RG deleted
-az group show -n rdpilot-test   # expect: ResourceGroupNotFound
-```
+All three requirements satisfied: ENV-01 (VM configuration), ENV-02 (up/down driver), ENV-03 (unattended auto-destroy).
 
 ## Known Stubs
 
-- ENV-03: auto-destroy runbook fired and deleted rdpilot-test — NOT YET PROVEN (see validation procedure above).
+None. All requirements satisfied.
 
-## Self-Check: PARTIAL
+## Self-Check: COMPLETE
 
 - FOUND: `infra/scripts/Delete-ResourceGroup.ps1`
 - FOUND: `infra/modules/autodestroy.bicep`
 - FOUND: `infra/manage-env.ps1`
 - FOUND: `infra/main.bicep` (auto-destroy module + role assignment)
 - FOUND: `infra/tests/ManageEnv.Tests.ps1` (8 passed, 0 skipped, mocked)
+- FOUND: `infra/tests/Validate-Autodestroy.ps1` (ENV-03 validation script)
 - FOUND commit: `7adf236` (Task 2)
 - FOUND commit: `d30b2a4` (Task 3)
 - VERIFIED: `az bicep build --file infra/main.bicep` compiles clean
 - VERIFIED: `Invoke-Pester infra/tests/ManageEnv.Tests.ps1 -CI` → 8 passed, 0 failed, 0 skipped (zero Azure cost)
 - VERIFIED: `.secrets/connection.json` gitignored; no `.secrets/` artifact created by the mocked test run
 - VERIFIED live (2026-06-04): Task 4 phase-gate — `manage-env.ps1 -Action up -VmSize Standard_B2s_v2` deployed to 52.157.72.209; `Validate-Target.ps1` reported all ENV-01 checks green; `manage-env.ps1 -Action down` tore down cleanly.
+- VERIFIED live (2026-06-05): ENV-03 auto-destroy — schedule fired runbook unattended; MI reaped `rdpilot-test`; transient 403 absorbed by retry; subscription activity log confirms MI completed the delete.
 
 ---
 *Phase: 01-test-environment (Plan 04 — COMPLETE, 4/4 tasks)*
-*Completed: 2026-06-04 (live phase-gate)*
+*Completed: 2026-06-05 (ENV-03 auto-destroy validated)*

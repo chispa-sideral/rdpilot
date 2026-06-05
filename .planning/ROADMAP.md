@@ -13,7 +13,7 @@ Nine dependency-ordered phases build rdpilot from the ground up: a disposable Az
 
 Decimal phases appear between their surrounding integers in numeric order.
 
-- [ ] **Phase 1: Test Environment** - Provision a disposable Azure Windows VM pre-configured for RDP automation, with up/down script and scheduled auto-destroy — ENV-01/02 verified (live gate 2026-06-04); ENV-03 auto-destroy UNVALIDATED (runbook deployed, scheduled delete path not yet proven)
+- [x] **Phase 1: Test Environment** - Provision a disposable Azure Windows VM pre-configured for RDP automation, with up/down script and scheduled auto-destroy — ENV-01/02/03 all verified (ENV-01/02 live gate 2026-06-04; ENV-03 auto-destroy validated 2026-06-05)
 - [ ] **Phase 2: RDP Session + Framebuffer Core** - Connect, authenticate, keep session rendered, and produce full-desktop screenshots
 - [ ] **Phase 3: Input Injection** - Inject mouse and keyboard actions at remote coordinates with a locked DPI contract
 - [ ] **Phase 4: DVC Transport Channel** - Establish and verify the RDPILOT_SENSOR dynamic virtual channel before any sensor modules exist
@@ -49,7 +49,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 
 **Wave 3** *(blocked on Wave 2 completion)*
 
-  - [x] 01-04-PLAN.md — Auto-destroy (runbook + schedule + RBAC) + manage-env.ps1 up/down + phase-gate live run *(plans/code complete; live up→validate→down passed 2026-06-04; **ENV-03 auto-destroy validation OUTSTANDING** — scheduled runbook delete path not yet proven)*
+  - [x] 01-04-PLAN.md — Auto-destroy (runbook + schedule + RBAC) + manage-env.ps1 up/down + phase-gate live run *(all complete; live up→validate→down passed 2026-06-04; ENV-03 auto-destroy validated 2026-06-05 — schedule fired runbook unattended, MI reaped rdpilot-test)*
 
 ### Phase 2: RDP Session + Framebuffer Core
 
@@ -171,7 +171,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8 →
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Test Environment | 4/4 | In-progress (ENV-03 unvalidated) | - |
+| 1. Test Environment | 4/4 | Complete | 2026-06-05 |
 | 2. RDP Session + Framebuffer Core | 0/? | Not started | - |
 | 3. Input Injection | 0/? | Not started | - |
 | 4. DVC Transport Channel | 0/? | Not started | - |
