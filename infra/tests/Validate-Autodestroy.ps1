@@ -101,9 +101,10 @@ function Invoke-Az {
 # State tracked for cleanup
 # ---------------------------------------------------------------------------
 $tempScheduleName    = $null   # set in ARRANGE; used in CLEANUP
-$tempJobScheduleId   = $null   # set in ARRANGE; used in CLEANUP
+$jobScheduleId       = $null   # GUID generated in ARRANGE; used in CLEANUP
 $scheduleCreatedAt   = $null   # UTC datetime — used to filter jobs by create time
-$script:scheduleCreated = $false  # true ONLY after a successful schedule create; gates cleanup
+$script:scheduleCreated    = $false  # true ONLY after a successful schedule create; gates schedule delete
+$script:jobScheduleCreated = $false  # true ONLY after a successful jobSchedule PUT; gates jobSchedule delete
 $passed              = $false
 
 # ---------------------------------------------------------------------------
@@ -268,23 +269,35 @@ try {
     Write-Pass "One-time schedule '$tempScheduleName' created"
 
     # Create the jobSchedule link: schedule → runbook with -ResourceGroupName parameter.
-    # The jobSchedule ID is a GUID; the CLI returns it for use in cleanup.
-    $jsJson = az automation job-schedule create `
-        -g $ManagementResourceGroup `
-        --automation-account-name $AutomationAccount `
-        --schedule-name $tempScheduleName `
-        --runbook-name $RunbookName `
-        --parameters "ResourceGroupName=$TestResourceGroup" `
-        -o json 2>&1
+    # `az automation job-schedule` does NOT exist as a CLI subgroup (az 2.86.0), so we
+    # PUT the jobSchedule directly to the ARM endpoint via `az rest`. The jobSchedule
+    # name is a client-generated GUID. Body is written to a temp file and passed with
+    # --body @file to avoid Windows inline-JSON quoting issues.
+    $jobScheduleId = (New-Guid).Guid
+    $jsUri = "https://management.azure.com/subscriptions/$($acct.id)/resourceGroups/$ManagementResourceGroup/providers/Microsoft.Automation/automationAccounts/$AutomationAccount/jobSchedules/$jobScheduleId?api-version=2023-11-01"
 
-    if ($LASTEXITCODE -ne 0) {
-        throw "Failed to create jobSchedule linking '$tempScheduleName' → '$RunbookName': $jsJson"
+    $jsBodyObj = @{
+        properties = @{
+            schedule   = @{ name = $tempScheduleName }
+            runbook    = @{ name = $RunbookName }
+            parameters = @{ ResourceGroupName = $TestResourceGroup }
+        }
+    }
+    $jsBodyFile = Join-Path ([System.IO.Path]::GetTempPath()) ("rdpilot-jobschedule-{0}.json" -f $jobScheduleId)
+    try {
+        $jsBodyObj | ConvertTo-Json -Depth 5 | Set-Content -Path $jsBodyFile -Encoding UTF8
+
+        $jsJson = az rest --method put --uri $jsUri --body "@$jsBodyFile" -o json 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            throw "Failed to create jobSchedule (PUT $jobScheduleId) linking '$tempScheduleName' → '$RunbookName': $jsJson"
+        }
+    }
+    finally {
+        if (Test-Path $jsBodyFile) { Remove-Item $jsBodyFile -Force -ErrorAction SilentlyContinue }
     }
 
-    $jsObj             = ($jsJson | Where-Object { $_ -is [string] }) -join '' | ConvertFrom-Json
-    $tempJobScheduleId = $jsObj.properties.jobScheduleId
-
-    Write-Pass "jobSchedule link created (id: $tempJobScheduleId)"
+    $script:jobScheduleCreated = $true
+    Write-Pass "jobSchedule link created (id: $jobScheduleId)"
     Write-Host ""
     Write-Host "  Scheduled one-time auto-destroy trigger for $fireTimeIso UTC (~$leadDisplay min from now)."
     Write-Host "  Waiting for the SCHEDULE to fire the runbook UNATTENDED — not triggering it manually."
@@ -349,7 +362,7 @@ try {
         Write-Host ""
         Write-Host "FAILURE MODE (a): The schedule never fired a job for runbook '$RunbookName' within ${TimeoutMinutes} min."
         Write-Host "This indicates a schedule→jobSchedule wiring problem. Check:"
-        Write-Host "  - The jobSchedule link exists:  az automation job-schedule list -g $ManagementResourceGroup --automation-account-name $AutomationAccount"
+        Write-Host "  - The jobSchedule link exists:  az rest --method get --uri `"https://management.azure.com/subscriptions/$($acct.id)/resourceGroups/$ManagementResourceGroup/providers/Microsoft.Automation/automationAccounts/$AutomationAccount/jobSchedules?api-version=2023-11-01`""
         Write-Host "  - The schedule start-time was in the future at creation time (fire time was $fireTimeIso UTC)."
         Write-Host "  - Azure Automation service health: https://status.azure.com/"
         Write-Host ""
@@ -386,13 +399,15 @@ try {
         Start-Sleep -Seconds $pollIntervalSeconds
     }
 
-    # Read job output and error streams for diagnostics.
+    # Read job output and error streams for diagnostics. `az automation job-output` is
+    # not a real CLI subcommand (job has only list/show) — read streams via az rest,
+    # the same endpoint used for the error stream below.
     Write-Step ""
     Write-Step "  --- Job output stream ---"
-    $jobOutputRaw = az automation job-output show `
-        -g $ManagementResourceGroup `
-        --automation-account-name $AutomationAccount `
-        --job-name $triggeredJobId `
+    $jobOutputRaw = az rest `
+        --method GET `
+        --url "https://management.azure.com/subscriptions/$($acct.id)/resourceGroups/$ManagementResourceGroup/providers/Microsoft.Automation/automationAccounts/$AutomationAccount/jobs/$triggeredJobId/streams?`$filter=properties/streamType eq 'Output'&api-version=2023-11-01" `
+        --query 'value[].properties.summary' `
         -o tsv 2>$null
     if ($jobOutputRaw) {
         $jobOutputRaw -split "`n" | ForEach-Object { Write-Host "    $_" }
@@ -470,31 +485,31 @@ try {
     #    Never touch the production 'daily-autodestroy' schedule.
     # =======================================================================
 
-    # Only run cleanup if this run actually CREATED the temp schedule. If creation
-    # failed (or never ran), the schedule never existed — attempting to delete it
-    # would print a misleading "failed to remove" warning. Skip silently in that case.
-    if (-not $script:scheduleCreated) {
+    # Cleanup is independently gated: delete the jobSchedule (if created) FIRST, then
+    # the schedule (if created). Each guard prevents a misleading "failed to remove"
+    # warning for something that was never created. NEVER touch the production
+    # 'daily-autodestroy' schedule or its jobSchedule link.
+    if (-not $script:scheduleCreated -and -not $script:jobScheduleCreated) {
         Write-Step ""
-        Write-Step "--- Cleanup: nothing to remove (temp schedule was never created) ---"
+        Write-Step "--- Cleanup: nothing to remove (temp schedule/jobSchedule were never created) ---"
     } else {
         Write-Step ""
-        Write-Step "--- Cleanup: removing temporary schedule '$tempScheduleName' ---"
+        Write-Step "--- Cleanup: removing temporary jobSchedule + schedule ---"
 
-        if ($tempJobScheduleId) {
-            $jsDelRaw = az automation job-schedule delete `
-                -g $ManagementResourceGroup `
-                --automation-account-name $AutomationAccount `
-                --job-schedule-id $tempJobScheduleId `
-                --yes 2>&1
+        # jobSchedule first (it links the schedule to the runbook). DELETE via az rest —
+        # `az automation job-schedule` is not a real CLI subgroup.
+        if ($script:jobScheduleCreated -and $jobScheduleId) {
+            $jsDelUri = "https://management.azure.com/subscriptions/$($acct.id)/resourceGroups/$ManagementResourceGroup/providers/Microsoft.Automation/automationAccounts/$AutomationAccount/jobSchedules/$jobScheduleId?api-version=2023-11-01"
+            $jsDelRaw = az rest --method delete --uri $jsDelUri -o json 2>&1
             if ($LASTEXITCODE -eq 0) {
-                Write-Host "  Removed jobSchedule link (id: $tempJobScheduleId)"
+                Write-Host "  Removed jobSchedule link (id: $jobScheduleId)"
             } else {
-                Write-Host "  Warning: failed to remove jobSchedule link $tempJobScheduleId — clean up manually:"
-                Write-Host "    az automation job-schedule delete -g $ManagementResourceGroup --automation-account-name $AutomationAccount --job-schedule-id $tempJobScheduleId --yes"
+                Write-Host "  Warning: failed to remove jobSchedule link $jobScheduleId — clean up manually:"
+                Write-Host "    az rest --method delete --uri `"$jsDelUri`""
             }
         }
 
-        if ($tempScheduleName) {
+        if ($script:scheduleCreated -and $tempScheduleName) {
             $schedDelRaw = az automation schedule delete `
                 -g $ManagementResourceGroup `
                 --automation-account-name $AutomationAccount `
