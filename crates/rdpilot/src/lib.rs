@@ -24,6 +24,7 @@ mod framebuffer;
 mod input;
 mod keepalive;
 mod screenshot;
+mod sensor;
 mod session;
 mod session_loop;
 

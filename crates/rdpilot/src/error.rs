@@ -83,6 +83,12 @@ pub enum Error {
         /// The negotiated desktop height.
         desktop_h: u32,
     },
+
+    /// A DVC (Dynamic Virtual Channel) transport error: registration, channel
+    /// lookup, encode/decode, or handshake failure on the `RDPILOT_SENSOR`
+    /// channel (Phase 4, SENSOR-03).
+    #[error("DVC transport error: {0}")]
+    Dvc(String),
 }
 
 /// Convenience alias for results returned by the `rdpilot` public API.
@@ -123,6 +129,15 @@ impl Error {
             desktop_h,
         }
     }
+
+    /// Construct a [`Error::Dvc`] from any error type displayable as a string.
+    ///
+    /// Third-party errors (`ironrdp-dvc`, `serde_json`) are source-erased into
+    /// an owned `String` (D-09) — mirrors [`Error::coordinate_out_of_bounds`]'s
+    /// role as the single call-site-friendly constructor for its variant.
+    pub(crate) fn dvc(msg: impl Into<String>) -> Self {
+        Error::Dvc(msg.into())
+    }
 }
 
 /// Ensure the error renders without leaking any internal/third-party detail
@@ -140,6 +155,7 @@ impl Error {
             Error::Config(_) => "config",
             Error::Session(_) => "session",
             Error::CoordinateOutOfBounds { .. } => "coordinate_out_of_bounds",
+            Error::Dvc(_) => "dvc",
         }
     }
 }

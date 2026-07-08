@@ -2711,6 +2711,7 @@ dependencies = [
  "ironrdp-tokio",
  "rustls",
  "rustls-native-certs",
+ "serde",
  "serde_json",
  "serial_test",
  "sspi",
