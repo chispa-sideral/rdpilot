@@ -35,13 +35,19 @@ use crate::keepalive::{null_input_event, KEEPALIVE_INTERVAL};
 
 /// Control/input events the [`Session`](crate::Session) sends into the loop.
 ///
-/// Phase 2 only needs `Close`; the keepalive is emitted from its own `select!`
-/// arm (no self-send through the channel). Phase 3 (input injection) will add a
-/// `FastPath(Vec<FastPathInputEvent>)` variant that the consumer sends here and
-/// the loop forwards to `process_fastpath_input`.
+/// `Close` requests a graceful client-side shutdown; the keepalive is emitted
+/// from its own `select!` arm (no self-send through the channel). `FastPath`
+/// (Phase 3, input injection) carries a pre-built batch of
+/// [`FastPathInputEvent`]s — constructed by `Session::send_mouse`/`send_key`
+/// via `ironrdp_input::Database::apply` — that this loop only forwards to
+/// `process_fastpath_input`; the loop never constructs input events itself and
+/// never sleeps for inter-event timing (Pitfall 3).
 pub(crate) enum RdpInputEvent {
     /// Begin a graceful client-side shutdown (sent by `Session::close`).
     Close,
+    /// A pre-built batch of fast-path input events to forward to the active
+    /// stage, unchanged, in the same order.
+    FastPath(Vec<ironrdp::pdu::input::fast_path::FastPathInputEvent>),
 }
 
 /// Run the active-session pump until the connection terminates or the input
@@ -91,6 +97,14 @@ pub(crate) async fn run(
                         active_stage
                             .graceful_shutdown()
                             .map_err(|e| Error::Session(format!("graceful shutdown failed: {e}")))?
+                    }
+                    Some(RdpInputEvent::FastPath(events)) => {
+                        // Pre-built by Session::send_mouse/send_key; this loop
+                        // only forwards, it never constructs input events or
+                        // sleeps between them (Pitfall 3).
+                        active_stage
+                            .process_fastpath_input(&mut image, &events)
+                            .map_err(|e| Error::Session(format!("input injection failed: {e}")))?
                     }
                     None => {
                         // All senders dropped without an explicit Close (e.g. the

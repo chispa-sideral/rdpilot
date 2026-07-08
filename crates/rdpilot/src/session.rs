@@ -17,14 +17,17 @@
 //! Only owned SDK types appear in the public signatures — no `ironrdp`, `image`,
 //! `rustls`, or `tokio` type leaks (D-09). No `unwrap`/`expect`/`panic` (API-01).
 
+use std::sync::Mutex;
 use std::thread::JoinHandle;
 
+use ironrdp_input::Database;
 use tokio::sync::mpsc;
 
 use crate::config::ConnectionConfig;
 use crate::connect;
 use crate::error::{Error, Result};
 use crate::framebuffer::SharedFrame;
+use crate::input::MouseAction;
 use crate::screenshot::Screenshot;
 use crate::session_loop::{self, RdpInputEvent};
 
@@ -53,6 +56,17 @@ pub struct Session {
     input_tx: mpsc::Sender<RdpInputEvent>,
     /// Read handle to the shared latest-frame snapshot.
     frame: SharedFrame,
+    /// Stateful input tracking (button/modifier state, move dedup) for real
+    /// user input (D-3.6). Locked only for the synchronous
+    /// `Database::apply()` call — never held across an `.await` (Pitfall 3,
+    /// T-03-07).
+    input_db: Mutex<Database>,
+    /// The negotiated desktop size, in physical virtual-desktop pixels
+    /// `(width, height)`, captured once at connect time (D-3.2). See
+    /// `Session::connect`'s doc comment for why this is a deliberate v1
+    /// static capture, not live-updated on a server-driven reactivation
+    /// resize (RESEARCH Open Q1 / Assumption A1).
+    desktop_size: (u32, u32),
 }
 
 impl Session {
@@ -68,6 +82,23 @@ impl Session {
     /// authentication fails.
     pub async fn connect(cfg: &ConnectionConfig) -> Result<Session> {
         let (connection_result, framed) = connect::connect(cfg).await?;
+
+        // Deliberate v1 static capture (D-3.2; RESEARCH Open Q1 / Assumption
+        // A1): copy the negotiated desktop size out here, BEFORE
+        // `connection_result` moves into the session-loop thread below. This
+        // value is never live-updated on a server-driven reactivation resize
+        // (`session_loop::reactivate` rebuilds the framebuffer at a new size,
+        // but does not write back here). Phase 1 fixes the VM's resolution
+        // and this phase's live tests do not exercise a mid-session resize,
+        // so a static connect-time capture is sufficient for this phase's
+        // success criteria; a future phase can promote this field to an
+        // `Arc<(AtomicU32, AtomicU32)>` written from `reactivate()` if live
+        // resize-correctness is ever needed. The widening u16 -> u32 cast is
+        // always lossless.
+        let desktop_size = (
+            u32::from(connection_result.desktop_size.width),
+            u32::from(connection_result.desktop_size.height),
+        );
 
         let frame = SharedFrame::new();
         let (input_tx, input_rx) = mpsc::channel(INPUT_CHANNEL_CAPACITY);
@@ -90,7 +121,34 @@ impl Session {
             thread: Some(thread),
             input_tx,
             frame,
+            input_db: Mutex::new(Database::new()),
+            desktop_size,
         })
+    }
+
+    /// The negotiated desktop size, in physical virtual-desktop pixels
+    /// `(width, height)` (D-3.2, SC#4).
+    ///
+    /// Captured once at connect time — see the doc comment on
+    /// `Session::connect` for why this is a deliberate v1 simplification
+    /// (not live-updated on a server-driven reactivation resize).
+    #[must_use]
+    pub fn desktop_size(&self) -> (u32, u32) {
+        self.desktop_size
+    }
+
+    /// Reject any coordinate `action` touches that falls outside
+    /// `self.desktop_size`, before any `ironrdp_input::Operation`/PDU is
+    /// built (D-3.2, SC#4 — "enforced", not merely documented; T-03-05).
+    fn check_bounds(&self, action: &MouseAction) -> Result<()> {
+        let (w, h) = self.desktop_size;
+        for (x, y) in action.coordinates() {
+            let (x, y) = (u32::from(x), u32::from(y));
+            if x >= w || y >= h {
+                return Err(Error::coordinate_out_of_bounds(x, y, w, h));
+            }
+        }
+        Ok(())
     }
 
     /// Capture the latest full-desktop framebuffer as an owned [`Screenshot`].
