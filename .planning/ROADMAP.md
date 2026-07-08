@@ -230,3 +230,17 @@ Plans:
 Plans:
 
 - [ ] TBD (promote with /gsd-review-backlog when ready)
+
+### Phase 999.3: Auto-surface the Azure live-test environment infra (local skill) (BACKLOG)
+
+**Goal:** Make the existing live-test infrastructure DISCOVERABLE and self-surfacing so any agent proactively provisions it when a phase needs live RDP validation — instead of treating live testing as unavailable or forgetting the infra exists. Phase 1 already built the full stack: `infra/` Bicep (network/NSG/WS2022 VM + CustomScriptExtension), in-guest `Configure-Target.ps1` (WinRM HTTPS, 96 DPI, SuppressWhenMinimized, SHA-verified 7-Zip), `manage-env.ps1 up`/`down`, and a scheduled auto-destroy runbook. The gap is DISCOVERABILITY, not capability.
+
+**Motivation:** During Phase 3 (Input Injection) execution, live validation (Wave 4 / 03-04) needs a running Windows target, but nothing in the executor's default context points at `manage-env.ps1 up`. Live-testing capability should announce itself at the moment of need.
+
+**Proposed approach:** Author a local project skill (e.g. `.claude/skills/live-test-env/SKILL.md`) that documents: (a) the infra exists and where (`infra/`, `manage-env.ps1`), (b) how to spin it up/down (`manage-env.ps1 up` → connection details in `.secrets/connection.json`; `down` to tear down; auto-destroy as backstop), (c) the known gotchas (VM size `Standard_B2s_v2` in westeurope since `Standard_B2ms` is SkuNotAvailable; scoop rustup + MinGW gcc env for the Windows build host; RDPILOT_LIVE env gating for the gated suite), and (d) a trigger note so agents consult it whenever a phase's success criteria require a live remote Windows session. Cross-reference from CLAUDE.md if useful.
+
+**Requirements:** TBD
+**Plans:** 0 plans
+
+Plans:
+- [ ] TBD (promote with /gsd-review-backlog when ready)
