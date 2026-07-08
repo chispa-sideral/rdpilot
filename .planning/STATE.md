@@ -2,15 +2,15 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-status: verifying
-stopped_at: "Completed 03-04-PLAN.md (Phase 3 live input-injection validation — canonical gate: 10/10 live tests pass)"
-last_updated: "2026-07-08T21:29:27.032Z"
+status: executing
+stopped_at: "Completed 04-01-PLAN.md (Phase 4 DVC transport channel — offline envelope + RdpilotSensorProcessor foundation; Wave 1 of 3 complete)"
+last_updated: "2026-07-08T22:33:58.353Z"
 last_activity: 2026-07-08
 progress:
   total_phases: 9
   completed_phases: 3
-  total_plans: 11
-  completed_plans: 11
+  total_plans: 14
+  completed_plans: 12
   percent: 33
 ---
 
@@ -21,16 +21,18 @@ progress:
 See: .planning/PROJECT.md (updated 2026-06-04)
 
 **Core value:** A local AI agent can connect to a remote Windows desktop over RDP and read/inspect a program that is only reachable via RDP — using both screenshots and structured accessibility data, without installing or running the agent itself on the remote machine.
-**Current focus:** Phase 3 — input-injection
+**Current focus:** Phase 4 — dvc-transport-channel
 
 ## Current Position
 
-Phase: 3 (input-injection) — EXECUTING
-Plan: 4 of 4
-Status: Phase complete — ready for verification
+Phase: 4 (dvc-transport-channel) — EXECUTING
+Plan: 1 of 3
+Status: Executing — Plan 1 of 3 done (offline DVC envelope + RdpilotSensorProcessor foundation), Plan 02 next
 Last activity: 2026-07-08
 
-Progress: [████░░░░░░] 22% (Phase 3: 1/4 plans — input vocabulary + translation contract layer complete)
+Note: Phase 3 remains `status: verifying` (pending /gsd-verify-work) in the frontmatter above; Phase 4 planning/execution began before that gate ran.
+
+Progress: [████░░░░░░] 33% (Phase 4: 1/3 plans — offline envelope + RdpilotSensorProcessor foundation complete)
 
 ## Performance Metrics
 
@@ -58,6 +60,7 @@ Progress: [████░░░░░░] 22% (Phase 3: 1/4 plans — input voc
 | Phase 03-input-injection P02 | ~40min | 2 tasks | 2 files |
 | Phase 03 P03 | 15min | 1 tasks | 1 files |
 | Phase 03 P04 | ~90min | 1 tasks | 2 files |
+| Phase 04 P01 | 25min | 2 tasks | 4 files |
 
 ## Accumulated Context
 
@@ -92,6 +95,7 @@ Recent decisions affecting current work:
 - [Phase ?]: Phase 3 Plan 2: Mutex<Database> lives in Session (not session_loop), locked only for synchronous apply(); DoubleClick/Drag inter-batch timing is tokio::time::sleep on the caller's async context, never in the session-loop select! (Pitfall 3). Session::desktop_size() is a deliberate v1 static capture at connect time.
 - [Phase ?]: Phase 3 Plan 3: send_key mirrors send_mouse's lock/apply/drop/send shape with no bounds-check/timing (Type/Combo is always a single Operation batch); no logging added at all (trivially satisfies never-log-typed-content)
 - [Phase ?]: Server Manager auto-launch suppressed at infra layer (Configure-Target.ps1 DEFAULT hive) after breaking bare-desktop input assumptions during Phase 3 live validation; DOUBLE_CLICK_GAP=100ms and DRAG_INTERPOLATION_STEPS=5/DRAG_STEP_GAP=15ms empirically confirmed reliable, no tuning needed
+- [Phase ?]: Used ironrdp::pdu::pdu_other_err!(desc, source: e) instead of ironrdp::core::other_err! for PduResult construction in RdpilotSensorProcessor::start() (PduError does not implement OtherErr) — Verified by reading ironrdp-pdu-0.8.0 and ironrdp-core-0.2.0 source directly; correction to RESEARCH's code example, not a CONTEXT deviation
 
 ### Pending Todos
 
@@ -113,6 +117,6 @@ Phase 2 Plan 02: pre-existing rustdoc intra-doc-link warnings in config.rs (Wave
 
 ## Session Continuity
 
-Last session: 2026-07-08T21:29:15.733Z
-Stopped at: Completed 03-04-PLAN.md (Phase 3 live input-injection validation — canonical gate: 10/10 live tests pass)
-Resume file: None (Phase 3 complete, ready for /gsd-verify-work)
+Last session: 2026-07-08T22:33:19.676Z
+Stopped at: Completed 04-01-PLAN.md (Phase 4 DVC transport channel — offline envelope + RdpilotSensorProcessor foundation; Wave 1 of 3 complete)
+Resume file: None (Wave 2/Plan 02 depends on this; not yet started)
