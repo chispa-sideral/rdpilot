@@ -577,6 +577,161 @@ fn coordinate_contract_enforced() {
     });
 }
 
+/// Criterion #3 / INPUT-02 (SC#3): typed text is received by the remote
+/// session, observed via screenshot-diff on a reversible, app-independent,
+/// standard-integrity surface (process launch is Phase 6 — Pitfall 4): the
+/// Start menu's search box, opened via `Ctrl+Esc` (a `KeyAction::Combo`, not
+/// a launched app).
+///
+/// NEVER asserts on or logs the typed string itself beyond its presence via
+/// the screenshot diff (Security V5) — only the boolean "did the frame
+/// change" is asserted.
+#[test]
+#[ignore = "live: requires a provisioned RDP target (RDPILOT_LIVE=1)"]
+fn keyboard_typed_text_is_received() {
+    let Some(cfg) = require_target!("keyboard_typed_text_is_received") else {
+        return;
+    };
+    block_on(async {
+        let session = rdpilot::Session::connect(&cfg).await.expect("connect");
+        let _ = capture_when_ready(&session).await;
+        settle().await;
+
+        // Open Start — its search box takes input focus immediately, no
+        // click needed. (Ctrl+Esc's own screen-change is independently
+        // exercised in `keyboard_combos_are_received`; this test's own
+        // before/after pair isolates the text-render change.)
+        session
+            .send_key(KeyAction::Combo(vec![Key::Ctrl, Key::Esc]))
+            .await
+            .expect("Ctrl+Esc opens Start");
+        settle().await;
+
+        let before_type = session.screenshot().await.expect("screenshot before typing");
+
+        session
+            .send_key(KeyAction::Type("rdpilot".into()))
+            .await
+            .expect("Type round-trips");
+        settle().await;
+
+        let after_type = session.screenshot().await.expect("screenshot after typing");
+
+        // Whole-frame comparison at a low threshold: the typed query renders
+        // in a small search-box region relative to the full desktop, so
+        // REGION_CHANGE_THRESHOLD (tuned for larger cropped regions like a
+        // context menu) is not used directly here. DECISION POINT: if flaky
+        // on the live VM, narrow this to a rect scoped to the actual
+        // observed search-box bounds (Windows 10 vs 11 Start layouts place
+        // it differently) at the checkpoint.
+        const TYPED_TEXT_CHANGE_THRESHOLD: f32 = 0.0005;
+        assert!(
+            changed_fraction(&before_type, &after_type) > TYPED_TEXT_CHANGE_THRESHOLD,
+            "typed text did not visibly render in the Start search box (SC#3)"
+        );
+
+        // Dismiss cleanly.
+        session
+            .send_key(KeyAction::Combo(vec![Key::Esc]))
+            .await
+            .expect("Esc closes Start");
+        settle().await;
+
+        session.close().await.expect("close");
+    });
+}
+
+/// Criterion #3 / INPUT-02 (SC#3): key COMBINATIONS are received — `Ctrl+Esc`
+/// (opens Start, screenshot-diff observable), `Alt+F4` (opens the "Shut Down
+/// Windows" dialog on a focused desktop, screenshot-diff observable, then
+/// CANCELLED with Esc so the VM is left untouched — T-03-15), and `Ctrl+A`
+/// (round-trip only; a text-selection highlight is not reliably
+/// screenshot-diffable). Targets are standard-integrity, reversible OS
+/// surfaces only (process launch is Phase 6 — Pitfall 4; never an elevated
+/// target).
+#[test]
+#[ignore = "live: requires a provisioned RDP target (RDPILOT_LIVE=1)"]
+fn keyboard_combos_are_received() {
+    let Some(cfg) = require_target!("keyboard_combos_are_received") else {
+        return;
+    };
+    block_on(async {
+        let session = rdpilot::Session::connect(&cfg).await.expect("connect");
+        let _ = capture_when_ready(&session).await;
+        settle().await;
+
+        // --- Ctrl+Esc opens Start: screenshot-diff observable. ---
+        const COMBO_CHANGE_THRESHOLD: f32 = 0.001;
+        let before_start = session.screenshot().await.expect("screenshot before Ctrl+Esc");
+        session
+            .send_key(KeyAction::Combo(vec![Key::Ctrl, Key::Esc]))
+            .await
+            .expect("Ctrl+Esc round-trips");
+        settle().await;
+        let after_start = session.screenshot().await.expect("screenshot after Ctrl+Esc");
+        assert!(
+            changed_fraction(&before_start, &after_start) > COMBO_CHANGE_THRESHOLD,
+            "Ctrl+Esc did not visibly open the Start menu (SC#3)"
+        );
+
+        // --- Ctrl+A: round-trip only. A text-selection highlight in the
+        // Start search box is not reliably screenshot-diffable (the exact
+        // highlight color/extent is theme- and content-dependent), so the
+        // acceptance here is that the combo completes without error and the
+        // session stays alive — per the plan's explicit carve-out. ---
+        session
+            .send_key(KeyAction::Combo(vec![Key::Ctrl, Key::A]))
+            .await
+            .expect("Ctrl+A round-trips");
+        assert!(session.screenshot().await.is_ok(), "session alive after Ctrl+A");
+
+        // Close Start before moving to the desktop-focused Alt+F4 case.
+        session
+            .send_key(KeyAction::Combo(vec![Key::Esc]))
+            .await
+            .expect("Esc closes Start");
+        settle().await;
+
+        // --- Alt+F4 on a focused desktop: opens the "Shut Down Windows"
+        // dialog, screenshot-diff observable, then IMMEDIATELY CANCELLED
+        // (T-03-15 — never let the shutdown dialog's default action fire;
+        // the VM must be left untouched). ---
+        let (w, h) = session.desktop_size();
+        let (cx, cy) = (
+            u16::try_from(w / 2).expect("desktop width fits u16"),
+            u16::try_from(h / 2).expect("desktop height fits u16"),
+        );
+        // Click an empty desktop area first to give the desktop shell input
+        // focus (Alt+F4 targets whatever currently has focus).
+        session
+            .send_mouse(MouseAction::Click { x: cx, y: cy, button: Button::Left })
+            .await
+            .expect("focusing click round-trips");
+        settle().await;
+
+        let before_altf4 = session.screenshot().await.expect("screenshot before Alt+F4");
+        session
+            .send_key(KeyAction::Combo(vec![Key::Alt, Key::F4]))
+            .await
+            .expect("Alt+F4 round-trips");
+        settle().await;
+        let after_altf4 = session.screenshot().await.expect("screenshot after Alt+F4");
+        assert!(
+            changed_fraction(&before_altf4, &after_altf4) > COMBO_CHANGE_THRESHOLD,
+            "Alt+F4 did not visibly open the Shut Down Windows dialog (SC#3)"
+        );
+
+        // CANCEL immediately — never let this dialog's default action fire.
+        session
+            .send_key(KeyAction::Combo(vec![Key::Esc]))
+            .await
+            .expect("Esc cancels the Shut Down Windows dialog");
+        settle().await;
+
+        session.close().await.expect("close");
+    });
+}
+
 /// Poll `screenshot()` until the first graphics update lands (it errors with
 /// `Error::Session` until then). Bounded so a stuck connection fails the test
 /// rather than hanging forever.
