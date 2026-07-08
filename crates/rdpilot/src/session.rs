@@ -19,7 +19,9 @@
 
 use std::sync::Mutex;
 use std::thread::JoinHandle;
+use std::time::Duration;
 
+use ironrdp::pdu::input::fast_path::FastPathInputEvent;
 use ironrdp_input::Database;
 use tokio::sync::mpsc;
 
@@ -30,6 +32,23 @@ use crate::framebuffer::SharedFrame;
 use crate::input::MouseAction;
 use crate::screenshot::Screenshot;
 use crate::session_loop::{self, RdpInputEvent};
+
+/// Inter-click delay for [`MouseAction::DoubleClick`] (D-3.7). RDP has no
+/// native double-click PDU, so a double-click is synthesized as two single
+/// clicks separated by this delay, applied on the caller's async context
+/// (never inside the session-loop `select!`, Pitfall 3). Windows'
+/// `GetDoubleClickTime()` defaults to 500ms; 100ms sits comfortably inside
+/// that window. LIVE-VERIFY tuning target confirmed against the real VM in
+/// Plan 04 (RESEARCH §4 — this value is empirical, not derivable statically).
+const DOUBLE_CLICK_GAP: Duration = Duration::from_millis(100);
+
+/// Spacing between a [`MouseAction::Drag`]'s interpolated `MouseMove`
+/// batches (D-3.8), applied on the caller's async context (Pitfall 3), so
+/// consecutive moves are observable as distinct wall-clock events past the
+/// `SM_CXDRAG`/`SM_CYDRAG` (~4px) distance threshold rather than arriving as
+/// one instantaneous burst. LIVE-VERIFY tuning target confirmed against the
+/// real VM in Plan 04 (RESEARCH §4 — empirical, not derivable statically).
+const DRAG_STEP_GAP: Duration = Duration::from_millis(15);
 
 /// Bound on the input/control channel. Keepalive + close are low-frequency; a
 /// small buffer is ample and bounds memory if the loop briefly lags.
@@ -148,6 +167,65 @@ impl Session {
                 return Err(Error::coordinate_out_of_bounds(x, y, w, h));
             }
         }
+        Ok(())
+    }
+
+    /// Send a mouse action to the remote session (D-3.1, INPUT-01, SC#2).
+    ///
+    /// Every action's coordinate(s) are bounds-checked against
+    /// [`Session::desktop_size`] and rejected with
+    /// [`Error::CoordinateOutOfBounds`] **before** any
+    /// `ironrdp_input::Operation`/PDU is built (D-3.2, SC#4). The action is
+    /// then translated into one or more ordered `Operation` batches
+    /// ([`crate::input::mouse_operations`]); each batch is applied to the
+    /// stateful [`Database`] under a brief lock (never held across an
+    /// `.await`) and the resulting fast-path events are sent into the
+    /// session loop. `DoubleClick`/`Drag` space their batches with a real
+    /// `tokio::time::sleep` **on this caller's async context** — the
+    /// session-loop `select!` never sleeps (Pitfall 3).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::CoordinateOutOfBounds`] if any coordinate `action`
+    /// touches falls outside the negotiated desktop size (nothing is sent in
+    /// that case), or [`Error::Session`] if the input channel is closed
+    /// (the session loop already exited) or the internal input-state lock is
+    /// poisoned.
+    pub async fn send_mouse(&self, action: MouseAction) -> Result<()> {
+        self.check_bounds(&action)?;
+
+        // Only DoubleClick/Drag need an inter-batch delay (D-3.7/D-3.8); all
+        // other actions translate to exactly one batch, so no gap is used.
+        let gap = match action {
+            MouseAction::DoubleClick { .. } => Some(DOUBLE_CLICK_GAP),
+            MouseAction::Drag { .. } => Some(DRAG_STEP_GAP),
+            MouseAction::Move { .. } | MouseAction::Click { .. } | MouseAction::Scroll { .. } => None,
+        };
+
+        let batches = crate::input::mouse_operations(&action);
+        let last_index = batches.len().saturating_sub(1);
+
+        for (i, batch) in batches.into_iter().enumerate() {
+            let events: Vec<FastPathInputEvent> = {
+                let mut db = self
+                    .input_db
+                    .lock()
+                    .map_err(|_| Error::Session("input state lock poisoned".to_owned()))?;
+                db.apply(batch).into_iter().collect()
+            }; // guard dropped here — never held across the .await below
+
+            self.input_tx
+                .send(RdpInputEvent::FastPath(events))
+                .await
+                .map_err(|_| Error::Session("input channel closed".to_owned()))?;
+
+            if let Some(gap) = gap {
+                if i != last_index {
+                    tokio::time::sleep(gap).await;
+                }
+            }
+        }
+
         Ok(())
     }
 
