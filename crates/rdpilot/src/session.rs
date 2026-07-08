@@ -302,7 +302,7 @@ impl Drop for Session {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::input::Button;
+    use crate::input::{Button, Key, KeyAction};
 
     /// A default desktop size for offline tests that don't care about the
     /// exact value.
@@ -506,5 +506,71 @@ mod tests {
             count += 1;
         }
         assert_eq!(count, 2, "DoubleClick must synthesize exactly two batches");
+    }
+
+    // --- Task 1: send_key -- Type (Unicode) + Combo (scancode) wiring (INPUT-02, SC#3) ---
+
+    /// `send_key(KeyAction::Type(..))` sends a single non-empty `FastPath`
+    /// batch carrying the per-character Unicode operations (D-3.5).
+    #[tokio::test]
+    async fn send_key_type_sends_nonempty_fastpath_batch() {
+        let (session, mut input_rx) = test_session_with_channel((1920, 1080));
+
+        session
+            .send_key(KeyAction::Type("hi".into()))
+            .await
+            .expect("Type send succeeds");
+
+        let RdpInputEvent::FastPath(events) = input_rx.try_recv().expect("a FastPath message was sent") else {
+            panic!("expected a FastPath event");
+        };
+        assert!(!events.is_empty());
+        assert!(input_rx.try_recv().is_err(), "Type must send exactly one batch");
+    }
+
+    /// `send_key(KeyAction::Combo([Ctrl, A]))` sends a single non-empty
+    /// `FastPath` batch (scancode down/up, modifier ordering -- D-3.5).
+    #[tokio::test]
+    async fn send_key_combo_ctrl_a_sends_nonempty_fastpath_batch() {
+        let (session, mut input_rx) = test_session_with_channel((1920, 1080));
+
+        session
+            .send_key(KeyAction::Combo(vec![Key::Ctrl, Key::A]))
+            .await
+            .expect("Ctrl+A combo send succeeds");
+
+        let RdpInputEvent::FastPath(events) = input_rx.try_recv().expect("a FastPath message was sent") else {
+            panic!("expected a FastPath event");
+        };
+        assert!(!events.is_empty());
+    }
+
+    /// `send_key(KeyAction::Combo([Alt, F4]))` likewise sends a non-empty
+    /// `FastPath` batch (SC#3 -- Alt+F4 expressible).
+    #[tokio::test]
+    async fn send_key_combo_alt_f4_sends_nonempty_fastpath_batch() {
+        let (session, mut input_rx) = test_session_with_channel((1920, 1080));
+
+        session
+            .send_key(KeyAction::Combo(vec![Key::Alt, Key::F4]))
+            .await
+            .expect("Alt+F4 combo send succeeds");
+
+        let RdpInputEvent::FastPath(events) = input_rx.try_recv().expect("a FastPath message was sent") else {
+            panic!("expected a FastPath event");
+        };
+        assert!(!events.is_empty());
+    }
+
+    /// A degenerate empty `Combo` returns `Ok` without panicking (API-01,
+    /// T-03-11); it may send an empty/no-op batch.
+    #[tokio::test]
+    async fn send_key_empty_combo_returns_ok_without_panic() {
+        let (session, _input_rx) = test_session_with_channel((1920, 1080));
+
+        session
+            .send_key(KeyAction::Combo(vec![]))
+            .await
+            .expect("empty combo must not error");
     }
 }
