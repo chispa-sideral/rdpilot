@@ -166,8 +166,12 @@ pub(crate) enum HandshakeState {
 /// only ever locked for a brief synchronous mutation, never held across an
 /// `.await`.
 pub(crate) struct SensorShared {
-    pending: Mutex<HashMap<u64, oneshot::Sender<()>>>,
-    handshake: Mutex<HandshakeState>,
+    /// Fields are `pub(crate)` (not accessed via getters): `Session::ping()`
+    /// (session.rs) and `RdpilotSensorProcessor::process()` (this module)
+    /// both need direct lock access to the same two mutexes, and both are
+    /// already crate-internal-only (D-09) — no accessor indirection needed.
+    pub(crate) pending: Mutex<HashMap<u64, oneshot::Sender<()>>>,
+    pub(crate) handshake: Mutex<HandshakeState>,
 }
 
 impl SensorShared {

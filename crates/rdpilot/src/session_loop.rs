@@ -48,6 +48,14 @@ pub(crate) enum RdpInputEvent {
     /// A pre-built batch of fast-path input events to forward to the active
     /// stage, unchanged, in the same order.
     FastPath(Vec<ironrdp::pdu::input::fast_path::FastPathInputEvent>),
+    /// A proactive ping request on the `RDPILOT_SENSOR` DVC channel (SENSOR-03,
+    /// SC#2), carrying the correlation `req_id` `Session::ping()` allocated.
+    /// Unlike `FastPath`, this loop *builds* the outbound bytes itself (via
+    /// `ActiveStage::get_dvc` + `RdpilotSensorProcessor::encode_ping` +
+    /// `ironrdp_dvc::encode_dvc_messages`) rather than merely forwarding a
+    /// pre-built payload — `DvcProcessor::start()`/`process()` are reactive
+    /// only and cannot originate a send on their own (RESEARCH Q1).
+    Ping(u64),
 }
 
 /// Run the active-session pump until the connection terminates or the input
@@ -105,6 +113,40 @@ pub(crate) async fn run(
                         active_stage
                             .process_fastpath_input(&mut image, &events)
                             .map_err(|e| Error::Session(format!("input injection failed: {e}")))?
+                    }
+                    Some(RdpInputEvent::Ping(req_id)) => {
+                        // Proactive send: DvcProcessor::start()/process() are
+                        // reactive only (RESEARCH Q1), so the outbound Ping
+                        // bytes are built here, from outside the processor,
+                        // mirroring IronRDP's own `ActiveStage::encode_resize`
+                        // (Display Control DVC) internal pattern.
+                        let (channel_id, dvc_messages) = {
+                            // Block-scoped: `get_dvc()` borrows `&mut
+                            // active_stage`; that borrow MUST end before the
+                            // second `&mut active_stage` call below
+                            // (Pitfall 3) — this scope is load-bearing.
+                            let dvc = active_stage
+                                .get_dvc::<crate::sensor::RdpilotSensorProcessor>()
+                                .ok_or_else(|| Error::Dvc("sensor channel not registered".to_owned()))?;
+                            let channel_id = dvc
+                                .channel_id()
+                                .ok_or_else(|| Error::Dvc("sensor channel not yet open".to_owned()))?;
+                            let processor = dvc
+                                .channel_processor_downcast_ref::<crate::sensor::RdpilotSensorProcessor>()
+                                .ok_or_else(|| Error::Dvc("sensor processor downcast failed".to_owned()))?;
+                            let dvc_messages = processor
+                                .encode_ping(req_id)
+                                .map_err(|e| Error::Dvc(e.to_string()))?;
+                            (channel_id, dvc_messages)
+                        };
+                        let svc_messages =
+                            ironrdp::dvc::encode_dvc_messages(channel_id, dvc_messages, ironrdp::svc::ChannelFlags::empty())
+                                .map_err(|e| Error::Dvc(e.to_string()))?;
+                        vec![ActiveStageOutput::ResponseFrame(
+                            active_stage
+                                .encode_dvc_messages(svc_messages)
+                                .map_err(|e| Error::Dvc(e.to_string()))?,
+                        )]
                     }
                     None => {
                         // All senders dropped without an explicit Close (e.g. the

@@ -283,6 +283,68 @@ impl Session {
         Ok(())
     }
 
+    /// Round-trip a ping over the `RDPILOT_SENSOR` DVC channel (SENSOR-03,
+    /// SC#2/SC#3).
+    ///
+    /// Fails fast with [`Error::Dvc`] — without sending anything — if the
+    /// version handshake previously detected a mismatch (SC#3: a clear
+    /// caller-visible error, never silent corruption). Otherwise allocates a
+    /// correlation id, registers a `oneshot` reply slot in the shared
+    /// [`SensorShared::pending`] map, sends [`RdpInputEvent::Ping`] into the
+    /// session loop (which builds and writes the outbound bytes via
+    /// `ActiveStage::encode_dvc_messages`), and bounds the whole round trip
+    /// at 500 ms (SC#2). A timeout removes the now-leaked pending entry so
+    /// it cannot be fulfilled later by a stale reply.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Dvc`] if the handshake previously mismatched, the
+    /// input channel is closed, the session loop closed the reply channel
+    /// before responding, or no pong arrives within 500 ms.
+    pub async fn ping(&self) -> Result<Duration> {
+        {
+            let handshake = match self.sensor.handshake.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if let crate::sensor::HandshakeState::Mismatched { local, remote } = &*handshake {
+                return Err(Error::dvc(format!(
+                    "sensor version mismatch: local v{local} vs remote v{remote}"
+                )));
+            }
+        } // guard dropped here — never held across the .await below
+
+        let req_id = self.next_req_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        {
+            let mut pending = match self.sensor.pending.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            pending.insert(req_id, tx);
+        } // guard dropped here — never held across the .await below
+
+        let started = std::time::Instant::now();
+
+        self.input_tx
+            .send(RdpInputEvent::Ping(req_id))
+            .await
+            .map_err(|_| Error::dvc("input channel closed"))?;
+
+        match tokio::time::timeout(Duration::from_millis(500), rx).await {
+            Ok(Ok(())) => Ok(started.elapsed()),
+            Ok(Err(_recv)) => Err(Error::dvc("sensor channel closed before replying")),
+            Err(_elapsed) => {
+                let mut pending = match self.sensor.pending.lock() {
+                    Ok(g) => g,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                pending.remove(&req_id);
+                Err(Error::dvc("ping timed out after 500ms"))
+            }
+        }
+    }
+
     /// Capture the latest full-desktop framebuffer as an owned [`Screenshot`].
     ///
     /// Clones the most recent snapshot maintained by the loop — it never touches
@@ -645,5 +707,62 @@ mod tests {
             .send_key(KeyAction::Combo(vec![]))
             .await
             .expect("empty combo must not error");
+    }
+
+    // --- Task 2: Session::ping() -- handshake fast-fail + 500ms timeout (SC#2/SC#3) ---
+
+    /// Build a `Session` wired to a real (undrained) channel with a
+    /// caller-supplied `SensorShared`, so `ping()` tests can control the
+    /// handshake state (no VM — no real `RdpilotSensorProcessor` involved).
+    fn test_session_with_sensor(sensor: Arc<SensorShared>) -> (Session, mpsc::Receiver<RdpInputEvent>) {
+        let (input_tx, input_rx) = mpsc::channel(INPUT_CHANNEL_CAPACITY);
+        let session = Session {
+            thread: None,
+            input_tx,
+            frame: SharedFrame::new(),
+            input_db: test_input_db(),
+            desktop_size: TEST_DESKTOP_SIZE,
+            sensor,
+            next_req_id: AtomicU64::new(1),
+        };
+        (session, input_rx)
+    }
+
+    /// A `Mismatched` handshake makes `ping()` fail fast with `Error::Dvc`
+    /// and never sends a `Ping` on the input channel (SC#3 — the caller
+    /// never even reaches the session loop on a version skew).
+    #[tokio::test]
+    async fn ping_fast_fails_on_mismatched_handshake_without_sending() {
+        let sensor = Arc::new(SensorShared::new());
+        {
+            let mut handshake = sensor.handshake.lock().expect("lock");
+            *handshake = crate::sensor::HandshakeState::Mismatched { local: 1, remote: 2 };
+        }
+        let (session, mut input_rx) = test_session_with_sensor(sensor);
+
+        let err = session.ping().await;
+        assert!(matches!(err, Err(Error::Dvc(_))));
+        assert!(
+            input_rx.try_recv().is_err(),
+            "a Mismatched handshake must fast-fail without sending a Ping"
+        );
+    }
+
+    /// With no session loop draining the channel (so no pong ever arrives),
+    /// `ping()` bounds the wait at 500ms and returns a timeout `Error::Dvc`
+    /// (SC#2 bound), rather than hanging forever.
+    #[tokio::test]
+    async fn ping_times_out_after_500ms_when_no_pong_arrives() {
+        let sensor = Arc::new(SensorShared::new());
+        let (session, _input_rx) = test_session_with_sensor(sensor);
+
+        let err = session.ping().await;
+        match err {
+            Err(Error::Dvc(msg)) => assert!(
+                msg.contains("500ms") || msg.contains("timed out"),
+                "expected a timeout-flavored message, got: {msg}"
+            ),
+            other => panic!("expected Err(Error::Dvc(_)) mentioning the timeout, got {other:?}"),
+        }
     }
 }
