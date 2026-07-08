@@ -90,7 +90,7 @@ Plans:
   3. Typed text and key combinations (e.g. Ctrl+A, Alt+F4) are received by the remote application
   4. The coordinate contract is documented and enforced: remote session is forced to 96 DPI (100%), and all coordinate values are in physical virtual-desktop pixels
 
-**Plans**: 2/4 plans executed
+**Plans**: 3/4 plans executed
 Plans:
 **Wave 1**
 
@@ -102,7 +102,7 @@ Plans:
 
 **Wave 3** *(blocked on Wave 2 completion)*
 
-- [ ] 03-03-PLAN.md — Session::send_key: Type (Unicode) + Combo (scancode, modifier ordering) — Ctrl+A / Alt+F4 expressible
+- [x] 03-03-PLAN.md — Session::send_key: Type (Unicode) + Combo (scancode, modifier ordering) — Ctrl+A / Alt+F4 expressible
 
 **Wave 4** *(blocked on Wave 3 completion)*
 
@@ -201,7 +201,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8 →
 |-------|----------------|--------|-----------|
 | 1. Test Environment | 4/4 | Complete | 2026-06-05 |
 | 2. RDP Session + Framebuffer Core | 3/3 | Complete    | 2026-06-05 |
-| 3. Input Injection | 2/4 | In Progress|  |
+| 3. Input Injection | 3/4 | In Progress|  |
 | 4. DVC Transport Channel | 0/? | Not started | - |
 | 5. Sensor Bootstrap + Deployment | 0/? | Not started | - |
 | 6. Window + Process Perception | 0/? | Not started | - |
