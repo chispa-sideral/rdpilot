@@ -13,7 +13,13 @@
          current-user hive, because the automation user's profile does not exist
          at provision time (RESEARCH.md Pitfall 1).
       3. Machine-wide RemoteDesktop_SuppressWhenMinimized=2 at HKLM + Wow6432Node.
-      4. 7-Zip silent install, gated by a pinned SHA-256 verification.
+      4. Server Manager auto-launch suppressed (DoNotOpenServerManagerAtLogon=1)
+         written to the DEFAULT user hive -- Server Manager otherwise auto-opens
+         maximized at every RDP logon and covers the full desktop, breaking any
+         automation that assumes a bare desktop is reachable (found live during
+         Phase 3 input-injection validation: it absorbed clicks/Alt+F4 intended
+         for the desktop and blocked Start-menu-scroll/shutdown-dialog checks).
+      5. 7-Zip silent install, gated by a pinned SHA-256 verification.
 
     Every mutation is guarded for idempotency: the CustomScriptExtension may
     re-execute on reboot, so a second run is a no-op (RESEARCH.md Pattern 1).
@@ -101,7 +107,7 @@ try {
 # 3. Machine-wide RemoteDesktop_SuppressWhenMinimized=2 (HKLM + Wow6432Node)
 #    reg add /f is idempotent.
 # =============================================================================
-Write-Host "[Configure-Target] (3/4) Machine-wide SuppressWhenMinimized..."
+Write-Host "[Configure-Target] (3/5) Machine-wide SuppressWhenMinimized..."
 
 reg add "HKLM\Software\Microsoft\Terminal Server Client" `
     /v RemoteDesktop_SuppressWhenMinimized /t REG_DWORD /d 2 /f | Out-Null
@@ -110,12 +116,37 @@ reg add "HKLM\Software\Wow6432Node\Microsoft\Terminal Server Client" `
 Write-Host "[Configure-Target]   SuppressWhenMinimized=2 set at HKLM + Wow6432Node."
 
 # =============================================================================
-# 4. 7-Zip silent install -- ONLY after SHA-256 verification of the download.
+# 4. Suppress Server Manager auto-launch at logon (DEFAULT user hive).
+#    Server Manager otherwise opens maximized on every interactive logon and
+#    covers the full desktop -- discovered live during Phase 3 input-injection
+#    validation, where it silently absorbed clicks and Alt+F4 intended for the
+#    bare desktop (a click at "desktop center" landed on Server Manager's own
+#    window; Alt+F4 targeted its window instead of opening the Shut Down
+#    Windows dialog). Written to the DEFAULT hive (same rationale as DPI/
+#    SuppressWhenMinimized above: the automation user's profile does not exist
+#    at provision time). reg add /f is idempotent.
+# =============================================================================
+Write-Host "[Configure-Target] (4/5) Suppress Server Manager auto-launch..."
+
+reg load $defaultHive $defaultNtUser | Out-Null
+try {
+    reg add "$defaultHive\Software\Microsoft\ServerManager" `
+        /v DoNotOpenServerManagerAtLogon /t REG_DWORD /d 1 /f | Out-Null
+    Write-Host "[Configure-Target]   wrote DoNotOpenServerManagerAtLogon=1 to default hive."
+} finally {
+    [gc]::Collect()
+    [gc]::WaitForPendingFinalizers()
+    reg unload $defaultHive | Out-Null
+    Write-Host "[Configure-Target]   default user hive unloaded."
+}
+
+# =============================================================================
+# 5. 7-Zip silent install -- ONLY after SHA-256 verification of the download.
 #    Guarded by the presence of 7zFM.exe so a re-run is a no-op. The expected
 #    hash is the pinned, human-approved constant; a mismatch throws BEFORE any
 #    installer runs (RESEARCH.md Package Audit / anti-pattern: never "latest").
 # =============================================================================
-Write-Host "[Configure-Target] (4/4) 7-Zip $SevenZipVersion install (SHA-256 gated)..."
+Write-Host "[Configure-Target] (5/5) 7-Zip $SevenZipVersion install (SHA-256 gated)..."
 
 if (-not (Test-Path $SevenZipFmExe)) {
     $installer = Join-Path $env:TEMP "7z$($SevenZipVersion.Replace('.',''))-x64.exe"
