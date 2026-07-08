@@ -18,7 +18,7 @@
 
 mod common;
 
-use rdpilot::{Rect, Screenshot};
+use rdpilot::{Button, Key, KeyAction, MouseAction, Rect, Screenshot};
 
 /// Skip helper: returns the live config or prints a skip note and returns `None`.
 /// Each test uses `let Some(cfg) = require_target!() else { return };`.
@@ -250,6 +250,330 @@ fn keepalive_survives_10min() {
         session.close().await.expect("close");
 
         assert!(!shot.rgba.is_empty(), "post-idle screenshot has pixels");
+    });
+}
+
+/// Threshold for [`region_changed`]: fraction of pixels within a cropped
+/// rectangle that must differ before the region is considered "meaningfully
+/// changed" (D-3.4) — well above ordinary sensor/codec noise (Pitfall 1's
+/// artifacts, cursor blink, sub-pixel rendering jitter), but low enough that
+/// a real menu/dialog/selection appearing reliably crosses it.
+const REGION_CHANGE_THRESHOLD: f32 = 0.01;
+
+/// Settle window after sending input, before capturing the "after"
+/// screenshot — gives the remote desktop time to run its open/close/render
+/// animation (menus, dialogs, typed text) before the framebuffer is sampled.
+const SETTLE: std::time::Duration = std::time::Duration::from_millis(800);
+
+async fn settle() {
+    tokio::time::sleep(SETTLE).await;
+}
+
+/// Fraction of pixels that differ between `before` and `after`, compared
+/// pixel-for-pixel over their full extent (`0.0..=1.0`). Differing
+/// dimensions are treated as "entirely changed" (`1.0`) rather than silently
+/// comparing misaligned bytes.
+fn changed_fraction(before: &Screenshot, after: &Screenshot) -> f32 {
+    if before.width != after.width || before.height != after.height {
+        return 1.0;
+    }
+    let total_px = (before.width as usize) * (before.height as usize);
+    if total_px == 0 {
+        return 0.0;
+    }
+    let mut changed = 0usize;
+    for i in 0..total_px {
+        let idx = i * 4;
+        if before.rgba[idx..idx + 4] != after.rgba[idx..idx + 4] {
+            changed += 1;
+        }
+    }
+    changed as f32 / total_px as f32
+}
+
+/// True when a meaningful fraction ([`REGION_CHANGE_THRESHOLD`]) of pixels
+/// within `rect` differ between `before` and `after` — the screenshot-diff
+/// observable this suite uses to prove an input action visibly affected the
+/// remote desktop (D-3.4; there is no ack path — RESEARCH Architecture step
+/// 7). Crops both screenshots to `rect` first so the comparison is scoped to
+/// the expected menu/dialog/selection region rather than the whole desktop
+/// (unrelated background motion elsewhere should not produce a false
+/// positive, and a small localized change should not be diluted into a false
+/// negative by the rest of an unrelated frame). Returns `false` (never
+/// panics) if `rect` is out of bounds for either screenshot.
+fn region_changed(before: &Screenshot, after: &Screenshot, rect: Rect) -> bool {
+    let (Ok(before_crop), Ok(after_crop)) = (before.crop(rect), after.crop(rect)) else {
+        return false;
+    };
+    changed_fraction(&before_crop, &after_crop) > REGION_CHANGE_THRESHOLD
+}
+
+/// Clamp a `w x h` rectangle anchored at `(x, y)` so it never exceeds
+/// `(max_w, max_h)` — builds an "around the click point" region for
+/// `region_changed` without risking an out-of-bounds crop on a small VM
+/// desktop.
+fn clamped_rect(x: u32, y: u32, w: u32, h: u32, max_w: u32, max_h: u32) -> Rect {
+    Rect {
+        x,
+        y,
+        w: w.min(max_w.saturating_sub(x)),
+        h: h.min(max_h.saturating_sub(y)),
+    }
+}
+
+/// Criterion #1 / INPUT-01 (SC#1): a click at a known coordinate activates
+/// the target element — a right-click on an empty desktop area opens the
+/// desktop context menu, observed via screenshot-diff (D-3.4). Uses an
+/// app-independent, standard-integrity, reversible OS surface (process
+/// launch is Phase 6 — Pitfall 4) and dismisses the menu with Esc so the
+/// desktop is left clean.
+#[test]
+#[ignore = "live: requires a provisioned RDP target (RDPILOT_LIVE=1)"]
+fn mouse_click_activates_menu() {
+    let Some(cfg) = require_target!("mouse_click_activates_menu") else {
+        return;
+    };
+    block_on(async {
+        let session = rdpilot::Session::connect(&cfg).await.expect("connect");
+        let _ = capture_when_ready(&session).await;
+        settle().await;
+
+        let (w, h) = session.desktop_size();
+        // Center of the desktop — an area unlikely to have a desktop icon on
+        // a stock VM image, so a right-click reliably opens the desktop
+        // context menu rather than an icon's own context menu.
+        let (cx, cy) = (w / 2, h / 2);
+
+        let before = session.screenshot().await.expect("screenshot before click");
+
+        session
+            .send_mouse(MouseAction::Click {
+                x: u16::try_from(cx).expect("desktop width fits u16"),
+                y: u16::try_from(cy).expect("desktop height fits u16"),
+                button: Button::Right,
+            })
+            .await
+            .expect("right-click round-trips");
+        settle().await;
+
+        let after = session.screenshot().await.expect("screenshot after click");
+
+        // The context menu renders anchored at (or near) the click point,
+        // extending down and to the right (Windows may flip the anchor near
+        // a screen edge; the desktop center avoids that case). A generous
+        // 400x500 region captures the menu regardless of exact item count.
+        let menu_rect = clamped_rect(cx, cy, 400, 500, w, h);
+        assert!(
+            region_changed(&before, &after, menu_rect),
+            "right-click on an empty desktop area did not visibly open a context menu (SC#1)"
+        );
+
+        // Dismiss cleanly so the desktop is left as found.
+        session
+            .send_key(KeyAction::Combo(vec![Key::Esc]))
+            .await
+            .expect("Esc dismisses the context menu");
+        settle().await;
+
+        session.close().await.expect("close");
+    });
+}
+
+/// Criterion #2 / INPUT-01: every `MouseAction` variant round-trips without
+/// error, and the visually-observable ones (right-click menu, Start-menu
+/// scroll) are confirmed via screenshot-diff (D-3.4). `DoubleClick` and
+/// `Drag` are exercised for a clean round-trip only — see the DECISION POINT
+/// comments at each for why a stronger screenshot-diff assertion is deferred
+/// to the live checkpoint's empirical tuning (RESEARCH §4, D-3.7/D-3.8).
+#[test]
+#[ignore = "live: requires a provisioned RDP target (RDPILOT_LIVE=1)"]
+fn mouse_action_types_all_work() {
+    let Some(cfg) = require_target!("mouse_action_types_all_work") else {
+        return;
+    };
+    block_on(async {
+        let session = rdpilot::Session::connect(&cfg).await.expect("connect");
+        let _ = capture_when_ready(&session).await;
+        settle().await;
+
+        let (w, h) = session.desktop_size();
+        let (cx, cy) = (
+            u16::try_from(w / 2).expect("desktop width fits u16"),
+            u16::try_from(h / 2).expect("desktop height fits u16"),
+        );
+
+        // Move: no button-state change; assert the round-trip is Ok and the
+        // session stays alive (not independently visually observable).
+        session
+            .send_mouse(MouseAction::Move { x: cx, y: cy })
+            .await
+            .expect("Move round-trips");
+        assert!(session.screenshot().await.is_ok(), "session alive after Move");
+
+        // Left click: assert Ok + alive. Left-clicking empty desktop
+        // typically has no visible effect worth screenshot-diffing.
+        session
+            .send_mouse(MouseAction::Click { x: cx, y: cy, button: Button::Left })
+            .await
+            .expect("left Click round-trips");
+        assert!(session.screenshot().await.is_ok(), "session alive after left Click");
+
+        // Middle click: assert Ok + alive (no default OS-level visible
+        // effect on an empty desktop area).
+        session
+            .send_mouse(MouseAction::Click { x: cx, y: cy, button: Button::Middle })
+            .await
+            .expect("middle Click round-trips");
+        assert!(session.screenshot().await.is_ok(), "session alive after middle Click");
+
+        // Right click IS observable: the desktop context menu opens.
+        let before_right = session.screenshot().await.expect("screenshot before right click");
+        session
+            .send_mouse(MouseAction::Click { x: cx, y: cy, button: Button::Right })
+            .await
+            .expect("right Click round-trips");
+        settle().await;
+        let after_right = session.screenshot().await.expect("screenshot after right click");
+        let menu_rect = clamped_rect(u32::from(cx), u32::from(cy), 400, 500, w, h);
+        assert!(
+            region_changed(&before_right, &after_right, menu_rect),
+            "right-click did not visibly open the context menu"
+        );
+        session
+            .send_key(KeyAction::Combo(vec![Key::Esc]))
+            .await
+            .expect("Esc dismisses menu");
+        settle().await;
+
+        // DoubleClick — DECISION POINT (D-3.7 live-verify): an empty desktop
+        // area has no icon to activate via double-click, so there is no
+        // reliable screenshot-diff target here offline. Assert only that the
+        // round-trip is Ok and the session stays alive. If a stronger live
+        // proof is wanted, double-click a known desktop icon (e.g. Recycle
+        // Bin, near the top-left on a stock image) at its actual observed
+        // coordinate and assert `region_changed` (a window opens) — confirm
+        // the icon's coordinate live and, if the double-click gap
+        // (`DOUBLE_CLICK_GAP` in session.rs) does not reliably register,
+        // increase it here at the checkpoint (RESEARCH §4).
+        session
+            .send_mouse(MouseAction::DoubleClick { x: cx, y: cy, button: Button::Left })
+            .await
+            .expect("DoubleClick round-trips");
+        assert!(session.screenshot().await.is_ok(), "session alive after DoubleClick");
+
+        // Scroll IS observable over a scrollable surface: open the Start
+        // menu (a reversible, standard-integrity, app-independent surface,
+        // Pitfall 4) and scroll its app list.
+        session
+            .send_key(KeyAction::Combo(vec![Key::Ctrl, Key::Esc]))
+            .await
+            .expect("Ctrl+Esc opens Start");
+        settle().await;
+        let before_scroll = session.screenshot().await.expect("screenshot before scroll");
+        session
+            .send_mouse(MouseAction::Scroll { x: cx, y: cy, dy: -120 })
+            .await
+            .expect("Scroll(dy:-120) round-trips");
+        settle().await;
+        let after_scroll_down = session.screenshot().await.expect("screenshot after scroll down");
+        session
+            .send_mouse(MouseAction::Scroll { x: cx, y: cy, dy: 120 })
+            .await
+            .expect("Scroll(dy:120) round-trips");
+        settle().await;
+        let after_scroll_up = session.screenshot().await.expect("screenshot after scroll up");
+
+        // Whole-frame comparison: the Start menu's app-list content is a
+        // small fraction of the full desktop, so a lower threshold than
+        // REGION_CHANGE_THRESHOLD (tuned for larger, tightly-cropped regions
+        // like a context menu) is used directly here. DECISION POINT: if
+        // this is flaky on the live VM (e.g. the default Start layout has no
+        // scrollable overflow), swap in a rect scoped to the actual observed
+        // app-list bounds at the checkpoint.
+        const SCROLL_CHANGE_THRESHOLD: f32 = 0.001;
+        let scrolled = changed_fraction(&before_scroll, &after_scroll_down) > SCROLL_CHANGE_THRESHOLD
+            || changed_fraction(&after_scroll_down, &after_scroll_up) > SCROLL_CHANGE_THRESHOLD;
+        assert!(scrolled, "scrolling the Start menu app list produced no visible change");
+
+        session
+            .send_key(KeyAction::Combo(vec![Key::Esc]))
+            .await
+            .expect("Esc closes Start");
+        settle().await;
+
+        // Drag — DECISION POINT (D-3.8 live-verify): dragging across two
+        // empty desktop points has no lasting visual trace once the mouse
+        // button releases (a selection rectangle is only visible mid-drag,
+        // which this call does not expose). Assert only that the round-trip
+        // is Ok and the session stays alive. If a stronger live proof is
+        // wanted, drag a known desktop icon (coordinate confirmed live,
+        // VM-image-specific) from `from` to `to` and assert `region_changed`
+        // at both the origin and destination rects; if the drag does not
+        // visibly register, increase `DRAG_INTERPOLATION_STEPS` (input.rs)
+        // and/or `DRAG_STEP_GAP` (session.rs) at the checkpoint (RESEARCH §4
+        // — `SM_CXDRAG`/`SM_CYDRAG` is a per-move distance threshold, not an
+        // event-count threshold).
+        let (from_x, from_y) = (cx, cy);
+        let (to_x, to_y) = (cx.saturating_add(50), cy.saturating_add(50));
+        session
+            .send_mouse(MouseAction::Drag {
+                from_x,
+                from_y,
+                to_x,
+                to_y,
+                button: Button::Left,
+            })
+            .await
+            .expect("Drag round-trips");
+        assert!(session.screenshot().await.is_ok(), "session alive after Drag");
+
+        session.close().await.expect("close");
+    });
+}
+
+/// Criterion #4 / SC#4 / D-3.2: `desktop_size()` reports the negotiated
+/// physical pixel size, and the coordinate contract is *enforced* (not just
+/// documented) — an out-of-bounds `send_mouse` coordinate is rejected with
+/// `Error::CoordinateOutOfBounds` before any PDU is built, while a
+/// well-formed in-bounds click at the same session still succeeds.
+#[test]
+#[ignore = "live: requires a provisioned RDP target (RDPILOT_LIVE=1)"]
+fn coordinate_contract_enforced() {
+    let Some(cfg) = require_target!("coordinate_contract_enforced") else {
+        return;
+    };
+    let want_w = u32::from(cfg.width());
+    let want_h = u32::from(cfg.height());
+
+    block_on(async {
+        let session = rdpilot::Session::connect(&cfg).await.expect("connect");
+        let _ = capture_when_ready(&session).await;
+
+        let (w, h) = session.desktop_size();
+        assert_eq!(w, want_w, "desktop_size() reports the requested physical width");
+        assert_eq!(h, want_h, "desktop_size() reports the requested physical height");
+
+        // Out-of-bounds: exactly at the width bound (the bounds check is
+        // `>=`, so `x == w` is the smallest rejected value).
+        let oob_x = u16::try_from(w).expect("desktop width fits u16");
+        let err = session
+            .send_mouse(MouseAction::Click { x: oob_x, y: 0, button: Button::Left })
+            .await
+            .expect_err("an out-of-bounds coordinate must be rejected, not silently sent");
+        assert!(
+            matches!(err, rdpilot::Error::CoordinateOutOfBounds { .. }),
+            "expected Error::CoordinateOutOfBounds, got {err:?}"
+        );
+
+        // A well-formed in-bounds click at the SAME session still succeeds —
+        // proves the rejection is a per-call bounds check, not a
+        // session-level failure state.
+        session
+            .send_mouse(MouseAction::Click { x: 10, y: 10, button: Button::Left })
+            .await
+            .expect("an in-bounds click still succeeds after a prior rejection");
+
+        session.close().await.expect("close");
     });
 }
 
