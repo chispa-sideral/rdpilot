@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-stopped_at: Completed 02-03-PLAN.md (live validation suite — Phase 2 proven end-to-end, 5/5 live criteria)
-last_updated: "2026-06-05T14:51:41.656Z"
-last_activity: 2026-06-05
+stopped_at: "Completed 03-01-PLAN.md (input injection contract layer: owned vocabulary + Operation translation, offline-only)"
+last_updated: "2026-07-08T20:23:27.059Z"
+last_activity: 2026-07-08 -- Phase 3 execution started
 progress:
-  total_phases: 10
+  total_phases: 9
   completed_phases: 2
-  total_plans: 7
-  completed_plans: 7
-  percent: 20
+  total_plans: 11
+  completed_plans: 8
+  percent: 22
 ---
 
 # Project State
@@ -21,16 +21,16 @@ progress:
 See: .planning/PROJECT.md (updated 2026-06-04)
 
 **Core value:** A local AI agent can connect to a remote Windows desktop over RDP and read/inspect a program that is only reachable via RDP — using both screenshots and structured accessibility data, without installing or running the agent itself on the remote machine.
-**Current focus:** Phase 2: RDP Session + Framebuffer Core
+**Current focus:** Phase 3 — input-injection
 
 ## Current Position
 
-Phase: 3 of 9 (input injection)
-Plan: Not started
-Status: Executing (Phase 2 COMPLETE — ready for Phase 3 planning)
-Last activity: 2026-06-05
+Phase: 3 (input-injection) — EXECUTING
+Plan: 2 of 4
+Status: Ready to execute
+Last activity: 2026-07-08 -- Phase 3 execution started
 
-Progress: [██████████] 100% (Phase 2 complete — 7/7 plans)
+Progress: [████░░░░░░] 22% (Phase 3: 1/4 plans — input vocabulary + translation contract layer complete)
 
 ## Performance Metrics
 
@@ -54,6 +54,7 @@ Progress: [██████████] 100% (Phase 2 complete — 7/7 plans)
 - Prior: 02-02 (~70 min, 3 tasks, 8 files) — live session machinery: connect/loop/framebuffer/keepalive/Session
 
 *Updated after each plan completion*
+| Phase 3 P1 | 55min | 2 tasks | 3 files |
 
 ## Accumulated Context
 
@@ -84,10 +85,11 @@ Recent decisions affecting current work:
 - Forbidden-token verify gates match literals anywhere in a file (incl. comments) — keep rationale prose token-free (HKCU, 0.0.0.0/0, deploymentScripts, Owner)
 - Auto-destroy topology = separate-management (user decision): persistent management RG (rdpilot-mgmt) holds the Automation Account; its managed identity = Contributor over the TEST RG (rdpilot-test) ONLY; West Europe; subscription = caller's active az sub (never hard-coded)
 - manage-env.ps1 publishes BOTH Configure-Target.ps1 (CSE) and Delete-ResourceGroup.ps1 (runbook publishContentLink) to a per-up private blob + short-lived read-only single-blob SAS; storage account lives in the TEST RG so `down` cascades it; `down` leaves the management RG in place
+- **Phase 3 Plan 1:** owned MouseAction/KeyAction/Button/Key vocabulary + pure translation to ironrdp_input::Operation batches, with Pitfall 1 (wheel |dy|>255 split) and Pitfall 5 (MouseMove-before-WheelRotations) guards; Error::CoordinateOutOfBounds mirrors CropOutOfBounds
 
 ### Pending Todos
 
-- Phase 3 (Input Injection): plan + execute. Build on the validated Session loop + RdpInputEvent seam; reuse the gated-live-test pattern (tests/common::load_config, RDPILOT_* env gating).
+- Phase 3 Plan 2 (mouse Session wiring): add `input_db: Mutex<ironrdp_input::Database>` + `desktop_size` fields to `Session`, `RdpInputEvent::FastPath` variant in `session_loop.rs`, and `Session::send_mouse`/`desktop_size()` consuming this plan's `mouse_operations`/`Error::coordinate_out_of_bounds`. Then Plan 3 (keyboard) and Plan 4 (gated live suite).
 - When re-running the canonical Phase 2 validation: default VM size Standard_B2ms is SkuNotAvailable in westeurope — use `-VmSize Standard_B2s_v2` (or another preflight-listed size).
 - Future agents on this machine must export the scoop rustup env (RUSTUP_HOME / CARGO_HOME / CARGO_HOME\bin on PATH) and have MinGW gcc on PATH for cargo to link.
 
@@ -105,6 +107,6 @@ Phase 2 Plan 02: pre-existing rustdoc intra-doc-link warnings in config.rs (Wave
 
 ## Session Continuity
 
-Last session: 2026-06-05T16:40:00.000Z
-Stopped at: Completed 02-03-PLAN.md (live validation suite — Phase 2 proven end-to-end, 5/5 live criteria)
-Resume file: None — Phase 2 complete; ready for Phase 3 planning
+Last session: 2026-07-08T20:23:11.228Z
+Stopped at: Completed 03-01-PLAN.md (input injection contract layer: owned vocabulary + Operation translation, offline-only)
+Resume file: 03-02-PLAN.md
