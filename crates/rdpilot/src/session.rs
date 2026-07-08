@@ -29,7 +29,7 @@ use crate::config::ConnectionConfig;
 use crate::connect;
 use crate::error::{Error, Result};
 use crate::framebuffer::SharedFrame;
-use crate::input::MouseAction;
+use crate::input::{KeyAction, MouseAction};
 use crate::screenshot::Screenshot;
 use crate::session_loop::{self, RdpInputEvent};
 
@@ -225,6 +225,46 @@ impl Session {
                 }
             }
         }
+
+        Ok(())
+    }
+
+    /// Send a keyboard action to the remote session (D-3.1, INPUT-02, SC#3).
+    ///
+    /// `KeyAction::Type(text)` is translated into per-character Unicode
+    /// key-press/release operations (layout-independent); `KeyAction::Combo(keys)`
+    /// is translated into scancode down/up operations with modifiers pressed
+    /// first and released last, in reverse order (D-3.5), so `Ctrl+A` and
+    /// `Alt+F4` are expressible. Both variants translate to exactly one
+    /// `Operation` batch — a Combo/Type is a single `apply()` call, unlike
+    /// `send_mouse`'s multi-batch DoubleClick/Drag, so no inter-event timing is
+    /// needed here (keyboard also carries no coordinates, so there is no bounds
+    /// check). Translation is entirely delegated to
+    /// [`crate::input::key_operations`], which is the only code in the crate
+    /// allowed to construct `ironrdp_input::Operation`s for keyboard input
+    /// (Pitfall 2) — this method never hand-builds a `KeyboardEvent`/
+    /// `UnicodeKeyboardEvent`. The typed text / key list is never logged
+    /// (Security V5, D-14 redaction parity).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Session`] if the input channel is closed (the session
+    /// loop already exited) or the internal input-state lock is poisoned.
+    pub async fn send_key(&self, action: KeyAction) -> Result<()> {
+        let ops = crate::input::key_operations(&action);
+
+        let events: Vec<FastPathInputEvent> = {
+            let mut db = self
+                .input_db
+                .lock()
+                .map_err(|_| Error::Session("input state lock poisoned".to_owned()))?;
+            db.apply(ops).into_iter().collect()
+        }; // guard dropped here — never held across the .await below
+
+        self.input_tx
+            .send(RdpInputEvent::FastPath(events))
+            .await
+            .map_err(|_| Error::Session("input channel closed".to_owned()))?;
 
         Ok(())
     }
