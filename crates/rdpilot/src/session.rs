@@ -166,6 +166,15 @@ impl Drop for Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::input::Button;
+
+    /// A default desktop size for offline tests that don't care about the
+    /// exact value.
+    const TEST_DESKTOP_SIZE: (u32, u32) = (1920, 1080);
+
+    fn test_input_db() -> Mutex<Database> {
+        Mutex::new(Database::new())
+    }
 
     /// `screenshot()` on a session with no captured frame returns a typed error,
     /// never a panic (no VM — drives only the snapshot read path).
@@ -177,6 +186,8 @@ mod tests {
             thread: None,
             input_tx,
             frame: SharedFrame::new(),
+            input_db: test_input_db(),
+            desktop_size: TEST_DESKTOP_SIZE,
         };
 
         let err = session.screenshot().await;
@@ -195,6 +206,8 @@ mod tests {
             thread: None,
             input_tx,
             frame,
+            input_db: test_input_db(),
+            desktop_size: TEST_DESKTOP_SIZE,
         };
 
         let shot = session.screenshot().await.expect("frame present");
@@ -211,7 +224,55 @@ mod tests {
             thread: None,
             input_tx,
             frame: SharedFrame::new(),
+            input_db: test_input_db(),
+            desktop_size: TEST_DESKTOP_SIZE,
         };
         drop(session); // must not panic
+    }
+
+    /// `desktop_size()` returns exactly the value set at construction (D-3.2).
+    #[test]
+    fn desktop_size_returns_construction_value() {
+        let (input_tx, _input_rx) = mpsc::channel(1);
+        let session = Session {
+            thread: None,
+            input_tx,
+            frame: SharedFrame::new(),
+            input_db: test_input_db(),
+            desktop_size: (1920, 1080),
+        };
+        assert_eq!(session.desktop_size(), (1920, 1080));
+    }
+
+    /// `check_bounds` rejects a coordinate at/past the desktop edge and
+    /// accepts an in-range one, without ever building a PDU (D-3.2, SC#4;
+    /// T-03-05).
+    #[test]
+    fn check_bounds_rejects_out_of_range_and_accepts_in_range() {
+        let (input_tx, _input_rx) = mpsc::channel(1);
+        let session = Session {
+            thread: None,
+            input_tx,
+            frame: SharedFrame::new(),
+            input_db: test_input_db(),
+            desktop_size: (1920, 1080),
+        };
+
+        let out_of_range = MouseAction::Click {
+            x: 5000,
+            y: 100,
+            button: Button::Left,
+        };
+        assert!(matches!(
+            session.check_bounds(&out_of_range),
+            Err(Error::CoordinateOutOfBounds { .. })
+        ));
+
+        let in_range = MouseAction::Click {
+            x: 100,
+            y: 100,
+            button: Button::Left,
+        };
+        assert!(session.check_bounds(&in_range).is_ok());
     }
 }
