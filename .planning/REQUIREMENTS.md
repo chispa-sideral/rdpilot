@@ -84,7 +84,7 @@ Stack (from research): IronRDP 0.14 (Rust) client core + primary language; C# .N
 | CAP-02 | Phase 6: Window + Process Perception | Pending |
 | INPUT-01 | Phase 3: Input Injection | Complete — proven live in Phase 3 Plan 04, 10/10 tests pass 2026-07-08 |
 | INPUT-02 | Phase 3: Input Injection | Complete — proven live in Phase 3 Plan 04, 10/10 tests pass 2026-07-08 |
-| SENSOR-03 | Phase 4: DVC Transport Channel | In Progress — Plan 01/3 complete (offline envelope + RdpilotSensorProcessor); SC#2/#3 live proof pending Plan 03 |
+| SENSOR-03 | Phase 4: DVC Transport Channel | In Progress — Plans 01-03 offline-authored and code-complete (envelope, RdpilotSensorProcessor, Session::ping(), throwaway WTS responder, WinRM deploy helper, gated live test); SC#2/#3 live proof against the Azure VM PENDING — requires pwsh + a live target, not available in this sandbox |
 | SENSOR-01 | Phase 5: Sensor Bootstrap + Deployment | Pending |
 | SENSOR-02 | Phase 5: Sensor Bootstrap + Deployment | Pending |
 | PERC-01 | Phase 6: Window + Process Perception | Pending |

@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-stopped_at: Completed 04-01-PLAN.md (Phase 4 DVC transport channel — offline envelope + RdpilotSensorProcessor foundation; Wave 1 of 3 complete)
-last_updated: "2026-07-08T22:43:55.889Z"
+stopped_at: Completed 04-03-PLAN.md code artifacts (offline) — Phase 4 DVC transport channel Wave 3 of 3; live ping/pong gate PENDING (needs pwsh + a live Azure VM, unavailable in this sandbox)
+last_updated: "2026-07-08T22:52:47.000Z"
 last_activity: 2026-07-08
 progress:
   total_phases: 9
   completed_phases: 3
-  total_plans: 14
-  completed_plans: 13
-  percent: 33
+  total_plans: 15
+  completed_plans: 15
+  percent: 36
 ---
 
 # Project State
@@ -25,14 +25,14 @@ See: .planning/PROJECT.md (updated 2026-06-04)
 
 ## Current Position
 
-Phase: 4 (dvc-transport-channel) — EXECUTING
-Plan: 2 of 3
-Status: Executing — Plan 1 of 3 done (offline DVC envelope + RdpilotSensorProcessor foundation), Plan 02 next
+Phase: 4 (dvc-transport-channel) — EXECUTING (code-complete; live gate outstanding)
+Plan: 3 of 3 (offline artifacts complete)
+Status: All 3 plans' code/scripts authored and offline-verified (envelope, RdpilotSensorProcessor, Session::ping(), throwaway WTS responder + WinRM deploy helper, gated sensor_ping_pong_under_500ms test). The end-of-phase live human-check (armed run against the Phase 1 Azure VM) has NOT run — this sandbox has no pwsh and no live VM. SENSOR-03 / SC#2 / SC#3-positive remain unproven until that live run passes.
 Last activity: 2026-07-08
 
 Note: Phase 3 remains `status: verifying` (pending /gsd-verify-work) in the frontmatter above; Phase 4 planning/execution began before that gate ran.
 
-Progress: [████░░░░░░] 33% (Phase 4: 1/3 plans — offline envelope + RdpilotSensorProcessor foundation complete)
+Progress: [████░░░░░░] 36% (Phase 4: 3/3 plans offline-code-complete — live ping/pong gate PENDING, see 04-03-SUMMARY.md)
 
 ## Performance Metrics
 
@@ -52,7 +52,8 @@ Progress: [████░░░░░░] 33% (Phase 4: 1/3 plans — offline e
 
 **Recent Trend:**
 
-- Last plan: 02-03 (~55 min incl. ~20-min canonical idle run, 3 tasks, 3 files) — example + gated live suite; 5/5 live pass at full 10-min idle; VM torn down
+- Last plan: 04-03 (~30 min, 2 tasks, 3 files) — throwaway WTS PowerShell responder + WinRM deploy/launch helper + gated `sensor_ping_pong_under_500ms` live test; offline-authored and offline-verified only, live ping/pong run against the Azure VM still PENDING (no pwsh/live VM in this sandbox)
+- Prior: 02-03 (~55 min incl. ~20-min canonical idle run, 3 tasks, 3 files) — example + gated live suite; 5/5 live pass at full 10-min idle; VM torn down
 - Prior: 02-02 (~70 min, 3 tasks, 8 files) — live session machinery: connect/loop/framebuffer/keepalive/Session
 
 *Updated after each plan completion*
@@ -62,6 +63,7 @@ Progress: [████░░░░░░] 33% (Phase 4: 1/3 plans — offline e
 | Phase 03 P04 | ~90min | 1 tasks | 2 files |
 | Phase 04 P01 | 25min | 2 tasks | 4 files |
 | Phase 04 P02 | 35min | 2 tasks | 4 files |
+| Phase 04 P03 | ~30min | 2 tasks | 3 files (offline code only; live gate pending) |
 
 ## Accumulated Context
 
@@ -107,6 +109,7 @@ Recent decisions affecting current work:
 
 ### Blockers/Concerns
 
+- **Phase 4 live gate (SENSOR-03/SC#2/SC#3-positive) PENDING:** all 04-03 code/scripts are written and offline-verified, but the actual live ping/pong run (`pwsh infra/manage-env.ps1 up` → `pwsh crates/rdpilot/tests/fixtures/deploy-responder.ps1` → `RDPILOT_LIVE=1 cargo test -p rdpilot sensor_ping_pong_under_500ms -- --ignored`) has NOT been executed. This sandbox has no `pwsh` and no route to the Phase 1 Azure VM. Must be run from a workstation with pwsh + the scoop rustup/MinGW toolchain (same constraint carried forward from 04-01/04-02) before Phase 4 can be marked live-verified.
 - Phase 5: AV/EDR environment on target is unknown — sensor binary hardening level TBD
 - Phase 5: Drive redirection GPO policy on target is unknown — WinRM fallback may be required
 - Phase 7/9: Target application UIA fidelity is unknown — identify and test before Phase 9 harness assertion design

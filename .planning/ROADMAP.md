@@ -119,13 +119,13 @@ Plans:
   2. A ping request sent over the RDPILOT_SENSOR channel returns a pong response from the server-side endpoint within 500 ms
   3. A version handshake is the first message on the channel, and a mismatch causes the channel to close with a clear error (not silent data corruption)
 
-**Plans**: 2/3 plans executed
+**Plans**: 3/3 plans offline-code-complete; live gate (end-of-phase human-check) still PENDING
 
 Plans:
 
 - [x] 04-01-PLAN.md — Offline foundation: JSON envelope (Version/Ping/Pong), RdpilotSensorProcessor + handshake state machine, Error::Dvc, serde promotion (Wave 1)
 - [x] 04-02-PLAN.md — Wiring: register the processor before connect_begin (SC#1), RdpInputEvent::Ping arm + Session::ping() with handshake fast-fail + 500ms timeout (SC#2/SC#3) (Wave 2)
-- [ ] 04-03-PLAN.md — Live gate: throwaway WTS PowerShell responder + WinRM deploy helper + gated sensor_ping_pong_under_500ms test; end-of-phase live proof on the Azure VM (Wave 3, needs live VM)
+- [x] 04-03-PLAN.md — Live gate artifacts: throwaway WTS PowerShell responder + WinRM deploy helper + gated sensor_ping_pong_under_500ms test authored and offline-verified (Wave 3). **Live run against the Azure VM is PENDING** — not executed in this sandbox (no pwsh, no live VM); SENSOR-03 stays unproven until that human-check runs
 
 ### Phase 5: Sensor Bootstrap + Deployment
 
