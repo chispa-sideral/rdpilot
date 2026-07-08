@@ -26,8 +26,8 @@ Stack (from research): IronRDP 0.14 (Rust) client core + primary language; C# .N
 
 ### Input
 
-- [ ] **INPUT-01**: User can inject mouse actions (move, click variants, scroll, drag) at remote coordinates, mapped to the Anthropic/OpenAI computer-use action vocabulary
-- [ ] **INPUT-02**: User can inject keyboard input (type text and key combinations/modifiers)
+- [x] **INPUT-01**: User can inject mouse actions (move, click variants, scroll, drag) at remote coordinates, mapped to the Anthropic/OpenAI computer-use action vocabulary
+- [x] **INPUT-02**: User can inject keyboard input (type text and key combinations/modifiers)
 
 ### Perception
 

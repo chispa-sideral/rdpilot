@@ -15,7 +15,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 
 - [x] **Phase 1: Test Environment** - Provision a disposable Azure Windows VM pre-configured for RDP automation, with up/down script and scheduled auto-destroy — ENV-01/02/03 all verified (ENV-01/02 live gate 2026-06-04; ENV-03 auto-destroy validated 2026-06-05)
 - [x] **Phase 2: RDP Session + Framebuffer Core** - Connect, authenticate, keep session rendered, and produce full-desktop screenshots — all 5 success criteria proven live (canonical run 5/5 pass on a real Azure VM with the full 10-min idle, 2026-06-05; SESS-01/SESS-02/CAP-01)
-- [ ] **Phase 3: Input Injection** - Inject mouse and keyboard actions at remote coordinates with a locked DPI contract
+- [x] **Phase 3: Input Injection** - Inject mouse and keyboard actions at remote coordinates with a locked DPI contract (completed 2026-07-08)
 - [ ] **Phase 4: DVC Transport Channel** - Establish and verify the RDPILOT_SENSOR dynamic virtual channel before any sensor modules exist
 - [ ] **Phase 5: Sensor Bootstrap + Deployment** - Build the C# NativeAOT sensor helper and deploy it onto a real target via drive redirection or WinRM
 - [ ] **Phase 6: Window + Process Perception** - Retrieve window list, process tree, per-window screenshots, focus control, and remote process launch over DVC
@@ -90,7 +90,7 @@ Plans:
   3. Typed text and key combinations (e.g. Ctrl+A, Alt+F4) are received by the remote application
   4. The coordinate contract is documented and enforced: remote session is forced to 96 DPI (100%), and all coordinate values are in physical virtual-desktop pixels
 
-**Plans**: 3/4 plans executed
+**Plans**: 4/4 plans complete
 Plans:
 **Wave 1**
 
@@ -106,7 +106,7 @@ Plans:
 
 **Wave 4** *(blocked on Wave 3 completion)*
 
-- [ ] 03-04-PLAN.md — Gated live screenshot-diff suite covering all 4 success criteria + canonical live-validation checkpoint (double-click / drag empirically tuned)
+- [x] 03-04-PLAN.md — Gated live screenshot-diff suite covering all 4 success criteria + canonical live-validation checkpoint (double-click / drag empirically tuned)
 
 ### Phase 4: DVC Transport Channel
 
@@ -201,7 +201,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8 →
 |-------|----------------|--------|-----------|
 | 1. Test Environment | 4/4 | Complete | 2026-06-05 |
 | 2. RDP Session + Framebuffer Core | 3/3 | Complete    | 2026-06-05 |
-| 3. Input Injection | 3/4 | In Progress|  |
+| 3. Input Injection | 4/4 | Complete   | 2026-07-08 |
 | 4. DVC Transport Channel | 0/? | Not started | - |
 | 5. Sensor Bootstrap + Deployment | 0/? | Not started | - |
 | 6. Window + Process Perception | 0/? | Not started | - |
@@ -243,4 +243,5 @@ Plans:
 **Plans:** 0 plans
 
 Plans:
+
 - [ ] TBD (promote with /gsd-review-backlog when ready)
