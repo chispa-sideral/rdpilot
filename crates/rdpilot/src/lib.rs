@@ -21,6 +21,7 @@ mod config;
 mod connect;
 mod error;
 mod framebuffer;
+mod input;
 mod keepalive;
 mod screenshot;
 mod session;
