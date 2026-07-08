@@ -14,7 +14,9 @@
 //!   for a self-signed lab target only (D-15, threat T-02-03).
 //! - **The `RDPILOT_SENSOR` DVC seam** is registered on the connector *before*
 //!   `connect_begin` (registration is impossible once the session is active — a hard
-//!   IronRDP constraint). Phase 2 leaves the seam; it does NOT build the sensor.
+//!   IronRDP constraint, SC#1). `RdpilotSensorProcessor` is registered here via
+//!   `DrdynvcClient::with_dynamic_channel`; `connect()` returns the shared
+//!   `Arc<SensorShared>` so `Session` can drive `Session::ping()` against it.
 //!
 //! Credentials and certificate material are never logged (Security V7, threat
 //! T-02-02). No `unwrap`/`expect`/`panic` in non-test code (API-01).
@@ -38,10 +40,10 @@ use tokio_rustls::TlsConnector;
 use crate::config::ConnectionConfig;
 use crate::error::{Error, Result};
 
-/// The dynamic virtual channel name reserved for the Phase 4 perception sensor.
+/// The dynamic virtual channel name for the Phase 4 perception sensor.
 ///
-/// Phase 2 only registers the DRDYNVC static channel that will *host* this dynamic
-/// channel; the actual `DvcProcessor` for `RDPILOT_SENSOR` is built in Phase 4.
+/// Registered via `RdpilotSensorProcessor::channel_name()` in [`connect`] before
+/// `connect_begin` (SC#1).
 pub(crate) const RDPILOT_SENSOR: &str = "RDPILOT_SENSOR";
 
 /// The framed transport over the TLS-upgraded, type-erased async stream.
@@ -66,7 +68,9 @@ pub(crate) type ConnectedFramed = TokioFramed<UpgradedStream>;
 /// reactivation sequence) and the TLS-upgraded [`ConnectedFramed`] ready for the
 /// PDU pump. Every failure is mapped to an owned [`Error`] variant; no
 /// credential or certificate material is ever logged.
-pub(crate) async fn connect(cfg: &ConnectionConfig) -> Result<(ConnectionResult, ConnectedFramed)> {
+pub(crate) async fn connect(
+    cfg: &ConnectionConfig,
+) -> Result<(ConnectionResult, ConnectedFramed, std::sync::Arc<crate::sensor::SensorShared>)> {
     let server_name = cfg.host().to_owned();
     let addr = resolve_addr(&server_name, cfg.get_port())?;
 
@@ -84,15 +88,16 @@ pub(crate) async fn connect(cfg: &ConnectionConfig) -> Result<(ConnectionResult,
     let mut connector = ClientConnector::new(connector_config, client_addr);
 
     // ── Phase 4 DVC seam ──────────────────────────────────────────────────────
-    // Register the DRDYNVC static channel on the connector BEFORE connect_begin.
-    // Dynamic virtual channels (including the future `RDPILOT_SENSOR` perception
-    // channel) can only be registered before the connection is finalized — this
-    // is a hard IronRDP constraint. Phase 4 will add the sensor processor via:
-    //     DrdynvcClient::new().with_dynamic_channel(RdpilotSensorProcessor::new())
-    // where the processor's `channel_name()` returns `RDPILOT_SENSOR`. Phase 2
-    // installs the empty host channel only and does NOT exercise the sensor.
-    let _ = RDPILOT_SENSOR; // anchor the reserved name to this seam
-    let drdynvc = DrdynvcClient::new();
+    // Register the sensor's DvcProcessor on the DRDYNVC static channel BEFORE
+    // connect_begin. Dynamic virtual channels (including `RDPILOT_SENSOR`, the
+    // perception channel) can only be registered before the connection is
+    // finalized — this is a hard IronRDP constraint (SC#1). `sensor` is the
+    // shared correlation state (pending oneshot map + handshake); one clone is
+    // moved into the processor here, the other is returned below so
+    // `Session::connect` can drive `Session::ping()` against the same state.
+    let sensor = std::sync::Arc::new(crate::sensor::SensorShared::new());
+    let drdynvc =
+        DrdynvcClient::new().with_dynamic_channel(crate::sensor::RdpilotSensorProcessor::new(sensor.clone()));
     connector = connector.with_static_channel(drdynvc);
 
     let should_upgrade = ironrdp_tokio::connect_begin(&mut framed, &mut connector)
@@ -122,7 +127,7 @@ pub(crate) async fn connect(cfg: &ConnectionConfig) -> Result<(ConnectionResult,
     .await
     .map_err(|e| Error::Connect(format!("connect_finalize failed: {e}")))?;
 
-    Ok((connection_result, upgraded_framed))
+    Ok((connection_result, upgraded_framed, sensor))
 }
 
 /// Resolve `host:port` to a single socket address.

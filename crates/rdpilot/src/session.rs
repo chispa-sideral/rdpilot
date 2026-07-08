@@ -17,7 +17,8 @@
 //! Only owned SDK types appear in the public signatures — no `ironrdp`, `image`,
 //! `rustls`, or `tokio` type leaks (D-09). No `unwrap`/`expect`/`panic` (API-01).
 
-use std::sync::Mutex;
+use std::sync::atomic::AtomicU64;
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -31,6 +32,7 @@ use crate::error::{Error, Result};
 use crate::framebuffer::SharedFrame;
 use crate::input::{KeyAction, MouseAction};
 use crate::screenshot::Screenshot;
+use crate::sensor::SensorShared;
 use crate::session_loop::{self, RdpInputEvent};
 
 /// Inter-click delay for [`MouseAction::DoubleClick`] (D-3.7). RDP has no
@@ -86,6 +88,16 @@ pub struct Session {
     /// static capture, not live-updated on a server-driven reactivation
     /// resize (RESEARCH Open Q1 / Assumption A1).
     desktop_size: (u32, u32),
+    /// Correlation state shared with the `RdpilotSensorProcessor` registered
+    /// in `connect.rs` (SENSOR-03, RESEARCH Q1): the pending `req_id`-keyed
+    /// oneshot map and the version-handshake outcome. `Session::ping()`
+    /// reads/mutates this from the caller's async context; the processor
+    /// mutates it from the dedicated session-loop OS thread.
+    sensor: Arc<SensorShared>,
+    /// Monotonic correlation-id counter for `Session::ping()` requests.
+    /// Starts at 1 — `req_id` 0 is reserved for the version handshake
+    /// (RESEARCH Q2, D-4.3).
+    next_req_id: AtomicU64,
 }
 
 impl Session {
@@ -100,7 +112,7 @@ impl Session {
     /// Returns [`Error::Connect`] / [`Error::Tls`] if the connection or
     /// authentication fails.
     pub async fn connect(cfg: &ConnectionConfig) -> Result<Session> {
-        let (connection_result, framed) = connect::connect(cfg).await?;
+        let (connection_result, framed, sensor) = connect::connect(cfg).await?;
 
         // Deliberate v1 static capture (D-3.2; RESEARCH Open Q1 / Assumption
         // A1): copy the negotiated desktop size out here, BEFORE
@@ -142,6 +154,8 @@ impl Session {
             frame,
             input_db: Mutex::new(Database::new()),
             desktop_size,
+            sensor,
+            next_req_id: AtomicU64::new(1),
         })
     }
 
@@ -352,6 +366,13 @@ mod tests {
         Mutex::new(Database::new())
     }
 
+    /// A fresh, unstarted `SensorShared` for offline test `Session` literals
+    /// (no VM — the handshake/pending map is never driven by a real
+    /// `RdpilotSensorProcessor` here).
+    fn test_sensor() -> Arc<SensorShared> {
+        Arc::new(SensorShared::new())
+    }
+
     /// `screenshot()` on a session with no captured frame returns a typed error,
     /// never a panic (no VM — drives only the snapshot read path).
     #[tokio::test]
@@ -364,6 +385,8 @@ mod tests {
             frame: SharedFrame::new(),
             input_db: test_input_db(),
             desktop_size: TEST_DESKTOP_SIZE,
+            sensor: test_sensor(),
+            next_req_id: AtomicU64::new(1),
         };
 
         let err = session.screenshot().await;
@@ -384,6 +407,8 @@ mod tests {
             frame,
             input_db: test_input_db(),
             desktop_size: TEST_DESKTOP_SIZE,
+            sensor: test_sensor(),
+            next_req_id: AtomicU64::new(1),
         };
 
         let shot = session.screenshot().await.expect("frame present");
@@ -402,6 +427,8 @@ mod tests {
             frame: SharedFrame::new(),
             input_db: test_input_db(),
             desktop_size: TEST_DESKTOP_SIZE,
+            sensor: test_sensor(),
+            next_req_id: AtomicU64::new(1),
         };
         drop(session); // must not panic
     }
@@ -416,6 +443,8 @@ mod tests {
             frame: SharedFrame::new(),
             input_db: test_input_db(),
             desktop_size: (1920, 1080),
+            sensor: test_sensor(),
+            next_req_id: AtomicU64::new(1),
         };
         assert_eq!(session.desktop_size(), (1920, 1080));
     }
@@ -432,6 +461,8 @@ mod tests {
             frame: SharedFrame::new(),
             input_db: test_input_db(),
             desktop_size: (1920, 1080),
+            sensor: test_sensor(),
+            next_req_id: AtomicU64::new(1),
         };
 
         let out_of_range = MouseAction::Click {
@@ -462,6 +493,8 @@ mod tests {
             frame: SharedFrame::new(),
             input_db: test_input_db(),
             desktop_size,
+            sensor: test_sensor(),
+            next_req_id: AtomicU64::new(1),
         };
         (session, input_rx)
     }
