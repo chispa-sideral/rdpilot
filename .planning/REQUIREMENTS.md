@@ -82,8 +82,8 @@ Stack (from research): IronRDP 0.14 (Rust) client core + primary language; C# .N
 | SESS-02 | Phase 2: RDP Session + Framebuffer Core | Complete |
 | CAP-01 | Phase 2: RDP Session + Framebuffer Core | Complete |
 | CAP-02 | Phase 6: Window + Process Perception | Pending |
-| INPUT-01 | Phase 3: Input Injection | In progress (Plan 1/4: offline contract layer done; Session wiring + live verification pending) |
-| INPUT-02 | Phase 3: Input Injection | In progress (Plan 1/4: offline contract layer done; Session wiring + live verification pending) |
+| INPUT-01 | Phase 3: Input Injection | Complete — proven live in Phase 3 Plan 04, 10/10 tests pass 2026-07-08 |
+| INPUT-02 | Phase 3: Input Injection | Complete — proven live in Phase 3 Plan 04, 10/10 tests pass 2026-07-08 |
 | SENSOR-03 | Phase 4: DVC Transport Channel | Pending |
 | SENSOR-01 | Phase 5: Sensor Bootstrap + Deployment | Pending |
 | SENSOR-02 | Phase 5: Sensor Bootstrap + Deployment | Pending |
