@@ -4,13 +4,13 @@ milestone: v1.0
 milestone_name: milestone
 status: executing
 stopped_at: "Completed 03-01-PLAN.md (input injection contract layer: owned vocabulary + Operation translation, offline-only)"
-last_updated: "2026-07-08T20:23:27.059Z"
+last_updated: "2026-07-08T20:39:22.788Z"
 last_activity: 2026-07-08 -- Phase 3 execution started
 progress:
   total_phases: 9
   completed_phases: 2
   total_plans: 11
-  completed_plans: 8
+  completed_plans: 9
   percent: 22
 ---
 
@@ -26,7 +26,7 @@ See: .planning/PROJECT.md (updated 2026-06-04)
 ## Current Position
 
 Phase: 3 (input-injection) — EXECUTING
-Plan: 2 of 4
+Plan: 3 of 4
 Status: Ready to execute
 Last activity: 2026-07-08 -- Phase 3 execution started
 
@@ -55,6 +55,7 @@ Progress: [████░░░░░░] 22% (Phase 3: 1/4 plans — input voc
 
 *Updated after each plan completion*
 | Phase 3 P1 | 55min | 2 tasks | 3 files |
+| Phase 03-input-injection P02 | ~40min | 2 tasks | 2 files |
 
 ## Accumulated Context
 
@@ -86,6 +87,7 @@ Recent decisions affecting current work:
 - Auto-destroy topology = separate-management (user decision): persistent management RG (rdpilot-mgmt) holds the Automation Account; its managed identity = Contributor over the TEST RG (rdpilot-test) ONLY; West Europe; subscription = caller's active az sub (never hard-coded)
 - manage-env.ps1 publishes BOTH Configure-Target.ps1 (CSE) and Delete-ResourceGroup.ps1 (runbook publishContentLink) to a per-up private blob + short-lived read-only single-blob SAS; storage account lives in the TEST RG so `down` cascades it; `down` leaves the management RG in place
 - **Phase 3 Plan 1:** owned MouseAction/KeyAction/Button/Key vocabulary + pure translation to ironrdp_input::Operation batches, with Pitfall 1 (wheel |dy|>255 split) and Pitfall 5 (MouseMove-before-WheelRotations) guards; Error::CoordinateOutOfBounds mirrors CropOutOfBounds
+- [Phase ?]: Phase 3 Plan 2: Mutex<Database> lives in Session (not session_loop), locked only for synchronous apply(); DoubleClick/Drag inter-batch timing is tokio::time::sleep on the caller's async context, never in the session-loop select! (Pitfall 3). Session::desktop_size() is a deliberate v1 static capture at connect time.
 
 ### Pending Todos
 
@@ -107,6 +109,6 @@ Phase 2 Plan 02: pre-existing rustdoc intra-doc-link warnings in config.rs (Wave
 
 ## Session Continuity
 
-Last session: 2026-07-08T20:23:11.228Z
+Last session: 2026-07-08T20:39:22.783Z
 Stopped at: Completed 03-01-PLAN.md (input injection contract layer: owned vocabulary + Operation translation, offline-only)
 Resume file: 03-02-PLAN.md

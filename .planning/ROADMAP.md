@@ -90,7 +90,7 @@ Plans:
   3. Typed text and key combinations (e.g. Ctrl+A, Alt+F4) are received by the remote application
   4. The coordinate contract is documented and enforced: remote session is forced to 96 DPI (100%), and all coordinate values are in physical virtual-desktop pixels
 
-**Plans**: 1/4 plans executed
+**Plans**: 2/4 plans executed
 Plans:
 **Wave 1**
 
@@ -98,7 +98,7 @@ Plans:
 
 **Wave 2** *(blocked on Wave 1 completion)*
 
-- [ ] 03-02-PLAN.md — Session input seam (RdpInputEvent::FastPath + Mutex<Database> + desktop_size accessor + coordinate bounds check) and send_mouse: move/click/double-click/scroll/drag with caller-side timing
+- [x] 03-02-PLAN.md — Session input seam (RdpInputEvent::FastPath + Mutex<Database> + desktop_size accessor + coordinate bounds check) and send_mouse: move/click/double-click/scroll/drag with caller-side timing
 
 **Wave 3** *(blocked on Wave 2 completion)*
 
@@ -201,7 +201,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8 →
 |-------|----------------|--------|-----------|
 | 1. Test Environment | 4/4 | Complete | 2026-06-05 |
 | 2. RDP Session + Framebuffer Core | 3/3 | Complete    | 2026-06-05 |
-| 3. Input Injection | 1/4 | In Progress|  |
+| 3. Input Injection | 2/4 | In Progress|  |
 | 4. DVC Transport Channel | 0/? | Not started | - |
 | 5. Sensor Bootstrap + Deployment | 0/? | Not started | - |
 | 6. Window + Process Perception | 0/? | Not started | - |
