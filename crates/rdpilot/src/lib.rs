@@ -29,10 +29,12 @@ mod session_loop;
 
 pub use config::ConnectionConfig;
 pub use error::{Error, Result};
+pub use input::{Button, Key, KeyAction, MouseAction};
 pub use screenshot::{Rect, Screenshot};
 pub use session::Session;
 
 // `connect`, `framebuffer`, `keepalive`, and `session_loop` are internal — they
 // are implementation details driven by `Session`, never part of the public
 // surface. The public API is exactly: `Session`, `ConnectionConfig`,
-// `Screenshot`, `Rect`, `Error`, `Result` (owned SDK types only, D-09).
+// `Screenshot`, `Rect`, `Error`, `Result`, `MouseAction`, `KeyAction`,
+// `Button`, `Key` (owned SDK types only, D-09).

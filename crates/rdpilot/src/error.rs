@@ -60,6 +60,29 @@ pub enum Error {
     /// loop introduced by a later plan in this phase).
     #[error("session/transport error: {0}")]
     Session(String),
+
+    /// A caller-supplied mouse coordinate fell outside the negotiated
+    /// desktop size.
+    ///
+    /// Mirrors [`Error::CropOutOfBounds`] exactly: rejected *before* any
+    /// `ironrdp_input::Operation`/PDU is constructed (D-3.2, SC#4). This is
+    /// the SDK-level correctness backstop for `MousePdu::encode`'s own
+    /// silent `as u8` wheel-magnitude wraparound (Pitfall 1, T-03-01) — a
+    /// bounds violation must always surface as a typed error, never a
+    /// silent clamp or wrap.
+    #[error(
+        "coordinate ({x},{y}) is out of bounds for a {desktop_w}x{desktop_h} desktop"
+    )]
+    CoordinateOutOfBounds {
+        /// The offending x coordinate.
+        x: u32,
+        /// The offending y coordinate.
+        y: u32,
+        /// The negotiated desktop width.
+        desktop_w: u32,
+        /// The negotiated desktop height.
+        desktop_h: u32,
+    },
 }
 
 /// Convenience alias for results returned by the `rdpilot` public API.
@@ -85,6 +108,21 @@ impl Error {
             image_h,
         }
     }
+
+    /// Construct a [`Error::CoordinateOutOfBounds`] from an offending
+    /// coordinate and the desktop dimensions it was checked against.
+    ///
+    /// Internal helper so `input.rs`'s bounds check (a later plan) does not
+    /// have to spell out the four fields at every call site — mirrors
+    /// [`Error::crop_out_of_bounds`] exactly.
+    pub(crate) fn coordinate_out_of_bounds(x: u32, y: u32, desktop_w: u32, desktop_h: u32) -> Self {
+        Error::CoordinateOutOfBounds {
+            x,
+            y,
+            desktop_w,
+            desktop_h,
+        }
+    }
 }
 
 /// Ensure the error renders without leaking any internal/third-party detail
@@ -101,6 +139,7 @@ impl Error {
             Error::CropOutOfBounds { .. } => "crop_out_of_bounds",
             Error::Config(_) => "config",
             Error::Session(_) => "session",
+            Error::CoordinateOutOfBounds { .. } => "coordinate_out_of_bounds",
         }
     }
 }
