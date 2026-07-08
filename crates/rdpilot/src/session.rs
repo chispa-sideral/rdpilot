@@ -333,4 +333,100 @@ mod tests {
         };
         assert!(session.check_bounds(&in_range).is_ok());
     }
+
+    /// Build a `Session` wired to a real (undrained) channel, so tests can
+    /// drain `input_rx` and assert on what `send_mouse` actually sent.
+    fn test_session_with_channel(desktop_size: (u32, u32)) -> (Session, mpsc::Receiver<RdpInputEvent>) {
+        let (input_tx, input_rx) = mpsc::channel(INPUT_CHANNEL_CAPACITY);
+        let session = Session {
+            thread: None,
+            input_tx,
+            frame: SharedFrame::new(),
+            input_db: test_input_db(),
+            desktop_size,
+        };
+        (session, input_rx)
+    }
+
+    /// An in-range `Click` sends exactly one non-empty `FastPath` batch
+    /// (SC#2).
+    #[tokio::test]
+    async fn send_mouse_click_sends_one_nonempty_fastpath_batch() {
+        let (session, mut input_rx) = test_session_with_channel((1920, 1080));
+
+        session
+            .send_mouse(MouseAction::Click {
+                x: 100,
+                y: 100,
+                button: Button::Left,
+            })
+            .await
+            .expect("in-range click succeeds");
+
+        let RdpInputEvent::FastPath(events) = input_rx.try_recv().expect("a FastPath message was sent") else {
+            panic!("expected a FastPath event");
+        };
+        assert!(!events.is_empty());
+        assert!(input_rx.try_recv().is_err(), "Click must send exactly one batch");
+    }
+
+    /// `Scroll` sends a `FastPath` batch containing a wheel event (D-3.3).
+    #[tokio::test]
+    async fn send_mouse_scroll_sends_wheel_event() {
+        use ironrdp::pdu::input::mouse::PointerFlags;
+
+        let (session, mut input_rx) = test_session_with_channel((1920, 1080));
+
+        session
+            .send_mouse(MouseAction::Scroll { x: 100, y: 100, dy: 120 })
+            .await
+            .expect("in-range scroll succeeds");
+
+        let RdpInputEvent::FastPath(events) = input_rx.try_recv().expect("a FastPath message was sent") else {
+            panic!("expected a FastPath event");
+        };
+        assert!(events.iter().any(|e| match e {
+            FastPathInputEvent::MouseEvent(pdu) => pdu.flags.contains(PointerFlags::VERTICAL_WHEEL),
+            _ => false,
+        }));
+    }
+
+    /// An out-of-bounds coordinate is rejected before anything is sent on
+    /// the channel (D-3.2, SC#4 — "enforced").
+    #[tokio::test]
+    async fn send_mouse_rejects_out_of_range_coordinate_before_sending() {
+        let (session, mut input_rx) = test_session_with_channel((1920, 1080));
+
+        let err = session
+            .send_mouse(MouseAction::Click {
+                x: 9000,
+                y: 100,
+                button: Button::Left,
+            })
+            .await;
+        assert!(matches!(err, Err(Error::CoordinateOutOfBounds { .. })));
+        assert!(input_rx.try_recv().is_err(), "nothing should have been sent");
+    }
+
+    /// `DoubleClick` synthesizes two single-click sequences, sent as two
+    /// separate `FastPath` messages (D-3.7).
+    #[tokio::test]
+    async fn send_mouse_double_click_emits_two_fastpath_messages() {
+        let (session, mut input_rx) = test_session_with_channel((1920, 1080));
+
+        session
+            .send_mouse(MouseAction::DoubleClick {
+                x: 100,
+                y: 100,
+                button: Button::Left,
+            })
+            .await
+            .expect("in-range double-click succeeds");
+
+        let mut count = 0;
+        while input_rx.try_recv().is_ok() {
+            count += 1;
+        }
+        assert_eq!(count, 2, "DoubleClick must synthesize exactly two batches");
+    }
 }
