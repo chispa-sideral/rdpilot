@@ -217,6 +217,7 @@ pub enum KeyAction {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ironrdp_input::Operation;
 
     /// The four D-3.1-locked call sites compile and construct verbatim.
     #[test]
@@ -294,5 +295,208 @@ mod tests {
         assert!(message.contains("1920"));
         assert!(message.contains("100"));
         assert!(message.contains("1080"));
+    }
+
+    // --- Task 2: scancode table (D-3.1) ---
+
+    /// Tags an `Operation` by variant name only, for order-of-operations
+    /// assertions (`Operation` itself derives only `Debug`/`Clone`, not
+    /// `PartialEq` — this is a test-only, ironrdp-input-source-verified
+    /// discriminant helper, not a public API).
+    fn op_kind(op: &Operation) -> &'static str {
+        match op {
+            Operation::MouseButtonPressed(_) => "MouseButtonPressed",
+            Operation::MouseButtonReleased(_) => "MouseButtonReleased",
+            Operation::MouseMove(_) => "MouseMove",
+            Operation::WheelRotations(_) => "WheelRotations",
+            Operation::KeyPressed(_) => "KeyPressed",
+            Operation::KeyReleased(_) => "KeyReleased",
+            Operation::UnicodeKeyPressed(_) => "UnicodeKeyPressed",
+            Operation::UnicodeKeyReleased(_) => "UnicodeKeyReleased",
+        }
+    }
+
+    #[test]
+    fn scancode_matches_set1_reference_bytes() {
+        assert_eq!(scancode(Key::Ctrl).as_u8(), (false, 0x1D));
+        assert_eq!(scancode(Key::A).as_u8(), (false, 0x1E));
+        assert_eq!(scancode(Key::F4).as_u8(), (false, 0x3E));
+    }
+
+    #[test]
+    fn arrow_keys_are_extended() {
+        let (extended, _) = scancode(Key::Up).as_u8();
+        assert!(extended);
+    }
+
+    // --- Task 2: mouse translation (D-3.3, D-3.7, D-3.8, Pitfall 1, Pitfall 5) ---
+
+    #[test]
+    fn scroll_always_emits_move_before_wheel_rotations() {
+        let batches = mouse_operations(&MouseAction::Scroll { x: 10, y: 20, dy: 120 });
+        assert_eq!(batches.len(), 1);
+        let batch = &batches[0];
+        assert_eq!(op_kind(&batch[0]), "MouseMove");
+        assert_eq!(op_kind(&batch[1]), "WheelRotations");
+    }
+
+    #[test]
+    fn scroll_single_notch_produces_exactly_one_wheel_rotation() {
+        let batches = mouse_operations(&MouseAction::Scroll { x: 0, y: 0, dy: 120 });
+        let wheel_ops = batches[0]
+            .iter()
+            .filter(|op| op_kind(op) == "WheelRotations")
+            .count();
+        assert_eq!(wheel_ops, 1);
+    }
+
+    #[test]
+    fn scroll_over_255_magnitude_splits_into_in_range_operations() {
+        let batches = mouse_operations(&MouseAction::Scroll { x: 0, y: 0, dy: 600 });
+        let wheel_ops: Vec<i16> = batches[0]
+            .iter()
+            .filter_map(|op| match op {
+                Operation::WheelRotations(w) => Some(w.rotation_units),
+                _ => None,
+            })
+            .collect();
+        assert!(wheel_ops.len() > 1, "expected a split, got {wheel_ops:?}");
+        for units in &wheel_ops {
+            assert!(
+                units.unsigned_abs() <= 255,
+                "PDU-unsafe magnitude reached translation output: {units}"
+            );
+            assert!(*units > 0, "sign must be preserved");
+        }
+        let total: i32 = wheel_ops.iter().map(|u| i32::from(*u)).sum();
+        assert_eq!(total, 600);
+    }
+
+    #[test]
+    fn scroll_negative_magnitude_preserves_sign_when_split() {
+        let batches = mouse_operations(&MouseAction::Scroll { x: 0, y: 0, dy: -600 });
+        let wheel_ops: Vec<i16> = batches[0]
+            .iter()
+            .filter_map(|op| match op {
+                Operation::WheelRotations(w) => Some(w.rotation_units),
+                _ => None,
+            })
+            .collect();
+        assert!(!wheel_ops.is_empty());
+        for units in &wheel_ops {
+            assert!(*units < 0);
+        }
+    }
+
+    #[test]
+    fn double_click_produces_two_batches() {
+        let batches = mouse_operations(&MouseAction::DoubleClick {
+            x: 1,
+            y: 1,
+            button: Button::Left,
+        });
+        assert_eq!(batches.len(), 2);
+        for batch in &batches {
+            assert_eq!(op_kind(&batch[0]), "MouseMove");
+            assert_eq!(op_kind(&batch[1]), "MouseButtonPressed");
+            assert_eq!(op_kind(&batch[2]), "MouseButtonReleased");
+        }
+    }
+
+    #[test]
+    fn drag_has_leading_press_and_trailing_release_with_interpolated_moves() {
+        let batches = mouse_operations(&MouseAction::Drag {
+            from_x: 0,
+            from_y: 0,
+            to_x: 100,
+            to_y: 50,
+            button: Button::Left,
+        });
+        assert!(batches.len() >= 3, "expected >= 3 batches, got {}", batches.len());
+        assert!(batches
+            .first()
+            .expect("non-empty")
+            .iter()
+            .any(|op| op_kind(op) == "MouseButtonPressed"));
+        assert!(batches
+            .last()
+            .expect("non-empty")
+            .iter()
+            .any(|op| op_kind(op) == "MouseButtonReleased"));
+        for batch in &batches[1..batches.len() - 1] {
+            assert!(batch.iter().all(|op| op_kind(op) == "MouseMove"));
+        }
+    }
+
+    // --- Task 2: keyboard translation (D-3.5, Pitfall 2, T-03-02, T-03-04) ---
+
+    #[test]
+    fn type_yields_unicode_press_release_pairs_per_char() {
+        let ops = key_operations(&KeyAction::Type("hi".into()));
+        let kinds: Vec<_> = ops.iter().map(op_kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "UnicodeKeyPressed",
+                "UnicodeKeyReleased",
+                "UnicodeKeyPressed",
+                "UnicodeKeyReleased",
+            ]
+        );
+        let chars: Vec<char> = ops
+            .iter()
+            .map(|op| match op {
+                Operation::UnicodeKeyPressed(c) | Operation::UnicodeKeyReleased(c) => *c,
+                other => panic!("expected a unicode key operation, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(chars, vec!['h', 'h', 'i', 'i']);
+    }
+
+    #[test]
+    fn combo_ctrl_a_presses_mods_first_and_releases_in_reverse() {
+        let ops = key_operations(&KeyAction::Combo(vec![Key::Ctrl, Key::A]));
+        let kinds: Vec<_> = ops.iter().map(op_kind).collect();
+        assert_eq!(
+            kinds,
+            vec!["KeyPressed", "KeyPressed", "KeyReleased", "KeyReleased"]
+        );
+        let scancodes: Vec<(bool, u8)> = ops
+            .iter()
+            .map(|op| match op {
+                Operation::KeyPressed(s) | Operation::KeyReleased(s) => s.as_u8(),
+                other => panic!("expected a key operation, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            scancodes,
+            vec![
+                scancode(Key::Ctrl).as_u8(),
+                scancode(Key::A).as_u8(),
+                scancode(Key::A).as_u8(),
+                scancode(Key::Ctrl).as_u8(),
+            ]
+        );
+    }
+
+    #[test]
+    fn combo_alt_f4_presses_mods_first_and_releases_in_reverse() {
+        let ops = key_operations(&KeyAction::Combo(vec![Key::Alt, Key::F4]));
+        let kinds: Vec<_> = ops.iter().map(op_kind).collect();
+        assert_eq!(
+            kinds,
+            vec!["KeyPressed", "KeyPressed", "KeyReleased", "KeyReleased"]
+        );
+    }
+
+    #[test]
+    fn combo_degenerate_cases_never_panic() {
+        assert!(key_operations(&KeyAction::Combo(vec![])).is_empty());
+
+        let all_mods = key_operations(&KeyAction::Combo(vec![Key::Ctrl, Key::Shift]));
+        assert_eq!(all_mods.len(), 4);
+
+        let mod_free = key_operations(&KeyAction::Combo(vec![Key::A]));
+        assert_eq!(mod_free.len(), 2);
     }
 }
