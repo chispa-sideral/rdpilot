@@ -735,6 +735,73 @@ fn keyboard_combos_are_received() {
     });
 }
 
+/// SENSOR-03 SC#2/SC#3 (positive path): a ping over `RDPILOT_SENSOR` returns a
+/// pong from the throwaway responder (`tests/fixtures/sensor-responder.ps1`,
+/// deployed via `tests/fixtures/deploy-responder.ps1`, D-4.1/D-4.5) within
+/// 500ms. A successful `Session::ping()` is only reachable after the Version
+/// handshake has already completed (`Session::ping()`'s handshake fast-fail,
+/// SC#3), so this single assertion proves both criteria's positive path at
+/// once.
+///
+/// The responder needs a moment to launch inside the interactive RDP session
+/// and open the DVC channel (the server-side ERROR_GEN_FAILURE/0x31 timing
+/// race the responder itself retries around); a bounded retry loop here
+/// tolerates the transient `Error::Dvc` while that settles and stops at the
+/// first `Ok(elapsed)`. If the responder is not running in the interactive
+/// session (Session > 0, not WinRM's Session 0 — the live-verify risk flagged
+/// in Plan 03), every attempt times out and the retry budget elapses with the
+/// last `Error::Dvc` surfaced as the failure (naming exactly this risk).
+#[test]
+#[ignore = "live: requires a provisioned RDP target + deployed sensor-responder.ps1 (RDPILOT_LIVE=1)"]
+fn sensor_ping_pong_under_500ms() {
+    let Some(cfg) = require_target!("sensor_ping_pong_under_500ms") else {
+        return;
+    };
+    block_on(async {
+        let session = rdpilot::Session::connect(&cfg).await.expect("connect");
+
+        // Bounded retry loop: tolerates the responder still launching / still
+        // opening the server-side DVC channel. ~15s total budget, short sleeps
+        // between attempts; stop at the first Ok(elapsed) — that elapsed is
+        // the actual round-trip bound (SC#2), measured separately from the
+        // one-time setup latency the retries absorb.
+        const RETRY_BUDGET: std::time::Duration = std::time::Duration::from_secs(15);
+        const RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+        let deadline = std::time::Instant::now() + RETRY_BUDGET;
+
+        let mut last_err: Option<rdpilot::Error> = None;
+        let mut result: Option<std::time::Duration> = None;
+        while std::time::Instant::now() < deadline {
+            match session.ping().await {
+                Ok(elapsed) => {
+                    result = Some(elapsed);
+                    break;
+                }
+                Err(e) => {
+                    last_err = Some(e);
+                    tokio::time::sleep(RETRY_INTERVAL).await;
+                }
+            }
+        }
+
+        session.close().await.expect("close");
+
+        let elapsed = result.unwrap_or_else(|| {
+            panic!(
+                "no successful ping within {RETRY_BUDGET:?} — responder not answering on \
+                 RDPILOT_SENSOR (is sensor-responder.ps1 running in the INTERACTIVE RDP \
+                 session, not WinRM's Session 0? run deploy-responder.ps1 first; last error: \
+                 {last_err:?})"
+            )
+        });
+
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "ping/pong round trip took {elapsed:?}, expected < 500ms (SC#2)"
+        );
+    });
+}
+
 /// Poll `screenshot()` until the first graphics update lands (it errors with
 /// `Error::Session` until then). Bounded so a stuck connection fails the test
 /// rather than hanging forever.
