@@ -2,15 +2,15 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-status: verifying
-stopped_at: Phase 5 Sensor Bootstrap + Deployment COMPLETE — live gate PASSED against a real Azure VM (RDPDR primary 22.61ms, WinRM fallback 21.62ms, both < 1s SC4 bound); SENSOR-01/SENSOR-02 validated
-last_updated: "2026-07-09T13:32:46.039Z"
+status: executing
+stopped_at: "Completed 06-01-PLAN.md (Phase 6 window+process perception — Rust DVC request/response generalization + owned perception types + Error::SensorRejected; Wave 1 of 4 complete)"
+last_updated: "2026-07-09T14:13:48.816Z"
 last_activity: 2026-07-09
 progress:
   total_phases: 9
   completed_phases: 5
-  total_plans: 18
-  completed_plans: 18
+  total_plans: 23
+  completed_plans: 19
   percent: 56
 ---
 
@@ -25,14 +25,14 @@ See: .planning/PROJECT.md (updated 2026-06-04)
 
 ## Current Position
 
-Phase: 5 (sensor-bootstrap-deployment) — COMPLETE (live gate PASSED)
-Plan: 4 of 4 (all complete, live-verified)
-Status: All 4 plans complete and LIVE-VERIFIED. The end-of-phase live gate ran against a real disposable Azure Windows VM (2026-07-09): SC1 (NativeAOT self-contained publish, no external .NET runtime, 2,699,264 bytes / ~2.57 MiB) PASS; SC2 (RDPDR primary deploy+launch, mandatory D-5.6) PASS, measured elapsed 22.612044ms; SC3 (WinRM fallback deploy+launch) PASS, measured round trip 21.62078ms; SC4 (<1s bound) met on both paths. Six live-run bugs found and fixed: three on the C# sensor (invalid XML comment, missing AllowUnsafeBlocks, StringMarshalling Utf16→Utf8) and three on the Rust side (rdpsnd stub channel required for Windows to start the RDPDR handshake per MS-RDPEFS Appendix A footnote <1>, QueryInformation/QueryVolumeInformation IRP support, and deploy_and_launch timing fixes — session settle + chunked typing). AV/EDR and drive-redirection-GPO risks did not materialize (no exclusion/policy change needed). SENSOR-01 and SENSOR-02 are now validated; the Azure VM was torn down after the run (`rdpilot-test` RG deleted, confirmed absent).
+Phase: 6 (window-process-perception) — IN PROGRESS
+Plan: 1 of 5 complete (wave 1 of 4)
+Status: 06-01-PLAN.md complete (offline, no VM): generalized the Version/Ping/Pong-only DVC envelope into a msg_type-agnostic req_id correlation mechanism (`SensorShared::pending` now carries reply payloads; `process()` fulfils any pending req_id generically), added `MsgType::{WindowList,ProcessTree,SetForegroundWindow,LaunchProcess}` + `RdpInputEvent::Request`/`encode_request`/`build_request_frame`, defined owned public `WindowInfo`/`WindowState`/`ProcessInfo` types + crate-internal wire structs/conversions in new `perception.rs`, and added `Error::SensorRejected` (D-6.4). This is the foundation plan every other Phase 6 plan builds against (the `<wire_contract>` in 06-01-PLAN.md is now the single source of truth for the wire schema). `cargo test -p rdpilot` fully green (78 passed, 0 failed) — see `06-01-SUMMARY.md`. Requirements PERC-01/PERC-02/PERC-04/PROC-01 are deliberately NOT yet marked complete in REQUIREMENTS.md (mirrors the Phase 5 SENSOR-01/02 convention of marking only at the live gate); they'll be marked at 06-05's live gate.
 Last activity: 2026-07-09
 
 Note: Phase 3 remains `status: verifying` (pending /gsd-verify-work) in the frontmatter above; Phase 4/5 planning/execution began before that gate ran.
 
-Progress: [█████░░░░░] 56% (Phase 5: 4/4 plans complete, live gate PASSED — see 05-04-SUMMARY.md)
+Progress: [████████░░] 83% (Phase 6: 1/5 plans complete — see 06-01-SUMMARY.md)
 
 ## Performance Metrics
 
@@ -68,6 +68,7 @@ Progress: [█████░░░░░] 56% (Phase 5: 4/4 plans complete, liv
 | Phase 05 P03 | 20min | 2 tasks | 4 files |
 | Phase 05 P01 | ~55min | 3 tasks | 6 files (incl. live-gate publish + 3 live-run bug fixes) |
 | Phase 05 P04 | ~2h5min | 3 tasks | 9 files (incl. live gate + 3 live-run bug fixes) |
+| Phase 06 P01 | 25min | 2 tasks | 6 files |
 
 ## Accumulated Context
 
@@ -112,6 +113,9 @@ Recent decisions affecting current work:
 - [Phase ?]: 05-03: introduced crate::connect::SENSOR_EXE_NAME as the single source of truth for the served/launched sensor filename, referenced by both the RDPDR backend registration and Session::deploy_and_launch's launch_command() helper
 - [Phase ?]: 05-03: deploy_and_launch poll-and-retry tuned offline as LAUNCH_ATTEMPTS=3 x PINGS_PER_LAUNCH_ATTEMPT=20 (~30s total outer budget), reasoned from Phase 4's empirical ~10s WTSVirtualChannelOpenEx retry-window finding -- to be live-tuned in Plan 04 if needed
 - **Phase 5 live gate (2026-07-09, PASSED):** SENSOR-01/SENSOR-02 validated live against a real disposable Azure VM. SC1: NativeAOT win-x64 self-contained publish, 2,699,264 bytes (~2.57 MiB), no external .NET runtime dependency, SHA256 identical VM-built vs locally-retrieved (resolves D-5.3). SC2 (RDPDR primary, mandatory D-5.6) PASS, measured elapsed 22.612044ms. SC3 (WinRM fallback) PASS, measured round trip 21.62078ms. SC4 (<1s) met on both paths. StringMarshalling resolved to Utf8/ANSI -- `WTSVirtualChannelOpenEx` has no W export, `Utf16` failed silently (05-01). `rdpsnd` static channel required for Windows to even start the RDPDR handshake -- MS-RDPEFS Appendix A footnote <1>: a Windows RDP server withholds the RDPDR Server Announce Request unless `rdpsnd` is also advertised/joined; added as a join-only, non-functional stub (`crates/rdpilot/src/rdpsnd_stub.rs`, commit 405f47c). Windows' real drive-access sequence (`Create -> QueryInformation -> QueryVolumeInformation -> QueryDirectory`, issued for any path including the drive root) required implementing those two previously-NOT_SUPPORTED IRPs in `RdpilotDriveBackend` (commit d07e710). `deploy_and_launch` needed two live-diagnosed timing fixes: a one-time 3s `SESSION_SETTLE` before the first launch attempt (interactive session can still be mid-transition immediately after connect) and chunked typed launch command (avoids Run-dialog ComboBox autocomplete corrupting the typed text) (commit e2fedf1). AV/EDR did not block the sensor exe (no exclusion needed); drive-redirection GPO did not block (no policy change needed) -- both empirical Phase-5 unknowns resolved with no remediation required. See `05-01-SUMMARY.md` and `05-04-SUMMARY.md`.
+- [Phase ?]: 06-01: Generic req_id-keyed fulfilment (one non-Version match arm serves every DVC reply type) instead of a per-msg_type handler, per RESEARCH Pattern 1
+- [Phase ?]: 06-01: session.rs updated outside this plan's stated files_modified to keep the crate compiling against the generalized RdpInputEvent/pending types (Rule 3 blocking-fix, no Session::ping() behavior change)
+- [Phase ?]: 06-01: Offline verification run against the native x86_64-unknown-linux-gnu target (this session's host has no windows-gnu/MinGW toolchain); the crate has no cfg(windows) code so this is a safe substitute — the real windows-gnu build should still be re-confirmed on the pinned dev machine before a live gate
 
 ### Pending Todos
 
@@ -138,6 +142,6 @@ Phase 2 Plan 02: pre-existing rustdoc intra-doc-link warnings in config.rs (Wave
 
 ## Session Continuity
 
-Last session: 2026-07-09T13:32:46.034Z
-Stopped at: Phase 6 context gathered
-Resume file: .planning/phases/06-window-process-perception/06-CONTEXT.md
+Last session: 2026-07-09T14:13:48.811Z
+Stopped at: Completed 06-01-PLAN.md (Phase 6 wave 1 foundation: generalized DVC plumbing + owned perception types + Error::SensorRejected)
+Resume file: .planning/phases/06-window-process-perception/06-02-PLAN.md
