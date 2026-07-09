@@ -160,11 +160,11 @@ Plans:
   3. The SDK brings a specified window to the foreground (set_foreground_window) and confirms the focus change in a subsequent window list query
   4. A launch_process() call starts a remote process (e.g. notepad.exe) and the new process appears in a subsequent process tree query
 
-**Plans**: 2/5 plans executed
+**Plans**: 3/5 plans executed
 
 - [x] 06-01-PLAN.md — (wave 1) Rust DVC request/response generalization + owned perception types + Error::SensorRejected + wire contract
 - [x] 06-02-PLAN.md — (wave 2, needs 01) Four sensor-backed Session methods (window list / process tree / focus / launch) + D-6.1 per-window screenshot crop
-- [ ] 06-03-PLAN.md — (wave 2, needs 01) C# Envelope.Payload→JsonElement AOT smoke-test FIRST, then the WindowList handler (EnumWindows, no COM)
+- [x] 06-03-PLAN.md — (wave 2, needs 01) C# Envelope.Payload→JsonElement AOT smoke-test FIRST, then the WindowList handler (EnumWindows, no COM)
 - [ ] 06-04-PLAN.md — (wave 3, needs 03) C# ProcessTree (Toolhelp32, never WMI) + SetForegroundWindow + fire-and-forget CreateProcessW launch
 - [ ] 06-05-PLAN.md — (wave 4, needs 02+04) Four gated live tests (one per success criterion) + end-of-phase live gate against a real Azure VM
 
@@ -223,7 +223,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8 →
 | 3. Input Injection | 4/4 | Complete   | 2026-07-08 |
 | 4. DVC Transport Channel | 3/3 | Complete | 2026-07-09 |
 | 5. Sensor Bootstrap + Deployment | 4/4 | Complete   | 2026-07-09 |
-| 6. Window + Process Perception | 2/5 | In Progress|  |
+| 6. Window + Process Perception | 3/5 | In Progress|  |
 | 7. UIA Tree Module | 0/? | Not started | - |
 | 8. Public SDK API + WorldState | 0/? | Not started | - |
 | 9. Scripted Proof Harness | 0/? | Not started | - |
