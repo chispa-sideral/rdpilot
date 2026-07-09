@@ -761,11 +761,17 @@ fn sensor_ping_pong_under_500ms() {
         let session = rdpilot::Session::connect(&cfg).await.expect("connect");
 
         // Bounded retry loop: tolerates the responder still launching / still
-        // opening the server-side DVC channel. ~15s total budget, short sleeps
+        // opening the server-side DVC channel. Live-measured against the
+        // Phase 1 Azure VM: the WinRM-registered AtLogOn scheduled task takes
+        // ~20-30s from interactive-session creation to actually launching the
+        // responder (Task Scheduler's own logon-trigger latency, separate
+        // from the responder's own documented up-to-10s WTSVirtualChannelOpenEx
+        // retry loop, RESEARCH Pitfall 1) — so the budget was widened from an
+        // initial 15s (empirically insufficient) to 60s total, short sleeps
         // between attempts; stop at the first Ok(elapsed) — that elapsed is
         // the actual round-trip bound (SC#2), measured separately from the
         // one-time setup latency the retries absorb.
-        const RETRY_BUDGET: std::time::Duration = std::time::Duration::from_secs(15);
+        const RETRY_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
         const RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
         let deadline = std::time::Instant::now() + RETRY_BUDGET;
 
@@ -799,6 +805,8 @@ fn sensor_ping_pong_under_500ms() {
             elapsed < std::time::Duration::from_millis(500),
             "ping/pong round trip took {elapsed:?}, expected < 500ms (SC#2)"
         );
+        // Surfaced for the end-of-phase human-check record (SC#2 measurement).
+        println!("sensor_ping_pong_under_500ms: measured round trip = {elapsed:?}");
     });
 }
 

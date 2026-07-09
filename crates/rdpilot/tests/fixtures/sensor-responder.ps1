@@ -99,14 +99,32 @@ Write-Host "[sensor-responder] channel open."
 function Read-Envelope {
     # Do NOT call WTSVirtualChannelQuery to convert this handle to a raw file
     # handle — unnecessary for a synchronous script (RESEARCH Q3 Anti-Pattern).
-    # Do NOT re-frame reads — the OS-level WTS layer already presents one
-    # WTSVirtualChannelWrite as one logical unit to the paired Read call
-    # (RESEARCH "Don't Hand-Roll": server-side DVC message framing).
+    # Do NOT hand-roll DVC message REASSEMBLY (chunking across multiple reads) —
+    # the OS-level WTS layer already presents one WTSVirtualChannelWrite as one
+    # logical unit to the paired Read call (RESEARCH "Don't Hand-Roll").
+    #
+    # LIVE-VERIFY FINDING (Phase 4 live gate, D-4.2 empirical adjustment): each
+    # read is consistently prefixed with a small fixed-size binary header
+    # (observed: 6 bytes, e.g. 0x00 0x00 0x03 0x00 0x00 0x00) ahead of the JSON
+    # body — the client-side ironrdp-dvc DATA PDU framing byte(s), which this
+    # throwaway PowerShell responder is NOT positioned to fully re-parse per
+    # MS-RDPEDYC (that would be re-implementing protocol internals the SDK
+    # already owns — out of scope for a disposable test fixture, D-4.1/D-4.2).
+    # Instead of assuming byte 0 is '{' (fragile), scan forward for the first
+    # '{' in the buffer and parse JSON from there — robust regardless of the
+    # exact header width, and the header bytes are simply discarded (never
+    # part of the envelope's meaning).
     $buf = New-Object byte[] 4096
     [uint32]$bytesRead = 0
     $ok = [RdpilotWts]::WTSVirtualChannelRead($handle, 5000, $buf, $buf.Length, [ref]$bytesRead)
     if (-not $ok -or $bytesRead -eq 0) { return $null }
-    $json = [System.Text.Encoding]::UTF8.GetString($buf, 0, $bytesRead)
+    $openBraceByte = [byte][char]'{'
+    $jsonStart = [Array]::IndexOf($buf[0..($bytesRead - 1)], $openBraceByte)
+    if ($jsonStart -lt 0) {
+        Write-Host "[sensor-responder] dropped malformed envelope: no '{' found in $bytesRead byte(s)"
+        return $null
+    }
+    $json = [System.Text.Encoding]::UTF8.GetString($buf, $jsonStart, $bytesRead - $jsonStart)
     try {
         return $json | ConvertFrom-Json
     } catch {
