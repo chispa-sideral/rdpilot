@@ -242,6 +242,14 @@ internal static class Program
             {
                 WriteEnvelope(handle, BuildProcessTreeReplyEnvelope(msg.ReqId));
             }
+            else if (msg.Type == MsgType.SetForegroundWindow)
+            {
+                WriteEnvelope(handle, BuildSetForegroundWindowReplyEnvelope(msg.ReqId, msg.Payload));
+            }
+            else if (msg.Type == MsgType.LaunchProcess)
+            {
+                WriteEnvelope(handle, BuildLaunchProcessReplyEnvelope(msg.ReqId, msg.Payload));
+            }
             // Any other message type this v1 protocol doesn't define is
             // silently ignored — never crashes the loop (T-05-01, mirrors
             // the Rust processor's own unknown-type handling).
@@ -306,6 +314,72 @@ internal static class Program
             ReqId = reqId,
             Type = MsgType.ProcessTree,
             Payload = payload,
+        };
+    }
+
+    /// Build the SetForegroundWindow reply envelope (T-06-01 / D-6.4):
+    /// deserializes the request payload and calls
+    /// <see cref="WindowControl.Focus"/>, which reports success only on the
+    /// Win32 call's own nonzero return (Pitfall 5 — call-success, not
+    /// visual outcome). A missing/malformed request payload, or any
+    /// exception from the handler, degrades to a `success:false` reply
+    /// instead of throwing out of the dispatch loop (D-6.4, T-06-01).
+    private static Envelope BuildSetForegroundWindowReplyEnvelope(ulong reqId, JsonElement? payload)
+    {
+        SetForegroundWindowResponse response;
+        try
+        {
+            SetForegroundWindowRequest? request = payload?.Deserialize(EnvelopeJsonContext.Default.SetForegroundWindowRequest);
+            response = request is null
+                ? new SetForegroundWindowResponse { Success = false, Data = null, Error = "missing/malformed SetForegroundWindow request payload" }
+                : WindowControl.Focus(request);
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[rdpilot-sensor] SetForegroundWindow handler failed: {ex}");
+            response = new SetForegroundWindowResponse { Success = false, Data = null, Error = ex.Message };
+        }
+
+        JsonElement responsePayload = JsonSerializer.SerializeToElement(response, EnvelopeJsonContext.Default.SetForegroundWindowResponse);
+        return new Envelope
+        {
+            Version = ProtocolVersion.Value,
+            ReqId = reqId,
+            Type = MsgType.SetForegroundWindow,
+            Payload = responsePayload,
+        };
+    }
+
+    /// Build the LaunchProcess reply envelope (T-06-01 / D-6.4):
+    /// deserializes the request payload and calls
+    /// <see cref="ProcessLaunch.Launch"/>, which replies with the new PID
+    /// the instant `CreateProcessW` returns (D-6.2 fire-and-forget,
+    /// Pitfall 6). A missing/malformed request payload, or any exception
+    /// from the handler, degrades to a `success:false` reply instead of
+    /// throwing out of the dispatch loop (D-6.4, T-06-01).
+    private static Envelope BuildLaunchProcessReplyEnvelope(ulong reqId, JsonElement? payload)
+    {
+        LaunchProcessResponse response;
+        try
+        {
+            LaunchProcessRequest? request = payload?.Deserialize(EnvelopeJsonContext.Default.LaunchProcessRequest);
+            response = request is null
+                ? new LaunchProcessResponse { Success = false, Data = null, Error = "missing/malformed LaunchProcess request payload" }
+                : ProcessLaunch.Launch(request);
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[rdpilot-sensor] LaunchProcess handler failed: {ex}");
+            response = new LaunchProcessResponse { Success = false, Data = null, Error = ex.Message };
+        }
+
+        JsonElement responsePayload = JsonSerializer.SerializeToElement(response, EnvelopeJsonContext.Default.LaunchProcessResponse);
+        return new Envelope
+        {
+            Version = ProtocolVersion.Value,
+            ReqId = reqId,
+            Type = MsgType.LaunchProcess,
+            Payload = responsePayload,
         };
     }
 

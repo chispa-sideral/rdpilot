@@ -26,6 +26,11 @@ namespace RdpilotSensor;
 [JsonSerializable(typeof(WindowListResponse))]
 [JsonSerializable(typeof(ProcessRecord))]
 [JsonSerializable(typeof(ProcessTreeResponse))]
+[JsonSerializable(typeof(SetForegroundWindowRequest))]
+[JsonSerializable(typeof(SetForegroundWindowResponse))]
+[JsonSerializable(typeof(LaunchProcessRequest))]
+[JsonSerializable(typeof(LaunchProcessData))]
+[JsonSerializable(typeof(LaunchProcessResponse))]
 internal partial class EnvelopeJsonContext : JsonSerializerContext
 {
 }

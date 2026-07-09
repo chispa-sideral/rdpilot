@@ -67,7 +67,7 @@ internal sealed record ProcessTreeResponse
 
 // ---------------------------------------------------------------------------
 // Win32 Toolhelp32 process walk (Pattern 5). All P/Invoke declarations use
-// [LibraryImport] only (never the older attribute-based DllImport, 05-01
+// [LibraryImport] only (never the older attribute-based P/Invoke marshalling, 05-01
 // discipline) against kernel32.dll — no COM, no managed WMI query API
 // (Pitfall 2). `CloseHandle` is declared `internal` here (not `private`) so
 // ProcessLaunch.cs (Task 2, this plan) can reuse the identical P/Invoke

@@ -82,7 +82,7 @@ internal sealed record WindowListResponse
 
 // ---------------------------------------------------------------------------
 // Win32 EnumWindows handler (Task 2, this plan). All P/Invoke declarations
-// use [LibraryImport] only (never the older attribute-based DllImport, 05-01
+// use [LibraryImport] only (never the older attribute-based P/Invoke marshalling, 05-01
 // discipline) against user32.dll — no COM, no managed WMI query API
 // (RESEARCH Pitfall 2). Title/class-name buffers are fixed-size Span<char>
 // (Pitfall 3: LibraryImport cannot marshal StringBuilder) bounded to
