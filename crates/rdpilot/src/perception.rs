@@ -18,14 +18,14 @@
 //! space), matching [`crate::Rect`]'s existing contract — the C# sensor MUST
 //! NOT emit DPI-scaled logical coordinates (D-6.3).
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// A single top-level window on the remote desktop (PERC-01).
 ///
 /// Reuses [`crate::Rect`] (the existing public rectangle type from
 /// `screenshot.rs`) so callers crop a [`crate::Screenshot`] with the exact
 /// geometry a window reports, in the same coordinate space.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct WindowInfo {
     /// The native Win32 window handle (`HWND`), as a raw integer.
     pub hwnd: u64,
@@ -45,7 +45,8 @@ pub struct WindowInfo {
 }
 
 /// A window's visibility/restore state (PERC-01).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum WindowState {
     /// Neither minimized nor maximized.
     Normal,
@@ -60,7 +61,7 @@ pub enum WindowState {
 /// `pid`/`parent_pid`/`name`/`path` are the D-6.3 hard-requirement floor;
 /// `command_line`/`owner` are best-effort extras that gracefully degrade to
 /// `None` when the sensor cannot retrieve them for a given process (D-6.3).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ProcessInfo {
     /// The process id.
     pub pid: u32,
@@ -195,7 +196,7 @@ impl ProcessInfoWire {
 /// has no field here. `depth`/`parent_id` are flat-array bookkeeping fields
 /// for a `TreeScope_Children`-only walk (depth is ~0/1) that future-proof
 /// the wire shape for a later, deeper-tree phase (D-7.4).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct UiaElement {
     /// The element's stable-ish identity: the UIA `RuntimeId` int array
     /// joined to a single string (D-7.2). Chosen over `AutomationId`, which
@@ -480,5 +481,97 @@ mod tests {
         assert_eq!(control_type_to_role(50032), "Window");
         assert_eq!(control_type_to_role(50004), "Edit");
         assert_eq!(control_type_to_role(99999), "Unknown");
+    }
+
+    /// `WindowState::Minimized` serializes as the lowercase string
+    /// `"minimized"`, matching the existing `WindowStateWire`
+    /// `#[serde(rename_all = "lowercase")]` deserialization convention.
+    #[test]
+    fn window_state_serializes_lowercase() {
+        assert_eq!(
+            serde_json::to_value(WindowState::Minimized).expect("WindowState serializes"),
+            serde_json::json!("minimized")
+        );
+        assert_eq!(
+            serde_json::to_value(WindowState::Normal).expect("WindowState serializes"),
+            serde_json::json!("normal")
+        );
+        assert_eq!(
+            serde_json::to_value(WindowState::Maximized).expect("WindowState serializes"),
+            serde_json::json!("maximized")
+        );
+    }
+
+    /// A fully-populated `WindowInfo` serializes without error and exposes
+    /// its documented fields (D-8.4).
+    #[test]
+    fn window_info_serializes_with_expected_fields() {
+        let window = WindowInfo {
+            hwnd: 65536,
+            title: "Untitled - Notepad".to_string(),
+            rect: crate::Rect {
+                x: 10,
+                y: 20,
+                w: 800,
+                h: 600,
+            },
+            z_order: 0,
+            state: WindowState::Minimized,
+            class_name: "Notepad".to_string(),
+            pid: 4242,
+        };
+        let value = serde_json::to_value(&window).expect("WindowInfo serializes");
+        let obj = value.as_object().expect("WindowInfo serializes as a JSON object");
+        assert_eq!(obj.get("hwnd").and_then(|v| v.as_u64()), Some(65536));
+        assert_eq!(obj.get("state").and_then(|v| v.as_str()), Some("minimized"));
+        assert_eq!(obj.get("pid").and_then(|v| v.as_u64()), Some(4242));
+    }
+
+    /// A fully-populated `ProcessInfo` serializes without error and exposes
+    /// its documented fields (D-8.4).
+    #[test]
+    fn process_info_serializes_with_expected_fields() {
+        let process = ProcessInfo {
+            pid: 4242,
+            parent_pid: 4,
+            name: "notepad.exe".to_string(),
+            path: "C:\\Windows\\System32\\notepad.exe".to_string(),
+            command_line: None,
+            owner: Some("SYSTEM".to_string()),
+        };
+        let value = serde_json::to_value(&process).expect("ProcessInfo serializes");
+        let obj = value.as_object().expect("ProcessInfo serializes as a JSON object");
+        assert_eq!(obj.get("pid").and_then(|v| v.as_u64()), Some(4242));
+        assert_eq!(obj.get("name").and_then(|v| v.as_str()), Some("notepad.exe"));
+        assert_eq!(obj.get("owner").and_then(|v| v.as_str()), Some("SYSTEM"));
+    }
+
+    /// A fully-populated `UiaElement` serializes without error and exposes
+    /// its documented fields, including `id`/`role`/`bbox` (D-8.4).
+    #[test]
+    fn uia_element_serializes_with_expected_fields() {
+        let element = UiaElement {
+            id: "42--3-7".to_string(),
+            role: "Button".to_string(),
+            name: "OK".to_string(),
+            bbox: crate::Rect {
+                x: 10,
+                y: 20,
+                w: 80,
+                h: 24,
+            },
+            enabled: true,
+            visible: true,
+            focusable: true,
+            focused: false,
+            depth: 1,
+            parent_id: "42--3".to_string(),
+        };
+        let value = serde_json::to_value(&element).expect("UiaElement serializes");
+        let obj = value.as_object().expect("UiaElement serializes as a JSON object");
+        assert_eq!(obj.get("id").and_then(|v| v.as_str()), Some("42--3-7"));
+        assert_eq!(obj.get("role").and_then(|v| v.as_str()), Some("Button"));
+        let bbox = obj.get("bbox").and_then(|v| v.as_object()).expect("bbox is an object");
+        assert_eq!(bbox.get("w").and_then(|v| v.as_u64()), Some(80));
     }
 }

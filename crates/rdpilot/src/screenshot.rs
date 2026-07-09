@@ -12,6 +12,7 @@ use image::codecs::png::PngEncoder;
 use image::{ExtendedColorType, ImageEncoder};
 
 use crate::error::{Error, Result};
+use serde::Serialize;
 
 /// Bytes per pixel in the RGBA32 framebuffer (R, G, B, A — 8 bits each).
 const BYTES_PER_PIXEL: usize = 4;
@@ -21,13 +22,20 @@ const BYTES_PER_PIXEL: usize = 4;
 /// `rgba` is row-major, `width * height * 4` bytes, with no stride padding —
 /// exactly the layout IronRDP's `DecodedImage` produces for the bitmap / RLE /
 /// RDP6 / RemoteFX paths (no YUV conversion needed).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub struct Screenshot {
     /// Image width, in pixels.
     pub width: u32,
     /// Image height, in pixels.
     pub height: u32,
     /// Tightly-packed RGBA32 pixel data (`width * height * 4` bytes).
+    ///
+    /// Excluded from serde output (`#[serde(skip)]`, D-8.4, threat T-08-02):
+    /// a serialized `Screenshot` carries only `width`/`height` so downstream
+    /// JSON consumers (a later `WorldState`) never see a raw pixel dump.
+    /// `Screenshot` deliberately does not derive `Deserialize` — `to_png()`
+    /// remains the only path bytes leave this type.
+    #[serde(skip)]
     pub rgba: Vec<u8>,
 }
 
@@ -35,7 +43,7 @@ pub struct Screenshot {
 ///
 /// The caller supplies the rectangle (CAP-01 #3); deriving real window geometry
 /// is a later phase.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct Rect {
     /// Origin x (left edge), in pixels.
     pub x: u32,
@@ -239,5 +247,34 @@ mod tests {
     fn from_rgba_rejects_mismatched_buffer() {
         let bad = Screenshot::from_rgba(2, 2, vec![0; 3]);
         assert!(matches!(bad, Err(Error::Decode(_))));
+    }
+
+    #[test]
+    fn screenshot_serializes_dims_only_never_rgba() {
+        let img = Screenshot::from_rgba(2, 2, vec![0; 2 * 2 * 4]).expect("valid buffer");
+        let value = serde_json::to_value(&img).expect("Screenshot serializes");
+        let obj = value.as_object().expect("Screenshot serializes as a JSON object");
+        assert_eq!(obj.get("width").and_then(|v| v.as_u64()), Some(2));
+        assert_eq!(obj.get("height").and_then(|v| v.as_u64()), Some(2));
+        assert!(
+            !obj.contains_key("rgba"),
+            "Screenshot serde output must never carry the rgba buffer (D-8.4, T-08-02)"
+        );
+    }
+
+    #[test]
+    fn rect_serializes_all_four_fields() {
+        let rect = Rect {
+            x: 1,
+            y: 2,
+            w: 3,
+            h: 4,
+        };
+        let value = serde_json::to_value(rect).expect("Rect serializes");
+        let obj = value.as_object().expect("Rect serializes as a JSON object");
+        assert_eq!(obj.get("x").and_then(|v| v.as_u64()), Some(1));
+        assert_eq!(obj.get("y").and_then(|v| v.as_u64()), Some(2));
+        assert_eq!(obj.get("w").and_then(|v| v.as_u64()), Some(3));
+        assert_eq!(obj.get("h").and_then(|v| v.as_u64()), Some(4));
     }
 }
