@@ -2,16 +2,16 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-status: completed
-stopped_at: "Completed 06-01-PLAN.md (Phase 6 window+process perception — Rust DVC request/response generalization + owned perception types + Error::SensorRejected; Wave 1 of 4 complete)"
-last_updated: "2026-07-09T16:45:34.655Z"
+status: verifying
+stopped_at: "Phase 6 window+process perception COMPLETE — live gate PASSED (all 4 SC), VM torn down"
+last_updated: "2026-07-09T16:48:07.000Z"
 last_activity: 2026-07-09
 progress:
   total_phases: 9
-  completed_phases: 5
+  completed_phases: 6
   total_plans: 23
   completed_plans: 23
-  percent: 56
+  percent: 67
 ---
 
 # Project State
@@ -21,18 +21,18 @@ progress:
 See: .planning/PROJECT.md (updated 2026-06-04)
 
 **Core value:** A local AI agent can connect to a remote Windows desktop over RDP and read/inspect a program that is only reachable via RDP — using both screenshots and structured accessibility data, without installing or running the agent itself on the remote machine.
-**Current focus:** Phase 6 — window-process-perception
+**Current focus:** Phase 7 — uia-tree-module
 
 ## Current Position
 
-Phase: 6 (window-process-perception) — IN PROGRESS
-Plan: 5 of 5 complete (wave 1 of 4)
-Status: 06-01-PLAN.md complete (offline, no VM): generalized the Version/Ping/Pong-only DVC envelope into a msg_type-agnostic req_id correlation mechanism (`SensorShared::pending` now carries reply payloads; `process()` fulfils any pending req_id generically), added `MsgType::{WindowList,ProcessTree,SetForegroundWindow,LaunchProcess}` + `RdpInputEvent::Request`/`encode_request`/`build_request_frame`, defined owned public `WindowInfo`/`WindowState`/`ProcessInfo` types + crate-internal wire structs/conversions in new `perception.rs`, and added `Error::SensorRejected` (D-6.4). This is the foundation plan every other Phase 6 plan builds against (the `<wire_contract>` in 06-01-PLAN.md is now the single source of truth for the wire schema). `cargo test -p rdpilot` fully green (78 passed, 0 failed) — see `06-01-SUMMARY.md`. Requirements PERC-01/PERC-02/PERC-04/PROC-01 are deliberately NOT yet marked complete in REQUIREMENTS.md (mirrors the Phase 5 SENSOR-01/02 convention of marking only at the live gate); they'll be marked at 06-05's live gate.
+Phase: 6 (window-process-perception) — COMPLETE (live gate PASSED)
+Plan: 5 of 5 complete, live-verified
+Status: All 5 plans complete and LIVE-VERIFIED. The end-of-phase live gate ran against a real disposable Azure Windows VM (2026-07-09): SC1/PERC-02 (`window_list_returns_visible_windows`) PASS — non-empty window list with valid HWND/title/rect/z-order/state/pid, rect within `desktop_size()`; SC2/PERC-01 (`process_tree_returns_pid_parent_name_path`) PASS — non-empty process list with nonzero pid/name and at least one resolved path; SC3/PERC-04 (`set_foreground_window_confirmed_by_followup_query`) PASS — confirmed on the first poll attempt after live fixes; SC4/PROC-01 (`launch_process_appears_in_followup_process_tree`) PASS — launched PID appeared in a follow-up process-tree query. CAP-02 (per-window cropped screenshot) also confirmed via soft smoke test. Three live-run bugs found and fixed: (1) `session.rs`'s `deploy_and_launch` now unconditionally `taskkill`s any already-running sensor before copy+start — Windows reconnects a disconnected interactive RDP session rather than creating a fresh one, so a stale process from a prior test blocked the new DVC channel (commit `2982994`); (2) `sensor/WindowControl.cs`'s `Focus()` now wraps `SetForegroundWindow` in `AttachThreadInput` to defeat Windows' foreground-lock-timeout restriction — a bare call returned TRUE with no Z-order effect (commit `84c3986`); (3) `live_session.rs`'s SC#3 test now confirms focus via the minimum z_order among TITLED windows only, not the global minimum — always-on-top shell chrome (the taskbar) legitimately outranks any normal app window regardless of focus (commit `b516b6f`). win-x64 NativeAOT publish proven ON the VM itself (via `az vm run-command invoke`, since WinRM Negotiate/NTLM auth failed from this Linux host): 2,866,176 bytes, zero AOT source-gen/trimming warnings, SHA256-verified identical VM-built vs. locally-retrieved. VM torn down and confirmed absent (`az group exists -n rdpilot-test` => false). PERC-01/PERC-02/PERC-04/PROC-01/CAP-02 are now marked complete in REQUIREMENTS.md — see `06-05-SUMMARY.md`.
 Last activity: 2026-07-09
 
-Note: Phase 3 remains `status: verifying` (pending /gsd-verify-work) in the frontmatter above; Phase 4/5 planning/execution began before that gate ran.
+Note: Phase 3 remains `status: verifying` (pending /gsd-verify-work) in the frontmatter above; Phase 4/5/6 planning/execution began before that gate ran.
 
-Progress: [████████░░] 83% (Phase 6: 1/5 plans complete — see 06-01-SUMMARY.md)
+Progress: [██████░░░░] 67% (Phase 6: 5/5 plans complete, live gate PASSED — see 06-05-SUMMARY.md)
 
 ## Performance Metrics
 
@@ -125,6 +125,7 @@ Recent decisions affecting current work:
 - [Phase ?]: Envelope.Payload retyped object? -> JsonElement? (RESEARCH Pitfall 1/Pattern 6), proven under a real NativeAOT publish (linux-x64 surrogate, win-x64 blocked by cross-OS AOT compile limitation) before any Win32 handler code was written
 - [Phase ?]: WindowList handler implemented: EnumWindows via static [UnmanagedCallersOnly] + delegate* unmanaged<> + GCHandle accumulator, [LibraryImport]-only user32.dll surface, bounded stackalloc title/class buffers, z_order = enumeration index, success:false degrade on any exception (D-6.4)
 - [Phase ?]: PROCESSENTRY32W's szExeFile embedded string field must be a blittable 'unsafe fixed char[260]' buffer, not MarshalAs(ByValTStr) -- the latter fails SYSLIB1051 under source-generated LibraryImport
+- [Phase ?]: 06-04: ProcessTree handler enumerates via CreateToolhelp32Snapshot/Process32FirstW/Process32NextW (plain [LibraryImport] against kernel32.dll) -- NEVER WMI/System.Management/ManagementObjectSearcher; full image path resolved best-effort per-pid via OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION) + QueryFullProcessImageNameW, falling back to empty string on per-process failure rather than failing the whole call; command_line/owner deliberately deferred to null (D-6.3, not a hard success criterion)
 - [Phase ?]: Phase 6 live gate (2026-07-09, PASSED): PERC-01/PERC-02/PERC-04/PROC-01/CAP-02 validated live against a real disposable Azure VM. win-x64 NativeAOT builds run ON the VM itself via az vm run-command invoke (WinRM Negotiate/NTLM auth failed from this Linux host — missing gssntlmssp GSS mechanism plugin; Basic auth rejected server-side); a short-lived Azure Storage blob SAS relay moved the built exe back. Three live-run bugs fixed: (1) launch_command now taskkills any already-running sensor before copy+start — Windows reconnects a disconnected interactive RDP session rather than creating a fresh one, so a stale process from a prior test blocked the new DVC channel; (2) SetForegroundWindow now wraps the call in AttachThreadInput to defeat Windows' foreground-lock-timeout restriction (a bare call returned TRUE with no Z-order effect); (3) the SC#3 test now confirms focus via the minimum z_order among TITLED windows only, not the global minimum — always-on-top shell chrome (the taskbar) legitimately outranks any normal app window regardless of focus. All four gated tests pass; VM torn down and confirmed (az group exists -n rdpilot-test => false).
 
 ### Pending Todos
@@ -152,6 +153,6 @@ Phase 2 Plan 02: pre-existing rustdoc intra-doc-link warnings in config.rs (Wave
 
 ## Session Continuity
 
-Last session: 2026-07-09T16:45:34.649Z
-Stopped at: Completed 06-01-PLAN.md (Phase 6 wave 1 foundation: generalized DVC plumbing + owned perception types + Error::SensorRejected)
-Resume file: .planning/phases/06-window-process-perception/06-02-PLAN.md
+Last session: 2026-07-09T16:48:07.000Z
+Stopped at: Phase 6 (Window + Process Perception) COMPLETE — live gate PASSED (SC1-SC4 all met); PERC-01/PERC-02/PERC-04/PROC-01/CAP-02 marked complete in REQUIREMENTS.md
+Resume file: .planning/phases/06-window-process-perception/06-05-SUMMARY.md (next: plan Phase 7 — UIA Tree Module)
