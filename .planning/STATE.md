@@ -2,15 +2,15 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-status: executing
+status: completed
 stopped_at: "Completed 06-01-PLAN.md (Phase 6 window+process perception — Rust DVC request/response generalization + owned perception types + Error::SensorRejected; Wave 1 of 4 complete)"
-last_updated: "2026-07-09T14:13:48.816Z"
+last_updated: "2026-07-09T14:23:09.568Z"
 last_activity: 2026-07-09
 progress:
   total_phases: 9
   completed_phases: 5
   total_plans: 23
-  completed_plans: 19
+  completed_plans: 20
   percent: 56
 ---
 
@@ -26,7 +26,7 @@ See: .planning/PROJECT.md (updated 2026-06-04)
 ## Current Position
 
 Phase: 6 (window-process-perception) — IN PROGRESS
-Plan: 1 of 5 complete (wave 1 of 4)
+Plan: 2 of 5 complete (wave 1 of 4)
 Status: 06-01-PLAN.md complete (offline, no VM): generalized the Version/Ping/Pong-only DVC envelope into a msg_type-agnostic req_id correlation mechanism (`SensorShared::pending` now carries reply payloads; `process()` fulfils any pending req_id generically), added `MsgType::{WindowList,ProcessTree,SetForegroundWindow,LaunchProcess}` + `RdpInputEvent::Request`/`encode_request`/`build_request_frame`, defined owned public `WindowInfo`/`WindowState`/`ProcessInfo` types + crate-internal wire structs/conversions in new `perception.rs`, and added `Error::SensorRejected` (D-6.4). This is the foundation plan every other Phase 6 plan builds against (the `<wire_contract>` in 06-01-PLAN.md is now the single source of truth for the wire schema). `cargo test -p rdpilot` fully green (78 passed, 0 failed) — see `06-01-SUMMARY.md`. Requirements PERC-01/PERC-02/PERC-04/PROC-01 are deliberately NOT yet marked complete in REQUIREMENTS.md (mirrors the Phase 5 SENSOR-01/02 convention of marking only at the live gate); they'll be marked at 06-05's live gate.
 Last activity: 2026-07-09
 
@@ -69,6 +69,7 @@ Progress: [████████░░] 83% (Phase 6: 1/5 plans complete — 
 | Phase 05 P01 | ~55min | 3 tasks | 6 files (incl. live-gate publish + 3 live-run bug fixes) |
 | Phase 05 P04 | ~2h5min | 3 tasks | 9 files (incl. live gate + 3 live-run bug fixes) |
 | Phase 06 P01 | 25min | 2 tasks | 6 files |
+| Phase 06 P02 | 35min | 2 tasks | 1 files |
 
 ## Accumulated Context
 
@@ -116,6 +117,8 @@ Recent decisions affecting current work:
 - [Phase ?]: 06-01: Generic req_id-keyed fulfilment (one non-Version match arm serves every DVC reply type) instead of a per-msg_type handler, per RESEARCH Pattern 1
 - [Phase ?]: 06-01: session.rs updated outside this plan's stated files_modified to keep the crate compiling against the generalized RdpInputEvent/pending types (Rule 3 blocking-fix, no Session::ping() behavior change)
 - [Phase ?]: 06-01: Offline verification run against the native x86_64-unknown-linux-gnu target (this session's host has no windows-gnu/MinGW toolchain); the crate has no cfg(windows) code so this is a safe substitute — the real windows-gnu build should still be re-confirmed on the pinned dev machine before a live gate
+- [Phase ?]: 06-02: get_window_list/get_process_tree/set_foreground_window/launch_process share one sensor_request() helper mirroring ping()'s round-trip shape with D-6.4 success/data vs success:false->SensorRejected branching
+- [Phase ?]: 06-02: screenshot_window delegates to a pure crop_to_window(shot, window) = shot.crop(window.rect) helper -- no coordinate remap, no sensor round trip (D-6.1)
 
 ### Pending Todos
 
@@ -142,6 +145,6 @@ Phase 2 Plan 02: pre-existing rustdoc intra-doc-link warnings in config.rs (Wave
 
 ## Session Continuity
 
-Last session: 2026-07-09T14:13:48.811Z
+Last session: 2026-07-09T14:23:09.563Z
 Stopped at: Completed 06-01-PLAN.md (Phase 6 wave 1 foundation: generalized DVC plumbing + owned perception types + Error::SensorRejected)
 Resume file: .planning/phases/06-window-process-perception/06-02-PLAN.md
