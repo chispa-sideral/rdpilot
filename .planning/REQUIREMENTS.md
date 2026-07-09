@@ -38,7 +38,7 @@ Stack (from research): IronRDP 0.14 (Rust) client core + primary language; C# .N
 
 ### Remote Sensor
 
-- [ ] **SENSOR-01**: A thin C# .NET 8 NativeAOT sensor helper exposes the structured-perception queries on the target
+- [x] **SENSOR-01**: A thin C# .NET 8 NativeAOT sensor helper exposes the structured-perception queries on the target
 - [x] **SENSOR-02**: The SDK can bootstrap/deploy and launch the sensor on the target (drive-redirection copy primary, WinRM fallback)
 - [x] **SENSOR-03**: A DVC request/response transport channel carries structured-perception data between the SDK and the sensor
 
@@ -85,8 +85,8 @@ Stack (from research): IronRDP 0.14 (Rust) client core + primary language; C# .N
 | INPUT-01 | Phase 3: Input Injection | Complete — proven live in Phase 3 Plan 04, 10/10 tests pass 2026-07-08 |
 | INPUT-02 | Phase 3: Input Injection | Complete — proven live in Phase 3 Plan 04, 10/10 tests pass 2026-07-08 |
 | SENSOR-03 | Phase 4: DVC Transport Channel | Complete — Plans 01-03 code-complete (envelope, RdpilotSensorProcessor, Session::ping(), throwaway WTS responder, WinRM deploy helper, gated live test) and LIVE-VERIFIED against a real disposable Azure Windows VM: `sensor_ping_pong_under_500ms` PASSED, measured round trip 165ms (SC#2), Version handshake proven first (SC#3 positive). Two bugs found and fixed during the live run: a session_loop.rs fix (transient DVC-not-ready Ping no longer kills the whole session) and a sensor-responder.ps1 fixture fix (JSON-start scan past a DVC framing prefix); test's outer setup-retry budget widened 15s→60s (empirically-measured AtLogOn scheduled-task latency). VM torn down after the run (`rdpilot-test` RG deleted). |
-| SENSOR-01 | Phase 5: Sensor Bootstrap + Deployment | Pending |
-| SENSOR-02 | Phase 5: Sensor Bootstrap + Deployment | Complete |
+| SENSOR-01 | Phase 5: Sensor Bootstrap + Deployment | Complete — `rdpilot-sensor.exe` built and LIVE-VERIFIED: NativeAOT win-x64 self-contained publish (2,699,264 bytes / ~2.57 MiB), no external .NET runtime dependency, runs with none installed; SHA256 identical VM-built vs locally-retrieved. See `05-01-SUMMARY.md`. |
+| SENSOR-02 | Phase 5: Sensor Bootstrap + Deployment | Complete — both deployment paths LIVE-VERIFIED against a real disposable Azure Windows VM (2026-07-09): RDPDR primary (mandatory, D-5.6) measured 22.612044ms; WinRM fallback measured 21.62078ms; both well under the 1s SC4 bound. Required an `rdpsnd` stub static channel (MS-RDPEFS Appendix A footnote <1>) for Windows to initiate the RDPDR handshake at all, plus QueryInformation/QueryVolumeInformation IRP support and launch-timing fixes (session settle + chunked typing). See `05-04-SUMMARY.md`. |
 | PERC-01 | Phase 6: Window + Process Perception | Pending |
 | PERC-02 | Phase 6: Window + Process Perception | Pending |
 | PERC-04 | Phase 6: Window + Process Perception | Pending |

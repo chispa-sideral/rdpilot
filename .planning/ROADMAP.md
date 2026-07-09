@@ -17,7 +17,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 - [x] **Phase 2: RDP Session + Framebuffer Core** - Connect, authenticate, keep session rendered, and produce full-desktop screenshots — all 5 success criteria proven live (canonical run 5/5 pass on a real Azure VM with the full 10-min idle, 2026-06-05; SESS-01/SESS-02/CAP-01)
 - [x] **Phase 3: Input Injection** - Inject mouse and keyboard actions at remote coordinates with a locked DPI contract (completed 2026-07-08)
 - [x] **Phase 4: DVC Transport Channel** - Establish and verify the RDPILOT_SENSOR dynamic virtual channel before any sensor modules exist — all 3 success criteria proven live (canonical run: sensor_ping_pong_under_500ms PASSED, measured round trip 165ms, on a real disposable Azure VM, 2026-07-09)
-- [ ] **Phase 5: Sensor Bootstrap + Deployment** - Build the C# NativeAOT sensor helper and deploy it onto a real target via drive redirection or WinRM
+- [x] **Phase 5: Sensor Bootstrap + Deployment** - Build the C# NativeAOT sensor helper and deploy it onto a real target via drive redirection or WinRM — all 4 success criteria proven live (canonical run: RDPDR primary 22.61ms, WinRM fallback 21.62ms, both < 1s bound, NativeAOT binary 2.57 MiB, on a real disposable Azure VM, 2026-07-09)
 - [ ] **Phase 6: Window + Process Perception** - Retrieve window list, process tree, per-window screenshots, focus control, and remote process launch over DVC
 - [ ] **Phase 7: UIA Tree Module** - Add the UI Automation sensor module and return a flat UiaElement[] over DVC
 - [ ] **Phase 8: Public SDK API + WorldState** - Expose a clean typed Session API and a coherent WorldState snapshot correlating framebuffer, windows, and UIA
@@ -139,14 +139,14 @@ Plans:
   3. When WinRM is available, the WinRM bootstrap path also successfully deploys and launches the sensor
   4. The deployed sensor opens the RDPILOT_SENSOR DVC channel and responds to a ping within 1 second of launch
 
-**Plans**: 2/4 plans executed
+**Plans**: 4/4 plans complete; live gate PASSED (canonical run 2026-07-09)
 
 Plans:
 
-- [ ] 05-01-PLAN.md — C# .NET 8 NativeAOT rdpilot-sensor.exe (Version/Ping/Pong server, SENSOR-01 / SC1)
+- [x] 05-01-PLAN.md — C# .NET 8 NativeAOT rdpilot-sensor.exe (Version/Ping/Pong server, SENSOR-01 / SC1). **Live SC1 PASSED**: self-contained publish, 2,699,264 bytes (~2.57 MiB), no external .NET runtime dependency.
 - [x] 05-02-PLAN.md — Rust foundation: Key::Win + minimal RdpilotDriveBackend + ironrdp-rdpdr dep (SENSOR-02 / SC2 foundation)
 - [x] 05-03-PLAN.md — RDPDR static-channel registration + Session::deploy_and_launch Win+R poll-and-retry (SENSOR-02 / SC2, SC4)
-- [ ] 05-04-PLAN.md — WinRM fallback fixture + both gated live tests + throwaway cleanup + live gate (SC2/SC3/SC4, D-5.7)
+- [x] 05-04-PLAN.md — WinRM fallback fixture + both gated live tests + throwaway cleanup + live gate (SC2/SC3/SC4, D-5.7). **Live gate PASSED** (2026-07-09): SC2 (RDPDR primary, mandatory) measured 22.612044ms; SC3 (WinRM fallback) measured 21.62078ms; SC4 (<1s) met on both. Bugs found and fixed live: rdpsnd stub channel required for Windows to start the RDPDR handshake (MS-RDPEFS Appendix A footnote <1>), QueryInformation/QueryVolumeInformation IRP support, deploy_and_launch timing fixes (session settle + chunked typing). AV/EDR and drive-redirection GPO risks did not materialize. VM torn down after the run (`rdpilot-test` RG deleted).
 
 ### Phase 6: Window + Process Perception
 
@@ -216,7 +216,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8 →
 | 2. RDP Session + Framebuffer Core | 3/3 | Complete    | 2026-06-05 |
 | 3. Input Injection | 4/4 | Complete   | 2026-07-08 |
 | 4. DVC Transport Channel | 3/3 | Complete | 2026-07-09 |
-| 5. Sensor Bootstrap + Deployment | 2/4 | In Progress|  |
+| 5. Sensor Bootstrap + Deployment | 4/4 | Complete   | 2026-07-09 |
 | 6. Window + Process Perception | 0/? | Not started | - |
 | 7. UIA Tree Module | 0/? | Not started | - |
 | 8. Public SDK API + WorldState | 0/? | Not started | - |

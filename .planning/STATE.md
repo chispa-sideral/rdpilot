@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: verifying
-stopped_at: Phase 4 DVC transport channel COMPLETE — live gate PASSED against a real Azure VM (sensor_ping_pong_under_500ms, 165ms measured round trip); SENSOR-03 validated
-last_updated: "2026-07-09T10:52:24.920Z"
+stopped_at: Phase 5 Sensor Bootstrap + Deployment COMPLETE — live gate PASSED against a real Azure VM (RDPDR primary 22.61ms, WinRM fallback 21.62ms, both < 1s SC4 bound); SENSOR-01/SENSOR-02 validated
+last_updated: "2026-07-09T15:05:00.000Z"
 last_activity: 2026-07-09
 progress:
   total_phases: 9
-  completed_phases: 4
+  completed_phases: 5
   total_plans: 18
-  completed_plans: 16
-  percent: 44
+  completed_plans: 18
+  percent: 56
 ---
 
 # Project State
@@ -21,18 +21,18 @@ progress:
 See: .planning/PROJECT.md (updated 2026-06-04)
 
 **Core value:** A local AI agent can connect to a remote Windows desktop over RDP and read/inspect a program that is only reachable via RDP — using both screenshots and structured accessibility data, without installing or running the agent itself on the remote machine.
-**Current focus:** Phase 4 — dvc-transport-channel
+**Current focus:** Phase 6 — window-process-perception
 
 ## Current Position
 
-Phase: 4 (dvc-transport-channel) — COMPLETE (live gate PASSED)
-Plan: 3 of 3 (all complete, live-verified)
-Status: All 3 plans complete and LIVE-VERIFIED. The end-of-phase live human-check ran against a real disposable Azure Windows VM (2026-07-09): `sensor_ping_pong_under_500ms` PASSED with a measured round trip of 165ms (SC#2), and the Version handshake was proven to precede and gate the successful ping (SC#3 positive path). Two genuine bugs were found and fixed during the live run: (1) `session_loop.rs` — a transient "DVC not yet open" condition on a Ping was fatally propagated via `?` and killed the entire session-loop thread instead of just that call; (2) `sensor-responder.ps1` — `WTSVirtualChannelRead` consistently returned a small fixed-size binary prefix ahead of the JSON envelope that the responder wasn't stripping. The live test's outer setup-retry budget was also widened 15s→60s based on empirically-measured AtLogOn scheduled-task latency. SENSOR-03 is now validated; the Azure VM was torn down after the run (`rdpilot-test` RG deleted, confirmed absent).
+Phase: 5 (sensor-bootstrap-deployment) — COMPLETE (live gate PASSED)
+Plan: 4 of 4 (all complete, live-verified)
+Status: All 4 plans complete and LIVE-VERIFIED. The end-of-phase live gate ran against a real disposable Azure Windows VM (2026-07-09): SC1 (NativeAOT self-contained publish, no external .NET runtime, 2,699,264 bytes / ~2.57 MiB) PASS; SC2 (RDPDR primary deploy+launch, mandatory D-5.6) PASS, measured elapsed 22.612044ms; SC3 (WinRM fallback deploy+launch) PASS, measured round trip 21.62078ms; SC4 (<1s bound) met on both paths. Six live-run bugs found and fixed: three on the C# sensor (invalid XML comment, missing AllowUnsafeBlocks, StringMarshalling Utf16→Utf8) and three on the Rust side (rdpsnd stub channel required for Windows to start the RDPDR handshake per MS-RDPEFS Appendix A footnote <1>, QueryInformation/QueryVolumeInformation IRP support, and deploy_and_launch timing fixes — session settle + chunked typing). AV/EDR and drive-redirection-GPO risks did not materialize (no exclusion/policy change needed). SENSOR-01 and SENSOR-02 are now validated; the Azure VM was torn down after the run (`rdpilot-test` RG deleted, confirmed absent).
 Last activity: 2026-07-09
 
-Note: Phase 3 remains `status: verifying` (pending /gsd-verify-work) in the frontmatter above; Phase 4 planning/execution began before that gate ran.
+Note: Phase 3 remains `status: verifying` (pending /gsd-verify-work) in the frontmatter above; Phase 4/5 planning/execution began before that gate ran.
 
-Progress: [████░░░░░░] 44% (Phase 4: 3/3 plans complete, live gate PASSED — see 04-03-SUMMARY.md)
+Progress: [█████░░░░░] 56% (Phase 5: 4/4 plans complete, live gate PASSED — see 05-04-SUMMARY.md)
 
 ## Performance Metrics
 
@@ -66,6 +66,8 @@ Progress: [████░░░░░░] 44% (Phase 4: 3/3 plans complete, liv
 | Phase 04 P03 | ~30min | 2 tasks | 3 files (offline code only; live gate pending) |
 | Phase 05 P02 | 15min | 3 tasks | 5 files |
 | Phase 05 P03 | 20min | 2 tasks | 4 files |
+| Phase 05 P01 | ~55min | 3 tasks | 6 files (incl. live-gate publish + 3 live-run bug fixes) |
+| Phase 05 P04 | ~2h5min | 3 tasks | 9 files (incl. live gate + 3 live-run bug fixes) |
 
 ## Accumulated Context
 
@@ -109,6 +111,7 @@ Recent decisions affecting current work:
 - [Phase ?]: 05-03: Rdpdr::process() self-dispatches inbound MS-RDPEFS IRPs to the registered RdpdrBackend internally -- ActiveStage::process drives the RDPDR static channel automatically, exactly like the existing drdynvc channel; no session_loop.rs change was needed
 - [Phase ?]: 05-03: introduced crate::connect::SENSOR_EXE_NAME as the single source of truth for the served/launched sensor filename, referenced by both the RDPDR backend registration and Session::deploy_and_launch's launch_command() helper
 - [Phase ?]: 05-03: deploy_and_launch poll-and-retry tuned offline as LAUNCH_ATTEMPTS=3 x PINGS_PER_LAUNCH_ATTEMPT=20 (~30s total outer budget), reasoned from Phase 4's empirical ~10s WTSVirtualChannelOpenEx retry-window finding -- to be live-tuned in Plan 04 if needed
+- **Phase 5 live gate (2026-07-09, PASSED):** SENSOR-01/SENSOR-02 validated live against a real disposable Azure VM. SC1: NativeAOT win-x64 self-contained publish, 2,699,264 bytes (~2.57 MiB), no external .NET runtime dependency, SHA256 identical VM-built vs locally-retrieved (resolves D-5.3). SC2 (RDPDR primary, mandatory D-5.6) PASS, measured elapsed 22.612044ms. SC3 (WinRM fallback) PASS, measured round trip 21.62078ms. SC4 (<1s) met on both paths. StringMarshalling resolved to Utf8/ANSI -- `WTSVirtualChannelOpenEx` has no W export, `Utf16` failed silently (05-01). `rdpsnd` static channel required for Windows to even start the RDPDR handshake -- MS-RDPEFS Appendix A footnote <1>: a Windows RDP server withholds the RDPDR Server Announce Request unless `rdpsnd` is also advertised/joined; added as a join-only, non-functional stub (`crates/rdpilot/src/rdpsnd_stub.rs`, commit 405f47c). Windows' real drive-access sequence (`Create -> QueryInformation -> QueryVolumeInformation -> QueryDirectory`, issued for any path including the drive root) required implementing those two previously-NOT_SUPPORTED IRPs in `RdpilotDriveBackend` (commit d07e710). `deploy_and_launch` needed two live-diagnosed timing fixes: a one-time 3s `SESSION_SETTLE` before the first launch attempt (interactive session can still be mid-transition immediately after connect) and chunked typed launch command (avoids Run-dialog ComboBox autocomplete corrupting the typed text) (commit e2fedf1). AV/EDR did not block the sensor exe (no exclusion needed); drive-redirection GPO did not block (no policy change needed) -- both empirical Phase-5 unknowns resolved with no remediation required. See `05-01-SUMMARY.md` and `05-04-SUMMARY.md`.
 
 ### Pending Todos
 
@@ -118,10 +121,14 @@ Recent decisions affecting current work:
 
 ### Blockers/Concerns
 
-- Phase 5: AV/EDR environment on target is unknown — sensor binary hardening level TBD
-- Phase 5: Drive redirection GPO policy on target is unknown — WinRM fallback may be required
 - Phase 7/9: Target application UIA fidelity is unknown — identify and test before Phase 9 harness assertion design
-- Phase 5: NativeAOT binary size unknown — benchmark during Phase 5 (5-30+ MB range)
+- Phase 5 residual (non-blocking, carried forward): `deploy_and_launch`'s `SESSION_SETTLE` + chunked-typing fixes are empirically-tuned timing workarounds, not root-caused to a specific Windows readiness signal — may need revisiting on a differently-provisioned target
+- Phase 5 residual (non-blocking, carried forward): the `rdpsnd` stub channel is intentionally non-functional (presence-only) — correct for v1 scope but a permanent architectural addition, not a temporary hack
+
+**Resolved during Phase 5 (previously listed here):**
+- ~~AV/EDR environment on target unknown~~ — resolved: no block encountered live, `-AddAvExclusion` never needed (05-04)
+- ~~Drive redirection GPO policy on target unknown~~ — resolved: no block encountered live, no policy remediation needed (05-04)
+- ~~NativeAOT binary size unknown (5-30+ MB range)~~ — resolved: 2,699,264 bytes (~2.57 MiB) (05-01)
 
 ## Deferred Items
 
@@ -130,6 +137,6 @@ Phase 2 Plan 02: pre-existing rustdoc intra-doc-link warnings in config.rs (Wave
 
 ## Session Continuity
 
-Last session: 2026-07-09T10:52:24.915Z
-Stopped at: Phase 5 context gathered
-Resume file: .planning/phases/05-sensor-bootstrap-deployment/05-CONTEXT.md
+Last session: 2026-07-09T15:05:00.000Z
+Stopped at: Phase 5 (Sensor Bootstrap + Deployment) COMPLETE — live gate PASSED (SC1-SC4 all met); SENSOR-01/SENSOR-02 marked complete in REQUIREMENTS.md
+Resume file: .planning/phases/05-sensor-bootstrap-deployment/05-04-SUMMARY.md (next: plan Phase 6 — Window + Process Perception)
