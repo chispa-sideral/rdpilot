@@ -40,11 +40,24 @@ internal static class Program
     /// normal WTS channel loop — see <see cref="RunAotSmokeTest"/>.
     private const string SmokeTestArg = "--smoke-test";
 
+    /// Argument that selects the UIA COM-interop AOT risk-gate smoke test
+    /// (D-7.5, 07-02-PLAN.md Task 2) — sibling to <see cref="SmokeTestArg"/>,
+    /// exercises every risky UiaInterop.cs marshalling path (CoCreateInstance,
+    /// SAFEARRAY, BSTR, BOOL, RECT, FindAll) on the desktop root element
+    /// before any real UiaTree handler (07-04) depends on any of it — see
+    /// <see cref="RunUiaAotSmokeTest"/>.
+    private const string UiaSmokeTestArg = "--smoke-test-uia";
+
     private static int Main(string[] args)
     {
         if (args.Length > 0 && args[0] == SmokeTestArg)
         {
             return RunAotSmokeTest();
+        }
+
+        if (args.Length > 0 && args[0] == UiaSmokeTestArg)
+        {
+            return RunUiaAotSmokeTest();
         }
 
         nint handle = OpenChannelWithRetry();
@@ -154,6 +167,62 @@ internal static class Program
         catch (Exception ex)
         {
             Console.Error.WriteLine($"[smoke-test] FAIL: unexpected exception: {ex}");
+            return 1;
+        }
+    }
+
+    /// The UIA COM-interop AOT risk-gate smoke test (D-7.5, 07-02-PLAN.md
+    /// Task 2), sibling to <see cref="RunAotSmokeTest"/>. Exercises EVERY
+    /// risky UiaInterop.cs marshalling path in isolation, on the desktop
+    /// root element (always available, no target-app dependency), in the
+    /// order RESEARCH recommends so a failure pinpoints the culprit:
+    /// `ReadRuntimeId` FIRST (SAFEARRAY, the single riskiest line in the
+    /// phase — Pitfall 2/Assumption A1), then `GetCurrentName` (BSTR,
+    /// A2), `GetCurrentIsEnabled` (BOOL, A3), `GetCurrentBoundingRectangle`
+    /// (RECT-by-out-pointer, Open Question #2), `CreateTrueCondition`,
+    /// `FindAll`, `GetLength`.
+    ///
+    /// This is a throwaway diagnostic — it does NOT go through the
+    /// Envelope/DVC dispatch path and defines no `MsgType.Uia` (that
+    /// arrives in 07-04). This plan (07-02) only proves the offline
+    /// linux-x64 AOT-trim/source-gen surrogate publish is clean; the real
+    /// behavioral RUN of this smoke test happens on a genuine Windows host
+    /// at the 07-03 risk gate (RESEARCH Pitfall 7 — `CoCreateInstance` and
+    /// `ole32.dll`/UIA do not exist on Linux, so running this binary here
+    /// would be meaningless).
+    ///
+    /// Exit 0 + "PASS" (with the exercised values) on success, exit 1 +
+    /// "FAIL: ..." to stderr on any exception — never throws out of Main
+    /// (mirrors the T-05-01 drop-never-crash discipline used elsewhere in
+    /// this file).
+    private static int RunUiaAotSmokeTest()
+    {
+        try
+        {
+            IUIAutomation automation = UiaInterop.GetRootAutomation();
+            nint desktop = User32Interop.GetDesktopWindow();
+            IUIAutomationElement root = automation.ElementFromHandle(desktop);
+
+            // The single riskiest call in the whole phase — isolate it
+            // first (Pitfall 2 / Assumption A1).
+            int[] runtimeId = UiaInterop.ReadRuntimeId(root);
+
+            string name = root.GetCurrentName();                         // BSTR marshalling proof (A2)
+            bool enabled = root.GetCurrentIsEnabled();                    // BOOL marshalling proof (A3)
+            Rect32 rect = root.GetCurrentBoundingRectangle();             // struct-by-out-pointer proof
+            IUIAutomationCondition trueCondition = automation.CreateTrueCondition();
+            IUIAutomationElementArray children = root.FindAll(TreeScope.Children, trueCondition);
+            int childCount = children.GetLength();
+
+            Console.WriteLine(
+                $"[smoke-test-uia] PASS: root name='{name}' enabled={enabled} " +
+                $"rect={rect.Left},{rect.Top},{rect.Right},{rect.Bottom} " +
+                $"runtimeId.len={runtimeId.Length} children={childCount}");
+            return 0;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[smoke-test-uia] FAIL: {ex}");
             return 1;
         }
     }
@@ -462,4 +531,14 @@ internal static partial class Wts
     [LibraryImport("wtsapi32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     internal static partial bool WTSVirtualChannelClose(nint channelHandle);
+}
+
+/// The single user32.dll P/Invoke <see cref="RunUiaAotSmokeTest"/> needs:
+/// the desktop root window handle, an always-available target for the UIA
+/// smoke test that has no dependency on Notepad or any other specific app
+/// (07-02-PLAN.md Task 2).
+internal static partial class User32Interop
+{
+    [LibraryImport("user32.dll")]
+    internal static partial nint GetDesktopWindow();
 }
