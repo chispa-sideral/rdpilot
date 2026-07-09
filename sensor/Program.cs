@@ -234,10 +234,44 @@ internal static class Program
                     Payload = null,
                 });
             }
+            else if (msg.Type == MsgType.WindowList)
+            {
+                WriteEnvelope(handle, BuildWindowListReplyEnvelope(msg.ReqId));
+            }
             // Any other message type this v1 protocol doesn't define is
             // silently ignored — never crashes the loop (T-05-01, mirrors
             // the Rust processor's own unknown-type handling).
         }
+    }
+
+    /// Build the WindowList reply envelope (T-06-01 / D-6.4): enumerates
+    /// top-level windows via <see cref="WindowEnumeration.BuildWindowListResponse"/>
+    /// and wraps it `success:true`; on ANY exception from the handler,
+    /// degrades to a `success:false` reply carrying the exception message
+    /// instead of throwing out of the dispatch loop (mirrors the
+    /// ReadEnvelope/T-05-01 drop-never-crash discipline for the response
+    /// side too).
+    private static Envelope BuildWindowListReplyEnvelope(ulong reqId)
+    {
+        WindowListResponse response;
+        try
+        {
+            response = WindowEnumeration.BuildWindowListResponse();
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[rdpilot-sensor] WindowList handler failed: {ex}");
+            response = new WindowListResponse { Success = false, Data = null, Error = ex.Message };
+        }
+
+        JsonElement payload = JsonSerializer.SerializeToElement(response, EnvelopeJsonContext.Default.WindowListResponse);
+        return new Envelope
+        {
+            Version = ProtocolVersion.Value,
+            ReqId = reqId,
+            Type = MsgType.WindowList,
+            Payload = payload,
+        };
     }
 
     /// Read one WTS message, strip the leading binary DVC framing prefix by
