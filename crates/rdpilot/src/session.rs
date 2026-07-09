@@ -35,6 +35,7 @@ use crate::perception::{ProcessInfo, UiaElement, WindowInfo};
 use crate::screenshot::Screenshot;
 use crate::sensor::SensorShared;
 use crate::session_loop::{self, RdpInputEvent};
+use crate::worldstate::{UiaMode, WorldState, WorldStateOptions};
 
 /// Inter-click delay for [`MouseAction::DoubleClick`] (D-3.7). RDP has no
 /// native double-click PDU, so a double-click is synthesized as two single
@@ -648,6 +649,111 @@ impl Session {
             .into_iter()
             .map(crate::perception::UiaElementWire::into_owned)
             .collect())
+    }
+
+    /// Capture a correlated, timestamped snapshot of the remote desktop
+    /// (API-02, SC#2) — the first composite/aggregating `Session` method:
+    /// sequences the existing client-side [`Session::screenshot`] and 0-N
+    /// sensor round trips ([`Session::get_window_list`],
+    /// [`Session::get_uia_tree`]) under one batch timestamp and one
+    /// measured capture span.
+    ///
+    /// - SC#1: only owned SDK types appear in this signature and in
+    ///   [`WorldState`] — no `ironrdp`/`image`/sensor-wire type leaks.
+    /// - SC#2: the returned [`WorldState`] carries one [`SystemTime`]
+    ///   batch timestamp and one measured [`Duration`] `capture_span`
+    ///   spanning every sequenced fetch below.
+    /// - SC#3: every coordinate ([`Screenshot`] dims, [`WindowInfo::rect`],
+    ///   [`UiaElement::bbox`]) is the single shared `crate::Rect` physical
+    ///   pixel space — no scaling is introduced here.
+    /// - D-8.2/Pitfall 4: `capture_span` exceeding 500ms is a soft,
+    ///   best-effort signal surfaced on the returned value — it is NEVER
+    ///   compared against 500ms here and never causes a hard failure. A
+    ///   genuine transport/semantic error on any sequenced component call
+    ///   ([`Error::Dvc`]/[`Error::SensorRejected`]) is a DIFFERENT, hard
+    ///   condition: every such call is propagated with `?` and surfaces as
+    ///   `Err`, never silently downgraded to a `None` field.
+    /// - Pitfall 3: [`UiaMode::Foreground`]/[`UiaMode::AllTopLevel`] both
+    ///   need the top-level window list to resolve which window(s) to walk
+    ///   — that list is fetched at most once internally whenever needed,
+    ///   even if `opts.window_list` is `false`, but [`WorldState::window_list`]
+    ///   is only populated when the caller actually asked for it.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`Error::Session`]/[`Error::Decode`] from
+    /// [`Session::screenshot`], or [`Error::SensorRejected`]/[`Error::Dvc`]
+    /// from any sequenced [`Session::get_window_list`]/
+    /// [`Session::get_uia_tree`] call.
+    pub async fn world_state(&self, opts: WorldStateOptions) -> Result<WorldState> {
+        // Local-only span measurement -- NEVER stored in `WorldState`
+        // itself (Pitfall 2: `Instant` has no `Serialize` impl).
+        let started = std::time::Instant::now();
+
+        let screenshot = if opts.screenshot {
+            Some(self.screenshot().await?)
+        } else {
+            None
+        };
+
+        // Pitfall 3: `Foreground`/`AllTopLevel` both need the window list
+        // to resolve which window(s) to walk, even if the caller did not
+        // ask for `window_list` itself. Fetch it at most once.
+        let needs_list_internally =
+            opts.window_list || matches!(opts.uia, UiaMode::Foreground | UiaMode::AllTopLevel);
+        let windows = if needs_list_internally {
+            Some(self.get_window_list().await?)
+        } else {
+            None
+        };
+
+        let uia = match &opts.uia {
+            UiaMode::None => None,
+            UiaMode::Hwnd(hwnds) => {
+                let mut groups = Vec::with_capacity(hwnds.len());
+                for &hwnd in hwnds {
+                    groups.push((hwnd, self.get_uia_tree(hwnd).await?));
+                }
+                Some(groups)
+            }
+            UiaMode::Foreground => match windows.as_ref() {
+                Some(list) => {
+                    // The Phase 6 live-diagnosed foreground heuristic:
+                    // titled-only (always-on-top untitled shell chrome
+                    // otherwise outranks real app windows in raw z-order),
+                    // then minimum `z_order` among those.
+                    let foreground = list.iter().filter(|w| !w.title.is_empty()).min_by_key(|w| w.z_order);
+                    match foreground {
+                        Some(w) => Some(vec![(w.hwnd, self.get_uia_tree(w.hwnd).await?)]),
+                        None => Some(vec![]),
+                    }
+                }
+                // Unreachable in practice -- `needs_list_internally` always
+                // fetches the list for this mode -- but handled without a
+                // panic (API-01, SC#4) rather than via unwrap/expect.
+                None => Some(vec![]),
+            },
+            UiaMode::AllTopLevel => match windows.as_ref() {
+                Some(list) => {
+                    let mut groups = Vec::with_capacity(list.len());
+                    for w in list {
+                        groups.push((w.hwnd, self.get_uia_tree(w.hwnd).await?));
+                    }
+                    Some(groups)
+                }
+                None => Some(vec![]),
+            },
+        };
+
+        Ok(WorldState {
+            timestamp: std::time::SystemTime::now(),
+            capture_span: started.elapsed(),
+            screenshot,
+            // Populated ONLY when the caller asked for it, even though
+            // `windows` may have been fetched internally above (Pitfall 3).
+            window_list: if opts.window_list { windows } else { None },
+            uia,
+        })
     }
 
     /// Bring a remote window to the foreground (PERC-04, SENSOR-backed).
@@ -1377,6 +1483,282 @@ mod tests {
             pending.is_empty(),
             "the pending entry must be removed on timeout, not leaked"
         );
+    }
+
+    // --- Task 2 (08-02): world_state() -- composite snapshot aggregation ---
+
+    /// Drain the next `RdpInputEvent::Request` off `input_rx`, assert its
+    /// `msg_type`, and fulfil it with `reply` via the sensor's pending
+    /// oneshot map -- the shared drive-one-round-trip step every
+    /// `world_state()` test below repeats once per sequenced sensor call
+    /// (mirrors `get_window_list_success_returns_owned_windows`'s manual
+    /// steps, factored out to keep multi-request tests readable).
+    async fn drive_one_request(
+        sensor: &Arc<SensorShared>,
+        input_rx: &mut mpsc::Receiver<RdpInputEvent>,
+        expected: crate::sensor::MsgType,
+        reply: serde_json::Value,
+    ) -> Option<serde_json::Value> {
+        let RdpInputEvent::Request(msg_type, req_id, payload) =
+            input_rx.recv().await.expect("a Request was sent")
+        else {
+            panic!("expected a Request event");
+        };
+        assert_eq!(msg_type, expected);
+        let tx = {
+            let mut pending = sensor.pending.lock().expect("lock");
+            pending.remove(&req_id).expect("req_id registered in pending map")
+        };
+        tx.send(reply).expect("reply delivered before the receiver was dropped");
+        payload
+    }
+
+    /// A canned `WindowList` success reply with the given `(hwnd, title,
+    /// z_order)` triples, used across the `world_state()` tests below.
+    fn canned_window_list_reply(windows: &[(u64, &str, u32)]) -> serde_json::Value {
+        let data: Vec<serde_json::Value> = windows
+            .iter()
+            .map(|(hwnd, title, z_order)| {
+                serde_json::json!({
+                    "hwnd": hwnd,
+                    "title": title,
+                    "rect": {"x": 0, "y": 0, "w": 100, "h": 100},
+                    "z_order": z_order,
+                    "state": "normal",
+                    "class_name": "Some",
+                    "pid": 1
+                })
+            })
+            .collect();
+        serde_json::json!({ "success": true, "data": data })
+    }
+
+    /// A canned `Uia` success reply with a single element, used across the
+    /// `world_state()` tests below (contents are not asserted in detail --
+    /// only that a group was produced per hwnd).
+    fn canned_uia_reply() -> serde_json::Value {
+        serde_json::json!({
+            "success": true,
+            "data": [{
+                "runtime_id": [1],
+                "control_type": 50000,
+                "name": "OK",
+                "bbox": {"x": 0, "y": 0, "w": 10, "h": 10},
+                "enabled": true,
+                "visible": true,
+                "focusable": true,
+                "focused": false,
+                "depth": 0,
+                "parent_runtime_id": []
+            }]
+        })
+    }
+
+    /// `world_state(WorldStateOptions::default())` yields
+    /// `screenshot: Some`, `window_list: Some`, `uia: None`, with a
+    /// populated `capture_span` (SC#2 default is SC#2-compliant, D-8.1).
+    #[tokio::test]
+    async fn world_state_default_options_returns_screenshot_and_window_list_no_uia() {
+        let sensor = Arc::new(SensorShared::new());
+        let (session, mut input_rx) = test_session_with_sensor(sensor.clone());
+        session.frame.write(2, 2, vec![255u8; 2 * 2 * 4]);
+
+        let handle = tokio::spawn(async move { session.world_state(WorldStateOptions::default()).await });
+
+        drive_one_request(
+            &sensor,
+            &mut input_rx,
+            crate::sensor::MsgType::WindowList,
+            canned_window_list_reply(&[(111, "Notepad", 0)]),
+        )
+        .await;
+
+        let world = handle
+            .await
+            .expect("task did not panic")
+            .expect("world_state succeeds with default options");
+
+        let shot = world.screenshot.expect("default options request a screenshot");
+        assert_eq!((shot.width, shot.height), (2, 2));
+        let windows = world.window_list.expect("default options request the window list");
+        assert_eq!(windows.len(), 1);
+        assert!(world.uia.is_none(), "default options request no UIA");
+        assert!(world.capture_span >= Duration::ZERO);
+    }
+
+    /// Pitfall 3: `{screenshot:false, window_list:false, uia:Foreground}`
+    /// against a mocked window list containing an untitled top window and
+    /// two titled windows returns `window_list: None` (not requested) yet
+    /// `uia: Some(vec![(hwnd, elements)])` for the titled window with the
+    /// minimum `z_order` -- proving the list was fetched internally (one
+    /// `WindowList` request observed) but never surfaced, and that the
+    /// untitled always-on-top window is excluded from foreground selection.
+    #[tokio::test]
+    async fn world_state_foreground_uia_fetches_list_internally_but_hides_it() {
+        let sensor = Arc::new(SensorShared::new());
+        let (session, mut input_rx) = test_session_with_sensor(sensor.clone());
+
+        let opts = WorldStateOptions {
+            screenshot: false,
+            window_list: false,
+            uia: UiaMode::Foreground,
+        };
+        let handle = tokio::spawn(async move { session.world_state(opts).await });
+
+        drive_one_request(
+            &sensor,
+            &mut input_rx,
+            crate::sensor::MsgType::WindowList,
+            canned_window_list_reply(&[
+                (999, "", 0),                // untitled, topmost by raw z_order -- must be excluded
+                (111, "Background Window", 5),
+                (222, "Foreground Window", 2), // minimum z_order among titled windows
+            ]),
+        )
+        .await;
+
+        let payload = drive_one_request(
+            &sensor,
+            &mut input_rx,
+            crate::sensor::MsgType::Uia,
+            canned_uia_reply(),
+        )
+        .await;
+        assert_eq!(
+            payload.expect("get_uia_tree sends a payload")["hwnd"],
+            222,
+            "the foreground selection must pick the titled window with the minimum z_order"
+        );
+
+        let world = handle.await.expect("task did not panic").expect("world_state succeeds");
+        assert!(
+            world.window_list.is_none(),
+            "window_list was not requested, so it must stay None even though fetched internally"
+        );
+        let uia = world.uia.expect("Foreground mode requests a UIA group");
+        assert_eq!(uia.len(), 1);
+        assert_eq!(uia[0].0, 222);
+        assert_eq!(uia[0].1.len(), 1);
+    }
+
+    /// `AllTopLevel` with 2+ mocked windows: `uia` contains one
+    /// `(hwnd, Vec<UiaElement>)` entry per window in the list, in list
+    /// order; `window_list` is populated because it was also requested,
+    /// reusing the single internally-fetched list for both purposes.
+    #[tokio::test]
+    async fn world_state_all_top_level_uia_covers_every_window_in_order() {
+        let sensor = Arc::new(SensorShared::new());
+        let (session, mut input_rx) = test_session_with_sensor(sensor.clone());
+
+        let opts = WorldStateOptions {
+            screenshot: false,
+            window_list: true,
+            uia: UiaMode::AllTopLevel,
+        };
+        let handle = tokio::spawn(async move { session.world_state(opts).await });
+
+        drive_one_request(
+            &sensor,
+            &mut input_rx,
+            crate::sensor::MsgType::WindowList,
+            canned_window_list_reply(&[(111, "First", 0), (222, "Second", 1)]),
+        )
+        .await;
+
+        let payload_1 = drive_one_request(
+            &sensor,
+            &mut input_rx,
+            crate::sensor::MsgType::Uia,
+            canned_uia_reply(),
+        )
+        .await;
+        assert_eq!(payload_1.expect("payload present")["hwnd"], 111);
+
+        let payload_2 = drive_one_request(
+            &sensor,
+            &mut input_rx,
+            crate::sensor::MsgType::Uia,
+            canned_uia_reply(),
+        )
+        .await;
+        assert_eq!(payload_2.expect("payload present")["hwnd"], 222);
+
+        let world = handle.await.expect("task did not panic").expect("world_state succeeds");
+        assert_eq!(world.window_list.expect("window_list was requested").len(), 2);
+        let uia = world.uia.expect("AllTopLevel requests a UIA group per window");
+        assert_eq!(uia.len(), 2);
+        assert_eq!(uia[0].0, 111);
+        assert_eq!(uia[1].0, 222);
+    }
+
+    /// `UiaMode::Hwnd(vec![h1, h2])` fetches a UIA group per hwnd, in
+    /// order, WITHOUT ever fetching the window list (no `WindowList`
+    /// request observed); `window_list` stays `None` because it was not
+    /// requested.
+    #[tokio::test]
+    async fn world_state_hwnd_uia_fetches_group_per_handle_without_list() {
+        let sensor = Arc::new(SensorShared::new());
+        let (session, mut input_rx) = test_session_with_sensor(sensor.clone());
+
+        let opts = WorldStateOptions {
+            screenshot: false,
+            window_list: false,
+            uia: UiaMode::Hwnd(vec![111, 222]),
+        };
+        let handle = tokio::spawn(async move { session.world_state(opts).await });
+
+        let payload_1 = drive_one_request(
+            &sensor,
+            &mut input_rx,
+            crate::sensor::MsgType::Uia,
+            canned_uia_reply(),
+        )
+        .await;
+        assert_eq!(payload_1.expect("payload present")["hwnd"], 111);
+
+        let payload_2 = drive_one_request(
+            &sensor,
+            &mut input_rx,
+            crate::sensor::MsgType::Uia,
+            canned_uia_reply(),
+        )
+        .await;
+        assert_eq!(payload_2.expect("payload present")["hwnd"], 222);
+
+        let world = handle.await.expect("task did not panic").expect("world_state succeeds");
+        assert!(world.window_list.is_none(), "Hwnd mode never fetches the window list");
+        let uia = world.uia.expect("Hwnd mode requests a UIA group per handle");
+        assert_eq!(uia.len(), 2);
+        assert_eq!(uia[0].0, 111);
+        assert_eq!(uia[1].0, 222);
+    }
+
+    /// Pitfall 4: a mocked `success:false` reply on a sequenced component
+    /// call (here, the internally-fetched `WindowList` under default
+    /// options) makes `world_state()` return `Err(Error::SensorRejected)`,
+    /// NOT `Ok` with a `None` field -- the hard-error/soft-timing
+    /// distinction (D-8.2).
+    #[tokio::test]
+    async fn world_state_error_propagates_as_err_not_none() {
+        let sensor = Arc::new(SensorShared::new());
+        let (session, mut input_rx) = test_session_with_sensor(sensor.clone());
+        session.frame.write(2, 2, vec![255u8; 2 * 2 * 4]);
+
+        let handle = tokio::spawn(async move { session.world_state(WorldStateOptions::default()).await });
+
+        drive_one_request(
+            &sensor,
+            &mut input_rx,
+            crate::sensor::MsgType::WindowList,
+            serde_json::json!({ "success": false, "error": "enum failed" }),
+        )
+        .await;
+
+        let err = handle.await.expect("task did not panic");
+        match err {
+            Err(Error::SensorRejected(msg)) => assert!(msg.contains("enum failed")),
+            other => panic!("expected Err(Error::SensorRejected(_)) mentioning the reason, got {other:?}"),
+        }
     }
 
     // --- Task 2 (06-02): screenshot_window -- D-6.1 client-side per-window crop ---
