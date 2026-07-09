@@ -4,7 +4,7 @@ milestone: v1.0
 milestone_name: milestone
 status: verifying
 stopped_at: Phase 5 Sensor Bootstrap + Deployment COMPLETE — live gate PASSED against a real Azure VM (RDPDR primary 22.61ms, WinRM fallback 21.62ms, both < 1s SC4 bound); SENSOR-01/SENSOR-02 validated
-last_updated: "2026-07-09T15:05:00.000Z"
+last_updated: "2026-07-09T13:32:46.039Z"
 last_activity: 2026-07-09
 progress:
   total_phases: 9
@@ -126,6 +126,7 @@ Recent decisions affecting current work:
 - Phase 5 residual (non-blocking, carried forward): the `rdpsnd` stub channel is intentionally non-functional (presence-only) — correct for v1 scope but a permanent architectural addition, not a temporary hack
 
 **Resolved during Phase 5 (previously listed here):**
+
 - ~~AV/EDR environment on target unknown~~ — resolved: no block encountered live, `-AddAvExclusion` never needed (05-04)
 - ~~Drive redirection GPO policy on target unknown~~ — resolved: no block encountered live, no policy remediation needed (05-04)
 - ~~NativeAOT binary size unknown (5-30+ MB range)~~ — resolved: 2,699,264 bytes (~2.57 MiB) (05-01)
@@ -137,6 +138,6 @@ Phase 2 Plan 02: pre-existing rustdoc intra-doc-link warnings in config.rs (Wave
 
 ## Session Continuity
 
-Last session: 2026-07-09T15:05:00.000Z
-Stopped at: Phase 5 (Sensor Bootstrap + Deployment) COMPLETE — live gate PASSED (SC1-SC4 all met); SENSOR-01/SENSOR-02 marked complete in REQUIREMENTS.md
-Resume file: .planning/phases/05-sensor-bootstrap-deployment/05-04-SUMMARY.md (next: plan Phase 6 — Window + Process Perception)
+Last session: 2026-07-09T13:32:46.034Z
+Stopped at: Phase 6 context gathered
+Resume file: .planning/phases/06-window-process-perception/06-CONTEXT.md
