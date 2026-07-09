@@ -6,10 +6,12 @@
 //! and the `SensorShared` correlation state that lets `Session::ping()` (a later
 //! plan) round-trip a request across the dedicated session-loop OS thread.
 //!
-//! This module implements ONLY the `Version`/`Ping`/`Pong` message types
-//! (D-4.3). `WindowList`/`ProcessTree`/`Uia` payloads are Phase 6-7 work and are
-//! deliberately absent here — the envelope shape is designed to grow into them
-//! without reworking framing.
+//! This module implements the `Version`/`Ping`/`Pong` message types (D-4.3)
+//! plus the Phase 6 `WindowList`/`ProcessTree`/`SetForegroundWindow`/
+//! `LaunchProcess` request/response types. All non-`Version` replies share one
+//! generic, msg_type-agnostic fulfilment path keyed on `req_id`
+//! (RESEARCH Pattern 1) — the envelope shape does not need reworking as new
+//! message types (e.g. Phase 7's `Uia`) are added.
 //!
 //! No `unwrap`/`expect`/`panic!` outside `#[cfg(test)]` (API-01): malformed or
 //! oversized inbound JSON from the (by-design unauthenticated, Pitfall m3) DVC
@@ -40,15 +42,22 @@ pub(crate) struct Envelope {
     pub(crate) payload: Option<serde_json::Value>,
 }
 
-/// The set of message types implemented this phase (D-4.3): only the version
-/// handshake and the ping/pong heartbeat. Serializes as the bare externally-
-/// tagged unit string form — `"Version"`, `"Ping"`, `"Pong"` — matching the
-/// wire shape verified in RESEARCH Q2.
+/// The set of message types this crate can send/receive over the
+/// `RDPILOT_SENSOR` DVC (D-4.3, Phase 6 wire contract): the version
+/// handshake, the ping/pong heartbeat, and the four Phase 6 request/response
+/// types. Serializes as the bare externally-tagged unit string form —
+/// `"Version"`, `"Ping"`, `"Pong"`, `"WindowList"`, `"ProcessTree"`,
+/// `"SetForegroundWindow"`, `"LaunchProcess"` — matching the wire shape
+/// verified in RESEARCH Q2.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum MsgType {
     Version,
     Ping,
     Pong,
+    WindowList,
+    ProcessTree,
+    SetForegroundWindow,
+    LaunchProcess,
 }
 
 #[cfg(test)]
@@ -170,7 +179,7 @@ pub(crate) struct SensorShared {
     /// (session.rs) and `RdpilotSensorProcessor::process()` (this module)
     /// both need direct lock access to the same two mutexes, and both are
     /// already crate-internal-only (D-09) — no accessor indirection needed.
-    pub(crate) pending: Mutex<HashMap<u64, oneshot::Sender<()>>>,
+    pub(crate) pending: Mutex<HashMap<u64, oneshot::Sender<serde_json::Value>>>,
     pub(crate) handshake: Mutex<HandshakeState>,
 }
 
@@ -190,8 +199,10 @@ impl SensorShared {
 ///
 /// `start()` unconditionally sends the `Version` handshake as the first
 /// outbound message (SC#3); `process()` drives the handshake state machine
-/// and fulfils `Pong` correlations. Crate-internal only — no `ironrdp-dvc`
-/// type is ever re-exported from this crate's public API (D-09).
+/// and generically fulfils any pending `req_id` correlation regardless of
+/// reply `msg_type` (RESEARCH Pattern 1). Crate-internal only — no
+/// `ironrdp-dvc` type is ever re-exported from this crate's public API
+/// (D-09).
 pub(crate) struct RdpilotSensorProcessor {
     shared: Arc<SensorShared>,
 }
@@ -209,18 +220,25 @@ impl RdpilotSensorProcessor {
         Self { shared }
     }
 
-    /// Build a `Ping` envelope for `req_id` and return it as a single boxed
-    /// outbound DVC message.
+    /// Build an envelope for `msg_type`/`req_id`/`payload` and return it as a
+    /// single boxed outbound DVC message (RESEARCH Pattern 2: one encode path
+    /// for every outbound request type, not one hand-written method per
+    /// `MsgType`).
     ///
-    /// The caller (a later plan's session-loop dispatch arm) hands the result
-    /// to `ironrdp_dvc::encode_dvc_messages` for wire-level chunking —
-    /// this method never chunks (D-4.3).
-    pub(crate) fn encode_ping(&self, req_id: u64) -> std::result::Result<Vec<DvcMessage>, serde_json::Error> {
+    /// The caller (the session-loop dispatch arm) hands the result to
+    /// `ironrdp_dvc::encode_dvc_messages` for wire-level chunking — this
+    /// method never chunks (D-4.3).
+    pub(crate) fn encode_request(
+        &self,
+        msg_type: MsgType,
+        req_id: u64,
+        payload: Option<serde_json::Value>,
+    ) -> std::result::Result<Vec<DvcMessage>, serde_json::Error> {
         let envelope = Envelope {
             version: PROTOCOL_VERSION,
             req_id,
-            msg_type: MsgType::Ping,
-            payload: None,
+            msg_type,
+            payload,
         };
         let msg = JsonDvcMessage::new(&envelope)?;
         Ok(vec![Box::new(msg)])
@@ -270,7 +288,15 @@ impl DvcProcessor for RdpilotSensorProcessor {
                 // The handshake is a terminal two-message exchange; no reply.
                 Ok(Vec::new())
             }
-            MsgType::Pong => {
+            // Every other reply type (Pong, WindowList, ProcessTree,
+            // SetForegroundWindow, LaunchProcess, and any future addition)
+            // shares one generic, msg_type-agnostic fulfilment path
+            // (RESEARCH Pattern 1): if `req_id` has a pending oneshot, hand it
+            // the raw reply payload and let the awaiting caller (`Session`)
+            // interpret/deserialize it for its own request type. A reply for
+            // an unknown/already-fulfilled req_id is silently dropped — it
+            // cannot resurrect or double-fulfil a stale entry (T-06-04).
+            _ => {
                 let mut pending = match self.shared.pending.lock() {
                     Ok(g) => g,
                     Err(poisoned) => poisoned.into_inner(),
@@ -278,12 +304,10 @@ impl DvcProcessor for RdpilotSensorProcessor {
                 if let Some(sender) = pending.remove(&envelope.req_id) {
                     // Ignore the Result: the receiver may already be gone if
                     // a caller-side timeout fired first.
-                    let _ = sender.send(());
+                    let _ = sender.send(envelope.payload.unwrap_or(serde_json::Value::Null));
                 }
                 Ok(Vec::new())
             }
-            // The SDK is the DVC client and never receives a Ping.
-            MsgType::Ping => Ok(Vec::new()),
         }
     }
 }
@@ -386,7 +410,9 @@ mod processor_tests {
     }
 
     /// A `Pong` with a known `req_id` fulfils the pending `oneshot` and
-    /// removes the entry so it cannot be double-fulfilled.
+    /// removes the entry so it cannot be double-fulfilled. A payload-less
+    /// reply fulfils with `Value::Null` (the generic fulfilment path's
+    /// `unwrap_or(Value::Null)` default).
     #[test]
     fn pong_fulfils_and_removes_pending_oneshot() {
         let (mut processor, shared) = fresh_processor();
@@ -409,13 +435,133 @@ mod processor_tests {
             .process(0, &encode_envelope(&reply))
             .expect("process() succeeds");
 
-        assert_eq!(rx.try_recv(), Ok(()), "oneshot must be fulfilled");
+        assert_eq!(
+            rx.try_recv(),
+            Ok(serde_json::Value::Null),
+            "oneshot must be fulfilled with Value::Null for a payload-less reply"
+        );
 
         let pending = match shared.pending.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
         assert!(!pending.contains_key(&7), "entry must be removed after fulfilling");
+    }
+
+    /// A `Version` reply (req_id 0) still drives the handshake state machine
+    /// and never touches the pending map — the Version arm is handled
+    /// separately from the generic fulfilment arm and does not consult
+    /// `pending` at all, even though `req_id` is 0 and 0 is a value a caller
+    /// could theoretically register.
+    #[test]
+    fn version_reply_drives_handshake_and_never_touches_pending_map() {
+        let (mut processor, shared) = fresh_processor();
+        {
+            let mut pending = match shared.pending.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            let (tx, _rx) = oneshot::channel();
+            pending.insert(0, tx);
+        }
+
+        let reply = Envelope {
+            version: PROTOCOL_VERSION,
+            req_id: 0,
+            msg_type: MsgType::Version,
+            payload: None,
+        };
+        processor
+            .process(0, &encode_envelope(&reply))
+            .expect("process() succeeds");
+
+        let handshake = match shared.handshake.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        assert!(matches!(*handshake, HandshakeState::Ok));
+
+        let pending = match shared.pending.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        assert!(
+            pending.contains_key(&0),
+            "the Version arm must never touch the pending map, even for req_id 0"
+        );
+    }
+
+    /// A `WindowList` reply with a pending `req_id` fulfils that req_id's
+    /// oneshot with `envelope.payload`, proving the fulfilment path is
+    /// msg_type-agnostic, NOT special-cased to `Pong` (RESEARCH Pattern 1).
+    #[test]
+    fn window_list_reply_fulfils_pending_oneshot_with_payload() {
+        let (mut processor, shared) = fresh_processor();
+        let (tx, mut rx) = oneshot::channel();
+        {
+            let mut pending = match shared.pending.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            pending.insert(42, tx);
+        }
+
+        let payload = serde_json::json!({"success": true, "data": []});
+        let reply = Envelope {
+            version: PROTOCOL_VERSION,
+            req_id: 42,
+            msg_type: MsgType::WindowList,
+            payload: Some(payload.clone()),
+        };
+        processor
+            .process(0, &encode_envelope(&reply))
+            .expect("process() succeeds");
+
+        assert_eq!(
+            rx.try_recv(),
+            Ok(payload),
+            "oneshot must be fulfilled with the reply's payload verbatim"
+        );
+
+        let pending = match shared.pending.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        assert!(!pending.contains_key(&42), "entry must be removed after fulfilling");
+    }
+
+    /// A reply whose `req_id` is NOT in the pending map is dropped
+    /// (`Ok(empty)`, no panic) and leaves the map unchanged (T-06-04: a late
+    /// reply for an unknown req_id must not resurrect or corrupt state).
+    #[test]
+    fn reply_for_unknown_req_id_is_dropped_and_map_unchanged() {
+        let (mut processor, shared) = fresh_processor();
+        {
+            let mut pending = match shared.pending.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            let (tx, _rx) = oneshot::channel();
+            pending.insert(1, tx);
+        }
+
+        let reply = Envelope {
+            version: PROTOCOL_VERSION,
+            req_id: 999,
+            msg_type: MsgType::Pong,
+            payload: None,
+        };
+        let out = processor
+            .process(0, &encode_envelope(&reply))
+            .expect("process() succeeds");
+        assert!(out.is_empty());
+
+        let pending = match shared.pending.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        assert_eq!(pending.len(), 1, "map must be unchanged");
+        assert!(pending.contains_key(&1), "the unrelated pending entry must survive untouched");
     }
 
     /// Malformed/truncated inbound bytes are dropped (`Ok(empty)`), never a

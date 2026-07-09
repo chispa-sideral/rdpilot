@@ -375,7 +375,7 @@ impl Session {
     /// version handshake previously detected a mismatch (SC#3: a clear
     /// caller-visible error, never silent corruption). Otherwise allocates a
     /// correlation id, registers a `oneshot` reply slot in the shared
-    /// [`SensorShared::pending`] map, sends [`RdpInputEvent::Ping`] into the
+    /// [`SensorShared::pending`] map, sends [`RdpInputEvent::Request`] into the
     /// session loop (which builds and writes the outbound bytes via
     /// `ActiveStage::encode_dvc_messages`), and bounds the whole round trip
     /// at 500 ms (SC#2). A timeout removes the now-leaked pending entry so
@@ -412,12 +412,14 @@ impl Session {
         let started = std::time::Instant::now();
 
         self.input_tx
-            .send(RdpInputEvent::Ping(req_id))
+            .send(RdpInputEvent::Request(crate::sensor::MsgType::Ping, req_id, None))
             .await
             .map_err(|_| Error::dvc("input channel closed"))?;
 
         match tokio::time::timeout(Duration::from_millis(500), rx).await {
-            Ok(Ok(())) => Ok(started.elapsed()),
+            // A Pong reply's payload is always empty (Value::Null); ping()
+            // only cares that the round trip completed, not the payload.
+            Ok(Ok(_payload)) => Ok(started.elapsed()),
             Ok(Err(_recv)) => Err(Error::dvc("sensor channel closed before replying")),
             Err(_elapsed) => {
                 let mut pending = match self.sensor.pending.lock() {

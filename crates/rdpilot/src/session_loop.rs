@@ -48,14 +48,16 @@ pub(crate) enum RdpInputEvent {
     /// A pre-built batch of fast-path input events to forward to the active
     /// stage, unchanged, in the same order.
     FastPath(Vec<ironrdp::pdu::input::fast_path::FastPathInputEvent>),
-    /// A proactive ping request on the `RDPILOT_SENSOR` DVC channel (SENSOR-03,
-    /// SC#2), carrying the correlation `req_id` `Session::ping()` allocated.
-    /// Unlike `FastPath`, this loop *builds* the outbound bytes itself (via
-    /// `ActiveStage::get_dvc` + `RdpilotSensorProcessor::encode_ping` +
+    /// A proactive typed request on the `RDPILOT_SENSOR` DVC channel
+    /// (SENSOR-03, SC#2; generalized Phase 6, RESEARCH Pattern 2), carrying
+    /// the message type, the correlation `req_id` the caller allocated, and
+    /// an optional JSON payload. Unlike `FastPath`, this loop *builds* the
+    /// outbound bytes itself (via `ActiveStage::get_dvc` +
+    /// `RdpilotSensorProcessor::encode_request` +
     /// `ironrdp_dvc::encode_dvc_messages`) rather than merely forwarding a
     /// pre-built payload — `DvcProcessor::start()`/`process()` are reactive
     /// only and cannot originate a send on their own (RESEARCH Q1).
-    Ping(u64),
+    Request(crate::sensor::MsgType, u64, Option<serde_json::Value>),
 }
 
 /// Run the active-session pump until the connection terminates or the input
@@ -114,9 +116,9 @@ pub(crate) async fn run(
                             .process_fastpath_input(&mut image, &events)
                             .map_err(|e| Error::Session(format!("input injection failed: {e}")))?
                     }
-                    Some(RdpInputEvent::Ping(req_id)) => {
+                    Some(RdpInputEvent::Request(msg_type, req_id, payload)) => {
                         // Proactive send: DvcProcessor::start()/process() are
-                        // reactive only (RESEARCH Q1), so the outbound Ping
+                        // reactive only (RESEARCH Q1), so the outbound request
                         // bytes are built here, from outside the processor,
                         // mirroring IronRDP's own `ActiveStage::encode_resize`
                         // (Display Control DVC) internal pattern.
@@ -126,19 +128,19 @@ pub(crate) async fn run(
                         // opens it asynchronously, live-verified to take up to
                         // several seconds after the interactive session is
                         // created). That is an expected, per-call-retryable
-                        // condition — `Session::ping()` already bounds each
-                        // attempt at 500ms and leaves the pending oneshot
+                        // condition — the caller already bounds each attempt
+                        // with its own timeout and leaves the pending oneshot
                         // unresolved on failure here, so the caller's timeout
                         // surfaces a normal `Error::Dvc` it can retry. Ending
                         // the WHOLE session loop thread on a single not-yet-open
-                        // ping would be fatal to every other in-flight/future
+                        // request would be fatal to every other in-flight/future
                         // operation (mouse/keyboard/screenshot) too — bug fixed
                         // during the Phase 4 live gate (SC#2/SC#3).
-                        match build_ping_frame(&mut active_stage, req_id) {
+                        match build_request_frame(&mut active_stage, msg_type, req_id, payload) {
                             Ok(frame_bytes) => vec![ActiveStageOutput::ResponseFrame(frame_bytes)],
                             Err(e) => {
-                                debug!(%e, "ping request dropped (sensor DVC not ready yet); \
-                                    the caller's 500ms client-side timeout will surface a retryable error");
+                                debug!(%e, "sensor request dropped (sensor DVC not ready yet); \
+                                    the caller's client-side timeout will surface a retryable error");
                                 vec![]
                             }
                         }
@@ -202,21 +204,28 @@ pub(crate) async fn run(
     Ok(())
 }
 
-/// Build the outbound DVC frame bytes for a single `Ping(req_id)` request.
+/// Build the outbound DVC frame bytes for a single typed sensor request
+/// (RESEARCH Pattern 2: one builder for every `MsgType`, not one per message
+/// type).
 ///
 /// Looks up the registered [`crate::sensor::RdpilotSensorProcessor`] DVC,
 /// requires it to be open (`channel_id()` populated — i.e. the server-side
 /// responder has completed `WTSVirtualChannelOpenEx` and the drdynvc Create
-/// handshake), encodes the Ping envelope via
-/// [`crate::sensor::RdpilotSensorProcessor::encode_ping`], and wraps it into a
-/// single outbound frame via [`ActiveStage::encode_dvc_messages`].
+/// handshake), encodes the request envelope via
+/// [`crate::sensor::RdpilotSensorProcessor::encode_request`], and wraps it
+/// into a single outbound frame via [`ActiveStage::encode_dvc_messages`].
 ///
 /// Returns [`Error::Dvc`] — deliberately NOT propagated with `?` by the caller
 /// — when the channel is not yet registered/open: this is an expected,
 /// transient, per-call-retryable condition (the responder opens the channel
 /// asynchronously after the interactive session exists), not a fatal session
 /// error (see the call site in [`run`]).
-fn build_ping_frame(active_stage: &mut ActiveStage, req_id: u64) -> Result<Vec<u8>> {
+fn build_request_frame(
+    active_stage: &mut ActiveStage,
+    msg_type: crate::sensor::MsgType,
+    req_id: u64,
+    payload: Option<serde_json::Value>,
+) -> Result<Vec<u8>> {
     let (channel_id, dvc_messages) = {
         // Block-scoped: `get_dvc()` borrows `&mut active_stage`; that borrow
         // MUST end before the second `&mut active_stage` call below
@@ -231,7 +240,7 @@ fn build_ping_frame(active_stage: &mut ActiveStage, req_id: u64) -> Result<Vec<u
             .channel_processor_downcast_ref::<crate::sensor::RdpilotSensorProcessor>()
             .ok_or_else(|| Error::Dvc("sensor processor downcast failed".to_owned()))?;
         let dvc_messages = processor
-            .encode_ping(req_id)
+            .encode_request(msg_type, req_id, payload)
             .map_err(|e| Error::Dvc(e.to_string()))?;
         (channel_id, dvc_messages)
     };
