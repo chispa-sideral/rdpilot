@@ -183,6 +183,159 @@ impl ProcessInfoWire {
     }
 }
 
+/// A single UI Automation element in a flat, `TreeScope_Children`-scoped
+/// tree walk (PERC-03, D-7.4).
+///
+/// Reuses [`crate::Rect`] (the same public rectangle type as
+/// [`WindowInfo::rect`]) so `bbox` shares the framebuffer/window-list
+/// coordinate space: physical virtual-desktop pixels, `u32 x/y/w/h`
+/// (SC#2, D-7.1).
+///
+/// `value` (`ValuePattern`) is explicitly DEFERRED to backlog (D-7.1) and
+/// has no field here. `depth`/`parent_id` are flat-array bookkeeping fields
+/// for a `TreeScope_Children`-only walk (depth is ~0/1) that future-proof
+/// the wire shape for a later, deeper-tree phase (D-7.4).
+#[derive(Debug, Clone, PartialEq)]
+pub struct UiaElement {
+    /// The element's stable-ish identity: the UIA `RuntimeId` int array
+    /// joined to a single string (D-7.2). Chosen over `AutomationId`, which
+    /// is empty on non-instrumented Win32 apps (e.g. Notepad).
+    pub id: String,
+    /// The element's UIA `ControlType` mapped to a stable, locale-independent
+    /// English friendly string (e.g. `"Button"`, `"Window"`) — NOT
+    /// `LocalizedControlType` (D-7.3). Unmapped/unknown `ControlType` ids
+    /// map to `"Unknown"`.
+    pub role: String,
+    /// The element's UIA `Name` property (may be empty).
+    pub name: String,
+    /// The element's bounding rectangle, in physical virtual-desktop pixels
+    /// (the framebuffer coordinate space, matching [`crate::Rect`] and
+    /// [`WindowInfo::rect`] exactly — SC#2).
+    pub bbox: crate::Rect,
+    /// Whether the element is enabled (`IsEnabled` UIA property).
+    pub enabled: bool,
+    /// Whether the element is visible (derived from `IsOffscreen`/similar on
+    /// the sensor side; wire-level boolean passthrough here).
+    pub visible: bool,
+    /// Whether the element is keyboard-focusable (`IsKeyboardFocusable`).
+    pub focusable: bool,
+    /// Whether the element currently has keyboard focus (`HasKeyboardFocus`).
+    pub focused: bool,
+    /// The element's depth in the flat tree-walk result. For the
+    /// `TreeScope_Children`-only walk this phase performs, values are ~0
+    /// (the root) / 1 (its direct children) — future-proofing for a later
+    /// deeper-tree phase (D-7.4).
+    pub depth: u32,
+    /// The parent element's [`UiaElement::id`] (same `RuntimeId`-join
+    /// format, D-7.2), or an empty string if there is no parent in this
+    /// flat result.
+    pub parent_id: String,
+}
+
+/// The 41 UIA `ControlType` ids (stable since Windows 8.1) mapped to a
+/// stable, locale-independent English friendly string (D-7.3). Unknown ids
+/// (including any future additions) map to `"Unknown"`.
+///
+/// Source: `learn.microsoft.com/en-us/windows/win32/winauto/uiauto-controltype-ids`
+/// (07-RESEARCH.md Code Examples).
+#[allow(dead_code)] // Consumed by Task 2's Session::get_uia_tree (interface-first).
+pub(crate) fn control_type_to_role(id: i32) -> &'static str {
+    match id {
+        50000 => "Button",
+        50001 => "Calendar",
+        50002 => "CheckBox",
+        50003 => "ComboBox",
+        50004 => "Edit",
+        50005 => "Hyperlink",
+        50006 => "Image",
+        50007 => "ListItem",
+        50008 => "List",
+        50009 => "Menu",
+        50010 => "MenuBar",
+        50011 => "MenuItem",
+        50012 => "ProgressBar",
+        50013 => "RadioButton",
+        50014 => "ScrollBar",
+        50015 => "Slider",
+        50016 => "Spinner",
+        50017 => "StatusBar",
+        50018 => "Tab",
+        50019 => "TabItem",
+        50020 => "Text",
+        50021 => "ToolBar",
+        50022 => "ToolTip",
+        50023 => "Tree",
+        50024 => "TreeItem",
+        50025 => "Custom",
+        50026 => "Group",
+        50027 => "Thumb",
+        50028 => "DataGrid",
+        50029 => "DataItem",
+        50030 => "Document",
+        50031 => "SplitButton",
+        50032 => "Window",
+        50033 => "Pane",
+        50034 => "Header",
+        50035 => "HeaderItem",
+        50036 => "Table",
+        50037 => "TitleBar",
+        50038 => "Separator",
+        50039 => "SemanticZoom",
+        50040 => "AppBar",
+        _ => "Unknown",
+    }
+}
+
+/// Join a UIA `RuntimeId` (or `parent_runtime_id`) int array into a stable,
+/// deterministic `"-"`-joined string (D-7.2, Claude's Discretion). `"-"`
+/// avoids the ambiguity `"."` could introduce if a component were ever
+/// negative. An empty slice joins to an empty string.
+#[allow(dead_code)] // Consumed by Task 2's Session::get_uia_tree (interface-first).
+pub(crate) fn runtime_id_to_string(ids: &[i32]) -> String {
+    ids.iter().map(i32::to_string).collect::<Vec<_>>().join("-")
+}
+
+/// Crate-internal wire shape for [`UiaElement`] (the Phase 7 wire
+/// contract's `Uia` `data` array element).
+///
+/// The sensor ships RAW `runtime_id`/`parent_runtime_id` int arrays and a
+/// RAW `control_type` int; [`UiaElementWire::into_owned`] performs the
+/// D-7.2 join and D-7.3 map here in the SDK (chosen for offline
+/// testability and to keep the AOT sensor binary logic-thin, per
+/// 07-RESEARCH's Architectural Responsibility Map).
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)] // Consumed by Task 2's Session::get_uia_tree (interface-first).
+pub(crate) struct UiaElementWire {
+    runtime_id: Vec<i32>,
+    control_type: i32,
+    name: String,
+    bbox: RectWire,
+    enabled: bool,
+    visible: bool,
+    focusable: bool,
+    focused: bool,
+    depth: u32,
+    parent_runtime_id: Vec<i32>,
+}
+
+impl UiaElementWire {
+    #[allow(dead_code)] // Consumed by Task 2's Session::get_uia_tree (interface-first).
+    pub(crate) fn into_owned(self) -> UiaElement {
+        UiaElement {
+            id: runtime_id_to_string(&self.runtime_id),
+            role: control_type_to_role(self.control_type).to_string(),
+            name: self.name,
+            bbox: self.bbox.into_owned(),
+            enabled: self.enabled,
+            visible: self.visible,
+            focusable: self.focusable,
+            focused: self.focused,
+            depth: self.depth,
+            parent_id: runtime_id_to_string(&self.parent_runtime_id),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -257,5 +410,75 @@ mod tests {
         assert_eq!(p.path, "C:\\Windows\\System32\\notepad.exe");
         assert_eq!(p.command_line, None);
         assert_eq!(p.owner, None);
+    }
+
+    /// A canned `Uia` `data` JSON array (per the wire contract, raw
+    /// `runtime_id`/`control_type`/`parent_runtime_id`) deserializes into
+    /// `Vec<UiaElementWire>`, maps via `into_owned` to `Vec<UiaElement>`,
+    /// and every field equals the source — no loss across the round trip
+    /// (SC#4).
+    #[test]
+    fn uia_element_wire_round_trips() {
+        let data = serde_json::json!([
+            {
+                "runtime_id": [42, -3, 7],
+                "control_type": 50000,
+                "name": "OK",
+                "bbox": {"x": 10, "y": 20, "w": 80, "h": 24},
+                "enabled": true,
+                "visible": true,
+                "focusable": true,
+                "focused": false,
+                "depth": 1,
+                "parent_runtime_id": [42, -3]
+            }
+        ]);
+
+        let wires: Vec<UiaElementWire> =
+            serde_json::from_value(data).expect("canned Uia data deserializes");
+        let elements: Vec<UiaElement> = wires.into_iter().map(UiaElementWire::into_owned).collect();
+
+        assert_eq!(elements.len(), 1);
+        let e = &elements[0];
+        assert_eq!(e.id, "42--3-7");
+        assert_eq!(e.role, "Button");
+        assert_eq!(e.name, "OK");
+        assert_eq!(
+            e.bbox,
+            crate::Rect {
+                x: 10,
+                y: 20,
+                w: 80,
+                h: 24
+            }
+        );
+        assert!(e.enabled);
+        assert!(e.visible);
+        assert!(e.focusable);
+        assert!(!e.focused);
+        assert_eq!(e.depth, 1);
+        assert_eq!(e.parent_id, "42--3");
+    }
+
+    /// `runtime_id_to_string` joins a `RuntimeId` int array with `-` into a
+    /// stable, deterministic string; the same input always yields the same
+    /// output (D-7.2).
+    #[test]
+    fn runtime_id_to_string_is_deterministic() {
+        let ids = [42, -3, 7];
+        assert_eq!(runtime_id_to_string(&ids), "42--3-7");
+        assert_eq!(runtime_id_to_string(&ids), runtime_id_to_string(&ids));
+        assert_eq!(runtime_id_to_string(&[]), "");
+    }
+
+    /// `control_type_to_role` maps known `ControlType` ids to their stable
+    /// English friendly string, and any out-of-table id to `"Unknown"`
+    /// (D-7.3).
+    #[test]
+    fn control_type_maps_known_and_unknown_ids() {
+        assert_eq!(control_type_to_role(50000), "Button");
+        assert_eq!(control_type_to_role(50032), "Window");
+        assert_eq!(control_type_to_role(50004), "Edit");
+        assert_eq!(control_type_to_role(99999), "Unknown");
     }
 }

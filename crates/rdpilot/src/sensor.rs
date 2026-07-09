@@ -6,12 +6,12 @@
 //! and the `SensorShared` correlation state that lets `Session::ping()` (a later
 //! plan) round-trip a request across the dedicated session-loop OS thread.
 //!
-//! This module implements the `Version`/`Ping`/`Pong` message types (D-4.3)
-//! plus the Phase 6 `WindowList`/`ProcessTree`/`SetForegroundWindow`/
-//! `LaunchProcess` request/response types. All non-`Version` replies share one
-//! generic, msg_type-agnostic fulfilment path keyed on `req_id`
-//! (RESEARCH Pattern 1) — the envelope shape does not need reworking as new
-//! message types (e.g. Phase 7's `Uia`) are added.
+//! This module implements the `Version`/`Ping`/`Pong` message types (D-4.3),
+//! the Phase 6 `WindowList`/`ProcessTree`/`SetForegroundWindow`/
+//! `LaunchProcess` request/response types, and Phase 7's `Uia` tree-walk
+//! request type. All non-`Version` replies share one generic,
+//! msg_type-agnostic fulfilment path keyed on `req_id` (RESEARCH Pattern 1)
+//! — the envelope shape did not need reworking to add `Uia`.
 //!
 //! No `unwrap`/`expect`/`panic!` outside `#[cfg(test)]` (API-01): malformed or
 //! oversized inbound JSON from the (by-design unauthenticated, Pitfall m3) DVC
@@ -43,12 +43,14 @@ pub(crate) struct Envelope {
 }
 
 /// The set of message types this crate can send/receive over the
-/// `RDPILOT_SENSOR` DVC (D-4.3, Phase 6 wire contract): the version
-/// handshake, the ping/pong heartbeat, and the four Phase 6 request/response
-/// types. Serializes as the bare externally-tagged unit string form —
-/// `"Version"`, `"Ping"`, `"Pong"`, `"WindowList"`, `"ProcessTree"`,
-/// `"SetForegroundWindow"`, `"LaunchProcess"` — matching the wire shape
-/// verified in RESEARCH Q2.
+/// `RDPILOT_SENSOR` DVC (D-4.3, Phase 6 wire contract, extended by Phase 7):
+/// the version handshake, the ping/pong heartbeat, the four Phase 6
+/// request/response types, and Phase 7's `Uia` tree-walk request. Serializes
+/// as the bare externally-tagged unit string form — `"Version"`, `"Ping"`,
+/// `"Pong"`, `"WindowList"`, `"ProcessTree"`, `"SetForegroundWindow"`,
+/// `"LaunchProcess"`, `"Uia"` — matching the wire shape verified in RESEARCH
+/// Q2. `Uia` reuses the existing generic non-`Version` fulfilment path
+/// (RESEARCH Pattern 1) with zero dispatch/correlation changes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum MsgType {
     Version,
@@ -58,6 +60,7 @@ pub(crate) enum MsgType {
     ProcessTree,
     SetForegroundWindow,
     LaunchProcess,
+    Uia,
 }
 
 #[cfg(test)]
