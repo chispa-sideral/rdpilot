@@ -184,18 +184,26 @@ internal static class Program
 /// that older mechanism is incompatible with Native AOT for the string-
 /// marshalled open call, RESEARCH Pitfall 1 / T-05-02).
 ///
-/// StringMarshalling.Utf16 is tried first per RESEARCH Assumption A3; the
-/// Phase-4 PowerShell fixture used the ANSI entry point (CharSet.Ansi) and
-/// worked live, so if the open call fails at the P/Invoke resolution level
-/// (not the retry-poll timing race above) on the Windows build host, flip
-/// this to StringMarshalling.Utf8 (the ANSI 'A' entry point) — a cheap
-/// runtime confirmation, not a structural risk (RESEARCH Open Question #3).
+/// Live-tuned (Plan 04 live gate, RESEARCH Open Question #3 resolved):
+/// StringMarshalling.Utf16 was tried first per RESEARCH Assumption A3, but
+/// the live gate showed the sensor process starting, retrying its bounded
+/// open loop for its full ~10s budget, and exiting -- WTSVirtualChannelOpenEx
+/// never succeeded and the RDPILOT_SENSOR DVC never even appeared on the
+/// client-side wire trace (confirmed via tracing on the Rust side: zero DVC
+/// Create Request for that name ever arrived). WTSVirtualChannelOpenEx is
+/// documented as an ANSI-only Win32 API (no "W" wide-string export exists in
+/// wtsapi32.dll) -- StringMarshalling.Utf16 caused the source generator to
+/// target a "WTSVirtualChannelOpenExW" entry point that does not exist,
+/// silently failing every call. Flipped to StringMarshalling.Utf8 (the ANSI
+/// 'A' entry point), matching the Phase-4 PowerShell fixture's proven-live
+/// CharSet.Ansi convention -- this was the exact fallback this doc comment
+/// already anticipated (RESEARCH Open Question #3).
 internal static partial class Wts
 {
     internal const uint WTS_CURRENT_SESSION = 0xFFFFFFFF;
     internal const uint WTS_CHANNEL_OPTION_DYNAMIC = 0x1;
 
-    [LibraryImport("wtsapi32.dll", StringMarshalling = StringMarshalling.Utf16, SetLastError = true)]
+    [LibraryImport("wtsapi32.dll", StringMarshalling = StringMarshalling.Utf8, SetLastError = true)]
     internal static partial nint WTSVirtualChannelOpenEx(uint sessionId, string virtualName, uint flags);
 
     [LibraryImport("wtsapi32.dll", SetLastError = true)]
