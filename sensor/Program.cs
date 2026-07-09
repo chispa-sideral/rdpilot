@@ -238,6 +238,10 @@ internal static class Program
             {
                 WriteEnvelope(handle, BuildWindowListReplyEnvelope(msg.ReqId));
             }
+            else if (msg.Type == MsgType.ProcessTree)
+            {
+                WriteEnvelope(handle, BuildProcessTreeReplyEnvelope(msg.ReqId));
+            }
             // Any other message type this v1 protocol doesn't define is
             // silently ignored — never crashes the loop (T-05-01, mirrors
             // the Rust processor's own unknown-type handling).
@@ -270,6 +274,37 @@ internal static class Program
             Version = ProtocolVersion.Value,
             ReqId = reqId,
             Type = MsgType.WindowList,
+            Payload = payload,
+        };
+    }
+
+    /// Build the ProcessTree reply envelope (T-06-01 / D-6.4): enumerates the
+    /// whole-system process snapshot via
+    /// <see cref="ProcessEnumeration.BuildProcessTreeResponse"/> (Toolhelp32,
+    /// NEVER the managed WMI query API — Pattern 5/Pitfall 2) and wraps it
+    /// `success:true`; on ANY exception from the handler, degrades to a
+    /// `success:false` reply carrying the exception message instead of
+    /// throwing out of the dispatch loop (mirrors
+    /// BuildWindowListReplyEnvelope's discipline).
+    private static Envelope BuildProcessTreeReplyEnvelope(ulong reqId)
+    {
+        ProcessTreeResponse response;
+        try
+        {
+            response = ProcessEnumeration.BuildProcessTreeResponse();
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[rdpilot-sensor] ProcessTree handler failed: {ex}");
+            response = new ProcessTreeResponse { Success = false, Data = null, Error = ex.Message };
+        }
+
+        JsonElement payload = JsonSerializer.SerializeToElement(response, EnvelopeJsonContext.Default.ProcessTreeResponse);
+        return new Envelope
+        {
+            Version = ProtocolVersion.Value,
+            ReqId = reqId,
+            Type = MsgType.ProcessTree,
             Payload = payload,
         };
     }
