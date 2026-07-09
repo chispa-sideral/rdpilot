@@ -180,7 +180,17 @@ Plans:
   3. A tree walk scoped to TreeScope_Children completes within 500 ms for a standard Win32 application
   4. The response is valid JSON-serializable UiaElement[] (round-trips through serde_json without loss)
 
-**Plans**: TBD
+**Plans**: 5 plans in 4 waves (risk-gate-first per D-7.5)
+
+- Wave 1 (offline, parallel):
+  - [ ] 07-01-PLAN.md — Rust wire extension: MsgType::Uia, owned UiaElement + UiaElementWire (RuntimeId join D-7.2 / ControlType→role map D-7.3, Rust-side), Session::get_uia_tree(hwnd), offline unit tests (SC#4/D-7.2/D-7.3)
+  - [ ] 07-02-PLAN.md — C# [GeneratedComInterface] UIA interop (4 GUID-verified interfaces, CoCreateInstance, SAFEARRAY decode) + --smoke-test-uia scaffolding; offline AOT-trim publish check (D-7.5)
+- Wave 2 (RISK GATE):
+  - [ ] 07-03-PLAN.md — win-x64 AOT-publish + run --smoke-test-uia on a real Windows VM; resolve SAFEARRAY/BSTR/BOOL marshalling (A1/A2/A3) before any handler code (D-7.5 spike gate)
+- Wave 3 (real handler):
+  - [ ] 07-04-PLAN.md — UiaTree.cs handler: ElementFromHandle → FindAll(TreeScope_Children) → per-element reads with per-element COMException skip (D-7.4/D-7.6/D-7.7) + Program.cs dispatch arm + EnvelopeJsonContext registrations
+- Wave 4 (live gate):
+  - [ ] 07-05-PLAN.md — Four gated live tests (one per SC) + end-of-phase live gate against a real Notepad window on a disposable Azure VM
 
 ### Phase 8: Public SDK API + WorldState
 
