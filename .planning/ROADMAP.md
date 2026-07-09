@@ -20,7 +20,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 - [x] **Phase 5: Sensor Bootstrap + Deployment** - Build the C# NativeAOT sensor helper and deploy it onto a real target via drive redirection or WinRM — all 4 success criteria proven live (canonical run: RDPDR primary 22.61ms, WinRM fallback 21.62ms, both < 1s bound, NativeAOT binary 2.57 MiB, on a real disposable Azure VM, 2026-07-09)
 - [x] **Phase 6: Window + Process Perception** - Retrieve window list, process tree, per-window screenshots, focus control, and remote process launch over DVC (completed 2026-07-09)
 - [x] **Phase 7: UIA Tree Module** - Add the UI Automation sensor module and return a flat UiaElement[] over DVC — all 4 success criteria proven live (canonical run: SC#3 TreeScope_Children walk measured 30.36ms, well under the 500ms bound, on a real disposable Azure VM against a launched Notepad window, 2026-07-09; PERC-03)
-- [ ] **Phase 8: Public SDK API + WorldState** - Expose a clean typed Session API and a coherent WorldState snapshot correlating framebuffer, windows, and UIA
+- [x] **Phase 8: Public SDK API + WorldState** - Expose a clean typed Session API and a coherent WorldState snapshot correlating framebuffer, windows, and UIA (completed 2026-07-09)
 - [ ] **Phase 9: Scripted Proof Harness** - Prove the full read/inspect loop end-to-end against a real remote-only Windows program
 
 ## Phase Details
@@ -204,7 +204,7 @@ Plans:
   3. All coordinate values in WorldState (screenshot dimensions, window rects, UIA bounding boxes, mouse input targets) are in the same virtual-desktop pixel space with no silent scaling
   4. The API compiles clean under strict Rust settings (no `unsafe` in public surface, no `unwrap` in library code)
 
-**Plans**: 2/3 plans executed
+**Plans**: 3/3 plans complete
 **UI hint**: yes (the SDK API ergonomics ARE the surface — no visual UI contract needed, per 08-CONTEXT)
 
 Plans:
@@ -219,7 +219,7 @@ Plans:
 
 **Wave 3** *(blocked on Wave 2 — thin live gate)*
 
-- [ ] 08-03-PLAN.md — Gated live `world_state` capture-span test(s) in tests/live_session.rs + end-of-phase live gate (SC#2, best-effort span per D-8.2; SC#1/SC#3/SC#4 already close offline)
+- [x] 08-03-PLAN.md — Gated live `world_state` capture-span test(s) in tests/live_session.rs + end-of-phase live gate (SC#2, best-effort span per D-8.2; SC#1/SC#3/SC#4 already close offline)
 
 ### Phase 9: Scripted Proof Harness
 
@@ -249,7 +249,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8 →
 | 5. Sensor Bootstrap + Deployment | 4/4 | Complete   | 2026-07-09 |
 | 6. Window + Process Perception | 5/5 | Complete   | 2026-07-09 |
 | 7. UIA Tree Module | 5/5 | Complete   | 2026-07-09 |
-| 8. Public SDK API + WorldState | 2/3 | In Progress|  |
+| 8. Public SDK API + WorldState | 3/3 | Complete   | 2026-07-09 |
 | 9. Scripted Proof Harness | 0/? | Not started | - |
 
 ## Backlog

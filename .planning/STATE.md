@@ -4,13 +4,13 @@ milestone: v1.0
 milestone_name: milestone
 status: completed
 stopped_at: Phase 8 Wave 1 (08-01) COMPLETE — strict lint gates + owned-type Serialize derives shipped. 08-02 (WorldState + world_state()) unblocked.
-last_updated: "2026-07-09T21:37:21.481Z"
+last_updated: "2026-07-09T21:42:09.433Z"
 last_activity: "2026-07-09 -- 08-01 (Wave 1) COMPLETE: lib.rs strict lint gates (API-01/SC#4 compiler-enforced) + Serialize derives on all five owned SDK types (Rect, dims-only Screenshot, WindowInfo, WindowState-lowercase, ProcessInfo, UiaElement). cargo clippy -p rdpilot --lib exits 0; cargo test -p rdpilot --lib passes 94/94. See 08-01-SUMMARY.md."
 progress:
   total_phases: 9
   completed_phases: 7
   total_plans: 31
-  completed_plans: 30
+  completed_plans: 31
   percent: 78
 ---
 
@@ -26,7 +26,7 @@ See: .planning/PROJECT.md (updated 2026-06-04)
 ## Current Position
 
 Phase: 8 (public-sdk-api-worldstate) — IN PROGRESS
-Plan: 2 of 3 (Wave 1 complete)
+Plan: 3 of 3 (Wave 1 complete)
 Status: 08-01 complete — 08-02 (WorldState + world_state()) unblocked
 Last activity: 2026-07-09 -- 08-01 (Wave 1) COMPLETE: lib.rs strict lint gates (API-01/SC#4 compiler-enforced) + Serialize derives on all five owned SDK types (Rect, dims-only Screenshot, WindowInfo, WindowState-lowercase, ProcessInfo, UiaElement). cargo clippy -p rdpilot --lib exits 0; cargo test -p rdpilot --lib passes 94/94. See 08-01-SUMMARY.md.
 
@@ -80,6 +80,7 @@ Progress: [█████████░] 94% (Phase 8: 1/3 plans complete — 
 | Phase 07-uia-tree-module P05 | ~40min | 2 tasks | 1 files |
 | Phase 08 P01 | ~5min | 2 tasks | 3 files |
 | Phase 08-public-sdk-api-worldstate P02 | 1200 | 2 tasks | 3 files |
+| Phase 08 P03 | 25min | 1 tasks | 1 files |
 
 ## Accumulated Context
 
@@ -145,6 +146,7 @@ Recent decisions affecting current work:
 - [Phase ?]: 08-01: lib.rs inner #![deny(unsafe_code)]/clippy::unwrap_used/clippy::expect_used gates make API-01/SC#4 compiler-enforced (never a Cargo.toml [lints] table, which would break tests/live_session.rs's 116 legitimate .expect() calls)
 - [Phase ?]: 08-01: Screenshot derives Serialize only (no Deserialize) with #[serde(skip)] on rgba — dims-only JSON output (D-8.4, threat T-08-02); to_png() remains the sole byte-egress path
 - [Phase ?]: D-8.1/D-8.2/D-8.4 applied verbatim: WorldStateOptions a-la-carte defaults to screenshot+window_list+no-UIA (SC#2-compliant); capture_span is SystemTime/Duration (never Instant) with the 500ms bound checked only at the Plan 03 live gate, never in code
+- [Phase ?]: Live VM measurement for SC#2 (08-03) deferred — no disposable Azure VM currently reachable; gated test authored and compiles clean offline
 
 ### Pending Todos
 
@@ -171,6 +173,6 @@ Phase 2 Plan 02: pre-existing rustdoc intra-doc-link warnings in config.rs (Wave
 
 ## Session Continuity
 
-Last session: 2026-07-09T21:37:21.476Z
+Last session: 2026-07-09T21:42:09.424Z
 Stopped at: Phase 8 context gathered
 Resume file: .planning/phases/08-public-sdk-api-worldstate/08-CONTEXT.md
