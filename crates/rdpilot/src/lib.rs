@@ -17,6 +17,18 @@
 //! crate [`Result`] alias. There are no `unwrap`/`expect`/`panic!` calls in
 //! non-test code.
 
+// API-01/SC#4: make "no unsafe/unwrap/expect in library code" a compile-time
+// guarantee, not a convention. These are deliberately `lib.rs` INNER
+// attributes (crate-scoped), NOT a `Cargo.toml [lints]` table — a `[lints]`
+// table is package-scoped and would also apply to `tests/live_session.rs`,
+// breaking its 116 legitimate `.expect()` calls. Inner attributes scope to
+// this library crate's compilation unit only, leaving separate `tests/*.rs`
+// integration-test crate roots untouched. Do not "helpfully" migrate these to
+// `Cargo.toml` — that will break the live-test suite.
+#![deny(unsafe_code)]
+#![deny(clippy::unwrap_used)]
+#![deny(clippy::expect_used)]
+
 mod config;
 mod connect;
 mod error;
