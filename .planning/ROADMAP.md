@@ -139,13 +139,13 @@ Plans:
   3. When WinRM is available, the WinRM bootstrap path also successfully deploys and launches the sensor
   4. The deployed sensor opens the RDPILOT_SENSOR DVC channel and responds to a ping within 1 second of launch
 
-**Plans**: 1/4 plans executed
+**Plans**: 2/4 plans executed
 
 Plans:
 
 - [ ] 05-01-PLAN.md — C# .NET 8 NativeAOT rdpilot-sensor.exe (Version/Ping/Pong server, SENSOR-01 / SC1)
 - [x] 05-02-PLAN.md — Rust foundation: Key::Win + minimal RdpilotDriveBackend + ironrdp-rdpdr dep (SENSOR-02 / SC2 foundation)
-- [ ] 05-03-PLAN.md — RDPDR static-channel registration + Session::deploy_and_launch Win+R poll-and-retry (SENSOR-02 / SC2, SC4)
+- [x] 05-03-PLAN.md — RDPDR static-channel registration + Session::deploy_and_launch Win+R poll-and-retry (SENSOR-02 / SC2, SC4)
 - [ ] 05-04-PLAN.md — WinRM fallback fixture + both gated live tests + throwaway cleanup + live gate (SC2/SC3/SC4, D-5.7)
 
 ### Phase 6: Window + Process Perception
@@ -216,7 +216,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8 →
 | 2. RDP Session + Framebuffer Core | 3/3 | Complete    | 2026-06-05 |
 | 3. Input Injection | 4/4 | Complete   | 2026-07-08 |
 | 4. DVC Transport Channel | 3/3 | Complete | 2026-07-09 |
-| 5. Sensor Bootstrap + Deployment | 1/4 | In Progress|  |
+| 5. Sensor Bootstrap + Deployment | 2/4 | In Progress|  |
 | 6. Window + Process Perception | 0/? | Not started | - |
 | 7. UIA Tree Module | 0/? | Not started | - |
 | 8. Public SDK API + WorldState | 0/? | Not started | - |

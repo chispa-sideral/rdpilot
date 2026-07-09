@@ -4,13 +4,13 @@ milestone: v1.0
 milestone_name: milestone
 status: verifying
 stopped_at: Phase 4 DVC transport channel COMPLETE — live gate PASSED against a real Azure VM (sensor_ping_pong_under_500ms, 165ms measured round trip); SENSOR-03 validated
-last_updated: "2026-07-09T10:42:39.318Z"
+last_updated: "2026-07-09T10:52:24.920Z"
 last_activity: 2026-07-09
 progress:
   total_phases: 9
   completed_phases: 4
   total_plans: 18
-  completed_plans: 15
+  completed_plans: 16
   percent: 44
 ---
 
@@ -65,6 +65,7 @@ Progress: [████░░░░░░] 44% (Phase 4: 3/3 plans complete, liv
 | Phase 04 P02 | 35min | 2 tasks | 4 files |
 | Phase 04 P03 | ~30min | 2 tasks | 3 files (offline code only; live gate pending) |
 | Phase 05 P02 | 15min | 3 tasks | 5 files |
+| Phase 05 P03 | 20min | 2 tasks | 4 files |
 
 ## Accumulated Context
 
@@ -104,6 +105,10 @@ Recent decisions affecting current work:
 - **Phase 4 live gate (2026-07-09):** SENSOR-03 validated live against a real disposable Azure VM (measured ping/pong round trip 165ms). Two bugs found and fixed: session_loop.rs's Ping handler no longer propagates a transient "DVC not registered/not yet open" lookup failure via `?` (which previously killed the whole session-loop thread on the very first ping attempt) — extracted to `build_ping_frame()`, dropped (vec![]) on failure so the caller's existing 500ms timeout surfaces a normal retryable error instead. sensor-responder.ps1's `Read-Envelope` now scans for the first `{` byte instead of assuming JSON starts at offset 0 — WTSVirtualChannelRead was consistently returning a small fixed binary prefix ahead of the JSON payload. Also empirically found: Task Scheduler's AtLogOn trigger takes ~20-30s to fire and does NOT refire on an RDP session *reconnect* (only a fresh logon) — the live test's outer setup-retry budget was widened 15s→60s to tolerate this deployment-mechanism latency (Session::ping()'s own hard 500ms per-call timeout, the actual SC#2 measurement, is unchanged).
 - [Phase ?]: 05-02: ServerDriveIoRequest has 11 variants not the plan's assumed 4 (efs.rs read_first); the 4 planned (Create/Close/Read/QueryDirectory) are implemented, the other 7 are typed-rejected with NOT_SUPPORTED, mirroring the crate's own handle_printer_io_request default
 - [Phase ?]: 05-02: not-found NtStatus for rejected RDPDR Create paths is NtStatus::NO_SUCH_FILE (0xC000000F) -- efs.rs has no OBJECT_NAME_NOT_FOUND constant
+- [Phase ?]: 05-03: Rdpdr::new(backend, computer_name)/with_drives(Some(vec![(id,name)])) matched the plan's assumed signature exactly (verified against pinned ironrdp-rdpdr-0.6.0 source) -- no deviation needed
+- [Phase ?]: 05-03: Rdpdr::process() self-dispatches inbound MS-RDPEFS IRPs to the registered RdpdrBackend internally -- ActiveStage::process drives the RDPDR static channel automatically, exactly like the existing drdynvc channel; no session_loop.rs change was needed
+- [Phase ?]: 05-03: introduced crate::connect::SENSOR_EXE_NAME as the single source of truth for the served/launched sensor filename, referenced by both the RDPDR backend registration and Session::deploy_and_launch's launch_command() helper
+- [Phase ?]: 05-03: deploy_and_launch poll-and-retry tuned offline as LAUNCH_ATTEMPTS=3 x PINGS_PER_LAUNCH_ATTEMPT=20 (~30s total outer budget), reasoned from Phase 4's empirical ~10s WTSVirtualChannelOpenEx retry-window finding -- to be live-tuned in Plan 04 if needed
 
 ### Pending Todos
 
@@ -125,6 +130,6 @@ Phase 2 Plan 02: pre-existing rustdoc intra-doc-link warnings in config.rs (Wave
 
 ## Session Continuity
 
-Last session: 2026-07-09T10:42:39.312Z
+Last session: 2026-07-09T10:52:24.915Z
 Stopped at: Phase 5 context gathered
 Resume file: .planning/phases/05-sensor-bootstrap-deployment/05-CONTEXT.md
