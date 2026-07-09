@@ -361,6 +361,10 @@ internal static class Program
             {
                 WriteEnvelope(handle, BuildLaunchProcessReplyEnvelope(msg.ReqId, msg.Payload));
             }
+            else if (msg.Type == MsgType.Uia)
+            {
+                WriteEnvelope(handle, BuildUiaTreeReplyEnvelope(msg.ReqId, msg.Payload));
+            }
             // Any other message type this v1 protocol doesn't define is
             // silently ignored — never crashes the loop (T-05-01, mirrors
             // the Rust processor's own unknown-type handling).
@@ -490,6 +494,41 @@ internal static class Program
             Version = ProtocolVersion.Value,
             ReqId = reqId,
             Type = MsgType.LaunchProcess,
+            Payload = responsePayload,
+        };
+    }
+
+    /// Build the Uia reply envelope (T-07-01 / D-6.4 / D-7.6): deserializes
+    /// the request payload and calls
+    /// <see cref="UiaTree.BuildUiaTreeResponse"/>, which itself degrades to
+    /// `success:false` on total handler failure (D-7.6's per-element skip
+    /// happens inside that call). A missing/malformed request payload, or
+    /// any exception escaping the handler, degrades to a `success:false`
+    /// reply instead of throwing out of the dispatch loop (D-6.4, T-07-01),
+    /// mirroring BuildSetForegroundWindowReplyEnvelope/
+    /// BuildLaunchProcessReplyEnvelope's discipline exactly.
+    private static Envelope BuildUiaTreeReplyEnvelope(ulong reqId, JsonElement? payload)
+    {
+        UiaTreeResponse response;
+        try
+        {
+            UiaTreeRequest? request = payload?.Deserialize(EnvelopeJsonContext.Default.UiaTreeRequest);
+            response = request is null
+                ? new UiaTreeResponse { Success = false, Data = null, Error = "missing/malformed Uia request payload" }
+                : UiaTree.BuildUiaTreeResponse(request.Hwnd);
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[rdpilot-sensor] Uia handler failed: {ex}");
+            response = new UiaTreeResponse { Success = false, Data = null, Error = ex.Message };
+        }
+
+        JsonElement responsePayload = JsonSerializer.SerializeToElement(response, EnvelopeJsonContext.Default.UiaTreeResponse);
+        return new Envelope
+        {
+            Version = ProtocolVersion.Value,
+            ReqId = reqId,
+            Type = MsgType.Uia,
             Payload = responsePayload,
         };
     }
