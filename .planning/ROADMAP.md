@@ -160,7 +160,12 @@ Plans:
   3. The SDK brings a specified window to the foreground (set_foreground_window) and confirms the focus change in a subsequent window list query
   4. A launch_process() call starts a remote process (e.g. notepad.exe) and the new process appears in a subsequent process tree query
 
-**Plans**: TBD
+**Plans**: 5 plans across 4 waves
+- [ ] 06-01-PLAN.md — (wave 1) Rust DVC request/response generalization + owned perception types + Error::SensorRejected + wire contract
+- [ ] 06-02-PLAN.md — (wave 2, needs 01) Four sensor-backed Session methods (window list / process tree / focus / launch) + D-6.1 per-window screenshot crop
+- [ ] 06-03-PLAN.md — (wave 2, needs 01) C# Envelope.Payload→JsonElement AOT smoke-test FIRST, then the WindowList handler (EnumWindows, no COM)
+- [ ] 06-04-PLAN.md — (wave 3, needs 03) C# ProcessTree (Toolhelp32, never WMI) + SetForegroundWindow + fire-and-forget CreateProcessW launch
+- [ ] 06-05-PLAN.md — (wave 4, needs 02+04) Four gated live tests (one per success criterion) + end-of-phase live gate against a real Azure VM
 
 ### Phase 7: UIA Tree Module
 
