@@ -35,8 +35,18 @@ internal static class Program
     private const uint ReadTimeoutMs = 5000;
     private const int ReadBufferSize = 8192;
 
-    private static int Main()
+    /// Argument that selects the AOT source-gen risk-gate smoke test
+    /// (RESEARCH Pitfall 1 / Pattern 6, 06-03-PLAN Task 1) instead of the
+    /// normal WTS channel loop — see <see cref="RunAotSmokeTest"/>.
+    private const string SmokeTestArg = "--smoke-test";
+
+    private static int Main(string[] args)
     {
+        if (args.Length > 0 && args[0] == SmokeTestArg)
+        {
+            return RunAotSmokeTest();
+        }
+
         nint handle = OpenChannelWithRetry();
         if (handle == 0)
         {
@@ -54,6 +64,98 @@ internal static class Program
         }
 
         return 0;
+    }
+
+    /// The single highest-risk unknown of Phase 6 (RESEARCH A1 / Pitfall 1 /
+    /// Pattern 6, 06-03-PLAN Task 1), proven BEFORE any Win32 window-
+    /// enumeration code is written: a real typed DTO (<see cref="WindowListResponse"/>)
+    /// round-trips through the retyped `Envelope.Payload` (now
+    /// `JsonElement?`, was `object?`) with zero reflection fallback, under
+    /// an ACTUAL `dotnet publish -p:PublishAot=true` binary — not just a
+    /// `dotnet build`. Every (de)serialize call below goes through the
+    /// source-generated `EnvelopeJsonContext.Default.*` overloads only,
+    /// matching the same discipline `ReadEnvelope`/`WriteEnvelope` use, so a
+    /// broken source-gen registration surfaces as an assertion failure here
+    /// (or a `JsonException`/`NotSupportedException` under
+    /// `JsonSerializerIsReflectionEnabledByDefault=false`) instead of
+    /// silently later inside the real WindowList handler (Task 2).
+    ///
+    /// Exit 0 + "PASS" on success, exit 1 + "FAIL: ..." on any mismatch or
+    /// exception — never throws out of Main (mirrors the T-05-01 drop-
+    /// never-crash discipline used elsewhere in this file).
+    private static int RunAotSmokeTest()
+    {
+        try
+        {
+            WindowListResponse original = new()
+            {
+                Success = true,
+                Data =
+                [
+                    new WindowRecord
+                    {
+                        Hwnd = 0x1234_5678_9ABC,
+                        Title = "Notepad",
+                        Rect = new WindowRect { X = 10, Y = 20, W = 800, H = 600 },
+                        ZOrder = 0,
+                        State = "normal",
+                        ClassName = "Notepad",
+                        Pid = 4242,
+                    },
+                ],
+                Error = null,
+            };
+
+            // serialize DTO -> JsonElement -> attach to Envelope.Payload
+            JsonElement payload = JsonSerializer.SerializeToElement(original, EnvelopeJsonContext.Default.WindowListResponse);
+            Envelope envelope = new()
+            {
+                Version = ProtocolVersion.Value,
+                ReqId = 1,
+                Type = MsgType.WindowList,
+                Payload = payload,
+            };
+
+            // Envelope -> wire bytes -> Envelope (the exact ReadEnvelope/WriteEnvelope path)
+            byte[] wireBytes = JsonSerializer.SerializeToUtf8Bytes(envelope, EnvelopeJsonContext.Default.Envelope);
+            Envelope? roundTripped = JsonSerializer.Deserialize(wireBytes, EnvelopeJsonContext.Default.Envelope);
+
+            if (roundTripped is not { Payload: { } roundTrippedPayload })
+            {
+                Console.Error.WriteLine("[smoke-test] FAIL: round-tripped envelope has a null payload");
+                return 1;
+            }
+
+            // JsonElement -> DTO (the exact shape a future request-payload read would use)
+            WindowRecord[]? decodedData = roundTrippedPayload.Deserialize(EnvelopeJsonContext.Default.WindowListResponse)?.Data;
+
+            bool matches = roundTripped.Type == MsgType.WindowList
+                && roundTripped.ReqId == envelope.ReqId
+                && decodedData is [{ } record]
+                && record.Hwnd == original.Data![0].Hwnd
+                && record.Title == original.Data[0].Title
+                && record.Rect.W == original.Data[0].Rect.W
+                && record.Rect.H == original.Data[0].Rect.H
+                && record.State == original.Data[0].State
+                && record.ClassName == original.Data[0].ClassName
+                && record.Pid == original.Data[0].Pid;
+
+            if (!matches)
+            {
+                Console.Error.WriteLine("[smoke-test] FAIL: round-tripped payload does not match the original DTO");
+                return 1;
+            }
+
+            Console.WriteLine(
+                "[smoke-test] PASS: WindowListResponse round-tripped through Envelope.Payload " +
+                "(JsonElement?) via EnvelopeJsonContext with no reflection fallback");
+            return 0;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[smoke-test] FAIL: unexpected exception: {ex}");
+            return 1;
+        }
     }
 
     /// Open the RDPILOT_SENSOR channel, retrying up to <see cref="OpenRetries"/>
