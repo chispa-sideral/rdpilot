@@ -1,0 +1,212 @@
+// rdpilot-sensor — the SERVER side of the RDPILOT_SENSOR DVC envelope
+// protocol (Version/Ping/Pong only, D-5.4, NO COM). Re-derives
+// tests/fixtures/sensor-responder.ps1's proven WTS open/read/write/close
+// shape idiomatically in C# (D-5.7) — NOT a transliteration:
+//
+//   - [LibraryImport], never the older attribute-based P/Invoke marshalling,
+//     for AOT-safe marshalling of the string-parameter WTSVirtualChannelOpenEx
+//     call (RESEARCH Pitfall 1, T-05-02).
+//   - Bounded retry-poll around the channel open, tolerating the empirically
+//     proven ERROR_GEN_FAILURE / 0x31 timing race (D-5.7 constraint #1,
+//     04-03-SUMMARY.md).
+//   - Must run inside the interactive RDP session (Session > 0) — the launch
+//     mechanism (Plans 03/04) guarantees this; on total open failure this
+//     process names that requirement in its diagnostic (D-5.7 constraint #2).
+//   - Every read scans forward for the first '{' byte and discards any
+//     leading binary DVC framing prefix before parsing JSON — the
+//     empirically observed 6-byte prefix from 04-03-SUMMARY.md (D-5.7
+//     constraint #3).
+//   - Malformed/truncated JSON is dropped (never crashes Main) — mirrors the
+//     Rust processor's drop-never-panic discipline (T-05-01, ASVS V5).
+
+using System.Runtime.InteropServices;
+using System.Text.Json;
+
+namespace RdpilotSensor;
+
+internal static class Program
+{
+    /// Must match crates/rdpilot/src/connect.rs's RDPILOT_SENSOR const
+    /// byte-for-byte (D-5.7's key_links contract).
+    private const string ChannelName = "RDPILOT_SENSOR";
+
+    private const int OpenRetries = 20;
+    private const int OpenRetryDelayMs = 500;
+    private const uint ReadTimeoutMs = 5000;
+    private const int ReadBufferSize = 8192;
+
+    private static int Main()
+    {
+        nint handle = OpenChannelWithRetry();
+        if (handle == 0)
+        {
+            // Diagnostic already printed by OpenChannelWithRetry.
+            return 1;
+        }
+
+        try
+        {
+            RunHandshakeAndPingPongLoop(handle);
+        }
+        finally
+        {
+            Wts.WTSVirtualChannelClose(handle);
+        }
+
+        return 0;
+    }
+
+    /// Open the RDPILOT_SENSOR channel, retrying up to <see cref="OpenRetries"/>
+    /// times (D-5.7 constraint #1: survives the ERROR_GEN_FAILURE / 0x31
+    /// timing race while the client-side DVC listener is still negotiating).
+    private static nint OpenChannelWithRetry()
+    {
+        nint handle = 0;
+        for (int attempt = 0; attempt < OpenRetries && handle == 0; attempt++)
+        {
+            handle = Wts.WTSVirtualChannelOpenEx(Wts.WTS_CURRENT_SESSION, ChannelName, Wts.WTS_CHANNEL_OPTION_DYNAMIC);
+            if (handle == 0)
+            {
+                Thread.Sleep(OpenRetryDelayMs);
+            }
+        }
+
+        if (handle == 0)
+        {
+            int lastError = Marshal.GetLastPInvokeError();
+            Console.Error.WriteLine(
+                $"[rdpilot-sensor] WTSVirtualChannelOpenEx failed after {OpenRetries} retries " +
+                $"(LastError={lastError}). This process MUST run inside the interactive RDP " +
+                "session (Session > 0) — a WinRM-launched process (Session 0) will never see " +
+                "the channel. Confirm the launch mechanism targets the interactive session " +
+                "(D-5.7 constraint #2).");
+        }
+
+        return handle;
+    }
+
+    /// Read the SDK's Version handshake (always the FIRST message on the
+    /// wire — RdpilotSensorProcessor::start() fires unconditionally the
+    /// instant the channel is created), echo this sensor's own version back
+    /// in the identical envelope shape, then loop answering every Ping with
+    /// a same-req_id Pong until the channel closes.
+    private static void RunHandshakeAndPingPongLoop(nint handle)
+    {
+        Envelope? version = null;
+        while (version is null)
+        {
+            Envelope? candidate = ReadEnvelope(handle);
+            if (candidate is { Type: MsgType.Version })
+            {
+                version = candidate;
+            }
+            // Anything read before the handshake (malformed bytes, or a
+            // non-Version message) is dropped and we keep waiting — the
+            // protocol guarantees Version is first, but never trust the
+            // wire over that guarantee (T-05-01).
+        }
+
+        WriteEnvelope(handle, new Envelope
+        {
+            Version = ProtocolVersion.Value,
+            ReqId = 0,
+            Type = MsgType.Version,
+            Payload = null,
+        });
+
+        while (true)
+        {
+            Envelope? msg = ReadEnvelope(handle);
+            if (msg is null)
+            {
+                continue;
+            }
+
+            if (msg.Type == MsgType.Ping)
+            {
+                WriteEnvelope(handle, new Envelope
+                {
+                    Version = ProtocolVersion.Value,
+                    ReqId = msg.ReqId,
+                    Type = MsgType.Pong,
+                    Payload = null,
+                });
+            }
+            // Any other message type this v1 protocol doesn't define is
+            // silently ignored — never crashes the loop (T-05-01, mirrors
+            // the Rust processor's own unknown-type handling).
+        }
+    }
+
+    /// Read one WTS message, strip the leading binary DVC framing prefix by
+    /// scanning forward for the first '{' byte (D-5.7 constraint #3 — do NOT
+    /// assume the JSON body starts at offset 0), then parse it via the
+    /// AOT-safe source-generated context. Malformed/truncated JSON, or a
+    /// read with no '{' at all, is dropped (returns null) — never throws out
+    /// of this method (T-05-01, ASVS V5).
+    private static Envelope? ReadEnvelope(nint handle)
+    {
+        byte[] buf = new byte[ReadBufferSize];
+        bool ok = Wts.WTSVirtualChannelRead(handle, ReadTimeoutMs, buf, (uint)buf.Length, out uint bytesRead);
+        if (!ok || bytesRead == 0)
+        {
+            return null;
+        }
+
+        int jsonStart = Array.IndexOf(buf, (byte)'{', 0, (int)bytesRead);
+        if (jsonStart < 0)
+        {
+            Console.Error.WriteLine($"[rdpilot-sensor] dropped malformed envelope: no '{{' found in {bytesRead} byte(s)");
+            return null;
+        }
+
+        ReadOnlySpan<byte> jsonSlice = buf.AsSpan(jsonStart, (int)bytesRead - jsonStart);
+        try
+        {
+            return JsonSerializer.Deserialize(jsonSlice, EnvelopeJsonContext.Default.Envelope);
+        }
+        catch (JsonException ex)
+        {
+            Console.Error.WriteLine($"[rdpilot-sensor] dropped malformed envelope: {ex.Message}");
+            return null;
+        }
+    }
+
+    private static void WriteEnvelope(nint handle, Envelope envelope)
+    {
+        byte[] bytes = JsonSerializer.SerializeToUtf8Bytes(envelope, EnvelopeJsonContext.Default.Envelope);
+        Wts.WTSVirtualChannelWrite(handle, bytes, (uint)bytes.Length, out _);
+    }
+}
+
+/// The WTS virtual-channel P/Invoke surface, source-generated via
+/// [LibraryImport] (NOT the older attribute-based P/Invoke marshalling —
+/// that older mechanism is incompatible with Native AOT for the string-
+/// marshalled open call, RESEARCH Pitfall 1 / T-05-02).
+///
+/// StringMarshalling.Utf16 is tried first per RESEARCH Assumption A3; the
+/// Phase-4 PowerShell fixture used the ANSI entry point (CharSet.Ansi) and
+/// worked live, so if the open call fails at the P/Invoke resolution level
+/// (not the retry-poll timing race above) on the Windows build host, flip
+/// this to StringMarshalling.Utf8 (the ANSI 'A' entry point) — a cheap
+/// runtime confirmation, not a structural risk (RESEARCH Open Question #3).
+internal static partial class Wts
+{
+    internal const uint WTS_CURRENT_SESSION = 0xFFFFFFFF;
+    internal const uint WTS_CHANNEL_OPTION_DYNAMIC = 0x1;
+
+    [LibraryImport("wtsapi32.dll", StringMarshalling = StringMarshalling.Utf16, SetLastError = true)]
+    internal static partial nint WTSVirtualChannelOpenEx(uint sessionId, string virtualName, uint flags);
+
+    [LibraryImport("wtsapi32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    internal static partial bool WTSVirtualChannelRead(nint channelHandle, uint timeout, byte[] buffer, uint bufferSize, out uint bytesRead);
+
+    [LibraryImport("wtsapi32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    internal static partial bool WTSVirtualChannelWrite(nint channelHandle, byte[] buffer, uint length, out uint bytesWritten);
+
+    [LibraryImport("wtsapi32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    internal static partial bool WTSVirtualChannelClose(nint channelHandle);
+}

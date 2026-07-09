@@ -1,0 +1,4 @@
+# .NET build output — the published NativeAOT rdpilot-sensor.exe is a build
+# artifact, not source (SC1 publish target; see 05-01-PLAN.md Task 3).
+bin/
+obj/

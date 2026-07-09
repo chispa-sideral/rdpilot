@@ -21,3 +21,9 @@ infra/*.json
 *.swp
 Thumbs.db
 .DS_Store
+
+# .NET / C# sensor build output (Phase 5, SENSOR-01) — sensor/.gitignore also
+# covers this from inside sensor/; duplicated here per plan for a top-level
+# `git status` that never shows the NativeAOT publish artifacts as untracked.
+sensor/bin/
+sensor/obj/

@@ -1,0 +1,41 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    NativeAOT self-contained win-x64 console project (SENSOR-01, D-5.3).
+
+    - PublishAot=true + SelfContained=true: `dotnet publish` produces a single
+      native rdpilot-sensor.exe with no external .NET runtime dependency (SC1).
+      NativeAOT does NOT cross-OS-compile (RESEARCH Pitfall 4) — the actual
+      `dotnet publish -r win-x64 -p:PublishAot=true --self-contained` MUST run
+      on a genuine Windows host with the .NET 8 SDK + native MSVC/Windows SDK
+      toolchain (see 05-01-PLAN.md Task 3).
+    - InvariantGlobalization=true: trims ICU, shrinks the AOT binary further —
+      the sensor never needs culture-aware formatting (D-5.3 binary-size goal).
+    - JsonSerializerIsReflectionEnabledByDefault=false: fails fast at publish
+      time if any reflection-based JSON path sneaks in instead of the
+      source-generated EnvelopeJsonContext (RESEARCH Anti-Patterns).
+    - No <PackageReference> — everything ships in the .NET 8 SDK itself
+      (RESEARCH Standard Stack: "No new NuGet packages are required").
+  -->
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+
+    <PublishAot>true</PublishAot>
+    <SelfContained>true</SelfContained>
+    <InvariantGlobalization>true</InvariantGlobalization>
+
+    <!-- AOT-safety guard: fail at publish time, not silently at runtime on the
+         remote target, if reflection-based JSON serialization is ever used
+         instead of the source-generated EnvelopeJsonContext. -->
+    <JsonSerializerIsReflectionEnabledByDefault>false</JsonSerializerIsReflectionEnabledByDefault>
+
+    <AssemblyName>rdpilot-sensor</AssemblyName>
+    <RootNamespace>RdpilotSensor</RootNamespace>
+  </PropertyGroup>
+
+</Project>
