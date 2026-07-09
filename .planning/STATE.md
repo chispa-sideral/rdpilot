@@ -4,13 +4,13 @@ milestone: v1.0
 milestone_name: milestone
 status: completed
 stopped_at: Phase 8 Wave 1 (08-01) COMPLETE — strict lint gates + owned-type Serialize derives shipped. 08-02 (WorldState + world_state()) unblocked.
-last_updated: "2026-07-09T21:31:19.356Z"
+last_updated: "2026-07-09T21:37:21.481Z"
 last_activity: "2026-07-09 -- 08-01 (Wave 1) COMPLETE: lib.rs strict lint gates (API-01/SC#4 compiler-enforced) + Serialize derives on all five owned SDK types (Rect, dims-only Screenshot, WindowInfo, WindowState-lowercase, ProcessInfo, UiaElement). cargo clippy -p rdpilot --lib exits 0; cargo test -p rdpilot --lib passes 94/94. See 08-01-SUMMARY.md."
 progress:
   total_phases: 9
   completed_phases: 7
   total_plans: 31
-  completed_plans: 29
+  completed_plans: 30
   percent: 78
 ---
 
@@ -26,7 +26,7 @@ See: .planning/PROJECT.md (updated 2026-06-04)
 ## Current Position
 
 Phase: 8 (public-sdk-api-worldstate) — IN PROGRESS
-Plan: 1 of 3 (Wave 1 complete)
+Plan: 2 of 3 (Wave 1 complete)
 Status: 08-01 complete — 08-02 (WorldState + world_state()) unblocked
 Last activity: 2026-07-09 -- 08-01 (Wave 1) COMPLETE: lib.rs strict lint gates (API-01/SC#4 compiler-enforced) + Serialize derives on all five owned SDK types (Rect, dims-only Screenshot, WindowInfo, WindowState-lowercase, ProcessInfo, UiaElement). cargo clippy -p rdpilot --lib exits 0; cargo test -p rdpilot --lib passes 94/94. See 08-01-SUMMARY.md.
 
@@ -79,6 +79,7 @@ Progress: [█████████░] 94% (Phase 8: 1/3 plans complete — 
 | Phase 07-uia-tree-module P04 | 25min | 2 tasks | 4 files |
 | Phase 07-uia-tree-module P05 | ~40min | 2 tasks | 1 files |
 | Phase 08 P01 | ~5min | 2 tasks | 3 files |
+| Phase 08-public-sdk-api-worldstate P02 | 1200 | 2 tasks | 3 files |
 
 ## Accumulated Context
 
@@ -143,6 +144,7 @@ Recent decisions affecting current work:
 - [Phase ?]: Phase 7 live gate (2026-07-09, PASSED): all four Phase 7 SC validated live against a real disposable Azure VM and a launched Notepad window. SC#1 field-complete UiaElement[] confirmed; SC#2 bbox coordinates confirmed in the same physical virtual-desktop pixel space as get_window_list (desktop_size bounds containment); SC#3 TreeScope_Children walk measured 30.36ms, >16x under the 500ms budget -- D-7.7's CreateCacheRequest bulk-cache optimization correctly never triggered, naive uncached per-property reads (07-04) are sufficient; SC#4 live serde_json round trip lossless. Sensor AOT-published win-x64 ON the VM via az vm run-command invoke (WinRM still unavailable from this host), SHA256 fa5d3e3c8d45c351e0d577cf654c6c524c8ecab9e4203917ef6637c053ce6e16 verified byte-identical between VM build and locally-relayed copy. One transient first-RDP-login deploy_and_launch timeout (the fresh-VM network-discoverable dialog condition first diagnosed in 07-03) recurred and self-resolved on a single retry, confirming it as a reproducible VM-provisioning-time artifact, not a code defect -- no code change made. VM torn down and confirmed absent (az group exists -n rdpilot-test => false; rdpilot-mgmt persists). PERC-03 genuinely retired.
 - [Phase ?]: 08-01: lib.rs inner #![deny(unsafe_code)]/clippy::unwrap_used/clippy::expect_used gates make API-01/SC#4 compiler-enforced (never a Cargo.toml [lints] table, which would break tests/live_session.rs's 116 legitimate .expect() calls)
 - [Phase ?]: 08-01: Screenshot derives Serialize only (no Deserialize) with #[serde(skip)] on rgba — dims-only JSON output (D-8.4, threat T-08-02); to_png() remains the sole byte-egress path
+- [Phase ?]: D-8.1/D-8.2/D-8.4 applied verbatim: WorldStateOptions a-la-carte defaults to screenshot+window_list+no-UIA (SC#2-compliant); capture_span is SystemTime/Duration (never Instant) with the 500ms bound checked only at the Plan 03 live gate, never in code
 
 ### Pending Todos
 
@@ -169,6 +171,6 @@ Phase 2 Plan 02: pre-existing rustdoc intra-doc-link warnings in config.rs (Wave
 
 ## Session Continuity
 
-Last session: 2026-07-09T21:31:19.348Z
+Last session: 2026-07-09T21:37:21.476Z
 Stopped at: Phase 8 context gathered
 Resume file: .planning/phases/08-public-sdk-api-worldstate/08-CONTEXT.md

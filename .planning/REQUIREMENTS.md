@@ -48,8 +48,8 @@ Stack (from research): IronRDP 0.14 (Rust) client core + primary language; C# .N
 
 ### SDK / WorldState
 
-- [ ] **API-01**: A clean, typed SDK API surface exposes control + perception so a consumer can drive a session programmatically
-- [ ] **API-02**: A coherent `WorldState` correlates screenshot + window list + UIA snapshot in one coordinate space, emitting both pixel and logical/DPI-scaled coordinates
+- [x] **API-01**: A clean, typed SDK API surface exposes control + perception so a consumer can drive a session programmatically
+- [x] **API-02**: A coherent `WorldState` correlates screenshot + window list + UIA snapshot in one coordinate space, emitting both pixel and logical/DPI-scaled coordinates
 
 ### Proof
 
@@ -92,6 +92,6 @@ Stack (from research): IronRDP 0.14 (Rust) client core + primary language; C# .N
 | PERC-04 | Phase 6: Window + Process Perception | Complete |
 | PROC-01 | Phase 6: Window + Process Perception | Complete |
 | PERC-03 | Phase 7: UIA Tree Module | Complete |
-| API-01 | Phase 8: Public SDK API + WorldState | Pending |
-| API-02 | Phase 8: Public SDK API + WorldState | Pending |
+| API-01 | Phase 8: Public SDK API + WorldState | Complete |
+| API-02 | Phase 8: Public SDK API + WorldState | Complete |
 | PROOF-01 | Phase 9: Scripted Proof Harness | Pending |

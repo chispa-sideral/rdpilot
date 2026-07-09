@@ -204,7 +204,7 @@ Plans:
   3. All coordinate values in WorldState (screenshot dimensions, window rects, UIA bounding boxes, mouse input targets) are in the same virtual-desktop pixel space with no silent scaling
   4. The API compiles clean under strict Rust settings (no `unsafe` in public surface, no `unwrap` in library code)
 
-**Plans**: 1/3 plans executed
+**Plans**: 2/3 plans executed
 **UI hint**: yes (the SDK API ergonomics ARE the surface — no visual UI contract needed, per 08-CONTEXT)
 
 Plans:
@@ -215,7 +215,7 @@ Plans:
 
 **Wave 2** *(blocked on Wave 1 — shares lib.rs + composes Plan 01's Serialize)*
 
-- [ ] 08-02-PLAN.md — New `worldstate.rs` (WorldStateOptions/UiaMode/WorldState, SystemTime+Duration, grouped-by-hwnd UIA) + `Session::world_state()` sequencing (Pitfall-3 internal list fetch, Pitfall-4 error propagation) + offline unit tests (API-02, SC#2/SC#3)
+- [x] 08-02-PLAN.md — New `worldstate.rs` (WorldStateOptions/UiaMode/WorldState, SystemTime+Duration, grouped-by-hwnd UIA) + `Session::world_state()` sequencing (Pitfall-3 internal list fetch, Pitfall-4 error propagation) + offline unit tests (API-02, SC#2/SC#3)
 
 **Wave 3** *(blocked on Wave 2 — thin live gate)*
 
@@ -249,7 +249,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8 →
 | 5. Sensor Bootstrap + Deployment | 4/4 | Complete   | 2026-07-09 |
 | 6. Window + Process Perception | 5/5 | Complete   | 2026-07-09 |
 | 7. UIA Tree Module | 5/5 | Complete   | 2026-07-09 |
-| 8. Public SDK API + WorldState | 1/3 | In Progress|  |
+| 8. Public SDK API + WorldState | 2/3 | In Progress|  |
 | 9. Scripted Proof Harness | 0/? | Not started | - |
 
 ## Backlog
