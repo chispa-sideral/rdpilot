@@ -180,11 +180,11 @@ Plans:
   3. A tree walk scoped to TreeScope_Children completes within 500 ms for a standard Win32 application
   4. The response is valid JSON-serializable UiaElement[] (round-trips through serde_json without loss)
 
-**Plans**: 1/5 plans executed
+**Plans**: 2/5 plans executed
 
 - Wave 1 (offline, parallel):
   - [x] 07-01-PLAN.md — Rust wire extension: MsgType::Uia, owned UiaElement + UiaElementWire (RuntimeId join D-7.2 / ControlType→role map D-7.3, Rust-side), Session::get_uia_tree(hwnd), offline unit tests (SC#4/D-7.2/D-7.3)
-  - [ ] 07-02-PLAN.md — C# [GeneratedComInterface] UIA interop (4 GUID-verified interfaces, CoCreateInstance, SAFEARRAY decode) + --smoke-test-uia scaffolding; offline AOT-trim publish check (D-7.5)
+  - [x] 07-02-PLAN.md — C# [GeneratedComInterface] UIA interop (4 GUID-verified interfaces, CoCreateInstance, SAFEARRAY decode) + --smoke-test-uia scaffolding; offline AOT-trim publish check (D-7.5)
 - Wave 2 (RISK GATE):
   - [ ] 07-03-PLAN.md — win-x64 AOT-publish + run --smoke-test-uia on a real Windows VM; resolve SAFEARRAY/BSTR/BOOL marshalling (A1/A2/A3) before any handler code (D-7.5 spike gate)
 - Wave 3 (real handler):
@@ -234,7 +234,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8 →
 | 4. DVC Transport Channel | 3/3 | Complete | 2026-07-09 |
 | 5. Sensor Bootstrap + Deployment | 4/4 | Complete   | 2026-07-09 |
 | 6. Window + Process Perception | 5/5 | Complete   | 2026-07-09 |
-| 7. UIA Tree Module | 1/5 | In Progress|  |
+| 7. UIA Tree Module | 2/5 | In Progress|  |
 | 8. Public SDK API + WorldState | 0/? | Not started | - |
 | 9. Scripted Proof Harness | 0/? | Not started | - |
 

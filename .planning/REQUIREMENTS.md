@@ -33,7 +33,7 @@ Stack (from research): IronRDP 0.14 (Rust) client core + primary language; C# .N
 
 - [x] **PERC-01**: User can enumerate the remote process tree
 - [x] **PERC-02**: User can enumerate remote windows (titles, geometry, foreground/z-order)
-- [ ] **PERC-03**: User can retrieve the UI Automation tree as a flat `UiaElement[]` (id, role, name, bbox, enabled, visible, focusable, focused, value?, depth, parentId)
+- [x] **PERC-03**: User can retrieve the UI Automation tree as a flat `UiaElement[]` (id, role, name, bbox, enabled, visible, focusable, focused, value?, depth, parentId)
 - [x] **PERC-04**: User can query and set the foreground window (focus)
 
 ### Remote Sensor
@@ -91,7 +91,7 @@ Stack (from research): IronRDP 0.14 (Rust) client core + primary language; C# .N
 | PERC-02 | Phase 6: Window + Process Perception | Complete |
 | PERC-04 | Phase 6: Window + Process Perception | Complete |
 | PROC-01 | Phase 6: Window + Process Perception | Complete |
-| PERC-03 | Phase 7: UIA Tree Module | Pending |
+| PERC-03 | Phase 7: UIA Tree Module | Complete |
 | API-01 | Phase 8: Public SDK API + WorldState | Pending |
 | API-02 | Phase 8: Public SDK API + WorldState | Pending |
 | PROOF-01 | Phase 9: Scripted Proof Harness | Pending |

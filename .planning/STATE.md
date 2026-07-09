@@ -4,13 +4,13 @@ milestone: v1.0
 milestone_name: milestone
 status: executing
 stopped_at: Phase 6 window+process perception COMPLETE — live gate PASSED (all 4 SC), VM torn down
-last_updated: "2026-07-09T18:31:54.833Z"
+last_updated: "2026-07-09T18:42:47.078Z"
 last_activity: 2026-07-09 -- Phase 7 execution started
 progress:
   total_phases: 9
   completed_phases: 6
   total_plans: 28
-  completed_plans: 24
+  completed_plans: 25
   percent: 67
 ---
 
@@ -26,7 +26,7 @@ See: .planning/PROJECT.md (updated 2026-06-04)
 ## Current Position
 
 Phase: 7 (uia-tree-module) — EXECUTING
-Plan: 2 of 5
+Plan: 3 of 5
 Status: Ready to execute
 Last activity: 2026-07-09 -- Phase 7 execution started
 
@@ -74,6 +74,7 @@ Progress: [██████░░░░] 67% (Phase 6: 5/5 plans complete, liv
 | Phase 06-window-process-perception P04 | 35min | 2 tasks | 6 files |
 | Phase 06 P05 | 58min | 1 tasks | 3 files |
 | Phase 07 P01 | 20min | 2 tasks | 4 files |
+| Phase 07 P02 | 20min | 2 tasks | 2 files |
 
 ## Accumulated Context
 
@@ -131,6 +132,9 @@ Recent decisions affecting current work:
 - [Phase ?]: 07-01: Wire contract ships RAW runtime_id/parent_runtime_id int arrays and RAW control_type int; Rust into_owned() does the D-7.2 join and D-7.3 map (locks the C# UiaElementRecord shape for 07-04)
 - [Phase ?]: 07-01: get_uia_tree reuses ENUMERATION_TIMEOUT_MS (2000ms) as the transport timeout -- SC#3's 500ms sensor-side walk budget is a separate, live-verified constraint, not tightened here
 - [Phase ?]: 07-01: Built/tested on native x86_64-unknown-linux-gnu (RUSTUP_TOOLCHAIN + --target override) instead of the repo-pinned x86_64-pc-windows-gnu toolchain, which is not installed on this host -- valid substitution since perception.rs/session.rs/sensor.rs have no cfg(windows) code
+- [Phase ?]: 07-02: Rect32 struct redeclared as a new top-level type in UiaInterop.cs (identical shape to WindowEnumeration.cs's private Rect32) rather than sharing the existing type, to keep this plan's file scope to UiaInterop.cs/Program.cs only.
+- [Phase ?]: 07-02: GeneratedComInterface does not support C# instance properties (SYSLIB1091) -- all UIA propget members declared as Get-prefixed methods instead.
+- [Phase ?]: 07-02: Marshal.SafeArrayGetLBound/GetUBound/GetElement/SafeArrayDestroy do not exist in .NET Core/.NET 8 (Framework-only) -- hand-rolled the equivalent oleaut32.dll SAFEARRAY exports via LibraryImport instead.
 
 ### Pending Todos
 
@@ -157,6 +161,6 @@ Phase 2 Plan 02: pre-existing rustdoc intra-doc-link warnings in config.rs (Wave
 
 ## Session Continuity
 
-Last session: 2026-07-09T18:31:54.827Z
+Last session: 2026-07-09T18:42:41.239Z
 Stopped at: Phase 6 (Window + Process Perception) COMPLETE — live gate PASSED (SC1-SC4 all met); PERC-01/PERC-02/PERC-04/PROC-01/CAP-02 marked complete in REQUIREMENTS.md
 Resume file: .planning/phases/06-window-process-perception/06-05-SUMMARY.md (next: plan Phase 7 — UIA Tree Module)
