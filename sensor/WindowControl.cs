@@ -47,11 +47,13 @@ internal sealed record SetForegroundWindowResponse
 
 // ---------------------------------------------------------------------------
 // Win32 focus control. [LibraryImport] only (05-01 discipline) against
-// user32.dll — no COM.
+// user32.dll/kernel32.dll — no COM.
 // ---------------------------------------------------------------------------
 
 internal static partial class WindowControl
 {
+    private const int SwRestore = 9;
+
     // Source: standard Win32 SetForegroundWindow signature
     // (learn.microsoft.com/windows/win32/api/winuser), RESEARCH Code
     // Examples — [ASSUMED], stable API since Windows 2000, low risk.
@@ -59,19 +61,95 @@ internal static partial class WindowControl
     [return: MarshalAs(UnmanagedType.Bool)]
     private static partial bool SetForegroundWindow(nint hWnd);
 
+    [LibraryImport("user32.dll")]
+    private static partial nint GetForegroundWindow();
+
+    [LibraryImport("user32.dll")]
+    private static partial uint GetWindowThreadProcessId(nint hWnd, nint lpdwProcessId);
+
+    [LibraryImport("kernel32.dll")]
+    private static partial uint GetCurrentThreadId();
+
+    [LibraryImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static partial bool AttachThreadInput(uint idAttach, uint idAttachTo, [MarshalAs(UnmanagedType.Bool)] bool fAttach);
+
+    [LibraryImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static partial bool BringWindowToTop(nint hWnd);
+
+    [LibraryImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static partial bool ShowWindow(nint hWnd, int nCmdShow);
+
     /// Calls `SetForegroundWindow` and reports `success:true` ONLY if the
     /// Win32 call itself returned nonzero (Pitfall 5 — call-success, not
     /// visual outcome). On a zero return, replies `success:false` carrying
     /// the last Win32 error for diagnostics.
+    ///
+    /// LIVE-DIAGNOSED BUG FIX (06-05 live gate): a bare `SetForegroundWindow`
+    /// call from this background sensor process — which owns no window and
+    /// has received no recent user input of its own — is subject to
+    /// Windows' foreground-lock-timeout restriction (Pitfall 5's documented
+    /// risk, now confirmed live): the call can return TRUE while the target
+    /// window's Z-order never actually changes (confirmed live: 10 poll
+    /// attempts, target hwnd's z_order never moved off a fixed position
+    /// several windows below topmost). The standard, well-established
+    /// workaround is to temporarily attach this thread's input queue to the
+    /// CURRENT foreground window's input queue via `AttachThreadInput`
+    /// before calling `SetForegroundWindow` — input-queue attachment is one
+    /// of the conditions Windows accepts as proof of "the calling thread is
+    /// allowed to set the foreground window" (see Raymond Chen's
+    /// documented `SetForegroundWindow` rules). `BringWindowToTop` +
+    /// `ShowWindow(SW_RESTORE)` are added alongside as belt-and-suspenders
+    /// for a minimized target. Threads are always detached again in a
+    /// `finally`, even on failure, so no lingering input-queue attachment
+    /// survives this call.
     internal static SetForegroundWindowResponse Focus(SetForegroundWindowRequest request)
     {
-        bool ok = SetForegroundWindow((nint)request.Hwnd);
+        nint hWnd = (nint)request.Hwnd;
+        nint foreground = GetForegroundWindow();
+        uint foregroundThread = GetWindowThreadProcessId(foreground, nint.Zero);
+        uint targetThread = GetWindowThreadProcessId(hWnd, nint.Zero);
+        uint currentThread = GetCurrentThreadId();
+
+        bool attachedToForeground = foregroundThread != 0
+            && foregroundThread != currentThread
+            && AttachThreadInput(currentThread, foregroundThread, true);
+        bool attachedToTarget = targetThread != 0
+            && targetThread != currentThread
+            && targetThread != foregroundThread
+            && AttachThreadInput(currentThread, targetThread, true);
+
+        bool ok;
+        int lastError = 0;
+        try
+        {
+            ShowWindow(hWnd, SwRestore);
+            BringWindowToTop(hWnd);
+            ok = SetForegroundWindow(hWnd);
+            if (!ok)
+            {
+                lastError = Marshal.GetLastPInvokeError();
+            }
+        }
+        finally
+        {
+            if (attachedToTarget)
+            {
+                AttachThreadInput(currentThread, targetThread, false);
+            }
+            if (attachedToForeground)
+            {
+                AttachThreadInput(currentThread, foregroundThread, false);
+            }
+        }
+
         if (ok)
         {
             return new SetForegroundWindowResponse { Success = true, Data = null, Error = null };
         }
 
-        int lastError = Marshal.GetLastPInvokeError();
         return new SetForegroundWindowResponse
         {
             Success = false,
