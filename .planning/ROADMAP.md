@@ -18,7 +18,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 - [x] **Phase 3: Input Injection** - Inject mouse and keyboard actions at remote coordinates with a locked DPI contract (completed 2026-07-08)
 - [x] **Phase 4: DVC Transport Channel** - Establish and verify the RDPILOT_SENSOR dynamic virtual channel before any sensor modules exist — all 3 success criteria proven live (canonical run: sensor_ping_pong_under_500ms PASSED, measured round trip 165ms, on a real disposable Azure VM, 2026-07-09)
 - [x] **Phase 5: Sensor Bootstrap + Deployment** - Build the C# NativeAOT sensor helper and deploy it onto a real target via drive redirection or WinRM — all 4 success criteria proven live (canonical run: RDPDR primary 22.61ms, WinRM fallback 21.62ms, both < 1s bound, NativeAOT binary 2.57 MiB, on a real disposable Azure VM, 2026-07-09)
-- [ ] **Phase 6: Window + Process Perception** - Retrieve window list, process tree, per-window screenshots, focus control, and remote process launch over DVC
+- [x] **Phase 6: Window + Process Perception** - Retrieve window list, process tree, per-window screenshots, focus control, and remote process launch over DVC (completed 2026-07-09)
 - [ ] **Phase 7: UIA Tree Module** - Add the UI Automation sensor module and return a flat UiaElement[] over DVC
 - [ ] **Phase 8: Public SDK API + WorldState** - Expose a clean typed Session API and a coherent WorldState snapshot correlating framebuffer, windows, and UIA
 - [ ] **Phase 9: Scripted Proof Harness** - Prove the full read/inspect loop end-to-end against a real remote-only Windows program
@@ -160,13 +160,13 @@ Plans:
   3. The SDK brings a specified window to the foreground (set_foreground_window) and confirms the focus change in a subsequent window list query
   4. A launch_process() call starts a remote process (e.g. notepad.exe) and the new process appears in a subsequent process tree query
 
-**Plans**: 4/5 plans executed
+**Plans**: 5/5 plans complete
 
 - [x] 06-01-PLAN.md — (wave 1) Rust DVC request/response generalization + owned perception types + Error::SensorRejected + wire contract
 - [x] 06-02-PLAN.md — (wave 2, needs 01) Four sensor-backed Session methods (window list / process tree / focus / launch) + D-6.1 per-window screenshot crop
 - [x] 06-03-PLAN.md — (wave 2, needs 01) C# Envelope.Payload→JsonElement AOT smoke-test FIRST, then the WindowList handler (EnumWindows, no COM)
 - [x] 06-04-PLAN.md — (wave 3, needs 03) C# ProcessTree (Toolhelp32, never WMI) + SetForegroundWindow + fire-and-forget CreateProcessW launch
-- [ ] 06-05-PLAN.md — (wave 4, needs 02+04) Four gated live tests (one per success criterion) + end-of-phase live gate against a real Azure VM
+- [x] 06-05-PLAN.md — (wave 4, needs 02+04) Four gated live tests (one per success criterion) + end-of-phase live gate against a real Azure VM
 
 ### Phase 7: UIA Tree Module
 
@@ -223,7 +223,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8 →
 | 3. Input Injection | 4/4 | Complete   | 2026-07-08 |
 | 4. DVC Transport Channel | 3/3 | Complete | 2026-07-09 |
 | 5. Sensor Bootstrap + Deployment | 4/4 | Complete   | 2026-07-09 |
-| 6. Window + Process Perception | 4/5 | In Progress|  |
+| 6. Window + Process Perception | 5/5 | Complete   | 2026-07-09 |
 | 7. UIA Tree Module | 0/? | Not started | - |
 | 8. Public SDK API + WorldState | 0/? | Not started | - |
 | 9. Scripted Proof Harness | 0/? | Not started | - |

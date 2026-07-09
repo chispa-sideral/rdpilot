@@ -4,13 +4,13 @@ milestone: v1.0
 milestone_name: milestone
 status: completed
 stopped_at: "Completed 06-01-PLAN.md (Phase 6 window+process perception — Rust DVC request/response generalization + owned perception types + Error::SensorRejected; Wave 1 of 4 complete)"
-last_updated: "2026-07-09T14:36:17.770Z"
+last_updated: "2026-07-09T16:45:34.655Z"
 last_activity: 2026-07-09
 progress:
   total_phases: 9
   completed_phases: 5
   total_plans: 23
-  completed_plans: 22
+  completed_plans: 23
   percent: 56
 ---
 
@@ -26,7 +26,7 @@ See: .planning/PROJECT.md (updated 2026-06-04)
 ## Current Position
 
 Phase: 6 (window-process-perception) — IN PROGRESS
-Plan: 4 of 5 complete (wave 1 of 4)
+Plan: 5 of 5 complete (wave 1 of 4)
 Status: 06-01-PLAN.md complete (offline, no VM): generalized the Version/Ping/Pong-only DVC envelope into a msg_type-agnostic req_id correlation mechanism (`SensorShared::pending` now carries reply payloads; `process()` fulfils any pending req_id generically), added `MsgType::{WindowList,ProcessTree,SetForegroundWindow,LaunchProcess}` + `RdpInputEvent::Request`/`encode_request`/`build_request_frame`, defined owned public `WindowInfo`/`WindowState`/`ProcessInfo` types + crate-internal wire structs/conversions in new `perception.rs`, and added `Error::SensorRejected` (D-6.4). This is the foundation plan every other Phase 6 plan builds against (the `<wire_contract>` in 06-01-PLAN.md is now the single source of truth for the wire schema). `cargo test -p rdpilot` fully green (78 passed, 0 failed) — see `06-01-SUMMARY.md`. Requirements PERC-01/PERC-02/PERC-04/PROC-01 are deliberately NOT yet marked complete in REQUIREMENTS.md (mirrors the Phase 5 SENSOR-01/02 convention of marking only at the live gate); they'll be marked at 06-05's live gate.
 Last activity: 2026-07-09
 
@@ -72,6 +72,7 @@ Progress: [████████░░] 83% (Phase 6: 1/5 plans complete — 
 | Phase 06 P02 | 35min | 2 tasks | 1 files |
 | Phase 06 P03 | 40min | 2 tasks | 4 files |
 | Phase 06-window-process-perception P04 | 35min | 2 tasks | 6 files |
+| Phase 06 P05 | 58min | 1 tasks | 3 files |
 
 ## Accumulated Context
 
@@ -124,6 +125,7 @@ Recent decisions affecting current work:
 - [Phase ?]: Envelope.Payload retyped object? -> JsonElement? (RESEARCH Pitfall 1/Pattern 6), proven under a real NativeAOT publish (linux-x64 surrogate, win-x64 blocked by cross-OS AOT compile limitation) before any Win32 handler code was written
 - [Phase ?]: WindowList handler implemented: EnumWindows via static [UnmanagedCallersOnly] + delegate* unmanaged<> + GCHandle accumulator, [LibraryImport]-only user32.dll surface, bounded stackalloc title/class buffers, z_order = enumeration index, success:false degrade on any exception (D-6.4)
 - [Phase ?]: PROCESSENTRY32W's szExeFile embedded string field must be a blittable 'unsafe fixed char[260]' buffer, not MarshalAs(ByValTStr) -- the latter fails SYSLIB1051 under source-generated LibraryImport
+- [Phase ?]: Phase 6 live gate (2026-07-09, PASSED): PERC-01/PERC-02/PERC-04/PROC-01/CAP-02 validated live against a real disposable Azure VM. win-x64 NativeAOT builds run ON the VM itself via az vm run-command invoke (WinRM Negotiate/NTLM auth failed from this Linux host — missing gssntlmssp GSS mechanism plugin; Basic auth rejected server-side); a short-lived Azure Storage blob SAS relay moved the built exe back. Three live-run bugs fixed: (1) launch_command now taskkills any already-running sensor before copy+start — Windows reconnects a disconnected interactive RDP session rather than creating a fresh one, so a stale process from a prior test blocked the new DVC channel; (2) SetForegroundWindow now wraps the call in AttachThreadInput to defeat Windows' foreground-lock-timeout restriction (a bare call returned TRUE with no Z-order effect); (3) the SC#3 test now confirms focus via the minimum z_order among TITLED windows only, not the global minimum — always-on-top shell chrome (the taskbar) legitimately outranks any normal app window regardless of focus. All four gated tests pass; VM torn down and confirmed (az group exists -n rdpilot-test => false).
 
 ### Pending Todos
 
@@ -150,6 +152,6 @@ Phase 2 Plan 02: pre-existing rustdoc intra-doc-link warnings in config.rs (Wave
 
 ## Session Continuity
 
-Last session: 2026-07-09T14:36:17.763Z
+Last session: 2026-07-09T16:45:34.649Z
 Stopped at: Completed 06-01-PLAN.md (Phase 6 wave 1 foundation: generalized DVC plumbing + owned perception types + Error::SensorRejected)
 Resume file: .planning/phases/06-window-process-perception/06-02-PLAN.md
