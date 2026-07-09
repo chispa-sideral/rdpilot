@@ -31,7 +31,7 @@ use crate::connect;
 use crate::error::{Error, Result};
 use crate::framebuffer::SharedFrame;
 use crate::input::{Key, KeyAction, MouseAction};
-use crate::perception::{ProcessInfo, WindowInfo};
+use crate::perception::{ProcessInfo, UiaElement, WindowInfo};
 use crate::screenshot::Screenshot;
 use crate::sensor::SensorShared;
 use crate::session_loop::{self, RdpInputEvent};
@@ -614,6 +614,39 @@ impl Session {
         Ok(wires
             .into_iter()
             .map(crate::perception::ProcessInfoWire::into_owned)
+            .collect())
+    }
+
+    /// Retrieve a flat UI Automation tree, scoped to `TreeScope_Children`,
+    /// for the given window (PERC-03, SENSOR-backed).
+    ///
+    /// Round-trips a `Uia` request bounded at [`ENUMERATION_TIMEOUT_MS`]
+    /// (the transport timeout — distinct from SC#3's 500ms sensor-side walk
+    /// budget, which the C# handler must hit and which is verified live,
+    /// not by tightening this transport bound) and deserializes the
+    /// reply's `data` array into owned [`UiaElement`] values — the
+    /// crate-internal `UiaElementWire` never leaves this crate (D-09). See
+    /// [`Session::get_window_list`] for the shared round-trip/error-
+    /// branching shape.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::SensorRejected`] if the sensor answered but rejected
+    /// the request (D-6.4), or [`Error::Dvc`] for a handshake mismatch, a
+    /// closed channel, a malformed reply, or a timeout.
+    pub async fn get_uia_tree(&self, hwnd: u64) -> Result<Vec<UiaElement>> {
+        let data = self
+            .sensor_request(
+                crate::sensor::MsgType::Uia,
+                Some(serde_json::json!({ "hwnd": hwnd })),
+                ENUMERATION_TIMEOUT_MS,
+            )
+            .await?;
+        let wires: Vec<crate::perception::UiaElementWire> =
+            serde_json::from_value(data).map_err(|e| Error::dvc(format!("malformed Uia reply: {e}")))?;
+        Ok(wires
+            .into_iter()
+            .map(crate::perception::UiaElementWire::into_owned)
             .collect())
     }
 
