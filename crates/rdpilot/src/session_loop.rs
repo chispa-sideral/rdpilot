@@ -120,33 +120,28 @@ pub(crate) async fn run(
                         // bytes are built here, from outside the processor,
                         // mirroring IronRDP's own `ActiveStage::encode_resize`
                         // (Display Control DVC) internal pattern.
-                        let (channel_id, dvc_messages) = {
-                            // Block-scoped: `get_dvc()` borrows `&mut
-                            // active_stage`; that borrow MUST end before the
-                            // second `&mut active_stage` call below
-                            // (Pitfall 3) — this scope is load-bearing.
-                            let dvc = active_stage
-                                .get_dvc::<crate::sensor::RdpilotSensorProcessor>()
-                                .ok_or_else(|| Error::Dvc("sensor channel not registered".to_owned()))?;
-                            let channel_id = dvc
-                                .channel_id()
-                                .ok_or_else(|| Error::Dvc("sensor channel not yet open".to_owned()))?;
-                            let processor = dvc
-                                .channel_processor_downcast_ref::<crate::sensor::RdpilotSensorProcessor>()
-                                .ok_or_else(|| Error::Dvc("sensor processor downcast failed".to_owned()))?;
-                            let dvc_messages = processor
-                                .encode_ping(req_id)
-                                .map_err(|e| Error::Dvc(e.to_string()))?;
-                            (channel_id, dvc_messages)
-                        };
-                        let svc_messages =
-                            ironrdp::dvc::encode_dvc_messages(channel_id, dvc_messages, ironrdp::svc::ChannelFlags::empty())
-                                .map_err(|e| Error::Dvc(e.to_string()))?;
-                        vec![ActiveStageOutput::ResponseFrame(
-                            active_stage
-                                .encode_dvc_messages(svc_messages)
-                                .map_err(|e| Error::Dvc(e.to_string()))?,
-                        )]
+                        //
+                        // NOT propagated via `?`: the DVC may legitimately not
+                        // be registered/open yet (the server-side responder
+                        // opens it asynchronously, live-verified to take up to
+                        // several seconds after the interactive session is
+                        // created). That is an expected, per-call-retryable
+                        // condition — `Session::ping()` already bounds each
+                        // attempt at 500ms and leaves the pending oneshot
+                        // unresolved on failure here, so the caller's timeout
+                        // surfaces a normal `Error::Dvc` it can retry. Ending
+                        // the WHOLE session loop thread on a single not-yet-open
+                        // ping would be fatal to every other in-flight/future
+                        // operation (mouse/keyboard/screenshot) too — bug fixed
+                        // during the Phase 4 live gate (SC#2/SC#3).
+                        match build_ping_frame(&mut active_stage, req_id) {
+                            Ok(frame_bytes) => vec![ActiveStageOutput::ResponseFrame(frame_bytes)],
+                            Err(e) => {
+                                debug!(%e, "ping request dropped (sensor DVC not ready yet); \
+                                    the caller's 500ms client-side timeout will surface a retryable error");
+                                vec![]
+                            }
+                        }
                     }
                     None => {
                         // All senders dropped without an explicit Close (e.g. the
@@ -205,6 +200,47 @@ pub(crate) async fn run(
     }
 
     Ok(())
+}
+
+/// Build the outbound DVC frame bytes for a single `Ping(req_id)` request.
+///
+/// Looks up the registered [`crate::sensor::RdpilotSensorProcessor`] DVC,
+/// requires it to be open (`channel_id()` populated — i.e. the server-side
+/// responder has completed `WTSVirtualChannelOpenEx` and the drdynvc Create
+/// handshake), encodes the Ping envelope via
+/// [`crate::sensor::RdpilotSensorProcessor::encode_ping`], and wraps it into a
+/// single outbound frame via [`ActiveStage::encode_dvc_messages`].
+///
+/// Returns [`Error::Dvc`] — deliberately NOT propagated with `?` by the caller
+/// — when the channel is not yet registered/open: this is an expected,
+/// transient, per-call-retryable condition (the responder opens the channel
+/// asynchronously after the interactive session exists), not a fatal session
+/// error (see the call site in [`run`]).
+fn build_ping_frame(active_stage: &mut ActiveStage, req_id: u64) -> Result<Vec<u8>> {
+    let (channel_id, dvc_messages) = {
+        // Block-scoped: `get_dvc()` borrows `&mut active_stage`; that borrow
+        // MUST end before the second `&mut active_stage` call below
+        // (Pitfall 3) — this scope is load-bearing.
+        let dvc = active_stage
+            .get_dvc::<crate::sensor::RdpilotSensorProcessor>()
+            .ok_or_else(|| Error::Dvc("sensor channel not registered".to_owned()))?;
+        let channel_id = dvc
+            .channel_id()
+            .ok_or_else(|| Error::Dvc("sensor channel not yet open".to_owned()))?;
+        let processor = dvc
+            .channel_processor_downcast_ref::<crate::sensor::RdpilotSensorProcessor>()
+            .ok_or_else(|| Error::Dvc("sensor processor downcast failed".to_owned()))?;
+        let dvc_messages = processor
+            .encode_ping(req_id)
+            .map_err(|e| Error::Dvc(e.to_string()))?;
+        (channel_id, dvc_messages)
+    };
+    let svc_messages =
+        ironrdp::dvc::encode_dvc_messages(channel_id, dvc_messages, ironrdp::svc::ChannelFlags::empty())
+            .map_err(|e| Error::Dvc(e.to_string()))?;
+    active_stage
+        .encode_dvc_messages(svc_messages)
+        .map_err(|e| Error::Dvc(e.to_string()))
 }
 
 /// Run the Deactivation-Reactivation sequence and rebuild the framebuffer.
