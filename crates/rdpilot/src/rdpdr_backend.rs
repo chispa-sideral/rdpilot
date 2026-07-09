@@ -34,11 +34,16 @@ use ironrdp::svc::SvcMessage;
 use ironrdp_rdpdr::backend::RdpdrBackend;
 use ironrdp_rdpdr::pdu::RdpdrPdu;
 use ironrdp_rdpdr::pdu::efs::{
-    ClientDriveQueryDirectoryResponse, DeviceCloseRequest, DeviceCloseResponse, DeviceControlRequest,
+    Boolean, Characteristics, ClientDriveQueryDirectoryResponse, ClientDriveQueryInformationResponse,
+    ClientDriveQueryVolumeInformationResponse, DeviceCloseRequest, DeviceCloseResponse, DeviceControlRequest,
     DeviceCreateRequest, DeviceCreateResponse, DeviceIoRequest, DeviceIoResponse, DeviceReadRequest,
-    DeviceReadResponse, FileAttributes, FileBothDirectoryInformation, FileDirectoryInformation,
-    FileFullDirectoryInformation, FileInformationClass, FileInformationClassLevel, FileNamesInformation, Information,
-    NtStatus, ServerDeviceAnnounceResponse, ServerDriveIoRequest, ServerDriveQueryDirectoryRequest,
+    DeviceReadResponse, FileAttributeTagInformation, FileAttributes, FileBasicInformation,
+    FileBothDirectoryInformation, FileDirectoryInformation, FileFsAttributeInformation, FileFsDeviceInformation,
+    FileFsFullSizeInformation, FileFsSizeInformation, FileFsVolumeInformation, FileFullDirectoryInformation,
+    FileInformationClass, FileInformationClassLevel, FileNamesInformation, FileStandardInformation,
+    FileSystemAttributes, FileSystemInformationClass, FileSystemInformationClassLevel, Information, NtStatus,
+    ServerDeviceAnnounceResponse, ServerDriveIoRequest, ServerDriveQueryDirectoryRequest,
+    ServerDriveQueryInformationRequest, ServerDriveQueryVolumeInformationRequest,
 };
 use ironrdp_rdpdr::pdu::esc::{ScardCall, ScardIoCtlCode};
 
@@ -251,6 +256,189 @@ impl RdpilotDriveBackend {
         ))])
     }
 
+    /// [`ServerDriveIoRequest::ServerDriveQueryInformationRequest`]: part of
+    /// Windows' STANDARD `Create`-then-`QueryInformation` sequence when
+    /// opening ANY path (including the drive root) -- live-diagnosed as a
+    /// hard requirement, not an optional extra (Plan 04 live gate,
+    /// D-5.6/SC2 blocking bug): a real Windows RDP client always issues this
+    /// immediately after a successful `Create`, and rejecting it with
+    /// `NOT_SUPPORTED` (this backend's prior behavior, inherited from the
+    /// generic 7-variant reject list) makes the ENTIRE redirected drive
+    /// unusable -- Explorer/`cmd`'s `dir`/`copy` all fail with "The device
+    /// is not connected" the moment they try to stat the root they just
+    /// opened. A known/open `file_id` (root or the served file) always
+    /// succeeds; an unknown id is rejected with `NtStatus::ACCESS_DENIED`
+    /// (mirrors `handle_read`'s access-control discipline, T-05-04) with no
+    /// buffer, per this response's own doc comment ("if io_status has an
+    /// io_status besides SUCCESS, buffer can be omitted").
+    fn handle_query_information(&self, req: ServerDriveQueryInformationRequest) -> PduResult<Vec<SvcMessage>> {
+        let ServerDriveQueryInformationRequest {
+            device_io_request,
+            file_info_class_lvl,
+        } = req;
+
+        let Some(entry) = self.open_files.get(&device_io_request.file_id).copied() else {
+            let response = ClientDriveQueryInformationResponse {
+                device_io_response: DeviceIoResponse::new(device_io_request, NtStatus::ACCESS_DENIED),
+                buffer: None,
+            };
+            return Ok(vec![SvcMessage::from(RdpdrPdu::ClientDriveQueryInformationResponse(
+                response,
+            ))]);
+        };
+
+        let is_dir = entry == OpenEntry::Root;
+        // A `stat` failure degrades to a zero-size entry rather than a hard
+        // error -- mirrors `handle_query_directory`'s defensive fallback
+        // (the served file may not exist yet/anymore); only meaningful for
+        // `OpenEntry::File`, the root has no backing `std::fs` metadata.
+        let file_size = if is_dir {
+            0
+        } else {
+            fs::metadata(&self.served_path)
+                .map(|meta| i64::try_from(meta.len()).unwrap_or(i64::MAX))
+                .unwrap_or(0)
+        };
+        let attrs = if is_dir {
+            FileAttributes::FILE_ATTRIBUTE_DIRECTORY
+        } else {
+            FileAttributes::FILE_ATTRIBUTE_NORMAL
+        };
+
+        let buffer = match file_info_class_lvl {
+            FileInformationClassLevel::FILE_BASIC_INFORMATION => {
+                Some(FileInformationClass::Basic(FileBasicInformation {
+                    creation_time: 0,
+                    last_access_time: 0,
+                    last_write_time: 0,
+                    change_time: 0,
+                    file_attributes: attrs,
+                }))
+            }
+            FileInformationClassLevel::FILE_STANDARD_INFORMATION => {
+                Some(FileInformationClass::Standard(FileStandardInformation {
+                    allocation_size: file_size,
+                    end_of_file: file_size,
+                    number_of_links: 1,
+                    delete_pending: Boolean::False,
+                    directory: if is_dir { Boolean::True } else { Boolean::False },
+                }))
+            }
+            FileInformationClassLevel::FILE_ATTRIBUTE_TAG_INFORMATION => {
+                Some(FileInformationClass::AttributeTag(FileAttributeTagInformation {
+                    file_attributes: attrs,
+                    reparse_tag: 0,
+                }))
+            }
+            // Any other level this minimal backend does not model: succeed
+            // with no buffer rather than fail the whole Create/stat sequence
+            // (T-05-01 -- never turn an unrecognized-but-benign request into
+            // a hard client-visible error).
+            _ => None,
+        };
+
+        let response = ClientDriveQueryInformationResponse {
+            device_io_response: DeviceIoResponse::new(device_io_request, NtStatus::SUCCESS),
+            buffer,
+        };
+        Ok(vec![SvcMessage::from(RdpdrPdu::ClientDriveQueryInformationResponse(
+            response,
+        ))])
+    }
+
+    /// [`ServerDriveIoRequest::ServerDriveQueryVolumeInformationRequest`]:
+    /// part of Windows' STANDARD directory-listing sequence (`dir`/Explorer
+    /// query the volume label/size/filesystem type before or alongside
+    /// enumerating files) -- live-diagnosed as a second hard requirement
+    /// alongside `QueryInformation` (Plan 04 live gate, D-5.6/SC2 blocking
+    /// bug, found immediately after fixing the first one: `dir` progressed
+    /// past "The device is not connected" to "The request could not be
+    /// performed because of an I/O device error", the generic client-side
+    /// surfacing of this backend's `NOT_SUPPORTED` reply). Always succeeds
+    /// with small, plausible fixed values (this backend serves exactly one
+    /// read-only file -- there is no real volume to report on); an unknown
+    /// `file_id` is rejected the same way `handle_query_information` is.
+    fn handle_query_volume_information(
+        &self,
+        req: ServerDriveQueryVolumeInformationRequest,
+    ) -> PduResult<Vec<SvcMessage>> {
+        let ServerDriveQueryVolumeInformationRequest {
+            device_io_request,
+            fs_info_class_lvl,
+        } = req;
+
+        if self.open_files.get(&device_io_request.file_id).is_none() {
+            let response = ClientDriveQueryVolumeInformationResponse {
+                device_io_reply: DeviceIoResponse::new(device_io_request, NtStatus::ACCESS_DENIED),
+                buffer: None,
+            };
+            return Ok(vec![SvcMessage::from(
+                RdpdrPdu::ClientDriveQueryVolumeInformationResponse(response),
+            )]);
+        }
+
+        // Fixed, plausible-but-arbitrary volume metadata -- this backend
+        // serves one read-only file, not a real filesystem, so there is no
+        // meaningful free-space/serial-number to report. 512-byte sectors, 1
+        // sector per allocation unit: the smallest self-consistent, nonzero
+        // values a Windows client would accept without misbehaving.
+        let buffer = match fs_info_class_lvl {
+            FileSystemInformationClassLevel::FILE_FS_VOLUME_INFORMATION => {
+                Some(FileSystemInformationClass::FileFsVolumeInformation(FileFsVolumeInformation {
+                    volume_creation_time: 0,
+                    volume_serial_number: 0x1234_5678,
+                    supports_objects: Boolean::False,
+                    volume_label: "RDPILOT".to_owned(),
+                }))
+            }
+            FileSystemInformationClassLevel::FILE_FS_SIZE_INFORMATION => {
+                Some(FileSystemInformationClass::FileFsSizeInformation(FileFsSizeInformation {
+                    total_alloc_units: 1,
+                    available_alloc_units: 0,
+                    sectors_per_alloc_unit: 1,
+                    bytes_per_sector: 512,
+                }))
+            }
+            FileSystemInformationClassLevel::FILE_FS_ATTRIBUTE_INFORMATION => {
+                Some(FileSystemInformationClass::FileFsAttributeInformation(FileFsAttributeInformation {
+                    file_system_attributes: FileSystemAttributes::FILE_CASE_SENSITIVE_SEARCH,
+                    max_component_name_len: 255,
+                    file_system_name: "RDPILOTFS".to_owned(),
+                }))
+            }
+            FileSystemInformationClassLevel::FILE_FS_FULL_SIZE_INFORMATION => {
+                Some(FileSystemInformationClass::FileFsFullSizeInformation(FileFsFullSizeInformation {
+                    total_alloc_units: 1,
+                    caller_available_alloc_units: 0,
+                    actual_available_alloc_units: 0,
+                    sectors_per_alloc_unit: 1,
+                    bytes_per_sector: 512,
+                }))
+            }
+            FileSystemInformationClassLevel::FILE_FS_DEVICE_INFORMATION => {
+                Some(FileSystemInformationClass::FileFsDeviceInformation(FileFsDeviceInformation {
+                    // FILE_DEVICE_DISK (0x00000007) -- the standard Windows
+                    // DDK device-type constant for a disk-like volume.
+                    device_type: 0x0000_0007,
+                    characteristics: Characteristics::FILE_REMOTE_DEVICE,
+                }))
+            }
+            // `decode` (efs.rs) already rejects any level besides the 5
+            // handled above at the wire-parsing stage, so this arm is
+            // unreachable in practice -- still a safe, non-panicking default
+            // (API-01) rather than an unwrap/expect.
+            _ => None,
+        };
+
+        let response = ClientDriveQueryVolumeInformationResponse {
+            device_io_reply: DeviceIoResponse::new(device_io_request, NtStatus::SUCCESS),
+            buffer,
+        };
+        Ok(vec![SvcMessage::from(
+            RdpdrPdu::ClientDriveQueryVolumeInformationResponse(response),
+        )])
+    }
+
     /// Build the single directory-listing entry in the shape the server
     /// asked for. `ServerDriveQueryDirectoryRequest::decode` (efs.rs, read at
     /// execution time) only ever admits these four
@@ -308,14 +496,12 @@ impl RdpdrBackend for RdpilotDriveBackend {
             ServerDriveIoRequest::DeviceCloseRequest(r) => self.handle_close(r),
             ServerDriveIoRequest::DeviceReadRequest(r) => self.handle_read(r),
             ServerDriveIoRequest::ServerDriveQueryDirectoryRequest(r) => self.handle_query_directory(r),
-            ServerDriveIoRequest::ServerDriveQueryInformationRequest(r) => {
-                Self::reject_unsupported(r.device_io_request)
-            }
+            ServerDriveIoRequest::ServerDriveQueryInformationRequest(r) => self.handle_query_information(r),
             ServerDriveIoRequest::ServerDriveNotifyChangeDirectoryRequest(r) => {
                 Self::reject_unsupported(r.device_io_request)
             }
             ServerDriveIoRequest::ServerDriveQueryVolumeInformationRequest(r) => {
-                Self::reject_unsupported(r.device_io_request)
+                self.handle_query_volume_information(r)
             }
             ServerDriveIoRequest::DeviceControlRequest(r) => Self::reject_unsupported(r.header),
             ServerDriveIoRequest::DeviceWriteRequest(r) => Self::reject_unsupported(r.device_io_request),
@@ -336,8 +522,9 @@ mod tests {
     use ironrdp_rdpdr::backend::RdpdrBackend as _;
     use ironrdp_rdpdr::pdu::efs::{
         CreateDisposition, CreateOptions, DesiredAccess, DeviceCloseRequest, DeviceCreateRequest, DeviceIoRequest,
-        DeviceIoResponse, DeviceReadRequest, FileAttributes, FileInformationClassLevel, MajorFunction, MinorFunction,
-        NtStatus, ServerDriveIoRequest, ServerDriveQueryDirectoryRequest, SharedAccess,
+        DeviceIoResponse, DeviceReadRequest, FileAttributes, FileInformationClassLevel, FileSystemInformationClassLevel,
+        MajorFunction, MinorFunction, NtStatus, ServerDriveIoRequest, ServerDriveQueryDirectoryRequest,
+        ServerDriveQueryInformationRequest, ServerDriveQueryVolumeInformationRequest, SharedAccess,
     };
 
     use super::RdpilotDriveBackend;
@@ -514,6 +701,129 @@ mod tests {
         let (status, data) = read_response_fields(&out[0]);
         assert_eq!(status, NtStatus::ACCESS_DENIED);
         assert!(data.is_empty());
+    }
+
+    /// `QueryInformation` on a known `file_id` (root or the served file)
+    /// always succeeds -- the live-diagnosed bug fix (Plan 04 live gate,
+    /// D-5.6/SC2): without this, Windows' standard Create-then-
+    /// QueryInformation sequence fails and the entire redirected drive is
+    /// unusable ("The device is not connected").
+    #[test]
+    fn query_information_succeeds_for_known_file_ids_and_rejects_unknown() {
+        let served_path = write_temp_file(b"0123456789");
+        let mut backend = RdpilotDriveBackend::new(served_path.clone(), "served.bin".to_owned());
+
+        let root_created = backend
+            .handle_drive_io_request(ServerDriveIoRequest::ServerCreateDriveRequest(create_req(1, "")))
+            .expect("root create returns Ok");
+        let (status, root_file_id) = create_response_fields(&root_created[0]);
+        assert_eq!(status, NtStatus::SUCCESS);
+
+        let file_created = backend
+            .handle_drive_io_request(ServerDriveIoRequest::ServerCreateDriveRequest(create_req(
+                2,
+                r"\served.bin",
+            )))
+            .expect("served-file create returns Ok");
+        let (status, file_file_id) = create_response_fields(&file_created[0]);
+        assert_eq!(status, NtStatus::SUCCESS);
+
+        for level in [
+            FileInformationClassLevel::FILE_BASIC_INFORMATION,
+            FileInformationClassLevel::FILE_STANDARD_INFORMATION,
+            FileInformationClassLevel::FILE_ATTRIBUTE_TAG_INFORMATION,
+        ] {
+            let query_root = ServerDriveIoRequest::ServerDriveQueryInformationRequest(
+                ServerDriveQueryInformationRequest {
+                    device_io_request: dev_io_req(root_file_id, MajorFunction::QueryInformation),
+                    file_info_class_lvl: level.clone(),
+                },
+            );
+            let out = backend
+                .handle_drive_io_request(query_root)
+                .expect("query on root returns Ok");
+            let (status, _tail) = decode_io_status_and_tail(&out[0]);
+            assert_eq!(status, NtStatus::SUCCESS, "root QueryInformation({level}) must succeed");
+
+            let query_file = ServerDriveIoRequest::ServerDriveQueryInformationRequest(
+                ServerDriveQueryInformationRequest {
+                    device_io_request: dev_io_req(file_file_id, MajorFunction::QueryInformation),
+                    file_info_class_lvl: level.clone(),
+                },
+            );
+            let out = backend
+                .handle_drive_io_request(query_file)
+                .expect("query on served file returns Ok");
+            let (status, _tail) = decode_io_status_and_tail(&out[0]);
+            assert_eq!(status, NtStatus::SUCCESS, "file QueryInformation({level}) must succeed");
+        }
+
+        let query_unknown = ServerDriveIoRequest::ServerDriveQueryInformationRequest(
+            ServerDriveQueryInformationRequest {
+                device_io_request: dev_io_req(9999, MajorFunction::QueryInformation),
+                file_info_class_lvl: FileInformationClassLevel::FILE_BASIC_INFORMATION,
+            },
+        );
+        let out = backend
+            .handle_drive_io_request(query_unknown)
+            .expect("rejected query still returns Ok, never propagates an Err");
+        let (status, _tail) = decode_io_status_and_tail(&out[0]);
+        assert_eq!(status, NtStatus::ACCESS_DENIED);
+
+        let _ = std::fs::remove_file(&served_path);
+    }
+
+    /// `QueryVolumeInformation` on a known `file_id` always succeeds for
+    /// every `FileSystemInformationClassLevel` this backend models -- the
+    /// second live-diagnosed bug fix (Plan 04 live gate, D-5.6/SC2), found
+    /// immediately after `QueryInformation`: Windows' `dir`/Explorer
+    /// sequence queries volume metadata too, and rejecting it with
+    /// `NOT_SUPPORTED` surfaced as a generic "I/O device error" on the
+    /// client.
+    #[test]
+    fn query_volume_information_succeeds_for_known_file_id_and_rejects_unknown() {
+        let served_path = write_temp_file(b"0123456789");
+        let mut backend = RdpilotDriveBackend::new(served_path.clone(), "served.bin".to_owned());
+
+        let root_created = backend
+            .handle_drive_io_request(ServerDriveIoRequest::ServerCreateDriveRequest(create_req(1, "")))
+            .expect("root create returns Ok");
+        let (status, root_file_id) = create_response_fields(&root_created[0]);
+        assert_eq!(status, NtStatus::SUCCESS);
+
+        for level in [
+            FileSystemInformationClassLevel::FILE_FS_VOLUME_INFORMATION,
+            FileSystemInformationClassLevel::FILE_FS_SIZE_INFORMATION,
+            FileSystemInformationClassLevel::FILE_FS_ATTRIBUTE_INFORMATION,
+            FileSystemInformationClassLevel::FILE_FS_FULL_SIZE_INFORMATION,
+            FileSystemInformationClassLevel::FILE_FS_DEVICE_INFORMATION,
+        ] {
+            let query = ServerDriveIoRequest::ServerDriveQueryVolumeInformationRequest(
+                ServerDriveQueryVolumeInformationRequest {
+                    device_io_request: dev_io_req(root_file_id, MajorFunction::QueryVolumeInformation),
+                    fs_info_class_lvl: level.clone(),
+                },
+            );
+            let out = backend
+                .handle_drive_io_request(query)
+                .expect("query volume info returns Ok");
+            let (status, _tail) = decode_io_status_and_tail(&out[0]);
+            assert_eq!(status, NtStatus::SUCCESS, "QueryVolumeInformation({level:?}) must succeed");
+        }
+
+        let query_unknown = ServerDriveIoRequest::ServerDriveQueryVolumeInformationRequest(
+            ServerDriveQueryVolumeInformationRequest {
+                device_io_request: dev_io_req(9999, MajorFunction::QueryVolumeInformation),
+                fs_info_class_lvl: FileSystemInformationClassLevel::FILE_FS_VOLUME_INFORMATION,
+            },
+        );
+        let out = backend
+            .handle_drive_io_request(query_unknown)
+            .expect("rejected query still returns Ok, never propagates an Err");
+        let (status, _tail) = decode_io_status_and_tail(&out[0]);
+        assert_eq!(status, NtStatus::ACCESS_DENIED);
+
+        let _ = std::fs::remove_file(&served_path);
     }
 
     /// A `Read` at a given offset/length returns exactly those bytes from
