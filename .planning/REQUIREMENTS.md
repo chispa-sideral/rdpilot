@@ -40,7 +40,7 @@ Stack (from research): IronRDP 0.14 (Rust) client core + primary language; C# .N
 
 - [ ] **SENSOR-01**: A thin C# .NET 8 NativeAOT sensor helper exposes the structured-perception queries on the target
 - [ ] **SENSOR-02**: The SDK can bootstrap/deploy and launch the sensor on the target (drive-redirection copy primary, WinRM fallback)
-- [ ] **SENSOR-03**: A DVC request/response transport channel carries structured-perception data between the SDK and the sensor
+- [x] **SENSOR-03**: A DVC request/response transport channel carries structured-perception data between the SDK and the sensor
 
 ### Process
 
@@ -84,7 +84,7 @@ Stack (from research): IronRDP 0.14 (Rust) client core + primary language; C# .N
 | CAP-02 | Phase 6: Window + Process Perception | Pending |
 | INPUT-01 | Phase 3: Input Injection | Complete — proven live in Phase 3 Plan 04, 10/10 tests pass 2026-07-08 |
 | INPUT-02 | Phase 3: Input Injection | Complete — proven live in Phase 3 Plan 04, 10/10 tests pass 2026-07-08 |
-| SENSOR-03 | Phase 4: DVC Transport Channel | In Progress — Plans 01-03 offline-authored and code-complete (envelope, RdpilotSensorProcessor, Session::ping(), throwaway WTS responder, WinRM deploy helper, gated live test); SC#2/#3 live proof against the Azure VM PENDING — requires pwsh + a live target, not available in this sandbox |
+| SENSOR-03 | Phase 4: DVC Transport Channel | Complete — Plans 01-03 code-complete (envelope, RdpilotSensorProcessor, Session::ping(), throwaway WTS responder, WinRM deploy helper, gated live test) and LIVE-VERIFIED against a real disposable Azure Windows VM: `sensor_ping_pong_under_500ms` PASSED, measured round trip 165ms (SC#2), Version handshake proven first (SC#3 positive). Two bugs found and fixed during the live run: a session_loop.rs fix (transient DVC-not-ready Ping no longer kills the whole session) and a sensor-responder.ps1 fixture fix (JSON-start scan past a DVC framing prefix); test's outer setup-retry budget widened 15s→60s (empirically-measured AtLogOn scheduled-task latency). VM torn down after the run (`rdpilot-test` RG deleted). |
 | SENSOR-01 | Phase 5: Sensor Bootstrap + Deployment | Pending |
 | SENSOR-02 | Phase 5: Sensor Bootstrap + Deployment | Pending |
 | PERC-01 | Phase 6: Window + Process Perception | Pending |

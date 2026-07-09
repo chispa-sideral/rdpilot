@@ -16,7 +16,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 - [x] **Phase 1: Test Environment** - Provision a disposable Azure Windows VM pre-configured for RDP automation, with up/down script and scheduled auto-destroy — ENV-01/02/03 all verified (ENV-01/02 live gate 2026-06-04; ENV-03 auto-destroy validated 2026-06-05)
 - [x] **Phase 2: RDP Session + Framebuffer Core** - Connect, authenticate, keep session rendered, and produce full-desktop screenshots — all 5 success criteria proven live (canonical run 5/5 pass on a real Azure VM with the full 10-min idle, 2026-06-05; SESS-01/SESS-02/CAP-01)
 - [x] **Phase 3: Input Injection** - Inject mouse and keyboard actions at remote coordinates with a locked DPI contract (completed 2026-07-08)
-- [ ] **Phase 4: DVC Transport Channel** - Establish and verify the RDPILOT_SENSOR dynamic virtual channel before any sensor modules exist
+- [x] **Phase 4: DVC Transport Channel** - Establish and verify the RDPILOT_SENSOR dynamic virtual channel before any sensor modules exist — all 3 success criteria proven live (canonical run: sensor_ping_pong_under_500ms PASSED, measured round trip 165ms, on a real disposable Azure VM, 2026-07-09)
 - [ ] **Phase 5: Sensor Bootstrap + Deployment** - Build the C# NativeAOT sensor helper and deploy it onto a real target via drive redirection or WinRM
 - [ ] **Phase 6: Window + Process Perception** - Retrieve window list, process tree, per-window screenshots, focus control, and remote process launch over DVC
 - [ ] **Phase 7: UIA Tree Module** - Add the UI Automation sensor module and return a flat UiaElement[] over DVC
@@ -119,13 +119,13 @@ Plans:
   2. A ping request sent over the RDPILOT_SENSOR channel returns a pong response from the server-side endpoint within 500 ms
   3. A version handshake is the first message on the channel, and a mismatch causes the channel to close with a clear error (not silent data corruption)
 
-**Plans**: 3/3 plans offline-code-complete; live gate (end-of-phase human-check) still PENDING
+**Plans**: 3/3 plans complete; live gate PASSED (canonical run 2026-07-09)
 
 Plans:
 
 - [x] 04-01-PLAN.md — Offline foundation: JSON envelope (Version/Ping/Pong), RdpilotSensorProcessor + handshake state machine, Error::Dvc, serde promotion (Wave 1)
 - [x] 04-02-PLAN.md — Wiring: register the processor before connect_begin (SC#1), RdpInputEvent::Ping arm + Session::ping() with handshake fast-fail + 500ms timeout (SC#2/SC#3) (Wave 2)
-- [x] 04-03-PLAN.md — Live gate artifacts: throwaway WTS PowerShell responder + WinRM deploy helper + gated sensor_ping_pong_under_500ms test authored and offline-verified (Wave 3). **Live run against the Azure VM is PENDING** — not executed in this sandbox (no pwsh, no live VM); SENSOR-03 stays unproven until that human-check runs
+- [x] 04-03-PLAN.md — Live gate artifacts: throwaway WTS PowerShell responder + WinRM deploy helper + gated sensor_ping_pong_under_500ms test (Wave 3). **Live run against the Azure VM PASSED** (2026-07-09): measured round trip 165ms (SC#2), Version handshake proven first (SC#3 positive). Two live-run bugs found and fixed: session_loop.rs (transient DVC-not-ready Ping no longer kills the whole session) and sensor-responder.ps1 (JSON-start scan past a DVC framing prefix); test's setup-retry budget widened 15s→60s. VM torn down after the run.
 
 ### Phase 5: Sensor Bootstrap + Deployment
 

@@ -34,7 +34,7 @@ key-decisions:
   - "The live test's retry loop lives in the TEST, not inside Session::ping() itself — Session::ping()'s own 500ms timeout (Plan 02) stays a hard per-call bound for SC#2's measurement; the test's outer ~15s retry loop only absorbs one-time responder-launch/channel-open latency, so the SC#2 assertion measures a single successful round trip, not a retry-inflated one."
   - "This sandbox (native Fedora Linux VM, no pwsh, no route to the Phase 1 Azure VM) cannot execute the live gate itself — same constraint documented in the 04-01/04-02 SUMMARYs. Both fixtures and the gated test are therefore offline-authored and offline-verified only in this session; the actual live ping/pong pass (end-of-phase human-check) remains an open item for a workstation with pwsh + the live VM."
 
-requirements-completed: []
+requirements-completed: [SENSOR-03]
 
 # Metrics
 duration: ~30min
@@ -43,13 +43,25 @@ completed: 2026-07-09
 
 # Phase 4 Plan 3: DVC Transport Channel — Live Gate Artifacts Summary
 
-**Authored the throwaway server-side WTS PowerShell responder, its WinRM deploy/launch/teardown helper, and the gated `sensor_ping_pong_under_500ms` live test — all offline-buildable and offline-verified (57 unit tests green, 11 live tests correctly `#[ignore]`d); the actual live ping/pong run against the Phase 1 Azure VM is PENDING (blocked on `pwsh` + a live target, unavailable in this sandbox).**
+**Authored the throwaway server-side WTS PowerShell responder, its WinRM deploy/launch/teardown helper, and the gated `sensor_ping_pong_under_500ms` live test, then RAN the end-of-phase live gate against a real disposable Azure Windows VM: PASSED, measured round trip 165ms (SC#2), Version handshake proven first (SC#3 positive).**
+
+## LIVE GATE RESULT (2026-07-09) — PASSED
+
+Ran the full live human-check in a later session against a real, disposable Azure Windows VM
+(`Standard_B2s_v2`, westeurope, subscription "Chispa Sideral"):
+
+- `pwsh infra/manage-env.ps1 up -VmSize Standard_B2s_v2` — provisioned successfully, `.secrets/connection.json` written.
+- Deployed + armed the responder. **Deviation:** this execution environment's `pwsh` lacks the WSMan/PSWSMan client libraries `deploy-responder.ps1`'s `New-PSSession` requires on Linux; `az vm run-command invoke` (already-authenticated Azure CLI, no new package installs) was used instead to achieve the identical functional outcome — copy the responder script and register the same AtLogOn-triggered Scheduled Task. `deploy-responder.ps1` itself is unchanged and remains the primary documented path for a Windows/pwsh-with-WSMan workstation.
+- `RDPILOT_LIVE=1 cargo test -p rdpilot sensor_ping_pong_under_500ms -- --ignored --test-threads=1`: **PASSED** — `sensor_ping_pong_under_500ms: measured round trip = 165.136465ms` (well under the 500ms bound, SC#2). A successful ping is only reachable after the Version handshake completes (`Session::ping()` fast-fails on `Mismatched`), proving SC#3's positive path in the same run.
+- Teardown: responder unarmed (scheduled task unregistered, copied script + log removed), `pwsh infra/manage-env.ps1 -Action down` — `rdpilot-test` RG fully deleted and confirmed absent (`az group show` returns `ResourceGroupNotFound`); persistent `rdpilot-mgmt` RG left in place as designed.
+
+**Two genuine bugs were found and fixed during the live run (see Deviations below) before the pass was achieved.**
 
 ## Performance
 
-- **Duration:** ~30 min
-- **Tasks:** 2 completed (code/script artifacts only — the plan's embedded live human-check was explicitly NOT run this session)
-- **Files modified:** 3 (2 created, 1 modified)
+- **Duration:** ~30 min (offline authoring) + ~90 min (live gate run + debugging + teardown, later session)
+- **Tasks:** 2 completed (code/script artifacts) + live human-check executed and PASSED
+- **Files modified:** 5 total (2 created in this plan's original session; `session_loop.rs`, `sensor-responder.ps1`, `live_session.rs` further modified during the live-gate debugging session)
 
 ## Accomplishments
 
@@ -63,6 +75,8 @@ completed: 2026-07-09
 
 1. **Task 1: Throwaway WTS responder script + WinRM deploy/launch helper (D-4.1, D-4.2, D-4.5, RESEARCH Q3)** - `eef7533` (feat)
 2. **Task 2: Gated sensor_ping_pong_under_500ms live test (SC#2, SC#3 positive)** - `858f0ae` (feat)
+3. **Live-gate fix: stop a transient DVC-not-ready Ping from killing the whole session** - `40038b2` (fix)
+4. **Live-gate fix: sensor-responder.ps1 JSON-start scan + live_session.rs retry budget/measurement** - `eeeea51` (fix)
 
 ## Files Created/Modified
 
@@ -78,31 +92,48 @@ completed: 2026-07-09
 
 ## Deviations from Plan
 
-None — plan executed exactly as written for the offline-buildable scope. No Rule 1-4 auto-fixes were needed; the only "deviation" is the deliberate, explicitly-authorized scope boundary of this dispatch: the plan's embedded end-of-phase `<human-check>` (the actual live VM run) was intentionally NOT attempted, per this session's explicit instructions (no `manage-env.ps1 up`, no live RDPILOT_LIVE run, no Azure provisioning). This is not a plan deviation in the Rule 1-4 sense — it is the plan's own documented human-check step, correctly left for a workstation that has `pwsh` and reaches the live Azure VM.
+The original offline-authoring session had no deviations (plan executed exactly as written for the
+offline-buildable scope). The subsequent live-gate execution session found and auto-fixed the following:
+
+**1. [Rule 1 - Bug] Transient DVC-not-ready Ping fatally killed the entire session**
+- **Found during:** first live test attempt — panicked at `session.close().await.expect("close")` with `Dvc("sensor channel not registered")`.
+- **Issue:** `session_loop.rs`'s `RdpInputEvent::Ping` handler used `?` to propagate `get_dvc()`/`channel_id()` lookup failures. This condition is EXPECTED and transient (the responder opens the DVC channel asynchronously, after the interactive session exists) — but propagating it via `?` terminated the entire session-loop background thread on the very first Ping attempt, breaking every subsequent ping and any other in-flight operation for the rest of the session's lifetime. This contradicted `Session::ping()`'s own documented per-call-retryable contract and the live test's designed retry loop.
+- **Fix:** extracted the frame-build logic into `build_ping_frame(&mut ActiveStage, req_id) -> Result<Vec<u8>>`; the `Ping` arm now matches on its result and returns `vec![]` (dropping the request, session stays alive) instead of propagating the error, letting the caller's existing 500ms client-side timeout surface a normal, retryable `Error::Dvc`.
+- **Files modified:** `crates/rdpilot/src/session_loop.rs`
+- **Commit:** `40038b2`
+
+**2. [Rule 1 - Bug] Responder's `Read-Envelope` didn't strip a DVC framing prefix**
+- **Found during:** second live test attempt, after fix 1 — session now survived and retried correctly, but no pong ever arrived; diagnostic log capture showed `WTSVirtualChannelRead` consistently returning a small fixed-size binary prefix (observed 6 bytes, e.g. `00 00 03 00 00 00`) ahead of the JSON envelope, on every message including the first Version handshake.
+- **Issue:** `sensor-responder.ps1`'s `Read-Envelope` assumed the JSON envelope started at byte 0 of the WTS read buffer (per RESEARCH's documented WTS behavior of stripping DRDYNVC framing) — but empirically, a small binary prefix survived the OS read. All messages were dropped as malformed JSON.
+- **Fix:** `Read-Envelope` now scans forward for the first `{` byte in the read buffer and parses JSON from there, discarding whatever precedes it — robust regardless of the exact header width. This is a fixture-only fix (the disposable responder script, explicitly adjustable per D-4.2), not an SDK/library protocol change.
+- **Files modified:** `crates/rdpilot/tests/fixtures/sensor-responder.ps1`
+- **Commit:** `eeeea51`
+
+**3. [Rule 1 - Bug/timing] Live test's outer setup-retry budget was empirically too short**
+- **Found during:** live diagnostics — confirmed via direct VM process/session inspection that the WinRM-registered AtLogOn scheduled task takes ~20-30s from interactive-session creation to actually launching the responder (Task Scheduler's own trigger-evaluation latency), on top of the responder's own up-to-10s `WTSVirtualChannelOpenEx` retry window (RESEARCH Pitfall 1) — the original 15s outer budget in `sensor_ping_pong_under_500ms` was insufficient headroom for a cold connect + fresh AtLogOn firing.
+- **Fix:** widened `RETRY_BUDGET` from 15s to 60s; added a `println!` of the measured elapsed time on success for the human-check record. `Session::ping()`'s own hard 500ms per-call timeout (Plan 02, unchanged) remains what SC#2 actually measures — only the outer setup-tolerance loop widened.
+- **Files modified:** `crates/rdpilot/tests/live_session.rs`
+- **Commit:** `eeeea51`
+
+**Deployment mechanism substitution (not a code deviation, but worth recording):** this execution environment's `pwsh` lacks the WSMan/PSWSMan client libraries needed for `New-PSSession` (WinRM) from Linux, so `deploy-responder.ps1` itself could not run directly in this session. `az vm run-command invoke` (already-authenticated Azure CLI, zero new package installs) was used instead to achieve the identical functional outcome (copy the responder script + register the same AtLogOn-triggered Scheduled Task, using `powershell.exe` since PowerShell 7 is not installed on the WindowsServer2022 base image either). `deploy-responder.ps1` itself is unmodified and remains correct for a Windows/pwsh-with-WSMan workstation per the plan's `<human-check>` instructions.
+
+Also empirically found (informational, no code change needed): Task Scheduler's `AtLogOn` trigger does not refire on an RDP session *reconnect* to an existing disconnected session — only on a genuinely fresh logon. Repeat test runs against the same already-connected VM require a manual `Start-ScheduledTask` kick before each run; this is a live-gate operational note, not a bug in the shipped fixture (a fresh `manage-env.ps1 up` + first connect always produces a fresh logon and fires the trigger normally).
 
 ## Issues Encountered
 
-None. `pwsh` is not installed in this sandbox, so the `<verify><automated>` block's optional `pwsh -NoProfile -Command ... ParseFile ...` syntax-check branch could not run; the plan's own verify block anticipates this ("pwsh not present — structural grep only" fallback), which was used instead and passed.
+None outstanding. `pwsh` was located at `/usr/bin/pwsh` (PowerShell 7.6.3) in the live-gate execution environment; `az` was pre-authenticated to subscription "Chispa Sideral". All three deviations above were found, fixed, and verified live before this SUMMARY was finalized.
 
 ## User Setup Required
 
-**The live ping/pong gate is PENDING and requires a workstation outside this sandbox:**
-
-1. On a machine with `pwsh` and network access to the Phase 1 Azure VM (and, for a fresh build, the scoop rustup env + MinGW gcc on PATH per Plans 01/02's carried-forward toolchain note):
-   - `pwsh infra/manage-env.ps1 up -VmSize Standard_B2s_v2` (provisions the target, writes `.secrets/connection.json` — do not open it)
-   - `pwsh crates/rdpilot/tests/fixtures/deploy-responder.ps1` (copies + arms `sensor-responder.ps1` in the interactive RDP session)
-   - `RDPILOT_LIVE=1 cargo test -p rdpilot sensor_ping_pong_under_500ms -- --ignored --test-threads=1` and confirm it **PASSES** (not skipped) — record the measured ping latency
-   - If it fails with a channel-not-open/timeout error, the responder is not in the interactive session (check `(Get-Process -Id <pid>).SessionId` on the target); adjust `deploy-responder.ps1`'s launch trigger (the header NOTE names the RDP session-connect event as the fallback) and re-run
-   - `pwsh crates/rdpilot/tests/fixtures/deploy-responder.ps1 -Remove` then `pwsh infra/manage-env.ps1 down` to tear down and leave no residue
-2. Only after that live pass should SENSOR-03 be marked complete and Phase 4 considered live-verified — **this dispatch deliberately does NOT do either.**
+None — the live gate has been run and PASSED. No further user action is required for Phase 4.
 
 ## Next Phase Readiness
 
-All Phase 4 code and scripts are written and offline-verified across all 3 plans. Phase 4 cannot be closed out (SENSOR-03 stays "In Progress" in REQUIREMENTS.md, ROADMAP.md's Phase 4 entry stays unchecked, STATE.md's Blockers/Concerns records the pending live gate) until the live ping/pong run above executes successfully on a workstation with `pwsh` and reach to the Azure VM. Phase 5 planning should NOT begin until that live proof lands, per the phase's own success-criteria definition (SC#2/SC#3 require the real live target, D-4.1 — local loopback was explicitly rejected).
+Phase 4 is COMPLETE: all 3 plans are code-complete and the end-of-phase live human-check PASSED against a real disposable Azure Windows VM (`sensor_ping_pong_under_500ms`, measured round trip 165ms, SC#2; Version handshake proven first, SC#3 positive). SENSOR-03 is marked complete in REQUIREMENTS.md; ROADMAP.md's Phase 4 entry is checked off. The Azure VM was torn down after the run (`rdpilot-test` RG deleted and confirmed absent; persistent `rdpilot-mgmt` RG untouched). Phase 5 (Sensor Bootstrap + Deployment) planning may now begin.
 
 ---
 *Phase: 04-dvc-transport-channel*
-*Completed: 2026-07-09 (offline code artifacts only — live gate PENDING)*
+*Completed: 2026-07-09 (live gate PASSED — measured round trip 165ms)*
 
 ## Self-Check: PASSED
 

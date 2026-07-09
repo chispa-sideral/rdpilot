@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-stopped_at: Completed 04-03-PLAN.md code artifacts (offline) — Phase 4 DVC transport channel Wave 3 of 3; live ping/pong gate PENDING (needs pwsh + a live Azure VM, unavailable in this sandbox)
-last_updated: "2026-07-08T22:52:47.000Z"
-last_activity: 2026-07-08
+stopped_at: Phase 4 DVC transport channel COMPLETE — live gate PASSED against a real Azure VM (sensor_ping_pong_under_500ms, 165ms measured round trip); SENSOR-03 validated
+last_updated: "2026-07-09T08:30:00.000Z"
+last_activity: 2026-07-09
 progress:
   total_phases: 9
-  completed_phases: 3
+  completed_phases: 4
   total_plans: 15
   completed_plans: 15
-  percent: 36
+  percent: 44
 ---
 
 # Project State
@@ -25,14 +25,14 @@ See: .planning/PROJECT.md (updated 2026-06-04)
 
 ## Current Position
 
-Phase: 4 (dvc-transport-channel) — EXECUTING (code-complete; live gate outstanding)
-Plan: 3 of 3 (offline artifacts complete)
-Status: All 3 plans' code/scripts authored and offline-verified (envelope, RdpilotSensorProcessor, Session::ping(), throwaway WTS responder + WinRM deploy helper, gated sensor_ping_pong_under_500ms test). The end-of-phase live human-check (armed run against the Phase 1 Azure VM) has NOT run — this sandbox has no pwsh and no live VM. SENSOR-03 / SC#2 / SC#3-positive remain unproven until that live run passes.
-Last activity: 2026-07-08
+Phase: 4 (dvc-transport-channel) — COMPLETE (live gate PASSED)
+Plan: 3 of 3 (all complete, live-verified)
+Status: All 3 plans complete and LIVE-VERIFIED. The end-of-phase live human-check ran against a real disposable Azure Windows VM (2026-07-09): `sensor_ping_pong_under_500ms` PASSED with a measured round trip of 165ms (SC#2), and the Version handshake was proven to precede and gate the successful ping (SC#3 positive path). Two genuine bugs were found and fixed during the live run: (1) `session_loop.rs` — a transient "DVC not yet open" condition on a Ping was fatally propagated via `?` and killed the entire session-loop thread instead of just that call; (2) `sensor-responder.ps1` — `WTSVirtualChannelRead` consistently returned a small fixed-size binary prefix ahead of the JSON envelope that the responder wasn't stripping. The live test's outer setup-retry budget was also widened 15s→60s based on empirically-measured AtLogOn scheduled-task latency. SENSOR-03 is now validated; the Azure VM was torn down after the run (`rdpilot-test` RG deleted, confirmed absent).
+Last activity: 2026-07-09
 
 Note: Phase 3 remains `status: verifying` (pending /gsd-verify-work) in the frontmatter above; Phase 4 planning/execution began before that gate ran.
 
-Progress: [████░░░░░░] 36% (Phase 4: 3/3 plans offline-code-complete — live ping/pong gate PENDING, see 04-03-SUMMARY.md)
+Progress: [████░░░░░░] 44% (Phase 4: 3/3 plans complete, live gate PASSED — see 04-03-SUMMARY.md)
 
 ## Performance Metrics
 
@@ -52,7 +52,7 @@ Progress: [████░░░░░░] 36% (Phase 4: 3/3 plans offline-code-
 
 **Recent Trend:**
 
-- Last plan: 04-03 (~30 min, 2 tasks, 3 files) — throwaway WTS PowerShell responder + WinRM deploy/launch helper + gated `sensor_ping_pong_under_500ms` live test; offline-authored and offline-verified only, live ping/pong run against the Azure VM still PENDING (no pwsh/live VM in this sandbox)
+- Last plan: 04-03 (~30 min authoring + live gate run, 2 tasks, 3 files + 2 live-run bug fixes) — throwaway WTS PowerShell responder + WinRM deploy/launch helper + gated `sensor_ping_pong_under_500ms` live test; LIVE-VERIFIED against a real Azure VM, measured round trip 165ms, VM torn down after the run
 - Prior: 02-03 (~55 min incl. ~20-min canonical idle run, 3 tasks, 3 files) — example + gated live suite; 5/5 live pass at full 10-min idle; VM torn down
 - Prior: 02-02 (~70 min, 3 tasks, 8 files) — live session machinery: connect/loop/framebuffer/keepalive/Session
 
@@ -100,6 +100,7 @@ Recent decisions affecting current work:
 - [Phase ?]: Server Manager auto-launch suppressed at infra layer (Configure-Target.ps1 DEFAULT hive) after breaking bare-desktop input assumptions during Phase 3 live validation; DOUBLE_CLICK_GAP=100ms and DRAG_INTERPOLATION_STEPS=5/DRAG_STEP_GAP=15ms empirically confirmed reliable, no tuning needed
 - [Phase ?]: Used ironrdp::pdu::pdu_other_err!(desc, source: e) instead of ironrdp::core::other_err! for PduResult construction in RdpilotSensorProcessor::start() (PduError does not implement OtherErr) — Verified by reading ironrdp-pdu-0.8.0 and ironrdp-core-0.2.0 source directly; correction to RESEARCH's code example, not a CONTEXT deviation
 - [Phase ?]: SensorShared fields widened to pub(crate) so Session::ping() and RdpilotSensorProcessor::process() share direct lock access (no accessor layer, matches module's crate-internal-only design)
+- **Phase 4 live gate (2026-07-09):** SENSOR-03 validated live against a real disposable Azure VM (measured ping/pong round trip 165ms). Two bugs found and fixed: session_loop.rs's Ping handler no longer propagates a transient "DVC not registered/not yet open" lookup failure via `?` (which previously killed the whole session-loop thread on the very first ping attempt) — extracted to `build_ping_frame()`, dropped (vec![]) on failure so the caller's existing 500ms timeout surfaces a normal retryable error instead. sensor-responder.ps1's `Read-Envelope` now scans for the first `{` byte instead of assuming JSON starts at offset 0 — WTSVirtualChannelRead was consistently returning a small fixed binary prefix ahead of the JSON payload. Also empirically found: Task Scheduler's AtLogOn trigger takes ~20-30s to fire and does NOT refire on an RDP session *reconnect* (only a fresh logon) — the live test's outer setup-retry budget was widened 15s→60s to tolerate this deployment-mechanism latency (Session::ping()'s own hard 500ms per-call timeout, the actual SC#2 measurement, is unchanged).
 
 ### Pending Todos
 
@@ -109,7 +110,6 @@ Recent decisions affecting current work:
 
 ### Blockers/Concerns
 
-- **Phase 4 live gate (SENSOR-03/SC#2/SC#3-positive) PENDING:** all 04-03 code/scripts are written and offline-verified, but the actual live ping/pong run (`pwsh infra/manage-env.ps1 up` → `pwsh crates/rdpilot/tests/fixtures/deploy-responder.ps1` → `RDPILOT_LIVE=1 cargo test -p rdpilot sensor_ping_pong_under_500ms -- --ignored`) has NOT been executed. This sandbox has no `pwsh` and no route to the Phase 1 Azure VM. Must be run from a workstation with pwsh + the scoop rustup/MinGW toolchain (same constraint carried forward from 04-01/04-02) before Phase 4 can be marked live-verified.
 - Phase 5: AV/EDR environment on target is unknown — sensor binary hardening level TBD
 - Phase 5: Drive redirection GPO policy on target is unknown — WinRM fallback may be required
 - Phase 7/9: Target application UIA fidelity is unknown — identify and test before Phase 9 harness assertion design
@@ -122,6 +122,6 @@ Phase 2 Plan 02: pre-existing rustdoc intra-doc-link warnings in config.rs (Wave
 
 ## Session Continuity
 
-Last session: 2026-07-08T22:43:55.884Z
-Stopped at: Completed 04-01-PLAN.md (Phase 4 DVC transport channel — offline envelope + RdpilotSensorProcessor foundation; Wave 1 of 3 complete)
-Resume file: None (Wave 2/Plan 02 depends on this; not yet started)
+Last session: 2026-07-09T08:30:00.000Z
+Stopped at: Completed 04-03-PLAN.md live gate — Phase 4 DVC transport channel COMPLETE; SENSOR-03 live-verified (165ms measured round trip); Azure VM torn down
+Resume file: None (Phase 4 complete; Phase 5 planning can begin)
