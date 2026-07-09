@@ -77,7 +77,56 @@ const PINGS_PER_LAUNCH_ATTEMPT: u32 = 20;
 /// command, giving the remote shell time to render the dialog before
 /// keystrokes are injected (D-5.1). Applied on the caller's async context —
 /// never inside the session-loop `select!` (Pitfall 3).
-const RUN_DIALOG_SETTLE: Duration = Duration::from_millis(300);
+///
+/// Live-tuned (Plan 04 live gate): widened from the offline-reasoned 300ms to
+/// 800ms after the live VM showed a rendered-but-not-yet-input-ready Run
+/// dialog at 300-500ms post-Win+R (see [`SESSION_SETTLE`]'s doc comment for
+/// the related, larger finding this pairs with).
+const RUN_DIALOG_SETTLE: Duration = Duration::from_millis(800);
+
+/// One-time settle delay before the FIRST launch attempt only, applied once
+/// at the top of [`Session::deploy_and_launch`] before any input is injected.
+///
+/// Live-tuned (Plan 04 live gate, empirical bug fix): live diagnostics showed
+/// that immediately after `Session::connect` returns, the remote interactive
+/// session can still be mid-transition (observed: the Windows lock-screen
+/// wallpaper still on screen, or a Run dialog that visually renders correctly
+/// but silently drops injected Unicode keyboard input) even though the first
+/// framebuffer has already arrived and `screenshot()` succeeds. Injecting
+/// Win+R + a typed command in this window produced a completely empty Run
+/// dialog textbox on every one of 3 retry attempts (all within the DVC-open
+/// retry budget, so this is NOT the D-5.7 sensor-side race — it reproduced
+/// even for pure `Type()` calls with no sensor involved). Waiting this long
+/// once, before the first attempt, before injecting ANY input, reliably
+/// (3/3 in live testing) let the desktop settle enough for typed input to
+/// register. Subsequent re-injections (attempts 2/3) do not repeat this
+/// delay — by then the session has had ample time to settle from the natural
+/// spacing of the ping-poll budget.
+const SESSION_SETTLE: Duration = Duration::from_secs(3);
+
+/// Number of characters typed per [`KeyAction::Type`] call when injecting
+/// the launch command (live-tuned bug fix, see
+/// [`Session::inject_launch_sequence`]'s doc comment for the full root
+/// cause). Small enough that the Run dialog's ComboBox autocomplete never
+/// falls behind a single burst; matches the chunk sizes that reproduced
+/// cleanly during live bisection.
+const TYPE_CHUNK_LEN: usize = 16;
+
+/// Settle delay between successive typed chunks (see [`TYPE_CHUNK_LEN`]).
+const TYPE_CHUNK_GAP: Duration = Duration::from_millis(150);
+
+/// Split `s` into `max_len`-character (not byte) chunks, preserving order.
+/// Pure and offline-testable. Never panics on empty input, non-ASCII input,
+/// or `max_len == 0` (treated as "one char per chunk" to avoid an infinite
+/// empty-chunk loop, API-01).
+fn chunk_str(s: &str, max_len: usize) -> Vec<String> {
+    let max_len = max_len.max(1);
+    let chars: Vec<char> = s.chars().collect();
+    chars
+        .chunks(max_len)
+        .map(|c| c.iter().collect::<String>())
+        .collect()
+}
 
 /// Build the Win+R run-command string that copies the sensor exe from the
 /// RDPDR-redirected `RDPILOT` drive to `%TEMP%` and starts it (D-5.1).
@@ -409,6 +458,12 @@ impl Session {
     /// for a reason unrelated to launch timing (input channel closed, input
     /// lock poisoned).
     pub async fn deploy_and_launch(&self) -> Result<Duration> {
+        // One-time settle before the FIRST attempt only (SESSION_SETTLE doc
+        // comment has the live-diagnosed root cause: the session can still
+        // be mid-transition immediately after connect, silently dropping
+        // injected input even though the first framebuffer already arrived).
+        tokio::time::sleep(SESSION_SETTLE).await;
+
         for _attempt in 1..=LAUNCH_ATTEMPTS {
             self.inject_launch_sequence().await?;
 
@@ -432,13 +487,33 @@ impl Session {
     }
 
     /// Inject the Win+R launch sequence (D-5.1): open Run, settle, type the
-    /// copy-and-start command, press Enter. Applied via the same
-    /// [`Session::send_key`] path real user input uses — no separate
+    /// copy-and-start command in small chunks, press Enter. Applied via the
+    /// same [`Session::send_key`] path real user input uses — no separate
     /// PDU-building code, no direct `ironrdp_input` construction here.
+    ///
+    /// Live-tuned (Plan 04 live gate, empirical bug fix): typing the entire
+    /// ~113-character command in ONE `send_key(Type(..))` call — one atomic
+    /// batch of ~226 Unicode key events delivered in a single FastPath PDU
+    /// with no inter-character delay — corrupted the text the Run dialog's
+    /// ComboBox autocomplete/MRU-suggestion logic actually submitted (live
+    /// evidence: `Get-CimInstance Win32_Process` showed the launched
+    /// `cmd.exe`'s actual command line as a spliced/truncated string, e.g.
+    /// `cmd /nsor.exet-sensor.exe && start ...`, NOT the intended text —
+    /// the visible Run dialog textbox looked correct in a screenshot taken
+    /// right after typing, but the autocomplete engine had silently
+    /// corrupted the underlying submission). Splitting the string into
+    /// small chunks with a short settle between each — mirroring the
+    /// manually-bisected sequence that reproduced cleanly during live
+    /// diagnosis — gives the ComboBox's autocomplete state machine time to
+    /// resolve between bursts and reliably produces the exact intended
+    /// command line.
     async fn inject_launch_sequence(&self) -> Result<()> {
         self.send_key(KeyAction::Combo(vec![Key::Win, Key::R])).await?;
         tokio::time::sleep(RUN_DIALOG_SETTLE).await;
-        self.send_key(KeyAction::Type(launch_command())).await?;
+        for chunk in chunk_str(&launch_command(), TYPE_CHUNK_LEN) {
+            self.send_key(KeyAction::Type(chunk)).await?;
+            tokio::time::sleep(TYPE_CHUNK_GAP).await;
+        }
         self.send_key(KeyAction::Combo(vec![Key::Enter])).await?;
         Ok(())
     }
@@ -882,6 +957,28 @@ mod tests {
             cmd.contains(crate::connect::SENSOR_EXE_NAME),
             "must reference the RDPDR-announced sensor filename (Task 1) so the two can never drift apart: {cmd}"
         );
+    }
+
+    /// `chunk_str` splits on character boundaries, preserves order and total
+    /// content, and never panics on edge cases (empty string, `max_len == 0`,
+    /// multi-byte chars) -- the live-diagnosed autocomplete-corruption fix
+    /// (see `inject_launch_sequence`'s doc comment) depends on this never
+    /// dropping or reordering characters.
+    #[test]
+    fn chunk_str_preserves_order_and_content() {
+        let chunks = chunk_str("abcdefghij", 3);
+        assert_eq!(chunks, vec!["abc", "def", "ghi", "j"]);
+        assert_eq!(chunks.concat(), "abcdefghij");
+
+        assert!(chunk_str("", 5).is_empty());
+
+        // max_len == 0 must not infinite-loop or panic -- treated as 1.
+        let single = chunk_str("xy", 0);
+        assert_eq!(single, vec!["x", "y"]);
+
+        // Multi-byte chars: chunk on char boundaries, never split mid-codepoint.
+        let unicode = chunk_str("é€", 1);
+        assert_eq!(unicode, vec!["é", "€"]);
     }
 
     /// `deploy_and_launch` propagates a closed-input-channel error from the
