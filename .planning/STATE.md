@@ -4,13 +4,13 @@ milestone: v1.0
 milestone_name: milestone
 status: verifying
 stopped_at: Phase 4 DVC transport channel COMPLETE — live gate PASSED against a real Azure VM (sensor_ping_pong_under_500ms, 165ms measured round trip); SENSOR-03 validated
-last_updated: "2026-07-09T09:57:57.313Z"
+last_updated: "2026-07-09T10:42:39.318Z"
 last_activity: 2026-07-09
 progress:
   total_phases: 9
   completed_phases: 4
-  total_plans: 14
-  completed_plans: 14
+  total_plans: 18
+  completed_plans: 15
   percent: 44
 ---
 
@@ -64,6 +64,7 @@ Progress: [████░░░░░░] 44% (Phase 4: 3/3 plans complete, liv
 | Phase 04 P01 | 25min | 2 tasks | 4 files |
 | Phase 04 P02 | 35min | 2 tasks | 4 files |
 | Phase 04 P03 | ~30min | 2 tasks | 3 files (offline code only; live gate pending) |
+| Phase 05 P02 | 15min | 3 tasks | 5 files |
 
 ## Accumulated Context
 
@@ -101,6 +102,8 @@ Recent decisions affecting current work:
 - [Phase ?]: Used ironrdp::pdu::pdu_other_err!(desc, source: e) instead of ironrdp::core::other_err! for PduResult construction in RdpilotSensorProcessor::start() (PduError does not implement OtherErr) — Verified by reading ironrdp-pdu-0.8.0 and ironrdp-core-0.2.0 source directly; correction to RESEARCH's code example, not a CONTEXT deviation
 - [Phase ?]: SensorShared fields widened to pub(crate) so Session::ping() and RdpilotSensorProcessor::process() share direct lock access (no accessor layer, matches module's crate-internal-only design)
 - **Phase 4 live gate (2026-07-09):** SENSOR-03 validated live against a real disposable Azure VM (measured ping/pong round trip 165ms). Two bugs found and fixed: session_loop.rs's Ping handler no longer propagates a transient "DVC not registered/not yet open" lookup failure via `?` (which previously killed the whole session-loop thread on the very first ping attempt) — extracted to `build_ping_frame()`, dropped (vec![]) on failure so the caller's existing 500ms timeout surfaces a normal retryable error instead. sensor-responder.ps1's `Read-Envelope` now scans for the first `{` byte instead of assuming JSON starts at offset 0 — WTSVirtualChannelRead was consistently returning a small fixed binary prefix ahead of the JSON payload. Also empirically found: Task Scheduler's AtLogOn trigger takes ~20-30s to fire and does NOT refire on an RDP session *reconnect* (only a fresh logon) — the live test's outer setup-retry budget was widened 15s→60s to tolerate this deployment-mechanism latency (Session::ping()'s own hard 500ms per-call timeout, the actual SC#2 measurement, is unchanged).
+- [Phase ?]: 05-02: ServerDriveIoRequest has 11 variants not the plan's assumed 4 (efs.rs read_first); the 4 planned (Create/Close/Read/QueryDirectory) are implemented, the other 7 are typed-rejected with NOT_SUPPORTED, mirroring the crate's own handle_printer_io_request default
+- [Phase ?]: 05-02: not-found NtStatus for rejected RDPDR Create paths is NtStatus::NO_SUCH_FILE (0xC000000F) -- efs.rs has no OBJECT_NAME_NOT_FOUND constant
 
 ### Pending Todos
 
@@ -122,6 +125,6 @@ Phase 2 Plan 02: pre-existing rustdoc intra-doc-link warnings in config.rs (Wave
 
 ## Session Continuity
 
-Last session: 2026-07-09T09:57:57.308Z
+Last session: 2026-07-09T10:42:39.312Z
 Stopped at: Phase 5 context gathered
 Resume file: .planning/phases/05-sensor-bootstrap-deployment/05-CONTEXT.md
