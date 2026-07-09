@@ -4,13 +4,13 @@ milestone: v1.0
 milestone_name: milestone
 status: executing
 stopped_at: Phase 6 window+process perception COMPLETE — live gate PASSED (all 4 SC), VM torn down
-last_updated: "2026-07-09T19:40:20.283Z"
+last_updated: "2026-07-09T19:45:57.643Z"
 last_activity: 2026-07-09 -- 07-03 D-7.5 live risk gate COMPLETE — checkpoint APPROVED by coordinator. `[smoke-test-uia] PASS` on real Windows VM, BSTR marshalling fix committed 44c2ac5, VM torn down. 07-04 (UiaTree handler) cleared to proceed.
 progress:
   total_phases: 9
   completed_phases: 6
   total_plans: 28
-  completed_plans: 26
+  completed_plans: 27
   percent: 67
 ---
 
@@ -26,7 +26,7 @@ See: .planning/PROJECT.md (updated 2026-06-04)
 ## Current Position
 
 Phase: 7 (uia-tree-module) — EXECUTING
-Plan: 4 of 5
+Plan: 5 of 5
 Status: Ready to execute
 Last activity: 2026-07-09 -- 07-03 D-7.5 live risk gate COMPLETE — checkpoint APPROVED by coordinator. `[smoke-test-uia] PASS` on real Windows VM, BSTR marshalling fix committed 44c2ac5, VM torn down. 07-04 (UiaTree handler) cleared to proceed.
 
@@ -76,6 +76,7 @@ Progress: [██████░░░░] 67% (Phase 6: 5/5 plans complete, liv
 | Phase 07 P01 | 20min | 2 tasks | 4 files |
 | Phase 07 P02 | 20min | 2 tasks | 2 files |
 | Phase 07 P03 | ~1h50min | 1 tasks | 2 files |
+| Phase 07-uia-tree-module P04 | 25min | 2 tasks | 4 files |
 
 ## Accumulated Context
 
@@ -136,6 +137,7 @@ Recent decisions affecting current work:
 - [Phase ?]: 07-02: Rect32 struct redeclared as a new top-level type in UiaInterop.cs (identical shape to WindowEnumeration.cs's private Rect32) rather than sharing the existing type, to keep this plan's file scope to UiaInterop.cs/Program.cs only.
 - [Phase ?]: 07-02: GeneratedComInterface does not support C# instance properties (SYSLIB1091) -- all UIA propget members declared as Get-prefixed methods instead.
 - [Phase ?]: 07-02: Marshal.SafeArrayGetLBound/GetUBound/GetElement/SafeArrayDestroy do not exist in .NET Core/.NET 8 (Framework-only) -- hand-rolled the equivalent oleaut32.dll SAFEARRAY exports via LibraryImport instead.
+- [Phase ?]: 07-04: Reused WindowRect for the UiaElementRecord bbox field rather than declaring a new UiaBboxRecord -- same namespace, same x/y/w/h shape, already JSON-registered.
 
 ### Pending Todos
 
@@ -162,6 +164,6 @@ Phase 2 Plan 02: pre-existing rustdoc intra-doc-link warnings in config.rs (Wave
 
 ## Session Continuity
 
-Last session: 2026-07-09T19:40:20.278Z
+Last session: 2026-07-09T19:45:54.378Z
 Stopped at: Phase 6 (Window + Process Perception) COMPLETE — live gate PASSED (SC1-SC4 all met); PERC-01/PERC-02/PERC-04/PROC-01/CAP-02 marked complete in REQUIREMENTS.md
 Resume file: .planning/phases/06-window-process-perception/06-05-SUMMARY.md (next: plan Phase 7 — UIA Tree Module)
