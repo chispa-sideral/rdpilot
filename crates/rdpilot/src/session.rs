@@ -31,6 +31,7 @@ use crate::connect;
 use crate::error::{Error, Result};
 use crate::framebuffer::SharedFrame;
 use crate::input::{Key, KeyAction, MouseAction};
+use crate::perception::{ProcessInfo, WindowInfo};
 use crate::screenshot::Screenshot;
 use crate::sensor::SensorShared;
 use crate::session_loop::{self, RdpInputEvent};
@@ -115,6 +116,24 @@ const TYPE_CHUNK_LEN: usize = 16;
 /// Settle delay between successive typed chunks (see [`TYPE_CHUNK_LEN`]).
 const TYPE_CHUNK_GAP: Duration = Duration::from_millis(150);
 
+/// Timeout for the two enumeration requests ([`Session::get_window_list`],
+/// [`Session::get_process_tree`]) — wider than [`ACTION_TIMEOUT_MS`] because
+/// real remote enumeration work (`EnumWindows` over every top-level window,
+/// a full process-snapshot walk) plus a larger JSON reply payload can
+/// legitimately take longer than [`Session::ping`]'s trivial no-payload
+/// round trip. LIVE-VERIFY tuning target for the Wave 4 gate (06-RESEARCH
+/// Pattern 3, Open Question 1) — mirrors how [`RUN_DIALOG_SETTLE`]/
+/// [`SESSION_SETTLE`] were empirically tuned in Phase 5.
+const ENUMERATION_TIMEOUT_MS: u64 = 2000;
+
+/// Timeout for the two near-instant action requests
+/// ([`Session::set_foreground_window`], [`Session::launch_process`]).
+/// Mirrors [`Session::ping`]'s existing 500ms bound — also a LIVE-VERIFY
+/// tuning target at the Wave 4 gate, kept distinct from
+/// [`ENUMERATION_TIMEOUT_MS`] in case live testing shows the two categories
+/// need different bounds.
+const ACTION_TIMEOUT_MS: u64 = 500;
+
 /// Split `s` into `max_len`-character (not byte) chunks, preserving order.
 /// Pure and offline-testable. Never panics on empty input, non-ASCII input,
 /// or `max_len == 0` (treated as "one char per chunk" to avoid an infinite
@@ -139,6 +158,17 @@ fn chunk_str(s: &str, max_len: usize) -> Vec<String> {
 fn launch_command() -> String {
     let name = crate::connect::SENSOR_EXE_NAME;
     format!("cmd /c copy \\\\tsclient\\RDPILOT\\{name} %TEMP%\\{name} && start \"\" %TEMP%\\{name}")
+}
+
+/// Pure crop-mapping helper behind [`Session::screenshot_window`] (D-6.1),
+/// factored out of the async method so it is unit-testable with a synthetic
+/// [`Screenshot`] and no live session/loop involved. `window.rect` is
+/// already in physical virtual-desktop pixels (the framebuffer coordinate
+/// space, guaranteed by the Phase 6 wire contract), so no coordinate remap
+/// happens here — this is exactly [`Screenshot::crop`], named for its call
+/// site.
+fn crop_to_window(shot: Screenshot, window: &WindowInfo) -> Result<Screenshot> {
+    shot.crop(window.rect)
 }
 
 /// A live, managed RDP session.
@@ -432,6 +462,197 @@ impl Session {
         }
     }
 
+    /// Round-trip a generic sensor request, returning the reply's `data` on
+    /// `success:true` — the shared plumbing behind
+    /// [`Session::get_window_list`], [`Session::get_process_tree`],
+    /// [`Session::set_foreground_window`], and [`Session::launch_process`]
+    /// (RESEARCH Pattern 3).
+    ///
+    /// Mirrors [`Session::ping`]'s five-step shape exactly (handshake
+    /// fast-fail check, allocate a `req_id`, register a `oneshot` reply slot
+    /// in [`SensorShared::pending`], send [`RdpInputEvent::Request`], await
+    /// with a `timeout_ms` bound — removing the pending entry on timeout so
+    /// a stale late reply cannot resurrect it), and adds the D-6.4
+    /// semantic-vs-transport error branch that `ping()` itself does not
+    /// need (a `Pong`'s payload carries no `{success,data|error}` envelope).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Dvc`] for a handshake mismatch, a closed
+    /// input/reply channel, or a timeout (transport failures), and
+    /// [`Error::SensorRejected`] when the sensor answered but its reply's
+    /// `success` field was `false` (D-6.4).
+    async fn sensor_request(
+        &self,
+        msg_type: crate::sensor::MsgType,
+        payload: Option<serde_json::Value>,
+        timeout_ms: u64,
+    ) -> Result<serde_json::Value> {
+        {
+            let handshake = match self.sensor.handshake.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if let crate::sensor::HandshakeState::Mismatched { local, remote } = &*handshake {
+                return Err(Error::dvc(format!(
+                    "sensor version mismatch: local v{local} vs remote v{remote}"
+                )));
+            }
+        } // guard dropped here — never held across the .await below
+
+        let req_id = self.next_req_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        {
+            let mut pending = match self.sensor.pending.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            pending.insert(req_id, tx);
+        } // guard dropped here — never held across the .await below
+
+        self.input_tx
+            .send(RdpInputEvent::Request(msg_type, req_id, payload))
+            .await
+            .map_err(|_| Error::dvc("input channel closed"))?;
+
+        match tokio::time::timeout(Duration::from_millis(timeout_ms), rx).await {
+            Ok(Ok(value)) => {
+                let success = value
+                    .get("success")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
+                if success {
+                    Ok(value.get("data").cloned().unwrap_or(serde_json::Value::Null))
+                } else {
+                    let reason = value
+                        .get("error")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("unknown");
+                    Err(Error::sensor_rejected(reason))
+                }
+            }
+            Ok(Err(_recv)) => Err(Error::dvc("sensor channel closed before replying")),
+            Err(_elapsed) => {
+                let mut pending = match self.sensor.pending.lock() {
+                    Ok(g) => g,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                pending.remove(&req_id);
+                Err(Error::dvc(format!("request timed out after {timeout_ms}ms")))
+            }
+        }
+    }
+
+    /// List all top-level windows on the remote desktop (PERC-02,
+    /// SENSOR-backed).
+    ///
+    /// Round-trips a `WindowList` request over the `RDPILOT_SENSOR` DVC
+    /// channel (via [`Session::sensor_request`], mirroring
+    /// [`Session::ping`]'s shape) bounded at [`ENUMERATION_TIMEOUT_MS`], and
+    /// deserializes the reply's `data` array into owned [`WindowInfo`]
+    /// values — the crate-internal `*Wire` structs never leave this crate
+    /// (D-09).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::SensorRejected`] if the sensor answered but rejected
+    /// the request (D-6.4), or [`Error::Dvc`] for a handshake mismatch, a
+    /// closed channel, a malformed reply, or a timeout.
+    pub async fn get_window_list(&self) -> Result<Vec<WindowInfo>> {
+        let data = self
+            .sensor_request(crate::sensor::MsgType::WindowList, None, ENUMERATION_TIMEOUT_MS)
+            .await?;
+        let wires: Vec<crate::perception::WindowInfoWire> =
+            serde_json::from_value(data).map_err(|e| Error::dvc(format!("malformed WindowList reply: {e}")))?;
+        Ok(wires
+            .into_iter()
+            .map(crate::perception::WindowInfoWire::into_owned)
+            .collect())
+    }
+
+    /// List the remote machine's process tree (PROC-01, SENSOR-backed).
+    ///
+    /// Round-trips a `ProcessTree` request bounded at
+    /// [`ENUMERATION_TIMEOUT_MS`] and deserializes the reply's `data` array
+    /// into owned [`ProcessInfo`] values (D-09). See
+    /// [`Session::get_window_list`] for the shared round-trip/error-branching
+    /// shape.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::SensorRejected`] if the sensor answered but rejected
+    /// the request (D-6.4), or [`Error::Dvc`] for a handshake mismatch, a
+    /// closed channel, a malformed reply, or a timeout.
+    pub async fn get_process_tree(&self) -> Result<Vec<ProcessInfo>> {
+        let data = self
+            .sensor_request(crate::sensor::MsgType::ProcessTree, None, ENUMERATION_TIMEOUT_MS)
+            .await?;
+        let wires: Vec<crate::perception::ProcessInfoWire> =
+            serde_json::from_value(data).map_err(|e| Error::dvc(format!("malformed ProcessTree reply: {e}")))?;
+        Ok(wires
+            .into_iter()
+            .map(crate::perception::ProcessInfoWire::into_owned)
+            .collect())
+    }
+
+    /// Bring a remote window to the foreground (PERC-04, SENSOR-backed).
+    ///
+    /// Round-trips a `SetForegroundWindow` request bounded at
+    /// [`ACTION_TIMEOUT_MS`]; the sensor reports `success:true` only if the
+    /// underlying `SetForegroundWindow` Win32 call itself succeeded (its
+    /// return value was nonzero) — it does not itself verify the visual
+    /// outcome (06-RESEARCH). The caller is responsible for confirming the
+    /// focus change with a follow-up [`Session::get_window_list`] call,
+    /// exactly as ROADMAP Phase 6 SC#3 specifies.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::SensorRejected`] if the sensor rejected the request
+    /// — e.g. a closed/invalid `hwnd` (D-6.4) — or [`Error::Dvc`] for a
+    /// handshake mismatch, a closed channel, or a timeout.
+    pub async fn set_foreground_window(&self, hwnd: u64) -> Result<()> {
+        self.sensor_request(
+            crate::sensor::MsgType::SetForegroundWindow,
+            Some(serde_json::json!({ "hwnd": hwnd })),
+            ACTION_TIMEOUT_MS,
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Launch a process on the remote machine (PROC-01, D-6.2,
+    /// SENSOR-backed).
+    ///
+    /// Round-trips a `LaunchProcess` request bounded at
+    /// [`ACTION_TIMEOUT_MS`] and returns the new process's PID read from the
+    /// reply — fire-and-forget (D-6.2): this call does NOT poll for the
+    /// process to appear in a later process tree; a caller that wants that
+    /// confirmation issues its own follow-up [`Session::get_process_tree`]
+    /// call. The exe path/arguments/working directory are operational, not
+    /// secret, but this call does not itself add any additional logging
+    /// beyond what the caller already holds (ASVS V5).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::SensorRejected`] if the sensor rejected the request
+    /// — e.g. the exe could not start (D-6.4) — or [`Error::Dvc`] for a
+    /// handshake mismatch, a closed channel, a malformed reply, or a
+    /// timeout.
+    pub async fn launch_process(&self, exe: &str, args: Option<&str>, cwd: Option<&str>) -> Result<u32> {
+        let data = self
+            .sensor_request(
+                crate::sensor::MsgType::LaunchProcess,
+                Some(serde_json::json!({ "exe": exe, "args": args, "cwd": cwd })),
+                ACTION_TIMEOUT_MS,
+            )
+            .await?;
+        let pid = data
+            .get("pid")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| Error::dvc("LaunchProcess reply missing/invalid \"pid\" field"))?;
+        u32::try_from(pid).map_err(|_| Error::dvc("LaunchProcess reply \"pid\" exceeds u32 range"))
+    }
+
     /// Deploy and launch the sensor exe in-band over RDPDR + injected input
     /// (D-5.1/D-5.2, SENSOR-02).
     ///
@@ -539,6 +760,34 @@ impl Session {
             ));
         }
         Screenshot::from_rgba(snap.width, snap.height, snap.rgba)
+    }
+
+    /// Capture a single window as a cropped screenshot (CAP-02, D-6.1).
+    ///
+    /// A pure client-side crop of the already-captured desktop framebuffer
+    /// (via [`Session::screenshot`]) to `window.rect` — **no sensor round
+    /// trip**. `WindowInfo.rect` is already in physical virtual-desktop
+    /// pixels (the framebuffer coordinate space, guaranteed by the Phase 6
+    /// wire contract), so no coordinate remap happens here.
+    ///
+    /// **Known limitation (D-6.1):** an occluded or minimized window yields
+    /// a clipped, stale, or blank crop, because only the RDP-rendered
+    /// desktop frame is available to crop — there is no sensor-side
+    /// `PrintWindow`/`BitBlt` capture of the window's own contents.
+    /// Sensor-side capture for occluded/minimized windows is deliberately
+    /// deferred to the backlog (06-RESEARCH Pattern 3 / D-6.1 locked
+    /// decision).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Session`] if no framebuffer has been captured yet
+    /// (propagated from [`Session::screenshot`]), or
+    /// [`Error::CropOutOfBounds`] if `window.rect` falls outside the
+    /// captured framebuffer (an off-screen or stale-geometry window) —
+    /// never panics.
+    pub async fn screenshot_window(&self, window: &WindowInfo) -> Result<Screenshot> {
+        let shot = self.screenshot().await?;
+        crop_to_window(shot, window)
     }
 
     /// Gracefully close the session and wait for the background task to finish.
@@ -939,6 +1188,233 @@ mod tests {
             ),
             other => panic!("expected Err(Error::Dvc(_)) mentioning the timeout, got {other:?}"),
         }
+    }
+
+    // --- Task 1 (06-02): sensor-backed Session methods -- D-6.4 error branching ---
+
+    /// `get_window_list` on a `success:true` reply deserializes the
+    /// wire-contract `data` array into owned `WindowInfo` values with all
+    /// fields intact -- exercised through the full `Session` round trip
+    /// (`sensor_request` -> deserialize), not just `perception.rs`'s own
+    /// wire-shape test.
+    #[tokio::test]
+    async fn get_window_list_success_returns_owned_windows() {
+        let sensor = Arc::new(SensorShared::new());
+        let (session, mut input_rx) = test_session_with_sensor(sensor.clone());
+
+        let handle = tokio::spawn(async move { session.get_window_list().await });
+
+        let RdpInputEvent::Request(msg_type, req_id, payload) =
+            input_rx.recv().await.expect("a Request was sent")
+        else {
+            panic!("expected a Request event");
+        };
+        assert!(matches!(msg_type, crate::sensor::MsgType::WindowList));
+        assert!(payload.is_none(), "get_window_list sends no payload");
+
+        let tx = {
+            let mut pending = sensor.pending.lock().expect("lock");
+            pending.remove(&req_id).expect("req_id registered in pending map")
+        };
+        tx.send(serde_json::json!({
+            "success": true,
+            "data": [{
+                "hwnd": 65536,
+                "title": "Untitled - Notepad",
+                "rect": {"x": 10, "y": 20, "w": 800, "h": 600},
+                "z_order": 0,
+                "state": "normal",
+                "class_name": "Notepad",
+                "pid": 4242
+            }]
+        }))
+        .expect("reply delivered before the receiver was dropped");
+
+        let windows = handle
+            .await
+            .expect("task did not panic")
+            .expect("get_window_list succeeds on a success:true reply");
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].hwnd, 65536);
+        assert_eq!(windows[0].title, "Untitled - Notepad");
+        assert_eq!(windows[0].pid, 4242);
+    }
+
+    /// `get_window_list` on a `success:false` reply returns
+    /// `Error::SensorRejected` whose `Display` carries the sensor's reason
+    /// (D-6.4).
+    #[tokio::test]
+    async fn get_window_list_semantic_failure_returns_sensor_rejected() {
+        let sensor = Arc::new(SensorShared::new());
+        let (session, mut input_rx) = test_session_with_sensor(sensor.clone());
+
+        let handle = tokio::spawn(async move { session.get_window_list().await });
+
+        let RdpInputEvent::Request(_msg_type, req_id, _payload) =
+            input_rx.recv().await.expect("a Request was sent")
+        else {
+            panic!("expected a Request event");
+        };
+        let tx = {
+            let mut pending = sensor.pending.lock().expect("lock");
+            pending.remove(&req_id).expect("req_id registered in pending map")
+        };
+        tx.send(serde_json::json!({ "success": false, "error": "enum failed" }))
+            .expect("reply delivered before the receiver was dropped");
+
+        let err = handle.await.expect("task did not panic");
+        match err {
+            Err(Error::SensorRejected(msg)) => assert!(msg.contains("enum failed")),
+            other => panic!("expected Err(Error::SensorRejected(_)) mentioning the reason, got {other:?}"),
+        }
+    }
+
+    /// `launch_process` on a `success:true` reply returns the PID read from
+    /// `data.pid` (D-6.2 -- fire-and-forget, no follow-up polling here).
+    #[tokio::test]
+    async fn launch_process_success_returns_pid() {
+        let sensor = Arc::new(SensorShared::new());
+        let (session, mut input_rx) = test_session_with_sensor(sensor.clone());
+
+        let handle = tokio::spawn(async move { session.launch_process("notepad.exe", None, None).await });
+
+        let RdpInputEvent::Request(msg_type, req_id, payload) =
+            input_rx.recv().await.expect("a Request was sent")
+        else {
+            panic!("expected a Request event");
+        };
+        assert!(matches!(msg_type, crate::sensor::MsgType::LaunchProcess));
+        assert_eq!(payload.expect("launch_process sends a payload")["exe"], "notepad.exe");
+
+        let tx = {
+            let mut pending = sensor.pending.lock().expect("lock");
+            pending.remove(&req_id).expect("req_id registered in pending map")
+        };
+        tx.send(serde_json::json!({ "success": true, "data": { "pid": 4321 } }))
+            .expect("reply delivered before the receiver was dropped");
+
+        let pid = handle
+            .await
+            .expect("task did not panic")
+            .expect("launch_process succeeds on a success:true reply");
+        assert_eq!(pid, 4321);
+    }
+
+    /// A reply that never arrives bounds the wait at the method's timeout
+    /// and returns a transport `Error::Dvc` -- never hangs -- and removes
+    /// the pending entry so a stale late reply cannot resurrect it (mirrors
+    /// `ping_times_out_after_500ms_when_no_pong_arrives`, extended with the
+    /// pending-map-removal assertion). Uses `set_foreground_window`'s
+    /// `ACTION_TIMEOUT_MS` (500ms) rather than the wider enumeration bound
+    /// to keep the test fast -- the round-trip/timeout plumbing lives in the
+    /// single shared `sensor_request` helper, so this exercises the
+    /// mechanism common to all four methods.
+    #[tokio::test]
+    async fn set_foreground_window_times_out_and_removes_pending_entry() {
+        let sensor = Arc::new(SensorShared::new());
+        let (session, _input_rx) = test_session_with_sensor(sensor.clone());
+
+        let err = session.set_foreground_window(1).await;
+        assert!(matches!(err, Err(Error::Dvc(_))));
+
+        let pending = sensor.pending.lock().expect("lock");
+        assert!(
+            pending.is_empty(),
+            "the pending entry must be removed on timeout, not leaked"
+        );
+    }
+
+    // --- Task 2 (06-02): screenshot_window -- D-6.1 client-side per-window crop ---
+
+    /// Build a `w x h` synthetic screenshot whose pixel (x,y) encodes
+    /// R=x, G=y, B=x+y, A=255 -- mirrors `screenshot.rs`'s own `checkerboard`
+    /// helper so subpixel assertions are exact.
+    fn checkerboard(w: u32, h: u32) -> Screenshot {
+        let mut rgba = Vec::with_capacity((w * h * 4) as usize);
+        for y in 0..h {
+            for x in 0..w {
+                rgba.push(x as u8);
+                rgba.push(y as u8);
+                rgba.push((x + y) as u8);
+                rgba.push(255);
+            }
+        }
+        Screenshot::from_rgba(w, h, rgba).expect("valid buffer")
+    }
+
+    /// A `WindowInfo` used only for its `rect` -- the other fields are
+    /// irrelevant to `crop_to_window`/`screenshot_window`, filled with cheap
+    /// placeholders.
+    fn test_window(rect: crate::Rect) -> WindowInfo {
+        WindowInfo {
+            hwnd: 1,
+            title: String::new(),
+            rect,
+            z_order: 0,
+            state: crate::WindowState::Normal,
+            class_name: String::new(),
+            pid: 1,
+        }
+    }
+
+    /// An in-bounds window rect crops to the exact dims and origin subpixel
+    /// (D-6.1) -- exercises the pure `crop_to_window` helper with no live
+    /// session/loop.
+    #[test]
+    fn crop_to_window_in_bounds_matches_rect_and_origin_pixel() {
+        let shot = checkerboard(10, 8);
+        let window = test_window(crate::Rect { x: 2, y: 3, w: 4, h: 2 });
+
+        let cropped = crop_to_window(shot, &window).expect("in-bounds crop succeeds");
+        assert_eq!(cropped.width, 4);
+        assert_eq!(cropped.height, 2);
+        // Origin pixel of the crop is source (x=2, y=3): R=2, G=3, B=5, A=255.
+        assert_eq!(&cropped.rgba[0..4], &[2, 3, 5, 255]);
+    }
+
+    /// A window rect that exceeds the framebuffer returns
+    /// `Error::CropOutOfBounds`, never panics -- the documented D-6.1
+    /// occlusion/off-screen limitation surfaces as a typed error, not a
+    /// crash.
+    #[test]
+    fn crop_to_window_out_of_bounds_returns_typed_error() {
+        let shot = checkerboard(10, 8);
+        let window = test_window(crate::Rect { x: 8, y: 0, w: 10, h: 1 });
+
+        let err = crop_to_window(shot, &window);
+        assert!(matches!(err, Err(Error::CropOutOfBounds { .. })));
+    }
+
+    /// `screenshot_window` wires `Session::screenshot` into `crop_to_window`
+    /// end-to-end: a session with a seeded frame and an in-bounds window
+    /// rect returns the correctly-sized crop (D-6.1) and never touches the
+    /// sensor DVC channel (no round trip).
+    #[tokio::test]
+    async fn screenshot_window_crops_the_captured_framebuffer_without_a_sensor_round_trip() {
+        let (input_tx, mut input_rx) = mpsc::channel(1);
+        let frame = SharedFrame::new();
+        frame.write(4, 4, vec![7u8; 4 * 4 * 4]);
+        let session = Session {
+            thread: None,
+            input_tx,
+            frame,
+            input_db: test_input_db(),
+            desktop_size: TEST_DESKTOP_SIZE,
+            sensor: test_sensor(),
+            next_req_id: AtomicU64::new(1),
+        };
+        let window = test_window(crate::Rect { x: 1, y: 1, w: 2, h: 2 });
+
+        let shot = session
+            .screenshot_window(&window)
+            .await
+            .expect("in-bounds window crop succeeds");
+        assert_eq!(shot.width, 2);
+        assert_eq!(shot.height, 2);
+        assert!(
+            input_rx.try_recv().is_err(),
+            "screenshot_window must not touch the sensor DVC channel (D-6.1)"
+        );
     }
 
     // --- Task 2: deploy_and_launch -- launch-command helper + Error::Bootstrap (D-5.1/D-5.2) ---
