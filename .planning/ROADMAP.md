@@ -219,7 +219,7 @@ Plans:
 
 **Wave 3** *(blocked on Wave 2 — thin live gate)*
 
-- [x] 08-03-PLAN.md — Gated live `world_state` capture-span test(s) in tests/live_session.rs + end-of-phase live gate (SC#2, best-effort span per D-8.2; SC#1/SC#3/SC#4 already close offline)
+- [x] 08-03-PLAN.md — Gated live `world_state` capture-span test(s) in tests/live_session.rs + end-of-phase live gate (SC#2, best-effort span per D-8.2; SC#1/SC#3/SC#4 already close offline). **Live gate PASSED** (2026-07-10): both gated tests ran against a real launched Notepad window on a disposable Azure VM — default-options `capture_span` measured 23ms, `UiaMode::Foreground` `capture_span` measured 73ms (one retry of the documented first-RDP-login `deploy_and_launch` transient), both >6x under the 500ms best-effort bound. SC#2 now empirically CLOSED. VM torn down and confirmed absent (`rdpilot-test` RG deleted; `rdpilot-mgmt` persists).
 
 ### Phase 9: Scripted Proof Harness
 

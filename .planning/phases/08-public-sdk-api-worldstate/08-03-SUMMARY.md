@@ -25,17 +25,17 @@ key-files:
     - "crates/rdpilot/tests/live_session.rs — added world_state_default_options_reports_capture_span and world_state_foreground_uia_matches_focused_window; added WorldState/WorldStateOptions/UiaMode to the public-API-only use list"
 
 key-decisions:
-  - "Live VM measurement (SC#2 empirical capture_span) is DEFERRED, not executed in this run — no disposable Azure VM is currently provisioned/reachable (see Deviations); the offline-authored gated test is the primary deliverable per the orchestrator's live-run policy and is complete"
+  - "Live VM measurement (SC#2 empirical capture_span) executed 2026-07-10 against a fresh disposable Azure VM (rdpilot-vm, Standard_B2s_v2, westeurope). Both gated world_state tests PASS live: default-options capture_span measured 23.524043ms (23ms); UiaMode::Foreground capture_span measured 73.194179ms (73ms) after one retry of the documented first-RDP-login deploy_and_launch transient (Phase 6/7 finding — self-resolved). Both are >6x under the D-8.2 best-effort 500ms bound. SC#2 is now empirically CLOSED. VM torn down and confirmed absent (`az group exists -n rdpilot-test` → false; `rdpilot-mgmt` persists)."
 
 requirements-completed: [API-01, API-02]
 
-duration: ~25min
-completed: 2026-07-09
+duration: ~25min (offline authoring) + ~35min (2026-07-10 live gate: provision + sensor build/relay + test run + teardown)
+completed: 2026-07-09 (offline) / 2026-07-10 (live gate)
 ---
 
 # Phase 8 Plan 3: Gated live `world_state` capture-span test Summary
 
-**Added two `#[ignore]`'d, `require_target!`-gated live tests exercising `Session::world_state()` (default options and `UiaMode::Foreground`) against a real target, recording the measured `capture_span` for SC#2 without a hard 500ms assertion; the live VM run itself is deferred (no provisioned/reachable target at execution time).**
+**Added two `#[ignore]`'d, `require_target!`-gated live tests exercising `Session::world_state()` (default options and `UiaMode::Foreground`) against a real target, recording the measured `capture_span` for SC#2; both tests were subsequently run live (2026-07-10) against a fresh disposable Azure VM and PASSED, with capture_span measured at 23ms (default options) and 73ms (Foreground UIA) — both well under the D-8.2 best-effort 500ms bound. SC#2 is now empirically CLOSED.**
 
 ## Performance
 
@@ -72,14 +72,25 @@ Each task was committed atomically:
 - Manually confirmed (via `git stash`) that `cargo clippy -p rdpilot --tests --all-features -- -D warnings` produces ~121 `expect_used`/`unwrap_used` errors on `src/session.rs`'s **existing offline unit test module** identically with and without this plan's changes — this is a pre-existing, documented artifact of applying `--tests`/`-D warnings` at the wrong scope (08-RESEARCH.md explicitly reproduces "116 errors" this way and documents `--lib`-only as the correct gate scope); not caused by, or in scope for, this plan.
 - Grepped the modified file to confirm only public `rdpilot` types are imported and no `ironrdp`/`image`/`rustls` symbol appears in the new tests.
 
-## Deviations from Plan
+## Live Gate Result (2026-07-10) — SC#2 CLOSED
 
-### Live VM run: DEFERRED (not a Rule 1-4 deviation — an explicitly plan-sanctioned deferral)
+The deferred live VM run (below, historical) was executed in a follow-up session:
+
+1. **Provisioned** a fresh disposable Azure VM (`infra/manage-env.ps1 up -VmSize Standard_B2s_v2`, westeurope) — the stale `.secrets/connection.json` host (`20.101.90.244`) referenced in the original deferral was confirmed unreachable and NOT reused; a brand-new VM (`rdpilot-vm`, public IP `20.123.147.255`) was deployed clean.
+2. **Built** the win-x64 NativeAOT sensor ON the VM via `az vm run-command invoke` (WinRM still unavailable from this Linux host — same Phase 5/6/7 substitution), embedding the sensor source as a base64 tarball directly in the script body (not as a `--parameters` value — a `--parameters`-based attempt failed near-instantly, consistent with an undocumented CLI parameter-size limit; embedding in the script body, the pattern Phase 6/7 already used, worked cleanly). Installed .NET 8 SDK 8.0.422 and VC++ Build Tools fresh (new VM image had neither). `dotnet publish -c Release -r win-x64 -p:PublishAot=true --self-contained` succeeded, zero warnings: `rdpilot-sensor.exe`, 3,037,696 bytes, SHA256 `7a775b990cca3b40e72d4cd8ce910ebfc8e14262dd660089a4e5c62355ec34c2`. Relayed back via a short-lived (3h) account-key Azure Storage blob SAS in a throwaway `relay` container inside the run's own storage account — the locally-downloaded copy's SHA256 is byte-identical to the VM-built copy.
+3. **Ran** `RDPILOT_LIVE=1 RDPILOT_SENSOR_EXE=.secrets/sensor-build/rdpilot-sensor.exe cargo test -p rdpilot --target x86_64-unknown-linux-gnu --test live_session -- --ignored --test-threads=1 --nocapture world_state` (RUSTUP_TOOLCHAIN=stable override — this Linux host has no `x86_64-pc-windows-gnu` toolchain installed, and the crate has no `cfg(windows)` code, so the linux-gnu substitute is valid, matching the Phase 6/7 precedent).
+   - `world_state_default_options_reports_capture_span`: **PASS**, measured `capture_span = 23.524043ms (23ms)`.
+   - `world_state_foreground_uia_matches_focused_window`: **PASS** on retry (first attempt hit `Dvc("request timed out after 2000ms")` while polling `get_window_list` for Notepad — this is the documented first-RDP-login `deploy_and_launch` transient first diagnosed in Phase 7, which self-resolves on a single retry; it did here, no code change needed), measured `capture_span = 73.194179ms (73ms)`.
+   - Both measured spans are **more than 6x under** the D-8.2 best-effort 500ms bound — no bound violation to record.
+4. **Tore down** the VM (`pwsh infra/manage-env.ps1 down`) and confirmed `az group exists -n rdpilot-test` → `false` (direct `az resource list -g rdpilot-test` independently confirms `ResourceGroupNotFound`); `rdpilot-mgmt` persists as designed.
+
+**SC#2 is now empirically CLOSED.** No code changes were required — this was a pure live-verification run of the Plan 03 offline-authored tests.
+
+### Live VM run: DEFERRED (historical — resolved above; not a Rule 1-4 deviation — an explicitly plan-sanctioned deferral at original authoring time)
 
 - **What was checked:** `.secrets/connection.json` and a previously-published `.secrets/sensor-build/rdpilot-sensor.exe` exist on disk from an earlier session, and `az account show` confirms an active, authenticated Azure CLI session (subscription "Chispa Sideral"). However, a direct TCP probe of `.secrets/connection.json`'s recorded host (`20.101.90.244:3389`) shows the RDP port is **not reachable** — the VM referenced by that stale credentials file is not currently running (most likely deallocated/torn down after a prior phase's live gate, per the project's disposable-VM pattern, T-08-05).
 - **Decision:** Per the orchestrator's explicit live-run policy for this plan ("DO NOT attempt a costly live provisioning unless you can confirm the environment supports it end-to-end... If you defer the live run, say so explicitly") and the plan's own acceptance criteria ("Deferral is acceptable if no target is available"), the live VM provisioning (`infra/manage-env.ps1 up`) was **not** attempted in this run. Provisioning a new disposable Azure VM is a cost-incurring, environment-scoped decision appropriately left to the orchestrator/user rather than auto-executed by the plan-level task loop (Rule 4 territory: significant infrastructure action, not a code fix).
-- **Impact:** SC#2's empirical `capture_span` measurement against a real target is **not yet recorded**. All other success criteria for this plan and phase (SC#1 public-API-only, SC#3 single coordinate space, SC#4 strict-lint compile-clean) are already closed offline by Plans 01–02 and reconfirmed here. The gated test authoring — the primary deliverable per the orchestrator's instructions — is complete and compiles clean.
-- **Follow-up:** A future live run should: (1) `pwsh infra/manage-env.ps1 up` (VM size `Standard_B2s_v2`, westeurope) or confirm/refresh `.secrets/connection.json` if a VM is already up, (2) confirm `.secrets/sensor-build/rdpilot-sensor.exe` is current (re-publish if the sensor source changed since the last publish), (3) `RDPILOT_LIVE=1 cargo test -p rdpilot --test live_session -- --include-ignored --test-threads=1 world_state`, (4) record the two measured `capture_span` values here or in a phase verification note, (5) `pwsh infra/manage-env.ps1 down`.
+- **Impact (at the time):** SC#2's empirical `capture_span` measurement against a real target was not yet recorded. All other success criteria for this plan and phase (SC#1 public-API-only, SC#3 single coordinate space, SC#4 strict-lint compile-clean) were already closed offline by Plans 01–02. **Resolved in the 2026-07-10 live gate above.**
 
 ### Auto-fixed Issues
 
@@ -102,3 +113,5 @@ None. This plan's threat model (T-08-05 disposable-VM cost, T-08-04 hwnd input v
 - FOUND: `crates/rdpilot/tests/live_session.rs` contains `world_state_default_options_reports_capture_span` and `world_state_foreground_uia_matches_focused_window`.
 - FOUND: commit `7bac3ec` in `git log --oneline`.
 - FOUND: `cargo test -p rdpilot --target x86_64-unknown-linux-gnu --test live_session` compiles and reports `22 ignored` (20 pre-existing + 2 new).
+- FOUND (2026-07-10 live gate): both `world_state` tests report `ok` under `RDPILOT_LIVE=1 --ignored --nocapture`, with measured `capture_span` lines `23.524043ms (23 ms)` and `73.194179ms (73 ms)` in the captured stdout.
+- FOUND: `az group exists -n rdpilot-test` → `false` post-teardown; `az resource list -g rdpilot-test` → `ResourceGroupNotFound`; `az group exists -n rdpilot-mgmt` → `true`.
