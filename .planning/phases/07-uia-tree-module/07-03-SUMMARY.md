@@ -48,7 +48,7 @@ completed: 2026-07-09
 ## Performance
 
 - **Duration:** ~1h50min (VM `up` through VM `down`)
-- **Tasks:** 1 of 2 (Task 1: AOT-publish + iterate until PASS). Task 2 is the plan's `checkpoint:human-verify` — reached and STOPPED per the plan's `gate="blocking"` / this session's explicit no-self-approve instruction; not executed by this agent.
+- **Tasks:** 2/2 completed. Task 1 (AOT-publish + iterate until PASS) executed and committed in-session; Task 2 (`checkpoint:human-verify`, `gate="blocking"`) was reached, reported without self-approval, and subsequently **APPROVED by the coordinator** ("risk gate is accepted... D-7.5 is now empirically retired — 07-04 ... is cleared to proceed").
 - **Files modified:** 2 (`sensor/UiaInterop.cs`, `sensor/Program.cs`)
 
 ## Feasibility Pre-Check
@@ -115,7 +115,7 @@ Task 1 (AOT-publish + iterate until PASS) was completed and committed:
 
 1. **Live-diagnosed BSTR marshalling fix** — `44c2ac5` (fix) — `sensor/UiaInterop.cs`, `sensor/Program.cs`
 
-Task 2 (`checkpoint:human-verify`, `gate="blocking"`) was **reached but not executed** — this session was explicitly instructed not to self-approve a blocking human-verify checkpoint; VM teardown (one of the checkpoint's `how-to-verify` steps) was performed as directed automation ahead of the human review, but the actual approval/resume-signal ("approved") was intentionally left for the orchestrator/user.
+Task 2 (`checkpoint:human-verify`, `gate="blocking"`) — VM teardown (one of the checkpoint's `how-to-verify` steps) was performed as directed automation ahead of the human review; the PASS line, fix scope, and teardown were then reported to the coordinator without self-approval. The coordinator subsequently reviewed and returned the resume-signal **"approved"**, confirming: the smoke-test PASS on the real win-x64 AOT binary, the A2 BSTR heap-corruption root-cause/fix (in-scope, commit `44c2ac5`), the clean AOT publish, and the VM teardown. D-7.5 is now empirically retired; 07-04 is cleared to proceed.
 
 ## Files Created/Modified
 
@@ -166,7 +166,7 @@ None beyond the pre-authorized live-gate execution itself. The user's Azure sess
 - 07-04 should reuse `UiaInterop.ReadName()` for `CurrentName` (do NOT reintroduce a plain `string GetCurrentName()` property) and `UiaInterop.ReadRuntimeId()` for `id` (D-7.2) exactly as this gate proved them.
 - 07-04 should be aware that `CurrentHasKeyboardFocus`/`CurrentIsKeyboardFocusable`/`CurrentIsOffscreen` (the three BOOL-returning slots NOT directly exercised by this smoke test, only `CurrentIsEnabled` was) share the identical `[MarshalAs(UnmanagedType.Bool)]` declaration pattern that passed here — expected to work, but 07-04's own handler exercise is the first DIRECT live confirmation for those three specific members.
 - No known stubs introduced by this plan (it is a pure risk-gate/fix plan, no new handler surface).
-- **Task 2 (the plan's `checkpoint:human-verify`, `gate="blocking"`) is PENDING** — the PASS is captured and the VM is torn down, but the checkpoint itself requires explicit human/orchestrator approval before 07-04 begins (this session did not self-approve, per explicit instruction).
+- **Task 2 (the plan's `checkpoint:human-verify`, `gate="blocking"`) is APPROVED** — the coordinator confirmed the PASS, the fix scope, and the VM teardown. Plan 07-03 is COMPLETE; 07-04 (the real `UiaTree` handler) is cleared to proceed.
 
 ## Threat Flags
 
