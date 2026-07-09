@@ -17,6 +17,16 @@
 //!   IronRDP constraint, SC#1). `RdpilotSensorProcessor` is registered here via
 //!   `DrdynvcClient::with_dynamic_channel`; `connect()` returns the shared
 //!   `Arc<SensorShared>` so `Session` can drive `Session::ping()` against it.
+//! - **The `RDPDR` static channel** (drive redirection, D-5.1, SENSOR-02) is
+//!   registered at the identical connect-time seam, as a SIBLING static channel
+//!   to `DrdynvcClient` — NOT routed through it. `ironrdp_rdpdr::Rdpdr` fully
+//!   implements `SvcProcessor`/`SvcClientProcessor` (verified in the pinned
+//!   `ironrdp-rdpdr-0.6.0` source) and dispatches inbound MS-RDPEFS IRPs to the
+//!   registered [`crate::rdpdr_backend::RdpilotDriveBackend`] internally —
+//!   `ActiveStage::process` drives it automatically, exactly like the drdynvc
+//!   static channel; no `session_loop.rs` change is needed. Registered only
+//!   when [`ConnectionConfig::get_sensor_binary_path`] is `Some`; when `None`,
+//!   the connect path is byte-for-byte the pre-Phase-5 behavior.
 //!
 //! Credentials and certificate material are never logged (Security V7, threat
 //! T-02-02). No `unwrap`/`expect`/`panic` in non-test code (API-01).
@@ -27,6 +37,7 @@ use std::sync::Arc;
 use ironrdp::connector::{ClientConnector, Config, ConnectionResult, Credentials, DesktopSize};
 use ironrdp::dvc::DrdynvcClient;
 use ironrdp::pdu::gcc::KeyboardType;
+use ironrdp_rdpdr::Rdpdr;
 use ironrdp::pdu::rdp::capability_sets::MajorPlatformType;
 use ironrdp::pdu::rdp::client_info::{PerformanceFlags, TimezoneInfo};
 use ironrdp_tokio::TokioFramed;
@@ -99,6 +110,23 @@ pub(crate) async fn connect(
     let drdynvc =
         DrdynvcClient::new().with_dynamic_channel(crate::sensor::RdpilotSensorProcessor::new(sensor.clone()));
     connector = connector.with_static_channel(drdynvc);
+
+    // ── Phase 5 RDPDR seam (D-5.1, SENSOR-02) ───────────────────────────────
+    // A SIBLING static channel to `drdynvc` above, registered at the identical
+    // connect-time seam — NOT routed through `DrdynvcClient` (RDPDR is a
+    // static virtual channel per MS-RDPEFS, unlike the `RDPILOT_SENSOR` DVC).
+    // Only registered when a sensor exe path is configured; otherwise the
+    // connect path is byte-for-byte the pre-Phase-5 behavior (existing tests
+    // stay green).
+    if let Some(sensor_path) = cfg.get_sensor_binary_path() {
+        let drive_backend = crate::rdpdr_backend::RdpilotDriveBackend::new(
+            sensor_path.to_path_buf(),
+            "rdpilot-sensor.exe",
+        );
+        let rdpdr = Rdpdr::new(Box::new(drive_backend), "rdpilot".to_owned())
+            .with_drives(Some(vec![(0, "RDPILOT".to_owned())]));
+        connector = connector.with_static_channel(rdpdr);
+    }
 
     let should_upgrade = ironrdp_tokio::connect_begin(&mut framed, &mut connector)
         .await

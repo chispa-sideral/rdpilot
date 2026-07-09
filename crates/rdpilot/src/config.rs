@@ -7,6 +7,7 @@
 //! touches OS credential machinery (D-14) and never logs credential fields.
 
 use std::fmt;
+use std::path::{Path, PathBuf};
 
 /// Default RDP port.
 pub const DEFAULT_PORT: u16 = 3389;
@@ -50,6 +51,14 @@ pub struct ConnectionConfig {
     /// Risk-named and **default `false`**. Intended only for self-signed
     /// workgroup lab targets (D-15). Thumbprint pinning is deferred.
     accept_invalid_certs: bool,
+    /// Local filesystem path of the sensor executable to serve over the
+    /// RDPDR redirected drive (D-5.1, SENSOR-02).
+    ///
+    /// `None` (the default) means no RDPDR static channel is registered at
+    /// connect time — the connect path is byte-for-byte the pre-Phase-5
+    /// behavior. Owned `PathBuf` (D-09 — no third-party type in the public
+    /// signature).
+    sensor_binary_path: Option<PathBuf>,
 }
 
 impl ConnectionConfig {
@@ -72,6 +81,7 @@ impl ConnectionConfig {
             width: DEFAULT_WIDTH,
             height: DEFAULT_HEIGHT,
             accept_invalid_certs: false,
+            sensor_binary_path: None,
         }
     }
 
@@ -104,6 +114,20 @@ impl ConnectionConfig {
     #[must_use]
     pub fn accept_invalid_certs(mut self, accept: bool) -> Self {
         self.accept_invalid_certs = accept;
+        self
+    }
+
+    /// Set the local filesystem path of the sensor executable to serve over
+    /// the RDPDR redirected drive (builder, D-5.1, SENSOR-02).
+    ///
+    /// When set, `connect::connect` registers the RDPDR static channel
+    /// (`RdpilotDriveBackend`) announcing a `RDPILOT` drive that serves this
+    /// file, alongside the existing `DrdynvcClient` registration. When unset
+    /// (the default), no RDPDR channel is registered and the connect path is
+    /// unchanged from pre-Phase-5 behavior.
+    #[must_use]
+    pub fn sensor_binary_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.sensor_binary_path = Some(path.into());
         self
     }
 
@@ -149,6 +173,15 @@ impl ConnectionConfig {
     pub fn get_accept_invalid_certs(&self) -> bool {
         self.accept_invalid_certs
     }
+
+    /// Local filesystem path of the sensor executable served over the RDPDR
+    /// redirected drive, if configured (D-5.1, SENSOR-02).
+    ///
+    /// `None` means the RDPDR static channel is not registered at connect
+    /// time.
+    pub fn get_sensor_binary_path(&self) -> Option<&Path> {
+        self.sensor_binary_path.as_deref()
+    }
 }
 
 /// Redacted `Debug`: never prints the password (D-14, threat T-02-02).
@@ -163,6 +196,7 @@ impl fmt::Debug for ConnectionConfig {
             .field("width", &self.width)
             .field("height", &self.height)
             .field("accept_invalid_certs", &self.accept_invalid_certs)
+            .field("sensor_binary_path", &self.sensor_binary_path)
             .finish()
     }
 }
@@ -180,6 +214,17 @@ mod tests {
         assert_eq!(cfg.get_domain(), None);
         // Cert validation must default ON.
         assert!(!cfg.get_accept_invalid_certs());
+        // No RDPDR channel is registered unless a sensor path is configured.
+        assert_eq!(cfg.get_sensor_binary_path(), None);
+    }
+
+    #[test]
+    fn sensor_binary_path_builder_and_getter_roundtrip() {
+        let cfg = ConnectionConfig::new("h", "u", "p").sensor_binary_path("/tmp/rdpilot-sensor.exe");
+        assert_eq!(
+            cfg.get_sensor_binary_path(),
+            Some(std::path::Path::new("/tmp/rdpilot-sensor.exe"))
+        );
     }
 
     #[test]
