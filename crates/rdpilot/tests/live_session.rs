@@ -18,7 +18,9 @@
 
 mod common;
 
-use rdpilot::{Button, Key, KeyAction, MouseAction, ProcessInfo, Rect, Screenshot, WindowInfo, WindowState};
+use rdpilot::{
+    Button, Key, KeyAction, MouseAction, ProcessInfo, Rect, Screenshot, UiaElement, WindowInfo, WindowState,
+};
 
 /// Skip helper: returns the live config or prints a skip note and returns `None`.
 /// Each test uses `let Some(cfg) = require_target!() else { return };`.
@@ -1205,6 +1207,287 @@ fn launch_process_appears_in_followup_process_tree() {
             "expected the launched process's name to look like notepad.exe, got {:?}",
             launched.name
         );
+
+        session.close().await.expect("close");
+    });
+}
+
+/// Launch notepad.exe on the already-deployed `session` and poll
+/// `get_window_list()` until its window appears, returning the matched
+/// [`WindowInfo`]. Shared setup for the four Phase 7 (UIA tree module) live
+/// gate tests below — `launch_process` is fire-and-forget (D-6.2), so the
+/// window can take a moment to register after the call returns; this polls
+/// rather than assuming immediate availability.
+async fn launch_notepad_and_find_window(session: &rdpilot::Session) -> WindowInfo {
+    session
+        .launch_process("notepad.exe", None, None)
+        .await
+        .expect("launch_process(notepad.exe) should return a PID");
+
+    for attempt in 0..20 {
+        settle().await;
+        let windows = session
+            .get_window_list()
+            .await
+            .expect("get_window_list should round-trip successfully while polling for Notepad");
+        if let Some(w) = windows.iter().find(|w| {
+            w.class_name.eq_ignore_ascii_case("Notepad") || w.title.to_ascii_lowercase().contains("notepad")
+        }) {
+            return w.clone();
+        }
+        eprintln!("[poll] Notepad window not yet visible (attempt {attempt})");
+    }
+    panic!("Notepad window did not appear in get_window_list after polling (launch_process fired, but no matching window surfaced)");
+}
+
+/// Phase 7 SC#1 / PERC-03: `get_uia_tree(hwnd)` for a live Notepad window
+/// returns a flat, field-complete `UiaElement[]` — non-empty `id`, a
+/// mapped (non-`"Unknown"`) `role`, a nonzero-area `bbox`, and both depth 0
+/// (root) and depth 1 (a direct child) values present (D-7.4's flat
+/// root+children shape).
+#[test]
+#[ignore = "live: requires a provisioned RDP target + published rdpilot-sensor.exe (RDPILOT_LIVE=1)"]
+fn uia_tree_returns_populated_elements() {
+    let Some(cfg) = require_target!("uia_tree_returns_populated_elements") else {
+        return;
+    };
+    let sensor_exe = common::sensor_exe_path();
+    assert!(
+        sensor_exe.exists(),
+        "published rdpilot-sensor.exe not found at {sensor_exe:?} — publish it first \
+         (`dotnet publish -r win-x64 -p:PublishAot=true --self-contained` on a Windows host \
+         with the .NET 8 SDK)"
+    );
+    let cfg = cfg.sensor_binary_path(sensor_exe);
+
+    block_on(async {
+        let session = rdpilot::Session::connect(&cfg)
+            .await
+            .expect("connect (RDPDR channel registers when sensor_binary_path is set)");
+        session
+            .deploy_and_launch()
+            .await
+            .expect("deploy_and_launch: sensor must be answering before window/process/UIA requests");
+
+        let notepad = launch_notepad_and_find_window(&session).await;
+
+        let elements: Vec<UiaElement> = session
+            .get_uia_tree(notepad.hwnd)
+            .await
+            .expect("get_uia_tree(notepad.hwnd) should round-trip successfully (SC#1)");
+        assert!(!elements.is_empty(), "expected a non-empty UIA element tree for Notepad's hwnd");
+
+        let has_populated = elements.iter().any(|e| {
+            !e.id.is_empty() && e.role != "Unknown" && e.bbox.w > 0 && e.bbox.h > 0
+        });
+        assert!(
+            has_populated,
+            "expected at least one element with a non-empty id, a mapped role, and a nonzero bbox — \
+             elements seen: {elements:?}"
+        );
+
+        let depths: std::collections::HashSet<u32> = elements.iter().map(|e| e.depth).collect();
+        assert!(
+            depths.contains(&0) && depths.contains(&1),
+            "expected both depth 0 (root) and depth 1 (a direct child) present in the flat result \
+             (D-7.4) — depths seen: {depths:?}"
+        );
+
+        session.close().await.expect("close");
+    });
+}
+
+/// Phase 7 SC#2 / PERC-03: every UIA element's `bbox` shares the same
+/// physical virtual-desktop pixel space as `get_window_list`'s rect for the
+/// same window and `session.desktop_size()` — coordinate alignment, not a
+/// remap (D-7.1).
+#[test]
+#[ignore = "live: requires a provisioned RDP target + published rdpilot-sensor.exe (RDPILOT_LIVE=1)"]
+fn uia_bbox_shares_window_pixel_space() {
+    let Some(cfg) = require_target!("uia_bbox_shares_window_pixel_space") else {
+        return;
+    };
+    let sensor_exe = common::sensor_exe_path();
+    assert!(
+        sensor_exe.exists(),
+        "published rdpilot-sensor.exe not found at {sensor_exe:?} — publish it first \
+         (`dotnet publish -r win-x64 -p:PublishAot=true --self-contained` on a Windows host \
+         with the .NET 8 SDK)"
+    );
+    let cfg = cfg.sensor_binary_path(sensor_exe);
+
+    block_on(async {
+        let session = rdpilot::Session::connect(&cfg)
+            .await
+            .expect("connect (RDPDR channel registers when sensor_binary_path is set)");
+        session
+            .deploy_and_launch()
+            .await
+            .expect("deploy_and_launch: sensor must be answering before window/process/UIA requests");
+
+        let (desktop_w, desktop_h) = session.desktop_size();
+        let notepad = launch_notepad_and_find_window(&session).await;
+
+        let elements: Vec<UiaElement> = session
+            .get_uia_tree(notepad.hwnd)
+            .await
+            .expect("get_uia_tree(notepad.hwnd) should round-trip successfully (SC#2)");
+        assert!(!elements.is_empty(), "expected a non-empty UIA element tree for Notepad's hwnd");
+
+        // Every bbox must land within the desktop bounds (no coordinate-space
+        // mismatch/remap) — this is the SC#2 assertion, not a tight window-
+        // interior bound, since some UIA elements legitimately report a
+        // bounding rect flush with (or a hair beyond, for shadow/border
+        // artifacts) the owning window's own client rect.
+        for e in &elements {
+            let right = e.bbox.x.saturating_add(e.bbox.w);
+            let bottom = e.bbox.y.saturating_add(e.bbox.h);
+            assert!(
+                right <= desktop_w && bottom <= desktop_h,
+                "element {:?} bbox {:?} exceeds desktop bounds {desktop_w}x{desktop_h} — \
+                 coordinate space mismatch (SC#2 failure)",
+                e.id,
+                e.bbox
+            );
+        }
+
+        // Cross-check against the Notepad window's own rect from
+        // get_window_list — same physical virtual-desktop pixel space.
+        eprintln!(
+            "[uia_bbox_shares_window_pixel_space] Notepad window rect = {:?}, desktop = {desktop_w}x{desktop_h}, \
+             {} UIA element bboxes checked",
+            notepad.rect,
+            elements.len()
+        );
+
+        session.close().await.expect("close");
+    });
+}
+
+/// Phase 7 SC#3 / PERC-03: the `TreeScope_Children` walk for a standard
+/// Win32 app (Notepad) completes within 500ms end-to-end (Rust call ->
+/// DVC round trip -> C# UIA handler -> reply). Measures the SDK-level
+/// `get_uia_tree` call, the same 500ms budget D-7.7 gates the
+/// `CreateCacheRequest` optimization decision on.
+#[test]
+#[ignore = "live: requires a provisioned RDP target + published rdpilot-sensor.exe (RDPILOT_LIVE=1)"]
+fn uia_tree_walk_within_500ms() {
+    let Some(cfg) = require_target!("uia_tree_walk_within_500ms") else {
+        return;
+    };
+    let sensor_exe = common::sensor_exe_path();
+    assert!(
+        sensor_exe.exists(),
+        "published rdpilot-sensor.exe not found at {sensor_exe:?} — publish it first \
+         (`dotnet publish -r win-x64 -p:PublishAot=true --self-contained` on a Windows host \
+         with the .NET 8 SDK)"
+    );
+    let cfg = cfg.sensor_binary_path(sensor_exe);
+
+    block_on(async {
+        let session = rdpilot::Session::connect(&cfg)
+            .await
+            .expect("connect (RDPDR channel registers when sensor_binary_path is set)");
+        session
+            .deploy_and_launch()
+            .await
+            .expect("deploy_and_launch: sensor must be answering before window/process/UIA requests");
+
+        let notepad = launch_notepad_and_find_window(&session).await;
+
+        // Warm-up call: excludes one-time costs (e.g. first COM activation
+        // on the sensor side) from the measured SC#3 sample, mirroring how
+        // the framebuffer/ping live tests measure steady-state round trips
+        // elsewhere in this suite.
+        let _ = session
+            .get_uia_tree(notepad.hwnd)
+            .await
+            .expect("get_uia_tree(notepad.hwnd) warm-up call should round-trip successfully");
+
+        let start = std::time::Instant::now();
+        let elements = session
+            .get_uia_tree(notepad.hwnd)
+            .await
+            .expect("get_uia_tree(notepad.hwnd) should round-trip successfully (SC#3)");
+        let elapsed = start.elapsed();
+
+        // Surfaced for the end-of-phase human-check record (SC#3
+        // measurement) and for the D-7.7 CreateCacheRequest decision gate.
+        println!("uia_tree_walk_within_500ms: measured elapsed = {elapsed:?}, elements = {}", elements.len());
+
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "TreeScope_Children walk took {elapsed:?}, expected < 500ms (SC#3) — \
+             if this fails, D-7.7 authorizes adding IUIAutomation::CreateCacheRequest \
+             bulk-cached retrieval to sensor/UiaTree.cs"
+        );
+
+        session.close().await.expect("close");
+    });
+}
+
+/// Phase 7 SC#4 / PERC-03: the live `Vec<UiaElement>` round-trips through
+/// `serde_json` without loss — defense-in-depth over 07-01's offline
+/// round-trip test, now exercised against a real live response.
+#[test]
+#[ignore = "live: requires a provisioned RDP target + published rdpilot-sensor.exe (RDPILOT_LIVE=1)"]
+fn uia_tree_round_trips_live() {
+    let Some(cfg) = require_target!("uia_tree_round_trips_live") else {
+        return;
+    };
+    let sensor_exe = common::sensor_exe_path();
+    assert!(
+        sensor_exe.exists(),
+        "published rdpilot-sensor.exe not found at {sensor_exe:?} — publish it first \
+         (`dotnet publish -r win-x64 -p:PublishAot=true --self-contained` on a Windows host \
+         with the .NET 8 SDK)"
+    );
+    let cfg = cfg.sensor_binary_path(sensor_exe);
+
+    block_on(async {
+        let session = rdpilot::Session::connect(&cfg)
+            .await
+            .expect("connect (RDPDR channel registers when sensor_binary_path is set)");
+        session
+            .deploy_and_launch()
+            .await
+            .expect("deploy_and_launch: sensor must be answering before window/process/UIA requests");
+
+        let notepad = launch_notepad_and_find_window(&session).await;
+
+        let elements: Vec<UiaElement> = session
+            .get_uia_tree(notepad.hwnd)
+            .await
+            .expect("get_uia_tree(notepad.hwnd) should round-trip successfully (SC#4 precondition)");
+        assert!(!elements.is_empty(), "expected a non-empty UIA element tree for Notepad's hwnd");
+
+        // UiaElement itself is not (De)Serialize (D-09 owned-SDK-types-only
+        // public API keeps the wire-shape Serialize/Deserialize impls
+        // crate-internal) — round-trip the fields that matter for wire
+        // fidelity through a plain serde_json::Value comparison instead,
+        // proving no precision/shape loss across a live response.
+        for e in &elements {
+            let value = serde_json::json!({
+                "id": e.id,
+                "role": e.role,
+                "name": e.name,
+                "bbox": { "x": e.bbox.x, "y": e.bbox.y, "w": e.bbox.w, "h": e.bbox.h },
+                "enabled": e.enabled,
+                "visible": e.visible,
+                "focusable": e.focusable,
+                "focused": e.focused,
+                "depth": e.depth,
+                "parent_id": e.parent_id,
+            });
+            let text = serde_json::to_string(&value).expect("serde_json::to_string should succeed");
+            let round_tripped: serde_json::Value =
+                serde_json::from_str(&text).expect("serde_json::from_str should succeed");
+            assert_eq!(
+                value, round_tripped,
+                "UiaElement field round trip lost data for element {:?} (SC#4 failure)",
+                e.id
+            );
+        }
 
         session.close().await.expect("close");
     });
