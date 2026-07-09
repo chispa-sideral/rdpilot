@@ -2,16 +2,16 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-status: executing
-stopped_at: Phase 6 window+process perception COMPLETE — live gate PASSED (all 4 SC), VM torn down
-last_updated: "2026-07-09T19:45:57.643Z"
-last_activity: 2026-07-09 -- 07-03 D-7.5 live risk gate COMPLETE — checkpoint APPROVED by coordinator. `[smoke-test-uia] PASS` on real Windows VM, BSTR marshalling fix committed 44c2ac5, VM torn down. 07-04 (UiaTree handler) cleared to proceed.
+status: verifying
+stopped_at: Phase 7 uia-tree-module COMPLETE — live gate PASSED (all 4 SC, SC3 measured 30.36ms), VM torn down
+last_updated: "2026-07-09T20:29:25.796Z"
+last_activity: 2026-07-09 -- 07-05 end-of-phase live gate COMPLETE — checkpoint APPROVED by coordinator. All four SC PASS live (SC3 measured 30.36ms, no CreateCacheRequest needed), VM torn down. PERC-03 marked complete; Phase 7 (UIA Tree Module) CLOSED OUT. Phase 8 (Public SDK API + WorldState) cleared to proceed.
 progress:
   total_phases: 9
-  completed_phases: 6
+  completed_phases: 7
   total_plans: 28
-  completed_plans: 27
-  percent: 67
+  completed_plans: 28
+  percent: 78
 ---
 
 # Project State
@@ -21,18 +21,18 @@ progress:
 See: .planning/PROJECT.md (updated 2026-06-04)
 
 **Core value:** A local AI agent can connect to a remote Windows desktop over RDP and read/inspect a program that is only reachable via RDP — using both screenshots and structured accessibility data, without installing or running the agent itself on the remote machine.
-**Current focus:** Phase 7 — uia-tree-module
+**Current focus:** Phase 8 — public-sdk-api-worldstate (Phase 7 CLOSED OUT)
 
 ## Current Position
 
-Phase: 7 (uia-tree-module) — EXECUTING
+Phase: 7 (uia-tree-module) — COMPLETE
 Plan: 5 of 5
-Status: Ready to execute
-Last activity: 2026-07-09 -- 07-03 D-7.5 live risk gate COMPLETE — checkpoint APPROVED by coordinator. `[smoke-test-uia] PASS` on real Windows VM, BSTR marshalling fix committed 44c2ac5, VM torn down. 07-04 (UiaTree handler) cleared to proceed.
+Status: Phase complete — live gate PASSED, ready for verification
+Last activity: 2026-07-09 -- 07-05 end-of-phase live gate COMPLETE — checkpoint APPROVED by coordinator. All four Phase 7 success criteria PASS live against a real disposable Azure VM (SC#1 field-complete UiaElement[], SC#2 bbox pixel-space alignment, SC#3 measured 30.36ms — no CreateCacheRequest needed, SC#4 lossless serde round trip), VM torn down. PERC-03 marked complete in REQUIREMENTS.md. Next: plan Phase 8 — Public SDK API + WorldState.
 
-Note: Phase 3 remains `status: verifying` (pending /gsd-verify-work) in the frontmatter above; Phase 4/5/6 planning/execution began before that gate ran.
+Note: Phase 3 remains `status: verifying` (pending /gsd-verify-work) in the frontmatter above; Phase 4/5/6/7 planning/execution began before that gate ran.
 
-Progress: [██████░░░░] 67% (Phase 6: 5/5 plans complete, live gate PASSED — see 06-05-SUMMARY.md)
+Progress: [████████░░] 78% (Phase 7: 5/5 plans complete, live gate PASSED — see 07-05-SUMMARY.md)
 
 ## Performance Metrics
 
@@ -77,6 +77,7 @@ Progress: [██████░░░░] 67% (Phase 6: 5/5 plans complete, liv
 | Phase 07 P02 | 20min | 2 tasks | 2 files |
 | Phase 07 P03 | ~1h50min | 1 tasks | 2 files |
 | Phase 07-uia-tree-module P04 | 25min | 2 tasks | 4 files |
+| Phase 07-uia-tree-module P05 | ~40min | 2 tasks | 1 files |
 
 ## Accumulated Context
 
@@ -138,6 +139,7 @@ Recent decisions affecting current work:
 - [Phase ?]: 07-02: GeneratedComInterface does not support C# instance properties (SYSLIB1091) -- all UIA propget members declared as Get-prefixed methods instead.
 - [Phase ?]: 07-02: Marshal.SafeArrayGetLBound/GetUBound/GetElement/SafeArrayDestroy do not exist in .NET Core/.NET 8 (Framework-only) -- hand-rolled the equivalent oleaut32.dll SAFEARRAY exports via LibraryImport instead.
 - [Phase ?]: 07-04: Reused WindowRect for the UiaElementRecord bbox field rather than declaring a new UiaBboxRecord -- same namespace, same x/y/w/h shape, already JSON-registered.
+- [Phase ?]: Phase 7 live gate (2026-07-09, PASSED): all four Phase 7 SC validated live against a real disposable Azure VM and a launched Notepad window. SC#1 field-complete UiaElement[] confirmed; SC#2 bbox coordinates confirmed in the same physical virtual-desktop pixel space as get_window_list (desktop_size bounds containment); SC#3 TreeScope_Children walk measured 30.36ms, >16x under the 500ms budget -- D-7.7's CreateCacheRequest bulk-cache optimization correctly never triggered, naive uncached per-property reads (07-04) are sufficient; SC#4 live serde_json round trip lossless. Sensor AOT-published win-x64 ON the VM via az vm run-command invoke (WinRM still unavailable from this host), SHA256 fa5d3e3c8d45c351e0d577cf654c6c524c8ecab9e4203917ef6637c053ce6e16 verified byte-identical between VM build and locally-relayed copy. One transient first-RDP-login deploy_and_launch timeout (the fresh-VM network-discoverable dialog condition first diagnosed in 07-03) recurred and self-resolved on a single retry, confirming it as a reproducible VM-provisioning-time artifact, not a code defect -- no code change made. VM torn down and confirmed absent (az group exists -n rdpilot-test => false; rdpilot-mgmt persists). PERC-03 genuinely retired.
 
 ### Pending Todos
 
@@ -164,6 +166,6 @@ Phase 2 Plan 02: pre-existing rustdoc intra-doc-link warnings in config.rs (Wave
 
 ## Session Continuity
 
-Last session: 2026-07-09T19:45:54.378Z
-Stopped at: Phase 6 (Window + Process Perception) COMPLETE — live gate PASSED (SC1-SC4 all met); PERC-01/PERC-02/PERC-04/PROC-01/CAP-02 marked complete in REQUIREMENTS.md
-Resume file: .planning/phases/06-window-process-perception/06-05-SUMMARY.md (next: plan Phase 7 — UIA Tree Module)
+Last session: 2026-07-09T20:29:25.789Z
+Stopped at: Phase 7 (UIA Tree Module) COMPLETE — live gate PASSED (SC1-SC4 all met, SC3 measured 30.36ms, no CreateCacheRequest needed); PERC-03 marked complete in REQUIREMENTS.md
+Resume file: .planning/phases/07-uia-tree-module/07-05-SUMMARY.md (next: plan Phase 8 — Public SDK API + WorldState)

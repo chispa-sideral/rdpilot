@@ -19,7 +19,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 - [x] **Phase 4: DVC Transport Channel** - Establish and verify the RDPILOT_SENSOR dynamic virtual channel before any sensor modules exist — all 3 success criteria proven live (canonical run: sensor_ping_pong_under_500ms PASSED, measured round trip 165ms, on a real disposable Azure VM, 2026-07-09)
 - [x] **Phase 5: Sensor Bootstrap + Deployment** - Build the C# NativeAOT sensor helper and deploy it onto a real target via drive redirection or WinRM — all 4 success criteria proven live (canonical run: RDPDR primary 22.61ms, WinRM fallback 21.62ms, both < 1s bound, NativeAOT binary 2.57 MiB, on a real disposable Azure VM, 2026-07-09)
 - [x] **Phase 6: Window + Process Perception** - Retrieve window list, process tree, per-window screenshots, focus control, and remote process launch over DVC (completed 2026-07-09)
-- [ ] **Phase 7: UIA Tree Module** - Add the UI Automation sensor module and return a flat UiaElement[] over DVC
+- [x] **Phase 7: UIA Tree Module** - Add the UI Automation sensor module and return a flat UiaElement[] over DVC — all 4 success criteria proven live (canonical run: SC#3 TreeScope_Children walk measured 30.36ms, well under the 500ms bound, on a real disposable Azure VM against a launched Notepad window, 2026-07-09; PERC-03)
 - [ ] **Phase 8: Public SDK API + WorldState** - Expose a clean typed Session API and a coherent WorldState snapshot correlating framebuffer, windows, and UIA
 - [ ] **Phase 9: Scripted Proof Harness** - Prove the full read/inspect loop end-to-end against a real remote-only Windows program
 
@@ -180,7 +180,7 @@ Plans:
   3. A tree walk scoped to TreeScope_Children completes within 500 ms for a standard Win32 application
   4. The response is valid JSON-serializable UiaElement[] (round-trips through serde_json without loss)
 
-**Plans**: 4/5 plans executed
+**Plans**: 5/5 plans complete
 
 - Wave 1 (offline, parallel):
   - [x] 07-01-PLAN.md — Rust wire extension: MsgType::Uia, owned UiaElement + UiaElementWire (RuntimeId join D-7.2 / ControlType→role map D-7.3, Rust-side), Session::get_uia_tree(hwnd), offline unit tests (SC#4/D-7.2/D-7.3)
@@ -190,7 +190,7 @@ Plans:
 - Wave 3 (real handler):
   - [x] 07-04-PLAN.md — UiaTree.cs handler: ElementFromHandle → FindAll(TreeScope_Children) → per-element reads with per-element COMException skip (D-7.4/D-7.6/D-7.7) + Program.cs dispatch arm + EnvelopeJsonContext registrations
 - Wave 4 (live gate):
-  - [ ] 07-05-PLAN.md — Four gated live tests (one per SC) + end-of-phase live gate against a real Notepad window on a disposable Azure VM
+  - [x] 07-05-PLAN.md — Four gated live tests (one per SC) + end-of-phase live gate against a real Notepad window on a disposable Azure VM. **Live gate PASSED** (2026-07-09): SC#1 field-complete UiaElement[] confirmed; SC#2 bbox coordinates confirmed in the same physical pixel space as get_window_list; SC#3 measured 30.36ms (>16x under the 500ms budget — D-7.7's CreateCacheRequest optimization correctly not needed); SC#4 live serde_json round trip lossless. Sensor AOT-published win-x64 ON the VM (SHA256 fa5d3e3c8d45c351e0d577cf654c6c524c8ecab9e4203917ef6637c053ce6e16, verified byte-identical relay). One transient first-RDP-login deploy_and_launch timeout (documented 07-03 condition) self-resolved on retry, no code change. VM torn down after the run (rdpilot-test RG deleted).
 
 ### Phase 8: Public SDK API + WorldState
 
@@ -234,7 +234,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8 →
 | 4. DVC Transport Channel | 3/3 | Complete | 2026-07-09 |
 | 5. Sensor Bootstrap + Deployment | 4/4 | Complete   | 2026-07-09 |
 | 6. Window + Process Perception | 5/5 | Complete   | 2026-07-09 |
-| 7. UIA Tree Module | 4/5 | In Progress|  |
+| 7. UIA Tree Module | 5/5 | Complete   | 2026-07-09 |
 | 8. Public SDK API + WorldState | 0/? | Not started | - |
 | 9. Scripted Proof Harness | 0/? | Not started | - |
 
