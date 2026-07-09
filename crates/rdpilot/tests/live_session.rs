@@ -1072,16 +1072,54 @@ fn set_foreground_window_confirmed_by_followup_query() {
             .expect("set_foreground_window should round-trip successfully");
         settle().await;
 
-        // DECISION POINT (live tuning): if the Win32 foreground-lock timeout
-        // (Pitfall 5, 06-RESEARCH) makes this flaky on the target VM — e.g.
-        // the just-launched notepad window has not yet finished stealing
-        // focus from the RDP shell — insert one additional `settle()` or a
-        // short poll-retry around the follow-up `get_window_list()` call
-        // here, and note the measured wait at the live-gate checkpoint.
-        let windows_after = session
-            .get_window_list()
-            .await
-            .expect("get_window_list (post-focus, SC#3 confirmation) should round-trip successfully");
+        // DECISION POINT (live tuning) RESOLVED (06-05 live gate), root-caused
+        // via a live window-list dump: comparing against the GLOBAL minimum
+        // z_order across ALL enumerated windows is the wrong metric — it
+        // includes always-on-top OS shell chrome (the taskbar; observed
+        // live at a fixed z_order with an empty title and a rect matching a
+        // taskbar strip, e.g. `y=1040, h=40` on a 1920x1080 desktop) that
+        // structurally sits above every normal application window
+        // regardless of focus. `set_foreground_window` neither can nor
+        // should be expected to out-rank always-on-top system chrome; doing
+        // so would be undesirable behavior, not a bug. The live dump showed
+        // our just-focused window WAS already the frontmost window among
+        // real, user-facing (non-empty-title) top-level windows — exactly
+        // what SC#3 ("brings a window forward, confirmed by a subsequent
+        // window list query") means in practice. So the correct comparison
+        // is topmost-among-titled-windows, not topmost-among-everything.
+        // Poll-retry still guards against genuine one-off focus-timing
+        // flakiness (Pitfall 5), re-settling between attempts, bounded so a
+        // genuinely broken focus change still fails the test.
+        const FOREGROUND_CONFIRM_ATTEMPTS: u32 = 10;
+        fn min_titled_z_order(windows: &[WindowInfo]) -> u32 {
+            windows
+                .iter()
+                .filter(|w| !w.title.is_empty())
+                .map(|w| w.z_order)
+                .min()
+                .unwrap_or(u32::MAX)
+        }
+        let mut windows_after = Vec::new();
+        let mut confirmed_topmost = false;
+        for attempt in 1..=FOREGROUND_CONFIRM_ATTEMPTS {
+            windows_after = session.get_window_list().await.expect(
+                "get_window_list (post-focus, SC#3 confirmation) should round-trip successfully",
+            );
+            let min_z_order = min_titled_z_order(&windows_after);
+            let is_topmost = windows_after
+                .iter()
+                .find(|w| w.hwnd == hwnd)
+                .is_some_and(|w| w.z_order == min_z_order);
+            if is_topmost {
+                confirmed_topmost = true;
+                println!(
+                    "set_foreground_window_confirmed_by_followup_query: confirmed topmost \
+                     (among titled windows) on poll attempt {attempt}/{FOREGROUND_CONFIRM_ATTEMPTS}"
+                );
+                break;
+            }
+            settle().await;
+        }
         let confirmed = windows_after
             .iter()
             .find(|w| w.hwnd == hwnd)
@@ -1091,12 +1129,28 @@ fn set_foreground_window_confirmed_by_followup_query() {
                      follow-up window list — windows seen: {windows_after:?}"
                 )
             });
-        let min_z_order = windows_after.iter().map(|w| w.z_order).min().unwrap_or(u32::MAX);
-        assert_eq!(
-            confirmed.z_order, min_z_order,
-            "hwnd {hwnd} should be topmost (z_order == {min_z_order}) in the follow-up \
-             window list after set_foreground_window (SC#3 — confirmation is the follow-up \
-             query, not the setter's own return)"
+        let min_z_order = min_titled_z_order(&windows_after);
+        if !confirmed_topmost {
+            let mut sorted: Vec<_> = windows_after.iter().collect();
+            sorted.sort_by_key(|w| w.z_order);
+            eprintln!("=== DIAGNOSTIC: full window list (sorted by z_order) ===");
+            for w in &sorted {
+                eprintln!(
+                    "  z={} hwnd={} pid={} state={:?} title={:?} rect={:?}",
+                    w.z_order, w.hwnd, w.pid, w.state, w.title, w.rect
+                );
+            }
+            eprintln!("=== target hwnd={hwnd} pid={pid} ===");
+        }
+        assert!(
+            confirmed_topmost,
+            "hwnd {hwnd} should be topmost AMONG TITLED (real, user-facing) windows \
+             (z_order == {min_z_order}) in the follow-up window list after \
+             set_foreground_window (SC#3 — confirmation is the follow-up query, not the \
+             setter's own return; always-on-top shell chrome with an empty title, e.g. the \
+             taskbar, is intentionally excluded from this comparison); last observed \
+             z_order = {}, after {} poll attempts",
+            confirmed.z_order, FOREGROUND_CONFIRM_ATTEMPTS
         );
 
         session.close().await.expect("close");
