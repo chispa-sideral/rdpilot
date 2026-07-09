@@ -6,7 +6,7 @@
     - PublishAot=true + SelfContained=true: `dotnet publish` produces a single
       native rdpilot-sensor.exe with no external .NET runtime dependency (SC1).
       NativeAOT does NOT cross-OS-compile (RESEARCH Pitfall 4) — the actual
-      `dotnet publish -r win-x64 -p:PublishAot=true --self-contained` MUST run
+      `dotnet publish -r win-x64 -p:PublishAot=true` with self-contained set MUST run
       on a genuine Windows host with the .NET 8 SDK + native MSVC/Windows SDK
       toolchain (see 05-01-PLAN.md Task 3).
     - InvariantGlobalization=true: trims ICU, shrinks the AOT binary further —
