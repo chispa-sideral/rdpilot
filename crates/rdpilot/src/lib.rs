@@ -24,6 +24,7 @@ mod framebuffer;
 mod input;
 mod keepalive;
 mod rdpdr_backend;
+mod rdpsnd_stub;
 mod screenshot;
 mod sensor;
 mod session;

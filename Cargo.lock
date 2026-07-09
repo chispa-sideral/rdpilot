@@ -2722,6 +2722,7 @@ dependencies = [
  "ironrdp-input",
  "ironrdp-pdu",
  "ironrdp-rdpdr",
+ "ironrdp-svc",
  "ironrdp-tls",
  "ironrdp-tokio",
  "rustls",

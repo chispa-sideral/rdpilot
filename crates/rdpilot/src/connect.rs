@@ -130,6 +130,18 @@ pub(crate) async fn connect(
         let rdpdr = Rdpdr::new(Box::new(drive_backend), "rdpilot".to_owned())
             .with_drives(Some(vec![(0, "RDPILOT".to_owned())]));
         connector = connector.with_static_channel(rdpdr);
+
+        // Live-diagnosed bug fix (05-04 live gate, D-5.6/SC2): MS-RDPEFS
+        // Appendix A footnote <1> requires "rdpsnd" to be advertised
+        // alongside "rdpdr" -- without it, a Windows RDP server joins the
+        // rdpdr channel successfully but silently NEVER sends the Server
+        // Announce Request that starts the RDPDR handshake (confirmed via
+        // live wire trace: ChannelJoinConfirm received for the rdpdr
+        // channel_id, but zero RDPDR traffic ever followed). This stub only
+        // needs to be present/joined, not functional -- see
+        // rdpsnd_stub.rs's doc comment for the full live-diagnosed root
+        // cause.
+        connector = connector.with_static_channel(crate::rdpsnd_stub::RdpsndStub::new());
     }
 
     let should_upgrade = ironrdp_tokio::connect_begin(&mut framed, &mut connector)
