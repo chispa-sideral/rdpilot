@@ -18,7 +18,7 @@
 
 mod common;
 
-use rdpilot::{Button, Key, KeyAction, MouseAction, Rect, Screenshot};
+use rdpilot::{Button, Key, KeyAction, MouseAction, ProcessInfo, Rect, Screenshot, WindowInfo, WindowState};
 
 /// Skip helper: returns the live config or prints a skip note and returns `None`.
 /// Each test uses `let Some(cfg) = require_target!() else { return };`.
@@ -876,4 +876,282 @@ async fn capture_when_ready(session: &rdpilot::Session) -> Screenshot {
         }
     }
     panic!("no framebuffer captured within 10s of connecting (no graphics update arrived)");
+}
+
+/// Phase 6 SC#1 / PERC-02: `get_window_list` returns visible windows with
+/// HWND/title/rect/z-order/state/pid, and rects land in physical
+/// virtual-desktop pixels — the same framebuffer coordinate space
+/// `session.desktop_size()` reports (the Phase 7 crop dependency).
+///
+/// Brings the sensor up in-band via `deploy_and_launch()` (the proven Phase
+/// 5 RDPDR path) before issuing any window/process request, per this plan's
+/// `<interface_context>`.
+#[test]
+#[ignore = "live: requires a provisioned RDP target + published rdpilot-sensor.exe (RDPILOT_LIVE=1)"]
+fn window_list_returns_visible_windows() {
+    let Some(cfg) = require_target!("window_list_returns_visible_windows") else {
+        return;
+    };
+    let sensor_exe = common::sensor_exe_path();
+    assert!(
+        sensor_exe.exists(),
+        "published rdpilot-sensor.exe not found at {sensor_exe:?} — publish it first \
+         (`dotnet publish -r win-x64 -p:PublishAot=true --self-contained` on a Windows host \
+         with the .NET 8 SDK)"
+    );
+    let cfg = cfg.sensor_binary_path(sensor_exe);
+
+    block_on(async {
+        let session = rdpilot::Session::connect(&cfg)
+            .await
+            .expect("connect (RDPDR channel registers when sensor_binary_path is set)");
+        session
+            .deploy_and_launch()
+            .await
+            .expect("deploy_and_launch: sensor must be answering before window/process requests");
+
+        let (desktop_w, desktop_h) = session.desktop_size();
+
+        let windows = session
+            .get_window_list()
+            .await
+            .expect("get_window_list should round-trip successfully (SC#1)");
+        assert!(!windows.is_empty(), "expected at least one visible window on the live desktop");
+
+        let in_bounds = |w: &WindowInfo| {
+            w.rect.x.saturating_add(w.rect.w) <= desktop_w
+                && w.rect.y.saturating_add(w.rect.h) <= desktop_h
+        };
+        let candidate = windows
+            .iter()
+            .find(|w| !w.title.is_empty() && w.pid != 0 && in_bounds(w))
+            .unwrap_or_else(|| {
+                panic!(
+                    "no window with a non-empty title, nonzero pid, and a rect within \
+                     desktop_size ({desktop_w}x{desktop_h}) — windows seen: {windows:?}"
+                )
+            });
+        // `state` is always a valid `WindowState` variant by construction
+        // (Rust's type system) — assert it is one of the three documented
+        // values for readability at the call site.
+        assert!(matches!(
+            candidate.state,
+            WindowState::Normal | WindowState::Minimized | WindowState::Maximized
+        ));
+
+        // Optional CAP-02 smoke: per-window screenshot crop matches the
+        // window's own rect dimensions. Soft — not a hard SC#1 gate (CAP-02
+        // is otherwise covered by the offline crop tests in 06-02); log
+        // rather than panic if the live crop is unavailable (e.g. the
+        // candidate window is occluded/minimized at capture time).
+        match session.screenshot_window(candidate).await {
+            Ok(shot) => {
+                assert_eq!(
+                    (shot.width, shot.height),
+                    (candidate.rect.w, candidate.rect.h),
+                    "screenshot_window crop dimensions should match the window rect (CAP-02 smoke)"
+                );
+            }
+            Err(e) => {
+                eprintln!(
+                    "[soft] screenshot_window CAP-02 smoke did not succeed for {candidate:?}: {e:?} \
+                     (non-fatal — CAP-02 is covered offline by 06-02's crop tests)"
+                );
+            }
+        }
+
+        session.close().await.expect("close");
+    });
+}
+
+/// Phase 6 SC#2 / PERC-01: `get_process_tree` returns pid/parent-pid/name
+/// for every process, and path for at least one ordinary process
+/// (best-effort path resolution, D-6.3). Deliberately does NOT assert on
+/// `command_line`/`owner` — those are optional extras (D-6.3), not part of
+/// this success criterion.
+#[test]
+#[ignore = "live: requires a provisioned RDP target + published rdpilot-sensor.exe (RDPILOT_LIVE=1)"]
+fn process_tree_returns_pid_parent_name_path() {
+    let Some(cfg) = require_target!("process_tree_returns_pid_parent_name_path") else {
+        return;
+    };
+    let sensor_exe = common::sensor_exe_path();
+    assert!(
+        sensor_exe.exists(),
+        "published rdpilot-sensor.exe not found at {sensor_exe:?} — publish it first \
+         (`dotnet publish -r win-x64 -p:PublishAot=true --self-contained` on a Windows host \
+         with the .NET 8 SDK)"
+    );
+    let cfg = cfg.sensor_binary_path(sensor_exe);
+
+    block_on(async {
+        let session = rdpilot::Session::connect(&cfg)
+            .await
+            .expect("connect (RDPDR channel registers when sensor_binary_path is set)");
+        session
+            .deploy_and_launch()
+            .await
+            .expect("deploy_and_launch: sensor must be answering before window/process requests");
+
+        let processes = session
+            .get_process_tree()
+            .await
+            .expect("get_process_tree should round-trip successfully (SC#2)");
+        assert!(!processes.is_empty(), "expected at least one process on the live desktop");
+
+        let has_pid_and_name = processes.iter().any(|p: &ProcessInfo| p.pid != 0 && !p.name.is_empty());
+        assert!(
+            has_pid_and_name,
+            "expected at least one process record with a nonzero pid and non-empty name"
+        );
+
+        let has_path = processes.iter().any(|p: &ProcessInfo| !p.path.is_empty());
+        assert!(
+            has_path,
+            "expected at least one process record with a non-empty path (best-effort \
+             path resolution should succeed for ordinary processes)"
+        );
+
+        session.close().await.expect("close");
+    });
+}
+
+/// Phase 6 SC#3 / PERC-04: `set_foreground_window` brings a window forward,
+/// confirmed by a SECOND `get_window_list()` query — NOT the setter's own
+/// `Ok(())` return (Pitfall 5 / SC#3). Launches notepad.exe first (fire-
+/// -and-forget, D-6.2) to get a window that is not already foreground, then
+/// focuses it and re-queries.
+#[test]
+#[ignore = "live: requires a provisioned RDP target + published rdpilot-sensor.exe (RDPILOT_LIVE=1)"]
+fn set_foreground_window_confirmed_by_followup_query() {
+    let Some(cfg) = require_target!("set_foreground_window_confirmed_by_followup_query") else {
+        return;
+    };
+    let sensor_exe = common::sensor_exe_path();
+    assert!(
+        sensor_exe.exists(),
+        "published rdpilot-sensor.exe not found at {sensor_exe:?} — publish it first \
+         (`dotnet publish -r win-x64 -p:PublishAot=true --self-contained` on a Windows host \
+         with the .NET 8 SDK)"
+    );
+    let cfg = cfg.sensor_binary_path(sensor_exe);
+
+    block_on(async {
+        let session = rdpilot::Session::connect(&cfg)
+            .await
+            .expect("connect (RDPDR channel registers when sensor_binary_path is set)");
+        session
+            .deploy_and_launch()
+            .await
+            .expect("deploy_and_launch: sensor must be answering before window/process requests");
+
+        let pid = session
+            .launch_process("notepad.exe", None, None)
+            .await
+            .expect("launch_process(notepad.exe) should return a PID");
+        settle().await;
+
+        let windows_before = session
+            .get_window_list()
+            .await
+            .expect("get_window_list (pre-focus) should round-trip successfully");
+        let target = windows_before
+            .iter()
+            .find(|w| w.pid == pid)
+            .unwrap_or_else(|| {
+                panic!(
+                    "no window owned by launched pid {pid} found in the pre-focus window list \
+                     — windows seen: {windows_before:?}"
+                )
+            });
+        let hwnd = target.hwnd;
+
+        session
+            .set_foreground_window(hwnd)
+            .await
+            .expect("set_foreground_window should round-trip successfully");
+        settle().await;
+
+        // DECISION POINT (live tuning): if the Win32 foreground-lock timeout
+        // (Pitfall 5, 06-RESEARCH) makes this flaky on the target VM — e.g.
+        // the just-launched notepad window has not yet finished stealing
+        // focus from the RDP shell — insert one additional `settle()` or a
+        // short poll-retry around the follow-up `get_window_list()` call
+        // here, and note the measured wait at the live-gate checkpoint.
+        let windows_after = session
+            .get_window_list()
+            .await
+            .expect("get_window_list (post-focus, SC#3 confirmation) should round-trip successfully");
+        let confirmed = windows_after
+            .iter()
+            .find(|w| w.hwnd == hwnd)
+            .unwrap_or_else(|| {
+                panic!(
+                    "hwnd {hwnd} (the window we just focused) no longer appears in the \
+                     follow-up window list — windows seen: {windows_after:?}"
+                )
+            });
+        let min_z_order = windows_after.iter().map(|w| w.z_order).min().unwrap_or(u32::MAX);
+        assert_eq!(
+            confirmed.z_order, min_z_order,
+            "hwnd {hwnd} should be topmost (z_order == {min_z_order}) in the follow-up \
+             window list after set_foreground_window (SC#3 — confirmation is the follow-up \
+             query, not the setter's own return)"
+        );
+
+        session.close().await.expect("close");
+    });
+}
+
+/// Phase 6 SC#4 / PROC-01: `launch_process` starts notepad.exe and the
+/// returned PID appears in a follow-up `get_process_tree()` query
+/// (fire-and-forget per D-6.2 — no wait/poll beyond a single `settle()`).
+#[test]
+#[ignore = "live: requires a provisioned RDP target + published rdpilot-sensor.exe (RDPILOT_LIVE=1)"]
+fn launch_process_appears_in_followup_process_tree() {
+    let Some(cfg) = require_target!("launch_process_appears_in_followup_process_tree") else {
+        return;
+    };
+    let sensor_exe = common::sensor_exe_path();
+    assert!(
+        sensor_exe.exists(),
+        "published rdpilot-sensor.exe not found at {sensor_exe:?} — publish it first \
+         (`dotnet publish -r win-x64 -p:PublishAot=true --self-contained` on a Windows host \
+         with the .NET 8 SDK)"
+    );
+    let cfg = cfg.sensor_binary_path(sensor_exe);
+
+    block_on(async {
+        let session = rdpilot::Session::connect(&cfg)
+            .await
+            .expect("connect (RDPDR channel registers when sensor_binary_path is set)");
+        session
+            .deploy_and_launch()
+            .await
+            .expect("deploy_and_launch: sensor must be answering before window/process requests");
+
+        let pid = session
+            .launch_process("notepad.exe", None, None)
+            .await
+            .expect("launch_process(notepad.exe) should return a PID (SC#4)");
+        settle().await;
+
+        let processes = session
+            .get_process_tree()
+            .await
+            .expect("get_process_tree (follow-up, SC#4 confirmation) should round-trip successfully");
+        let launched = processes.iter().find(|p: &&ProcessInfo| p.pid == pid).unwrap_or_else(|| {
+            panic!(
+                "launched pid {pid} not found in the follow-up process tree — \
+                 processes seen: {processes:?}"
+            )
+        });
+        assert!(
+            launched.name.to_ascii_lowercase().contains("notepad"),
+            "expected the launched process's name to look like notepad.exe, got {:?}",
+            launched.name
+        );
+
+        session.close().await.expect("close");
+    });
 }
