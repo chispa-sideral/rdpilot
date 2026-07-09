@@ -111,6 +111,36 @@ pub fn load_config() -> Option<ConnectionConfig> {
     Some(cfg)
 }
 
+/// Name of the env var that overrides the default published sensor exe
+/// location for [`sensor_exe_path`] — lets a live-gate run point at a
+/// different publish output without editing test code.
+pub const SENSOR_EXE_ENV: &str = "RDPILOT_SENSOR_EXE";
+
+/// Locate the published NativeAOT `rdpilot-sensor.exe` (Plan 01 Task 3),
+/// honoring [`SENSOR_EXE_ENV`] if set, otherwise defaulting to the standard
+/// `dotnet publish -r win-x64` output path relative to the workspace root —
+/// the same default `deploy-winrm.ps1`'s `-SensorExe` param uses.
+///
+/// Returns the candidate path regardless of whether it exists; callers
+/// (`sensor_rdpdr_deploy_and_ping_within_1s`) check existence themselves so
+/// the failure message can name the exact missing path.
+pub fn sensor_exe_path() -> PathBuf {
+    if let Some(over) = std::env::var_os(SENSOR_EXE_ENV) {
+        return PathBuf::from(over);
+    }
+    // crates/rdpilot -> crates -> <workspace root> -> sensor/bin/...
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("sensor")
+        .join("bin")
+        .join("Release")
+        .join("net8.0")
+        .join("win-x64")
+        .join("publish")
+        .join("rdpilot-sensor.exe")
+}
+
 /// Idle duration (in seconds) for the idle/keepalive tests, from
 /// [`IDLE_SECS_ENV`] or [`DEFAULT_IDLE_SECS`]. The canonical run sets `600`.
 pub fn idle_secs() -> u64 {

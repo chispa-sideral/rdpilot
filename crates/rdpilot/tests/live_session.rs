@@ -735,42 +735,97 @@ fn keyboard_combos_are_received() {
     });
 }
 
-/// SENSOR-03 SC#2/SC#3 (positive path): a ping over `RDPILOT_SENSOR` returns a
-/// pong from the throwaway responder (`tests/fixtures/sensor-responder.ps1`,
-/// deployed via `tests/fixtures/deploy-responder.ps1`, D-4.1/D-4.5) within
-/// 500ms. A successful `Session::ping()` is only reachable after the Version
-/// handshake has already completed (`Session::ping()`'s handshake fast-fail,
-/// SC#3), so this single assertion proves both criteria's positive path at
-/// once.
+/// SENSOR-02 SC#2 (MANDATORY, D-5.6) + SC#4: the RDPDR PRIMARY path deploys
+/// the REAL `rdpilot-sensor.exe` in-band via drive-redirection copy and
+/// launches it inside the RDP session with an injected Win+R command
+/// (`Session::deploy_and_launch`, D-5.1/D-5.2 — poll-and-retry, no WinRM
+/// involved at all). Supersedes Phase 4's throwaway
+/// `sensor_ping_pong_under_500ms` (D-5.7; `sensor-responder.ps1` +
+/// `deploy-responder.ps1` are deleted).
 ///
-/// The responder needs a moment to launch inside the interactive RDP session
-/// and open the DVC channel (the server-side ERROR_GEN_FAILURE/0x31 timing
-/// race the responder itself retries around); a bounded retry loop here
-/// tolerates the transient `Error::Dvc` while that settles and stops at the
-/// first `Ok(elapsed)`. If the responder is not running in the interactive
-/// session (Session > 0, not WinRM's Session 0 — the live-verify risk flagged
-/// in Plan 03), every attempt times out and the retry budget elapses with the
-/// last `Error::Dvc` surfaced as the failure (naming exactly this risk).
+/// `deploy_and_launch`'s returned elapsed IS the SC4 measurement: the first
+/// successful ping/pong after a SUCCESSFUL launch (not from the first
+/// keystroke attempt, D-5.2) — must be under 1 second.
+///
+/// RDPDR success here is MANDATORY, not conditionally waivable (D-5.6): the
+/// lab VM is configured to allow drive-redirection, and there is no
+/// "conditional pass" that lets the WinRM fallback substitute for this path.
+/// A failure here should be diagnosed as a drive-redirection Group Policy
+/// block on the target (Computer Configuration > Administrative Templates >
+/// Windows Components > Remote Desktop Services > Remote Desktop Session Host
+/// > Device and Resource Redirection) before anything else.
 #[test]
-#[ignore = "live: requires a provisioned RDP target + deployed sensor-responder.ps1 (RDPILOT_LIVE=1)"]
-fn sensor_ping_pong_under_500ms() {
-    let Some(cfg) = require_target!("sensor_ping_pong_under_500ms") else {
+#[ignore = "live: requires a provisioned RDP target + published rdpilot-sensor.exe (RDPILOT_LIVE=1)"]
+fn sensor_rdpdr_deploy_and_ping_within_1s() {
+    let Some(cfg) = require_target!("sensor_rdpdr_deploy_and_ping_within_1s") else {
+        return;
+    };
+    let sensor_exe = common::sensor_exe_path();
+    assert!(
+        sensor_exe.exists(),
+        "published rdpilot-sensor.exe not found at {sensor_exe:?} — publish it first \
+         (Plan 01 Task 3: `dotnet publish -r win-x64 -p:PublishAot=true --self-contained` \
+         on a Windows host with the .NET 8 SDK)"
+    );
+    let cfg = cfg.sensor_binary_path(sensor_exe);
+
+    block_on(async {
+        // Setting `sensor_binary_path` makes `connect` register the RDPDR
+        // static channel automatically (connect.rs, Plan 03 Task 1) — no
+        // separate opt-in call needed here.
+        let session = rdpilot::Session::connect(&cfg)
+            .await
+            .expect("connect (RDPDR channel registers when sensor_binary_path is set)");
+
+        let elapsed = session.deploy_and_launch().await.unwrap_or_else(|e| {
+            panic!(
+                "deploy_and_launch failed on the RDPDR primary path (SC2 mandatory, D-5.6) — \
+                 check whether drive-redirection is blocked by Group Policy on the target; \
+                 last error: {e:?}"
+            )
+        });
+
+        session.close().await.expect("close");
+
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "RDPDR deploy+launch -> first pong took {elapsed:?}, expected < 1s (SC4)"
+        );
+        // Surfaced for the end-of-phase human-check record (SC4 measurement).
+        println!("sensor_rdpdr_deploy_and_ping_within_1s: measured elapsed = {elapsed:?}");
+    });
+}
+
+/// SENSOR-02 SC#3 + SC#4: the WinRM FALLBACK path proves the REAL
+/// `rdpilot-sensor.exe`, deployed and armed by
+/// `tests/fixtures/deploy-winrm.ps1` (an AtLogOn Interactive-principal
+/// Scheduled Task — the same proven Phase 4 mechanism, adapted for the real
+/// exe), answers ping/pong within 1 second of having been launched.
+/// Supersedes Phase 4's throwaway `sensor_ping_pong_under_500ms` (D-5.7).
+///
+/// This test does NOT drive WinRM itself (no pwsh/WSMan reachable from the
+/// Linux authoring sandbox) — deploying is a human/host step run BEFORE this
+/// test, mirroring Phase 4's `deploy-responder.ps1` convention:
+///
+/// ```text
+/// pwsh crates/rdpilot/tests/fixtures/deploy-winrm.ps1
+/// RDPILOT_LIVE=1 cargo test -p rdpilot sensor_winrm_deploy_and_ping_within_1s -- --ignored --test-threads=1
+/// pwsh crates/rdpilot/tests/fixtures/deploy-winrm.ps1 -Remove
+/// ```
+///
+/// The 60s outer retry budget absorbs the AtLogOn scheduled-task's own
+/// ~20-30s launch latency (RESEARCH Pitfall 5, 04-03-SUMMARY.md) — the SC4
+/// "< 1s" bound is the elapsed of the FIRST successful `ping()`, measured
+/// separately from that one-time setup wait the retries absorb.
+#[test]
+#[ignore = "live: requires a provisioned RDP target + deployed rdpilot-sensor.exe via deploy-winrm.ps1 (RDPILOT_LIVE=1)"]
+fn sensor_winrm_deploy_and_ping_within_1s() {
+    let Some(cfg) = require_target!("sensor_winrm_deploy_and_ping_within_1s") else {
         return;
     };
     block_on(async {
         let session = rdpilot::Session::connect(&cfg).await.expect("connect");
 
-        // Bounded retry loop: tolerates the responder still launching / still
-        // opening the server-side DVC channel. Live-measured against the
-        // Phase 1 Azure VM: the WinRM-registered AtLogOn scheduled task takes
-        // ~20-30s from interactive-session creation to actually launching the
-        // responder (Task Scheduler's own logon-trigger latency, separate
-        // from the responder's own documented up-to-10s WTSVirtualChannelOpenEx
-        // retry loop, RESEARCH Pitfall 1) — so the budget was widened from an
-        // initial 15s (empirically insufficient) to 60s total, short sleeps
-        // between attempts; stop at the first Ok(elapsed) — that elapsed is
-        // the actual round-trip bound (SC#2), measured separately from the
-        // one-time setup latency the retries absorb.
         const RETRY_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
         const RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
         let deadline = std::time::Instant::now() + RETRY_BUDGET;
@@ -794,19 +849,19 @@ fn sensor_ping_pong_under_500ms() {
 
         let elapsed = result.unwrap_or_else(|| {
             panic!(
-                "no successful ping within {RETRY_BUDGET:?} — responder not answering on \
-                 RDPILOT_SENSOR (is sensor-responder.ps1 running in the INTERACTIVE RDP \
-                 session, not WinRM's Session 0? run deploy-responder.ps1 first; last error: \
-                 {last_err:?})"
+                "no successful ping within {RETRY_BUDGET:?} — sensor not answering on \
+                 RDPILOT_SENSOR (was `pwsh crates/rdpilot/tests/fixtures/deploy-winrm.ps1` run \
+                 first? is rdpilot-sensor.exe running in the INTERACTIVE RDP session, not \
+                 WinRM's Session 0? last error: {last_err:?})"
             )
         });
 
         assert!(
-            elapsed < std::time::Duration::from_millis(500),
-            "ping/pong round trip took {elapsed:?}, expected < 500ms (SC#2)"
+            elapsed < std::time::Duration::from_secs(1),
+            "WinRM-deployed ping/pong round trip took {elapsed:?}, expected < 1s (SC3 + SC4)"
         );
-        // Surfaced for the end-of-phase human-check record (SC#2 measurement).
-        println!("sensor_ping_pong_under_500ms: measured round trip = {elapsed:?}");
+        // Surfaced for the end-of-phase human-check record (SC3/SC4 measurement).
+        println!("sensor_winrm_deploy_and_ping_within_1s: measured round trip = {elapsed:?}");
     });
 }
 
