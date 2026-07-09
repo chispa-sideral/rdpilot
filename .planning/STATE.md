@@ -2,15 +2,15 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-status: verifying
-stopped_at: Phase 8 public-sdk-api-worldstate PLANNED — 3 plans across 3 waves (Wave 1 lint gates + Serialize; Wave 2 WorldState + world_state(); Wave 3 live gate SC#2). Ready to execute.
-last_updated: "2026-07-09T23:30:00.000Z"
-last_activity: "2026-07-09 -- 07-05 end-of-phase live gate COMPLETE — checkpoint APPROVED by coordinator. All four Phase 7 success criteria PASS live against a real disposable Azure VM (SC#1 field-complete UiaElement[], SC#2 bbox pixel-space alignment, SC#3 measured 30.36ms — no CreateCacheRequest needed, SC#4 lossless serde round trip), VM torn down. PERC-03 marked complete in REQUIREMENTS.md. Next: plan Phase 8 — Public SDK API + WorldState."
+status: completed
+stopped_at: Phase 8 Wave 1 (08-01) COMPLETE — strict lint gates + owned-type Serialize derives shipped. 08-02 (WorldState + world_state()) unblocked.
+last_updated: "2026-07-09T21:31:19.356Z"
+last_activity: "2026-07-09 -- 08-01 (Wave 1) COMPLETE: lib.rs strict lint gates (API-01/SC#4 compiler-enforced) + Serialize derives on all five owned SDK types (Rect, dims-only Screenshot, WindowInfo, WindowState-lowercase, ProcessInfo, UiaElement). cargo clippy -p rdpilot --lib exits 0; cargo test -p rdpilot --lib passes 94/94. See 08-01-SUMMARY.md."
 progress:
   total_phases: 9
   completed_phases: 7
   total_plans: 31
-  completed_plans: 28
+  completed_plans: 29
   percent: 78
 ---
 
@@ -21,18 +21,18 @@ progress:
 See: .planning/PROJECT.md (updated 2026-06-04)
 
 **Core value:** A local AI agent can connect to a remote Windows desktop over RDP and read/inspect a program that is only reachable via RDP — using both screenshots and structured accessibility data, without installing or running the agent itself on the remote machine.
-**Current focus:** Phase 8 — public-sdk-api-worldstate (Phase 7 CLOSED OUT)
+**Current focus:** Phase 8 — public-sdk-api-worldstate (Wave 1 complete, Wave 2 next)
 
 ## Current Position
 
-Phase: 7 (uia-tree-module) — COMPLETE
-Plan: 5 of 5
-Status: Phase complete — live gate PASSED, ready for verification
-Last activity: 2026-07-09 -- 07-05 end-of-phase live gate COMPLETE — checkpoint APPROVED by coordinator. All four Phase 7 success criteria PASS live against a real disposable Azure VM (SC#1 field-complete UiaElement[], SC#2 bbox pixel-space alignment, SC#3 measured 30.36ms — no CreateCacheRequest needed, SC#4 lossless serde round trip), VM torn down. PERC-03 marked complete in REQUIREMENTS.md. Next: plan Phase 8 — Public SDK API + WorldState.
+Phase: 8 (public-sdk-api-worldstate) — IN PROGRESS
+Plan: 1 of 3 (Wave 1 complete)
+Status: 08-01 complete — 08-02 (WorldState + world_state()) unblocked
+Last activity: 2026-07-09 -- 08-01 (Wave 1) COMPLETE: lib.rs strict lint gates (API-01/SC#4 compiler-enforced) + Serialize derives on all five owned SDK types (Rect, dims-only Screenshot, WindowInfo, WindowState-lowercase, ProcessInfo, UiaElement). cargo clippy -p rdpilot --lib exits 0; cargo test -p rdpilot --lib passes 94/94. See 08-01-SUMMARY.md.
 
 Note: Phase 3 remains `status: verifying` (pending /gsd-verify-work) in the frontmatter above; Phase 4/5/6/7 planning/execution began before that gate ran.
 
-Progress: [████████░░] 78% (Phase 7: 5/5 plans complete, live gate PASSED — see 07-05-SUMMARY.md)
+Progress: [█████████░] 94% (Phase 8: 1/3 plans complete — see 08-01-SUMMARY.md)
 
 ## Performance Metrics
 
@@ -78,6 +78,7 @@ Progress: [████████░░] 78% (Phase 7: 5/5 plans complete, liv
 | Phase 07 P03 | ~1h50min | 1 tasks | 2 files |
 | Phase 07-uia-tree-module P04 | 25min | 2 tasks | 4 files |
 | Phase 07-uia-tree-module P05 | ~40min | 2 tasks | 1 files |
+| Phase 08 P01 | ~5min | 2 tasks | 3 files |
 
 ## Accumulated Context
 
@@ -140,6 +141,8 @@ Recent decisions affecting current work:
 - [Phase ?]: 07-02: Marshal.SafeArrayGetLBound/GetUBound/GetElement/SafeArrayDestroy do not exist in .NET Core/.NET 8 (Framework-only) -- hand-rolled the equivalent oleaut32.dll SAFEARRAY exports via LibraryImport instead.
 - [Phase ?]: 07-04: Reused WindowRect for the UiaElementRecord bbox field rather than declaring a new UiaBboxRecord -- same namespace, same x/y/w/h shape, already JSON-registered.
 - [Phase ?]: Phase 7 live gate (2026-07-09, PASSED): all four Phase 7 SC validated live against a real disposable Azure VM and a launched Notepad window. SC#1 field-complete UiaElement[] confirmed; SC#2 bbox coordinates confirmed in the same physical virtual-desktop pixel space as get_window_list (desktop_size bounds containment); SC#3 TreeScope_Children walk measured 30.36ms, >16x under the 500ms budget -- D-7.7's CreateCacheRequest bulk-cache optimization correctly never triggered, naive uncached per-property reads (07-04) are sufficient; SC#4 live serde_json round trip lossless. Sensor AOT-published win-x64 ON the VM via az vm run-command invoke (WinRM still unavailable from this host), SHA256 fa5d3e3c8d45c351e0d577cf654c6c524c8ecab9e4203917ef6637c053ce6e16 verified byte-identical between VM build and locally-relayed copy. One transient first-RDP-login deploy_and_launch timeout (the fresh-VM network-discoverable dialog condition first diagnosed in 07-03) recurred and self-resolved on a single retry, confirming it as a reproducible VM-provisioning-time artifact, not a code defect -- no code change made. VM torn down and confirmed absent (az group exists -n rdpilot-test => false; rdpilot-mgmt persists). PERC-03 genuinely retired.
+- [Phase ?]: 08-01: lib.rs inner #![deny(unsafe_code)]/clippy::unwrap_used/clippy::expect_used gates make API-01/SC#4 compiler-enforced (never a Cargo.toml [lints] table, which would break tests/live_session.rs's 116 legitimate .expect() calls)
+- [Phase ?]: 08-01: Screenshot derives Serialize only (no Deserialize) with #[serde(skip)] on rgba — dims-only JSON output (D-8.4, threat T-08-02); to_png() remains the sole byte-egress path
 
 ### Pending Todos
 
@@ -166,6 +169,6 @@ Phase 2 Plan 02: pre-existing rustdoc intra-doc-link warnings in config.rs (Wave
 
 ## Session Continuity
 
-Last session: 2026-07-09T21:06:41.669Z
+Last session: 2026-07-09T21:31:19.348Z
 Stopped at: Phase 8 context gathered
 Resume file: .planning/phases/08-public-sdk-api-worldstate/08-CONTEXT.md
