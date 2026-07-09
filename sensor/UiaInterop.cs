@@ -98,12 +98,32 @@ internal partial interface IUIAutomationElementArray
 /// slot this phase's field set needs) -- 9 are real (D-7.1's field set +
 /// the tree-walk/identity plumbing), 32 are never-invoked placeholders
 /// required only to keep every real slot's vtable offset correct
-/// (Pitfall 1). `StringMarshalling = StringMarshalling.Utf16` is set at the
-/// interface level as the first-attempt `BSTR` marshalling strategy for
-/// `CurrentName` (RESEARCH Pitfall 3 / Assumption A2) -- COM strings are
-/// `BSTR` by convention; this is validated empirically at the 07-03 gate,
-/// not assumed correct here.
-[GeneratedComInterface(StringMarshalling = StringMarshalling.Utf16)]
+/// (Pitfall 1).
+///
+/// LIVE-DIAGNOSED BUG FIX (07-03 risk gate, RESEARCH Assumption A2): the
+/// first-attempt `StringMarshalling = StringMarshalling.Utf16` interface-
+/// level strategy for `CurrentName`'s `BSTR` return -- declaring the member
+/// as a plain C# `string GetCurrentName()` -- crashed the live win-x64 AOT
+/// binary with `STATUS_HEAP_CORRUPTION` (0xC0000374, faulting in
+/// `ntdll.dll`) the instant `GetCurrentName()` was called (confirmed via
+/// per-step `--smoke-test-uia` tracing: `ReadRuntimeId` and everything
+/// before it succeeded cleanly; the crash landed exactly here). Root cause:
+/// a COM `BSTR` is allocated by the OLE Automation allocator
+/// (`SysAllocString`) and MUST be freed with `SysFreeString` -- but
+/// `StringMarshalling.Utf16`'s implicit marshaller treats the returned
+/// pointer as a plain null-terminated `LPWSTR` and frees it with
+/// `CoTaskMemFree` instead, corrupting the OLE Automation heap the moment
+/// the mismatched allocator/deallocator pair collide. Fixed per RESEARCH's
+/// own documented fallback: declare the slot as `[PreserveSig]` returning
+/// the raw HRESULT plus an `out nint` to the raw `BSTR` pointer (identical
+/// shape to `GetRuntimeId`'s SAFEARRAY fallback below), then decode via
+/// `Marshal.PtrToStringBSTR` and free via `Marshal.FreeBSTR` in the managed
+/// caller (<see cref="UiaInterop.ReadName"/>) -- both of which ARE present
+/// on .NET 8's `Marshal` (unlike the `SafeArrayGet*` family removed in
+/// .NET Core), so no hand-rolled P/Invoke is needed here. The interface-
+/// level `StringMarshalling` attribute is removed entirely: this was its
+/// only consumer.
+[GeneratedComInterface]
 [Guid("d22108aa-8ac5-49a5-837b-37bbb3d7591e")]
 internal partial interface IUIAutomationElement
 {
@@ -165,9 +185,12 @@ internal partial interface IUIAutomationElement
     void _reserved20();
 
     /// Slot 21 (REAL): `CurrentName` (propget, native `BSTR`). Feeds `name`.
-    /// See the interface-level `StringMarshalling.Utf16` doc comment above
-    /// for the marshalling strategy/risk.
-    string GetCurrentName();
+    /// See the interface doc comment above for the marshalling
+    /// strategy/live-diagnosed fix -- `[PreserveSig]` + raw `out nint` BSTR
+    /// pointer, decoded manually by <see cref="UiaInterop.ReadName"/>
+    /// (RESEARCH Assumption A2 fallback).
+    [PreserveSig]
+    int GetCurrentName(out nint name);
 
     // Slots 22-23: CurrentAcceleratorKey, CurrentAccessKey -- placeholders,
     // never called.
@@ -384,6 +407,44 @@ internal static partial class UiaInterop
         finally
         {
             SafeArrayDestroy(psa);
+        }
+    }
+
+    /// Manual `BSTR` decode for `IUIAutomationElement.GetCurrentName`
+    /// (RESEARCH Assumption A2 -- live-diagnosed fallback, see the
+    /// interface doc comment on <see cref="IUIAutomationElement.GetCurrentName"/>).
+    /// `Marshal.PtrToStringBSTR`/`Marshal.FreeBSTR` (unlike the
+    /// `SafeArrayGet*` family) DO exist on .NET 8's `Marshal` -- both are
+    /// simple pointer-math helpers around the OLE Automation BSTR layout,
+    /// not part of the AOT-incompatible built-in COM interop system -- so
+    /// no hand-rolled P/Invoke is needed here, only the correct allocator-
+    /// matched free (`SysFreeString` under the hood, via `FreeBSTR`)
+    /// instead of the implicit marshaller's incorrect `CoTaskMemFree`.
+    /// ALWAYS frees the native `BSTR` in a `finally` block, even on the
+    /// exception path (same leak-safety discipline as
+    /// <see cref="ReadRuntimeId"/>/T-07-03).
+    internal static string ReadName(IUIAutomationElement element)
+    {
+        int hr = element.GetCurrentName(out nint bstr);
+        if (hr != 0)
+        {
+            throw new COMException("IUIAutomationElement.GetCurrentName failed", hr);
+        }
+
+        if (bstr == 0)
+        {
+            // A null BSTR is a valid empty-string result (e.g. an
+            // unnamed element) -- not an error, nothing to free.
+            return string.Empty;
+        }
+
+        try
+        {
+            return Marshal.PtrToStringBSTR(bstr);
+        }
+        finally
+        {
+            Marshal.FreeBSTR(bstr);
         }
     }
 }

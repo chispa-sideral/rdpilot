@@ -199,32 +199,74 @@ internal static class Program
     {
         try
         {
+            Step("about to GetRootAutomation()");
             IUIAutomation automation = UiaInterop.GetRootAutomation();
+            Step("GetRootAutomation() OK");
+
             nint desktop = User32Interop.GetDesktopWindow();
+            Step($"GetDesktopWindow() OK hwnd=0x{desktop:X}");
+
             IUIAutomationElement root = automation.ElementFromHandle(desktop);
+            Step("ElementFromHandle() OK");
 
             // The single riskiest call in the whole phase — isolate it
             // first (Pitfall 2 / Assumption A1).
+            Step("about to ReadRuntimeId()");
             int[] runtimeId = UiaInterop.ReadRuntimeId(root);
+            Step($"ReadRuntimeId() OK len={runtimeId.Length}");
 
-            string name = root.GetCurrentName();                         // BSTR marshalling proof (A2)
+            Step("about to ReadName()");
+            string name = UiaInterop.ReadName(root);                     // BSTR marshalling proof (A2) -- live-diagnosed fix, see UiaInterop.cs
+            Step($"ReadName() OK name='{name}'");
+
+            Step("about to GetCurrentIsEnabled()");
             bool enabled = root.GetCurrentIsEnabled();                    // BOOL marshalling proof (A3)
+            Step($"GetCurrentIsEnabled() OK enabled={enabled}");
+
+            Step("about to GetCurrentBoundingRectangle()");
             Rect32 rect = root.GetCurrentBoundingRectangle();             // struct-by-out-pointer proof
+            Step($"GetCurrentBoundingRectangle() OK rect={rect.Left},{rect.Top},{rect.Right},{rect.Bottom}");
+
+            Step("about to CreateTrueCondition()");
             IUIAutomationCondition trueCondition = automation.CreateTrueCondition();
+            Step("CreateTrueCondition() OK");
+
+            Step("about to FindAll()");
             IUIAutomationElementArray children = root.FindAll(TreeScope.Children, trueCondition);
+            Step("FindAll() OK");
+
+            Step("about to GetLength()");
             int childCount = children.GetLength();
+            Step($"GetLength() OK count={childCount}");
 
             Console.WriteLine(
                 $"[smoke-test-uia] PASS: root name='{name}' enabled={enabled} " +
                 $"rect={rect.Left},{rect.Top},{rect.Right},{rect.Bottom} " +
                 $"runtimeId.len={runtimeId.Length} children={childCount}");
+            Console.Out.Flush();
             return 0;
         }
         catch (Exception ex)
         {
             Console.Error.WriteLine($"[smoke-test-uia] FAIL: {ex}");
+            Console.Error.Flush();
             return 1;
         }
+    }
+
+    /// Diagnostic step tracer for <see cref="RunUiaAotSmokeTest"/> (D-7.5
+    /// live-gate diagnosis): writes AND immediately flushes, so that if a
+    /// later call crashes the process outright (e.g. a native access
+    /// violation/heap corruption that bypasses the managed try/catch
+    /// entirely), every step completed so far is still visible in the
+    /// redirected output file instead of being lost in an unflushed
+    /// buffered StreamWriter (.NET switches Console.Out to a buffered
+    /// StreamWriter, AutoFlush=false, whenever stdout is redirected to a
+    /// file rather than a real console).
+    private static void Step(string message)
+    {
+        Console.WriteLine($"[smoke-test-uia] step: {message}");
+        Console.Out.Flush();
     }
 
     /// Open the RDPILOT_SENSOR channel, retrying up to <see cref="OpenRetries"/>
