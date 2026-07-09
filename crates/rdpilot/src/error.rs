@@ -95,6 +95,15 @@ pub enum Error {
     /// responding sensor (no pong) within the poll-and-retry budget.
     #[error("sensor bootstrap failed: {0}")]
     Bootstrap(String),
+
+    /// The sensor understood and processed a request but rejected it as a
+    /// semantic failure (D-6.4) — e.g. `set_foreground_window` given a
+    /// closed/invalid `hwnd`, or `launch_process` given an exe that could
+    /// not start. Distinct from [`Error::Dvc`] (a transport/timeout/decode
+    /// failure): a `SensorRejected` means the round trip succeeded and the
+    /// reply's `success` field was `false`.
+    #[error("sensor rejected the request: {0}")]
+    SensorRejected(String),
 }
 
 /// Convenience alias for results returned by the `rdpilot` public API.
@@ -151,6 +160,14 @@ impl Error {
     pub(crate) fn bootstrap(msg: impl Into<String>) -> Self {
         Error::Bootstrap(msg.into())
     }
+
+    /// Construct a [`Error::SensorRejected`] from any message displayable as
+    /// a string (D-6.4) — mirrors [`Error::bootstrap`]'s role as the single
+    /// call-site-friendly constructor for its variant.
+    #[allow(dead_code)] // Consumed by Plan 02's request-issuing Session methods (interface-first).
+    pub(crate) fn sensor_rejected(msg: impl Into<String>) -> Self {
+        Error::SensorRejected(msg.into())
+    }
 }
 
 /// Ensure the error renders without leaking any internal/third-party detail
@@ -170,6 +187,7 @@ impl Error {
             Error::CoordinateOutOfBounds { .. } => "coordinate_out_of_bounds",
             Error::Dvc(_) => "dvc",
             Error::Bootstrap(_) => "bootstrap",
+            Error::SensorRejected(_) => "sensor_rejected",
         }
     }
 }
@@ -196,5 +214,19 @@ mod tests {
         let rendered = format!("{err}");
         assert!(rendered.contains("sensor bootstrap failed"));
         assert!(rendered.contains("no pong after 3 launch attempts"));
+    }
+
+    /// `Error::sensor_rejected` reports the `"sensor_rejected"` category
+    /// (D-6.4), matches `Error::SensorRejected(_)`, and its `Display`
+    /// contains the reason -- distinguishing a semantic sensor-side
+    /// rejection from a transport/timeout `Error::Dvc`.
+    #[test]
+    fn sensor_rejected_category_and_message_render() {
+        let err = Error::sensor_rejected("window closed");
+        assert_eq!(err.category(), "sensor_rejected");
+        assert!(matches!(err, Error::SensorRejected(_)));
+        let rendered = format!("{err}");
+        assert!(rendered.contains("sensor rejected the request"));
+        assert!(rendered.contains("window closed"));
     }
 }

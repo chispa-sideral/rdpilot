@@ -23,6 +23,7 @@ mod error;
 mod framebuffer;
 mod input;
 mod keepalive;
+mod perception;
 mod rdpdr_backend;
 mod rdpsnd_stub;
 mod screenshot;
@@ -33,6 +34,7 @@ mod session_loop;
 pub use config::ConnectionConfig;
 pub use error::{Error, Result};
 pub use input::{Button, Key, KeyAction, MouseAction};
+pub use perception::{ProcessInfo, WindowInfo, WindowState};
 pub use screenshot::{Rect, Screenshot};
 pub use session::Session;
 
@@ -40,4 +42,5 @@ pub use session::Session;
 // are implementation details driven by `Session`, never part of the public
 // surface. The public API is exactly: `Session`, `ConnectionConfig`,
 // `Screenshot`, `Rect`, `Error`, `Result`, `MouseAction`, `KeyAction`,
-// `Button`, `Key` (owned SDK types only, D-09).
+// `Button`, `Key`, `WindowInfo`, `WindowState`, `ProcessInfo` (owned SDK
+// types only, D-09).
