@@ -32,6 +32,7 @@ internal enum MsgType
     ProcessTree,
     SetForegroundWindow,
     LaunchProcess,
+    Uia,
 }
 
 /// The durable request/response envelope carried over `RDPILOT_SENSOR`:
