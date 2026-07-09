@@ -589,6 +589,44 @@ mod tests {
         assert!(extended);
     }
 
+    /// `Key::Win` maps to the Set-1 extended left-Windows/GUI scancode 0x5B
+    /// (05-02 RESEARCH Pitfall 3) -- required to express D-5.1's Win+R
+    /// launch sequence.
+    #[test]
+    fn win_key_maps_to_extended_0x5b() {
+        assert_eq!(scancode(Key::Win).as_u8(), (true, 0x5B));
+    }
+
+    /// `Key::Win` is a terminal key, not a modifier (`is_modifier(Win)` stays
+    /// false): a `Combo([Win, R])` presses both keys in call order and
+    /// releases in reverse order, yielding a non-empty ordered sequence --
+    /// no modifier-partition surprise (D-5.1's Win+R launch sequence).
+    #[test]
+    fn combo_win_r_yields_ordered_non_empty_sequence() {
+        let ops = key_operations(&KeyAction::Combo(vec![Key::Win, Key::R]));
+        let kinds: Vec<_> = ops.iter().map(op_kind).collect();
+        assert_eq!(
+            kinds,
+            vec!["KeyPressed", "KeyPressed", "KeyReleased", "KeyReleased"]
+        );
+        let scancodes: Vec<(bool, u8)> = ops
+            .iter()
+            .map(|op| match op {
+                Operation::KeyPressed(s) | Operation::KeyReleased(s) => s.as_u8(),
+                other => panic!("expected a key operation, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            scancodes,
+            vec![
+                scancode(Key::Win).as_u8(),
+                scancode(Key::R).as_u8(),
+                scancode(Key::R).as_u8(),
+                scancode(Key::Win).as_u8(),
+            ]
+        );
+    }
+
     // --- Task 2: mouse translation (D-3.3, D-3.7, D-3.8, Pitfall 1, Pitfall 5) ---
 
     #[test]
