@@ -258,3 +258,13 @@ Plans:
 Plans:
 
 - [ ] TBD (promote with /gsd-review-backlog when ready)
+
+### Phase 999.4: Remote Assistance / Shadowing (BACKLOG)
+
+**Goal:** We should support session shadowing (with and without control) so that an agent can offer assistance to a user in need.
+**Requirements:** TBD
+**Plans:** 0 plans
+
+Plans:
+
+- [ ] TBD (promote with /gsd-review-backlog when ready)
