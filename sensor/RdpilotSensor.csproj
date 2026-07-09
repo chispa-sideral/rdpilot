@@ -29,6 +29,16 @@
     <SelfContained>true</SelfContained>
     <InvariantGlobalization>true</InvariantGlobalization>
 
+    <!-- Required by the source-generated LibraryImport marshalling stubs for
+         the byte[]-buffer WTSVirtualChannelRead/Write P/Invoke signatures
+         (Program.cs's Wts class): the generator emits pinned-pointer
+         marshalling code that only compiles under /unsafe. Discovered live
+         at SC1 publish time (CS0227/SYSLIB1062); LibraryImport itself
+         remains the AOT-safe marshalling mechanism (T-05-02); this flag
+         only permits the generator's own emitted unsafe code, not any
+         hand-written unsafe block. -->
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+
     <!-- AOT-safety guard: fail at publish time, not silently at runtime on the
          remote target, if reflection-based JSON serialization is ever used
          instead of the source-generated EnvelopeJsonContext. -->
