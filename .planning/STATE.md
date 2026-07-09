@@ -4,8 +4,8 @@ milestone: v1.0
 milestone_name: milestone
 status: verifying
 stopped_at: Phase 7 uia-tree-module COMPLETE — live gate PASSED (all 4 SC, SC3 measured 30.36ms), VM torn down
-last_updated: "2026-07-09T20:29:25.796Z"
-last_activity: 2026-07-09 -- 07-05 end-of-phase live gate COMPLETE — checkpoint APPROVED by coordinator. All four SC PASS live (SC3 measured 30.36ms, no CreateCacheRequest needed), VM torn down. PERC-03 marked complete; Phase 7 (UIA Tree Module) CLOSED OUT. Phase 8 (Public SDK API + WorldState) cleared to proceed.
+last_updated: "2026-07-09T21:06:41.676Z"
+last_activity: "2026-07-09 -- 07-05 end-of-phase live gate COMPLETE — checkpoint APPROVED by coordinator. All four Phase 7 success criteria PASS live against a real disposable Azure VM (SC#1 field-complete UiaElement[], SC#2 bbox pixel-space alignment, SC#3 measured 30.36ms — no CreateCacheRequest needed, SC#4 lossless serde round trip), VM torn down. PERC-03 marked complete in REQUIREMENTS.md. Next: plan Phase 8 — Public SDK API + WorldState."
 progress:
   total_phases: 9
   completed_phases: 7
@@ -166,6 +166,6 @@ Phase 2 Plan 02: pre-existing rustdoc intra-doc-link warnings in config.rs (Wave
 
 ## Session Continuity
 
-Last session: 2026-07-09T20:29:25.789Z
-Stopped at: Phase 7 (UIA Tree Module) COMPLETE — live gate PASSED (SC1-SC4 all met, SC3 measured 30.36ms, no CreateCacheRequest needed); PERC-03 marked complete in REQUIREMENTS.md
-Resume file: .planning/phases/07-uia-tree-module/07-05-SUMMARY.md (next: plan Phase 8 — Public SDK API + WorldState)
+Last session: 2026-07-09T21:06:41.669Z
+Stopped at: Phase 8 context gathered
+Resume file: .planning/phases/08-public-sdk-api-worldstate/08-CONTEXT.md
