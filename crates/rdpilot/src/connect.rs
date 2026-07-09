@@ -57,6 +57,12 @@ use crate::error::{Error, Result};
 /// `connect_begin` (SC#1).
 pub(crate) const RDPILOT_SENSOR: &str = "RDPILOT_SENSOR";
 
+/// The filename the RDPDR drive backend serves the sensor exe under, and the
+/// filename [`crate::session::Session::deploy_and_launch`]'s in-band copy
+/// command references (D-5.1). Defined once here so the announced name and
+/// the launch command can never drift apart.
+pub(crate) const SENSOR_EXE_NAME: &str = "rdpilot-sensor.exe";
+
 /// The framed transport over the TLS-upgraded, type-erased async stream.
 ///
 /// The concrete stream type is boxed and erased so the rest of the SDK (the
@@ -119,10 +125,8 @@ pub(crate) async fn connect(
     // connect path is byte-for-byte the pre-Phase-5 behavior (existing tests
     // stay green).
     if let Some(sensor_path) = cfg.get_sensor_binary_path() {
-        let drive_backend = crate::rdpdr_backend::RdpilotDriveBackend::new(
-            sensor_path.to_path_buf(),
-            "rdpilot-sensor.exe",
-        );
+        let drive_backend =
+            crate::rdpdr_backend::RdpilotDriveBackend::new(sensor_path.to_path_buf(), SENSOR_EXE_NAME);
         let rdpdr = Rdpdr::new(Box::new(drive_backend), "rdpilot".to_owned())
             .with_drives(Some(vec![(0, "RDPILOT".to_owned())]));
         connector = connector.with_static_channel(rdpdr);

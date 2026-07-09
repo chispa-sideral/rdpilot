@@ -30,7 +30,7 @@ use crate::config::ConnectionConfig;
 use crate::connect;
 use crate::error::{Error, Result};
 use crate::framebuffer::SharedFrame;
-use crate::input::{KeyAction, MouseAction};
+use crate::input::{Key, KeyAction, MouseAction};
 use crate::screenshot::Screenshot;
 use crate::sensor::SensorShared;
 use crate::session_loop::{self, RdpInputEvent};
@@ -55,6 +55,42 @@ const DRAG_STEP_GAP: Duration = Duration::from_millis(15);
 /// Bound on the input/control channel. Keepalive + close are low-frequency; a
 /// small buffer is ample and bounds memory if the loop briefly lags.
 const INPUT_CHANNEL_CAPACITY: usize = 16;
+
+/// Number of Win+R launch-injection attempts [`Session::deploy_and_launch`]
+/// makes before giving up (D-5.2). Each attempt polls for a pong across
+/// [`PINGS_PER_LAUNCH_ATTEMPT`] `ping()` calls before re-injecting; three
+/// attempts gives resilience against a one-off missed keystroke/focus issue
+/// without an unbounded retry.
+const LAUNCH_ATTEMPTS: u32 = 3;
+
+/// Number of `ping()` polls attempted within a single launch attempt before
+/// [`Session::deploy_and_launch`] re-injects the launch sequence (D-5.2).
+/// Each `ping()` call is itself bounded at its own 500ms hard timeout
+/// (`Session::ping`, unchanged) — 20 polls gives ~10s per attempt, chosen to
+/// comfortably exceed the ~10s `WTSVirtualChannelOpenEx` open-retry window
+/// the sensor's own DVC-open race is expected to need (Phase 4 RESEARCH
+/// Pitfall 1 / 04-03-SUMMARY.md, carried forward to the C# sensor by D-5.7).
+/// Three attempts at ~10s each gives a ~30s total outer budget.
+const PINGS_PER_LAUNCH_ATTEMPT: u32 = 20;
+
+/// Settle delay between opening the Run dialog (Win+R) and typing the launch
+/// command, giving the remote shell time to render the dialog before
+/// keystrokes are injected (D-5.1). Applied on the caller's async context —
+/// never inside the session-loop `select!` (Pitfall 3).
+const RUN_DIALOG_SETTLE: Duration = Duration::from_millis(300);
+
+/// Build the Win+R run-command string that copies the sensor exe from the
+/// RDPDR-redirected `RDPILOT` drive to `%TEMP%` and starts it (D-5.1).
+///
+/// Pure and offline-testable (no `Session`/IO dependency). The served
+/// filename is [`crate::connect::SENSOR_EXE_NAME`] — the exact constant
+/// `connect::connect`'s RDPDR registration (Task 1) announces the drive
+/// backend under — so the announced name and this command can never drift
+/// apart.
+fn launch_command() -> String {
+    let name = crate::connect::SENSOR_EXE_NAME;
+    format!("cmd /c copy \\\\tsclient\\RDPILOT\\{name} %TEMP%\\{name} && start \"\" %TEMP%\\{name}")
+}
 
 /// A live, managed RDP session.
 ///
@@ -343,6 +379,68 @@ impl Session {
                 Err(Error::dvc("ping timed out after 500ms"))
             }
         }
+    }
+
+    /// Deploy and launch the sensor exe in-band over RDPDR + injected input
+    /// (D-5.1/D-5.2, SENSOR-02).
+    ///
+    /// Opens the Run dialog (Win+R), settles, types the copy-and-start
+    /// command referencing the RDPDR-redirected `RDPILOT` drive
+    /// ([`launch_command`]), presses Enter, then poll-retries
+    /// [`Session::ping`]. On the FIRST successful pong, returns its
+    /// round-trip elapsed — this is the SC4 measurement, taken from a
+    /// successful launch, **not** from the first keystroke (D-5.2). If no
+    /// pong arrives within a launch attempt's poll budget
+    /// ([`PINGS_PER_LAUNCH_ATTEMPT`] polls), the Win+R sequence is
+    /// re-injected, up to [`LAUNCH_ATTEMPTS`] times total, before giving up.
+    /// Runs entirely on the caller's async context (never inside the
+    /// session-loop `select!`, Pitfall 3).
+    ///
+    /// Requires the connect-time `ConnectionConfig::sensor_binary_path` to
+    /// have been set (so the RDPDR channel was registered, Task 1) —
+    /// callers that skip that configuration will simply never receive a
+    /// pong and this call exhausts its retry budget.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Bootstrap`] (T-05-08 — never hangs, never panics) if
+    /// no pong arrives after [`LAUNCH_ATTEMPTS`] re-injections, or propagates
+    /// [`Error::Session`]/[`Error::Dvc`] immediately if injecting input fails
+    /// for a reason unrelated to launch timing (input channel closed, input
+    /// lock poisoned).
+    pub async fn deploy_and_launch(&self) -> Result<Duration> {
+        for _attempt in 1..=LAUNCH_ATTEMPTS {
+            self.inject_launch_sequence().await?;
+
+            for _poll in 0..PINGS_PER_LAUNCH_ATTEMPT {
+                match self.ping().await {
+                    Ok(elapsed) => return Ok(elapsed),
+                    // A DVC timeout/transient error is expected while the
+                    // sensor process is still starting or opening its own
+                    // DVC handle (D-5.7) — keep polling within this attempt.
+                    Err(Error::Dvc(_)) => continue,
+                    // Anything else (channel closed, lock poisoned) is not a
+                    // launch-timing condition — surface it immediately.
+                    Err(other) => return Err(other),
+                }
+            }
+        }
+
+        Err(Error::bootstrap(format!(
+            "sensor did not respond after {LAUNCH_ATTEMPTS} launch attempt(s),              {PINGS_PER_LAUNCH_ATTEMPT} ping polls each — check RDPDR drive              redirection is enabled on the target, AV/EDR is not blocking the              copied exe, and the launch is reaching the correct interactive              session"
+        )))
+    }
+
+    /// Inject the Win+R launch sequence (D-5.1): open Run, settle, type the
+    /// copy-and-start command, press Enter. Applied via the same
+    /// [`Session::send_key`] path real user input uses — no separate
+    /// PDU-building code, no direct `ironrdp_input` construction here.
+    async fn inject_launch_sequence(&self) -> Result<()> {
+        self.send_key(KeyAction::Combo(vec![Key::Win, Key::R])).await?;
+        tokio::time::sleep(RUN_DIALOG_SETTLE).await;
+        self.send_key(KeyAction::Type(launch_command())).await?;
+        self.send_key(KeyAction::Combo(vec![Key::Enter])).await?;
+        Ok(())
     }
 
     /// Capture the latest full-desktop framebuffer as an owned [`Screenshot`].
@@ -764,5 +862,47 @@ mod tests {
             ),
             other => panic!("expected Err(Error::Dvc(_)) mentioning the timeout, got {other:?}"),
         }
+    }
+
+    // --- Task 2: deploy_and_launch -- launch-command helper + Error::Bootstrap (D-5.1/D-5.2) ---
+
+    /// The launch command copies the RDPDR-announced sensor exe from the
+    /// redirected `RDPILOT` drive to `%TEMP%` and starts it (D-5.1) — pure,
+    /// offline-testable, no VM.
+    #[test]
+    fn launch_command_references_redirected_drive_temp_dest_and_start() {
+        let cmd = launch_command();
+        assert!(
+            cmd.contains(r"\tsclient\RDPILOT"),
+            "must reference the RDPDR-redirected drive: {cmd}"
+        );
+        assert!(cmd.contains("%TEMP%"), "must copy to %TEMP%: {cmd}");
+        assert!(cmd.contains("start"), "must start the copied exe: {cmd}");
+        assert!(
+            cmd.contains(crate::connect::SENSOR_EXE_NAME),
+            "must reference the RDPDR-announced sensor filename (Task 1) so the two can never drift apart: {cmd}"
+        );
+    }
+
+    /// `deploy_and_launch` propagates a closed-input-channel error from the
+    /// Win+R injection step immediately, without hanging or panicking
+    /// (T-05-08) — fast (does not wait out the ping poll budget); the full
+    /// live inject-then-poll round trip is exercised in Plan 04.
+    #[tokio::test]
+    async fn deploy_and_launch_propagates_closed_channel_error_without_hanging() {
+        let (input_tx, input_rx) = mpsc::channel(1);
+        drop(input_rx); // closed channel -- send_key fails immediately, before any ping poll
+        let session = Session {
+            thread: None,
+            input_tx,
+            frame: SharedFrame::new(),
+            input_db: test_input_db(),
+            desktop_size: TEST_DESKTOP_SIZE,
+            sensor: test_sensor(),
+            next_req_id: AtomicU64::new(1),
+        };
+
+        let err = session.deploy_and_launch().await;
+        assert!(matches!(err, Err(Error::Session(_))));
     }
 }

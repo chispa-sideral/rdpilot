@@ -89,6 +89,12 @@ pub enum Error {
     /// channel (Phase 4, SENSOR-03).
     #[error("DVC transport error: {0}")]
     Dvc(String),
+
+    /// The in-band sensor deploy/launch bootstrap failed (D-5.1/D-5.2,
+    /// SENSOR-02): the injected Win+R launch sequence did not produce a
+    /// responding sensor (no pong) within the poll-and-retry budget.
+    #[error("sensor bootstrap failed: {0}")]
+    Bootstrap(String),
 }
 
 /// Convenience alias for results returned by the `rdpilot` public API.
@@ -138,6 +144,13 @@ impl Error {
     pub(crate) fn dvc(msg: impl Into<String>) -> Self {
         Error::Dvc(msg.into())
     }
+
+    /// Construct a [`Error::Bootstrap`] from any message displayable as a
+    /// string (D-5.2) — mirrors [`Error::dvc`]'s role as the single
+    /// call-site-friendly constructor for its variant.
+    pub(crate) fn bootstrap(msg: impl Into<String>) -> Self {
+        Error::Bootstrap(msg.into())
+    }
 }
 
 /// Ensure the error renders without leaking any internal/third-party detail
@@ -156,6 +169,7 @@ impl Error {
             Error::Session(_) => "session",
             Error::CoordinateOutOfBounds { .. } => "coordinate_out_of_bounds",
             Error::Dvc(_) => "dvc",
+            Error::Bootstrap(_) => "bootstrap",
         }
     }
 }
@@ -166,3 +180,21 @@ const _: fn() = || {
     fn assert_send_sync_static<T: Send + Sync + 'static>() {}
     assert_send_sync_static::<Error>();
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `Error::Bootstrap` reports the `"bootstrap"` category and renders its
+    /// message via `Display` (D-5.2) -- mirrors the existing `Error::Dvc`
+    /// coverage pattern for a new call-site-friendly variant.
+    #[test]
+    fn bootstrap_category_and_message_render() {
+        let err = Error::bootstrap("no pong after 3 launch attempts");
+        assert_eq!(err.category(), "bootstrap");
+        assert!(matches!(err, Error::Bootstrap(_)));
+        let rendered = format!("{err}");
+        assert!(rendered.contains("sensor bootstrap failed"));
+        assert!(rendered.contains("no pong after 3 launch attempts"));
+    }
+}
