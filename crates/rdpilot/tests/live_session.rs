@@ -19,7 +19,8 @@
 mod common;
 
 use rdpilot::{
-    Button, Key, KeyAction, MouseAction, ProcessInfo, Rect, Screenshot, UiaElement, WindowInfo, WindowState,
+    Button, Key, KeyAction, MouseAction, ProcessInfo, Rect, Screenshot, UiaElement, UiaMode, WindowInfo,
+    WindowState, WorldState, WorldStateOptions,
 };
 
 /// Skip helper: returns the live config or prints a skip note and returns `None`.
@@ -1488,6 +1489,158 @@ fn uia_tree_round_trips_live() {
                 e.id
             );
         }
+
+        session.close().await.expect("close");
+    });
+}
+
+/// Phase 8 SC#2 / API-02: `Session::world_state(WorldStateOptions::default())`
+/// against a real target returns the SC#2 default shape — screenshot +
+/// window list, no UIA — and records the measured `capture_span` for the
+/// record. Per D-8.2 the 500ms bound is BEST-EFFORT (as Phase 7 SC#3 reported
+/// "measured 30.36ms"): this test `eprintln!`s the measured span but does
+/// NOT `assert!` it is `< 500ms` — see `WorldState::capture_span`'s doc.
+#[test]
+#[ignore = "live: requires a provisioned RDP target + published rdpilot-sensor.exe (RDPILOT_LIVE=1)"]
+fn world_state_default_options_reports_capture_span() {
+    let Some(cfg) = require_target!("world_state_default_options_reports_capture_span") else {
+        return;
+    };
+    let sensor_exe = common::sensor_exe_path();
+    assert!(
+        sensor_exe.exists(),
+        "published rdpilot-sensor.exe not found at {sensor_exe:?} — publish it first \
+         (`dotnet publish -r win-x64 -p:PublishAot=true --self-contained` on a Windows host \
+         with the .NET 8 SDK)"
+    );
+    let cfg = cfg.sensor_binary_path(sensor_exe);
+
+    block_on(async {
+        let session = rdpilot::Session::connect(&cfg)
+            .await
+            .expect("connect (RDPDR channel registers when sensor_binary_path is set)");
+        session
+            .deploy_and_launch()
+            .await
+            .expect("deploy_and_launch: sensor must be answering before world_state requests");
+
+        // A titled app window gives get_window_list something real to
+        // report inside world_state's internal window-list fetch.
+        let _notepad = launch_notepad_and_find_window(&session).await;
+
+        let world: WorldState = session
+            .world_state(WorldStateOptions::default())
+            .await
+            .expect("world_state(default) should round-trip successfully (SC#2)");
+
+        assert!(world.screenshot.is_some(), "default options request a screenshot (SC#2 default shape)");
+        assert!(world.window_list.is_some(), "default options request a window list (SC#2 default shape)");
+        assert!(world.uia.is_none(), "default options request no UIA tree (SC#2 default shape)");
+
+        // Best-effort per D-8.2: record the measured span for the SC#2
+        // record. NEVER assert a hard `< 500ms` bound here — only that the
+        // measurement itself looks real (nonzero), catching a broken timer
+        // rather than gating on the timing figure.
+        assert!(
+            world.capture_span > std::time::Duration::ZERO,
+            "capture_span should be a real nonzero measurement"
+        );
+        eprintln!(
+            "world_state_default_options_reports_capture_span: measured capture_span = {:?} ({} ms)",
+            world.capture_span,
+            world.capture_span.as_millis()
+        );
+
+        session.close().await.expect("close");
+    });
+}
+
+/// Phase 8 SC#2 / API-02: `world_state` with `UiaMode::Foreground` exercises
+/// the Pitfall-3 internal window-list fetch AND the Foreground heuristic
+/// against a real target — the single returned `(hwnd, elements)` group must
+/// match the titled window with the minimum z_order (the same foreground
+/// heuristic `set_foreground_window_confirmed_by_followup_query` live-
+/// diagnosed in Phase 6: titled-only, since always-on-top shell chrome with
+/// no title outranks real app windows in raw z-order), and its element list
+/// must be non-empty. Also records the measured `capture_span` for the
+/// record (D-8.2 best-effort — no hard `< 500ms` assertion).
+#[test]
+#[ignore = "live: requires a provisioned RDP target + published rdpilot-sensor.exe (RDPILOT_LIVE=1)"]
+fn world_state_foreground_uia_matches_focused_window() {
+    let Some(cfg) = require_target!("world_state_foreground_uia_matches_focused_window") else {
+        return;
+    };
+    let sensor_exe = common::sensor_exe_path();
+    assert!(
+        sensor_exe.exists(),
+        "published rdpilot-sensor.exe not found at {sensor_exe:?} — publish it first \
+         (`dotnet publish -r win-x64 -p:PublishAot=true --self-contained` on a Windows host \
+         with the .NET 8 SDK)"
+    );
+    let cfg = cfg.sensor_binary_path(sensor_exe);
+
+    block_on(async {
+        let session = rdpilot::Session::connect(&cfg)
+            .await
+            .expect("connect (RDPDR channel registers when sensor_binary_path is set)");
+        session
+            .deploy_and_launch()
+            .await
+            .expect("deploy_and_launch: sensor must be answering before world_state requests");
+
+        let notepad = launch_notepad_and_find_window(&session).await;
+
+        // Independently determine the expected foreground hwnd using the
+        // same titled-min-z_order heuristic the SDK applies internally, so
+        // this assertion is not circular with world_state's own fetch.
+        let windows_before = session
+            .get_window_list()
+            .await
+            .expect("get_window_list (pre-check) should round-trip successfully");
+        fn min_titled_z_order(windows: &[WindowInfo]) -> u32 {
+            windows
+                .iter()
+                .filter(|w| !w.title.is_empty())
+                .map(|w| w.z_order)
+                .min()
+                .unwrap_or(u32::MAX)
+        }
+        let min_z = min_titled_z_order(&windows_before);
+        let expected_hwnd = windows_before
+            .iter()
+            .find(|w| w.z_order == min_z)
+            .map(|w| w.hwnd)
+            .unwrap_or_else(|| {
+                panic!("no titled window found to determine expected foreground hwnd — windows seen: {windows_before:?}")
+            });
+
+        let opts = WorldStateOptions {
+            screenshot: true,
+            window_list: true,
+            uia: UiaMode::Foreground,
+        };
+        let world: WorldState = session
+            .world_state(opts)
+            .await
+            .expect("world_state(Foreground) should round-trip successfully (SC#2)");
+
+        assert!(world.screenshot.is_some(), "screenshot was requested");
+        assert!(world.window_list.is_some(), "window_list was requested");
+        let uia = world.uia.expect("Foreground mode requests a UIA group");
+        assert_eq!(uia.len(), 1, "Foreground mode yields exactly one (hwnd, elements) group");
+        assert_eq!(
+            uia[0].0, expected_hwnd,
+            "Foreground group's hwnd should match the titled window with the minimum z_order \
+             (expected {expected_hwnd}, notepad hwnd was {}) — windows seen: {windows_before:?}",
+            notepad.hwnd
+        );
+        assert!(!uia[0].1.is_empty(), "Foreground UIA element list should be non-empty");
+
+        eprintln!(
+            "world_state_foreground_uia_matches_focused_window: measured capture_span = {:?} ({} ms)",
+            world.capture_span,
+            world.capture_span.as_millis()
+        );
 
         session.close().await.expect("close");
     });
