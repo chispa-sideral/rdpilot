@@ -155,9 +155,31 @@ fn chunk_str(s: &str, max_len: usize) -> Vec<String> {
 /// `connect::connect`'s RDPDR registration (Task 1) announces the drive
 /// backend under — so the announced name and this command can never drift
 /// apart.
+///
+/// LIVE-DIAGNOSED BUG FIX (06-05 live gate): a Windows interactive RDP
+/// session is REUSED (reconnected, not recreated) across separate client
+/// connections to the same account unless the prior session was explicitly
+/// logged off — confirmed live via `quser`/`qwinsta` showing the same
+/// session id in state `Disc` after `Session::close()`. If a prior
+/// `deploy_and_launch` call already launched a sensor process that is still
+/// running when a NEW connection calls `deploy_and_launch` again, the plain
+/// `copy` here silently fails (the destination exe is locked by the still-
+/// running process) and the chained `&&` short-circuits `start`, so NO new
+/// process ever launches — while the OLD process can no longer answer the
+/// NEW connection's dynamic virtual channel (its channel handle belongs to
+/// the prior, now-closed connection). The result is a hang that exhausts
+/// the full launch-attempt/ping-poll retry budget with no pong ever
+/// arriving. Fix: unconditionally `taskkill` any already-running instance
+/// first (`>nul 2>&1` — a "not found" exit code is expected and harmless on
+/// the very first launch in a session) and give the OS a moment to release
+/// the file handle before copying, so every call is idempotent regardless
+/// of prior launches in the same reused session.
 fn launch_command() -> String {
     let name = crate::connect::SENSOR_EXE_NAME;
-    format!("cmd /c copy \\\\tsclient\\RDPILOT\\{name} %TEMP%\\{name} && start \"\" %TEMP%\\{name}")
+    format!(
+        "cmd /c taskkill /F /IM {name} >nul 2>&1 & timeout /t 1 /nobreak >nul & \
+         copy \\\\tsclient\\RDPILOT\\{name} %TEMP%\\{name} && start \"\" %TEMP%\\{name}"
+    )
 }
 
 /// Pure crop-mapping helper behind [`Session::screenshot_window`] (D-6.1),
