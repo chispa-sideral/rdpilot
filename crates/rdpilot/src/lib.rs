@@ -23,6 +23,7 @@ mod error;
 mod framebuffer;
 mod input;
 mod keepalive;
+mod rdpdr_backend;
 mod screenshot;
 mod sensor;
 mod session;

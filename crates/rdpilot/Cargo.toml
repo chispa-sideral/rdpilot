@@ -32,6 +32,12 @@ ironrdp-tls = { version = "0.2", default-features = false, features = ["rustls"]
 ironrdp-dvc = "0.6"
 ironrdp-input = "0.6"
 ironrdp-pdu = "0.8"
+# RDPDR (drive-redirection) primary launch path (05-02, SENSOR-02, D-5.1).
+# Same Devolutions/IronRDP release train as the sibling ironrdp-* crates
+# above; the empty "-native" sibling crate is deliberately NOT added
+# (05-RESEARCH Pitfall 2: empty on the pinned x86_64-pc-windows-gnu target)
+# -- the SDK supplies its own std::fs-based backend (rdpdr_backend.rs, Task 3).
+ironrdp-rdpdr = "0.6"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }

@@ -101,6 +101,9 @@ pub enum Key {
     PageUp,
     PageDown,
     Insert,
+    /// The left Windows/GUI key (D-5.1: expresses a Win+R launch sequence).
+    /// A terminal key, not a modifier -- `is_modifier(Win)` stays false.
+    Win,
 }
 
 impl Key {
@@ -187,6 +190,9 @@ pub(crate) fn scancode(key: Key) -> Scancode {
         Key::PageUp => (true, 0x49),
         Key::PageDown => (true, 0x51),
         Key::Insert => (true, 0x52),
+        // Set-1 left Windows/GUI key: extended byte 0x5B (05-02 RESEARCH
+        // Pitfall 3; D-5.1's Win+R launch sequence).
+        Key::Win => (true, 0x5B),
     };
     Scancode::from_u8(extended, code)
 }
