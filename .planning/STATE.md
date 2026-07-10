@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: completed
-stopped_at: Phase 9 Plan 1 (09-01) COMPLETE — D-9.1 7-Zip UIA fidelity spike live-ran and human-approved. 09-02 (real assertion harness, now scoped to include a deeper UIA-walk capability) unblocked.
-last_updated: "2026-07-10T12:26:24.199Z"
-last_activity: "2026-07-10 -- 09-01 COMPLETE: D-9.1 7-Zip UIA fidelity spike live-ran against a real disposable Azure VM and was human-approved. 7-Zip stays the SC#2/SC#3 target; TreeScope_Children alone proved insufficient (5 depth-1 container elements only) so Plan 09-02 must add a scoped, caller-configurable deeper UIA-walk capability. Window predicate (class_name == "7-Zip::FM") and D-9.6 seeding form (full quoted 7zFM.exe path + quoted seed arg) confirmed. See 09-01-SUMMARY.md."
+stopped_at: Phase 9 Plan 4 (09-04) COMPLETE — terminal v1 live gate PASSED against a real disposable Azure VM (sensor AOT-rebuilt, all 4 PROOF-01 SCs proven live). PROOF-01 retired. v1.0 milestone CLOSED.
+last_updated: "2026-07-10T15:30:00.000Z"
+last_activity: "2026-07-10 -- 09-04 COMPLETE: terminal v1 live gate PASSED. Reused the existing healthy rdpilot-vm (no reprovision); mandatory sensor AOT-rebuild on the VM from current 09-02 source (SHA256 41a35f8c..., confirmed byte-identical VM-built vs relayed, confirmed different from the Phase 8 cache 7a775b99...). All four PROOF-01 SCs PASS against the real 7-Zip File Manager: SC#1 screenshot 1920x1080; SC#2 deeper UiaScope::Subtree walk found 30 named elements, latency 130.2ms after live-tuning SC2_MAX_DEPTH 4->3 (555.2ms->130.2ms, zero coverage loss, under the Phase 7 500ms budget); SC#3 navigation click + verified screenshot-diff change (after live-diagnosing and fixing a missing set_foreground_window call before the click -- Rule 1); SC#4 examples/proof_harness printed PROOF: PASS and exited 0. One documented first-RDP-login deploy_and_launch transient self-resolved on retry. VM torn down and confirmed absent. PROOF-01 retired in REQUIREMENTS.md; Phase 9 marked complete in ROADMAP.md; v1.0 milestone CLOSED. See 09-04-SUMMARY.md."
 progress:
   total_phases: 9
-  completed_phases: 8
+  completed_phases: 9
   total_plans: 35
-  completed_plans: 34
-  percent: 89
+  completed_plans: 35
+  percent: 100
 ---
 
 # Project State
@@ -21,18 +21,18 @@ progress:
 See: .planning/PROJECT.md (updated 2026-06-04)
 
 **Core value:** A local AI agent can connect to a remote Windows desktop over RDP and read/inspect a program that is only reachable via RDP — using both screenshots and structured accessibility data, without installing or running the agent itself on the remote machine.
-**Current focus:** Phase 9 — scripted-proof-harness (Plan 1 of 3 complete, Plan 2 next)
+**Current focus:** v1.0 milestone COMPLETE — all 9 phases (35/35 plans) done, PROOF-01 retired, terminal live gate PASSED 2026-07-10.
 
 ## Current Position
 
-Phase: 9 (scripted-proof-harness) — IN PROGRESS
-Plan: 3 of 3 complete
-Status: 09-01 complete (D-9.1 risk-gate spike, human-approved) — 09-02 (real assertion harness, scoped to include a deeper UIA-walk capability) unblocked
-Last activity: 2026-07-10 -- 09-01 COMPLETE: D-9.1 7-Zip UIA fidelity spike live-ran against a real disposable Azure VM and was human-approved. 7-Zip stays the SC#2/SC#3 target; TreeScope_Children alone proved insufficient (5 depth-1 container elements only) so Plan 09-02 must add a scoped, caller-configurable deeper UIA-walk capability. Window predicate (class_name == "7-Zip::FM") and D-9.6 seeding form (full quoted 7zFM.exe path + quoted seed arg) confirmed. See 09-01-SUMMARY.md.
+Phase: 9 (scripted-proof-harness) — COMPLETE
+Plan: 4 of 4 complete
+Status: v1.0 MILESTONE CLOSED. 09-04 terminal live gate PASSED (2026-07-10): all four PROOF-01 success criteria proven live against a real disposable Azure VM running a freshly AOT-rebuilt sensor and the real 7-Zip File Manager. No further Phase 9 work outstanding.
+Last activity: 2026-07-10 -- 09-04 COMPLETE: terminal v1 live gate PASSED against a real disposable Azure VM (reused, healthy). Sensor AOT-rebuilt on the VM from current 09-02 source (SHA256 41a35f8c..., confirmed different from the Phase 8 cache 7a775b99...). SC#1 screenshot 1920x1080; SC#2 deeper UiaScope::Subtree walk found 30 named elements at 130.2ms (live-tuned SC2_MAX_DEPTH 4->3, zero coverage loss, under the Phase 7 500ms budget); SC#3 navigation click + verified change (after a live-diagnosed set_foreground_window fix); SC#4 PROOF: PASS, exit code 0. VM torn down and confirmed absent. PROOF-01 retired; v1.0 milestone CLOSED. See 09-04-SUMMARY.md.
 
 Note: Phase 3 remains `status: verifying` (pending /gsd-verify-work) in the frontmatter above; Phase 4/5/6/7 planning/execution began before that gate ran.
 
-Progress: [█████████░] 89% (Phase 9: 1/3 plans complete — see 09-01-SUMMARY.md)
+Progress: [██████████] 100% (Phase 9: 4/4 plans complete — v1.0 milestone CLOSED, see 09-04-SUMMARY.md)
 
 ## Performance Metrics
 
@@ -84,6 +84,7 @@ Progress: [█████████░] 89% (Phase 9: 1/3 plans complete — 
 | Phase 09 P01 | ~70min | 2 tasks | 1 files |
 | Phase 09-scripted-proof-harness P02 | ~25min | 2 tasks | 6 files |
 | Phase 09 P03 | 55min | 3 tasks | 3 files |
+| Phase 09-scripted-proof-harness P04 | ~2h | 1 tasks | 1 files (terminal live gate; sensor rebuild + 1 live bug fix + 1 live-tune) |
 
 ## Accumulated Context
 
@@ -157,6 +158,7 @@ Recent decisions affecting current work:
 - [Phase ?]: SC2_MAX_DEPTH=4 requested for the 09-03 proof harness's UiaScope::Subtree walk (matches the 09-02-recorded sensor-side UIA_MAX_WALK_DEPTH cap); live-tune at the 09-04 gate
 - [Phase ?]: SC#2 assertion passes on any of menu item / toolbar button / listview row deeper elements present (not all three required)
 - [Phase ?]: D-9.2 navigation default: click deeper 'File' MenuItem if matched, else first matched deeper element
+- **Phase 9 terminal live gate (09-04, 2026-07-10, PASSED — v1.0 MILESTONE CLOSED):** All four PROOF-01 success criteria proven live against a real disposable Azure VM (reused from an earlier session, confirmed healthy rather than reprovisioned). Mandatory sensor AOT-rebuild on the VM from current 09-02 source (not the Phase 8 cache) via `az vm run-command invoke`, SHA256 `41a35f8cc60e0a1ab38c62b8736246518c84c0f7dc8220c25940f1ab9c313f6e`, confirmed byte-identical VM-built vs relayed and confirmed different from the Phase 8 cache hash `7a775b990cca3b40e72d4cd8ce910ebfc8e14262dd660089a4e5c62355ec34c2`. Two live-diagnosed fixes: (1) [Rule 1 bug] the SC#3 navigate step now calls `set_foreground_window` + settle before clicking a deeper element — a freshly `launch_process`'d window is not guaranteed OS foreground focus (identical root cause to Phase 6's own SC#3 diagnosis; every other live navigation test in the crate already did this, the 09-03 harness had missed it); (2) [Rule 3 live-tune] `SC2_MAX_DEPTH` tuned from 4 to 3 after measuring the deeper-walk latency at 555.2ms (over the Phase 7 SC#3 500ms budget) — re-measured at 130.2ms with zero loss of SC#2 element coverage. One documented first-RDP-login `deploy_and_launch` transient self-resolved on retry, no code change. Measured results: SC#1 screenshot 1920x1080; SC#2 30 deeper elements (menu items + toolbar buttons) matched at max_depth=3; SC#3 navigation + verified screenshot-diff change; SC#4 `examples/proof_harness` printed `PROOF: PASS` and exited 0. VM torn down and confirmed absent (`az group exists -n rdpilot-test` => false; `rdpilot-mgmt` persists). PROOF-01 retired in REQUIREMENTS.md; Phase 9 marked complete (4/4) in ROADMAP.md. See `09-04-SUMMARY.md`.
 
 ### Pending Todos
 
@@ -166,7 +168,8 @@ Recent decisions affecting current work:
 
 ### Blockers/Concerns
 
-- Phase 9 (new, from 09-01): `TreeScope_Children` alone (D-7.4) is insufficient for 7-Zip's meaningful SC#2 elements — Plan 09-02 must design and add a scoped, caller-configurable deeper UIA-walk capability before writing assertion code. Not a blocker to proceeding, but a required scope addition to track.
+None outstanding — v1.0 milestone is CLOSED as of 09-04 (2026-07-10). Phase 5 residual notes carried forward for future reference (non-blocking):
+
 - Phase 5 residual (non-blocking, carried forward): `deploy_and_launch`'s `SESSION_SETTLE` + chunked-typing fixes are empirically-tuned timing workarounds, not root-caused to a specific Windows readiness signal — may need revisiting on a differently-provisioned target
 - Phase 5 residual (non-blocking, carried forward): the `rdpsnd` stub channel is intentionally non-functional (presence-only) — correct for v1 scope but a permanent architectural addition, not a temporary hack
 
@@ -180,6 +183,10 @@ Recent decisions affecting current work:
 
 - ~~Phase 7/9: Target application UIA fidelity is unknown — identify and test before Phase 9 harness assertion design~~ — resolved: D-9.1 spike live-ran, human-approved; 7-Zip confirmed adequate (with the deeper-walk capability addition noted above), see 09-01-SUMMARY.md
 
+**Resolved during Phase 9 Plan 4 / terminal live gate (previously listed here):**
+
+- ~~Phase 9 (new, from 09-01): `TreeScope_Children` alone (D-7.4) is insufficient for 7-Zip's meaningful SC#2 elements — Plan 09-02 must design and add a scoped, caller-configurable deeper UIA-walk capability before writing assertion code.~~ — resolved: 09-02 added `UiaScope::Subtree{max_depth}`; 09-04's live gate proved it live against real 7-Zip (30 deeper elements matched, 130.2ms), see 09-04-SUMMARY.md
+
 ## Deferred Items
 
 None outstanding for Phase 1. All ENV-01/02/03 requirements satisfied.
@@ -187,6 +194,6 @@ Phase 2 Plan 02: pre-existing rustdoc intra-doc-link warnings in config.rs (Wave
 
 ## Session Continuity
 
-Last session: 2026-07-10T12:26:24.193Z
-Stopped at: Phase 9 Plan 1 (09-01) complete — D-9.1 spike human-approved, ready to plan/execute 09-02
-Resume file: .planning/phases/09-scripted-proof-harness/09-01-SUMMARY.md
+Last session: 2026-07-10T15:30:00.000Z
+Stopped at: Phase 9 Plan 4 (09-04) complete — terminal v1 live gate PASSED, PROOF-01 retired, v1.0 milestone CLOSED. No further v1 work outstanding; any next work is v2 (see REQUIREMENTS.md "v2 Requirements (Deferred)") or backlog phases (see ROADMAP.md Backlog).
+Resume file: .planning/phases/09-scripted-proof-harness/09-04-SUMMARY.md

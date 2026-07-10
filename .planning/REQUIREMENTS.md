@@ -53,7 +53,7 @@ Stack (from research): IronRDP 0.14 (Rust) client core + primary language; C# .N
 
 ### Proof
 
-- [ ] **PROOF-01**: A scripted harness proves the full read/inspect loop end-to-end on a real remote-only Windows program (connect → screenshot → read UIA tree → navigate → report findings)
+- [x] **PROOF-01**: A scripted harness proves the full read/inspect loop end-to-end on a real remote-only Windows program (connect → screenshot → read UIA tree → navigate → report findings)
 
 ## v2 Requirements (Deferred)
 
@@ -94,4 +94,4 @@ Stack (from research): IronRDP 0.14 (Rust) client core + primary language; C# .N
 | PERC-03 | Phase 7: UIA Tree Module | Complete |
 | API-01 | Phase 8: Public SDK API + WorldState | Complete |
 | API-02 | Phase 8: Public SDK API + WorldState | Complete |
-| PROOF-01 | Phase 9: Scripted Proof Harness | Pending |
+| PROOF-01 | Phase 9: Scripted Proof Harness | Complete — LIVE-VERIFIED against a real disposable Azure VM (2026-07-10): all four SCs PASS against the real 7-Zip File Manager with a freshly AOT-rebuilt sensor (SHA256 `41a35f8c...`, confirmed different from the Phase 8 cache). SC#1 screenshot 1920x1080; SC#2 deeper `UiaScope::Subtree` walk found 30 named deeper elements, latency 130.2ms (live-tuned `SC2_MAX_DEPTH` 4→3, under the 500ms budget); SC#3 navigation click + verified screenshot-diff change (after a live-diagnosed `set_foreground_window` fix); SC#4 `examples/proof_harness` printed `PROOF: PASS` and exited 0. VM torn down and confirmed absent. See `09-04-SUMMARY.md`. v1.0 milestone CLOSED. |

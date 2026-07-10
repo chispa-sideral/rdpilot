@@ -21,7 +21,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 - [x] **Phase 6: Window + Process Perception** - Retrieve window list, process tree, per-window screenshots, focus control, and remote process launch over DVC (completed 2026-07-09)
 - [x] **Phase 7: UIA Tree Module** - Add the UI Automation sensor module and return a flat UiaElement[] over DVC — all 4 success criteria proven live (canonical run: SC#3 TreeScope_Children walk measured 30.36ms, well under the 500ms bound, on a real disposable Azure VM against a launched Notepad window, 2026-07-09; PERC-03)
 - [x] **Phase 8: Public SDK API + WorldState** - Expose a clean typed Session API and a coherent WorldState snapshot correlating framebuffer, windows, and UIA (completed 2026-07-09)
-- [ ] **Phase 9: Scripted Proof Harness** - Prove the full read/inspect loop end-to-end against a real remote-only Windows program
+- [x] **Phase 9: Scripted Proof Harness** - Prove the full read/inspect loop end-to-end against a real remote-only Windows program — all 4 success criteria proven live (canonical run: sensor AOT-rebuilt on the VM (SHA256 `41a35f8c...`, confirmed ≠ Phase 8 cache), SC#2 deeper UIA walk 130.2ms after a live-tune from 555.2ms, `PROOF: PASS` exit code 0, on a real disposable Azure VM against the real 7-Zip File Manager, 2026-07-10; PROOF-01). **v1.0 milestone CLOSED.**
 
 ## Phase Details
 
@@ -233,7 +233,7 @@ Plans:
   3. The harness injects a navigation action (e.g. menu open, button click, or text entry) and verifies the result via a follow-up screenshot or UIA query
   4. The harness completes the full loop (connect → screenshot → get_windows → get_uia_tree → navigate → verify) and exits with a pass/fail report, all assertions documented
 
-**Plans**: 3/4 plans executed
+**Plans**: 4/4 plans complete; live gate PASSED (canonical run 2026-07-10)
 
 - Wave 1 (D-9.1 fidelity risk gate, spike-first):
   - [x] 09-01-PLAN.md — Throwaway live 7-Zip UIA dump spike (launch 7zFM.exe, dump get_uia_tree flat UiaElement[], record SC#2 elements + D-9.2 nav target + seeding/depth decision) + blocking human-verify; mirrors the Phase 7 D-7.5 gate
@@ -242,7 +242,7 @@ Plans:
 - Wave 3 (composition, blocked on 09-02 capability):
   - [x] 09-03-PLAN.md — Shared run_proof_harness + ProofReport (tests/support/), examples/proof_harness.rs (main -> ExitCode), gated proof_harness_end_to_end test — wired via #[path]; asserts real DEEPER 7-Zip elements via UiaScope::Subtree, exact "7-Zip::FM" predicate, D-9.6 seeding, D-9.3/D-9.4/D-9.5
 - Wave 4 (terminal v1 live gate, blocked on 09-03):
-  - [ ] 09-04-PLAN.md — End-of-phase live gate against a real disposable Azure VM: AOT-REBUILD the changed sensor ON the VM (not the Phase 8 cache), run the armed test + the example binary against real 7-Zip, prove SC#1-4, retire PROOF-01, tear down
+  - [x] 09-04-PLAN.md — End-of-phase live gate against a real disposable Azure VM: AOT-REBUILD the changed sensor ON the VM (not the Phase 8 cache), run the armed test + the example binary against real 7-Zip, prove SC#1-4, retire PROOF-01, tear down. **Live gate PASSED** (2026-07-10): sensor AOT-rebuilt on the (reused, healthy) VM, SHA256 `41a35f8cc60e0a1ab38c62b8736246518c84c0f7dc8220c25940f1ab9c313f6e`, confirmed byte-identical VM-built vs relayed and confirmed different from the Phase 8 cache (`7a775b990c...`). SC#1 screenshot 1920x1080; SC#2 deeper walk found 30 named elements, latency 130.2ms after a live-tune of `SC2_MAX_DEPTH` 4→3 (555.2ms→130.2ms, same element coverage), well under the Phase 7 500ms budget; SC#3 navigation click + verified screenshot-diff change, after a live-diagnosed fix (the navigate step now calls `set_foreground_window` before clicking — a freshly-launched window isn't guaranteed OS focus, same root cause Phase 6 SC#3 diagnosed); SC#4 `examples/proof_harness` printed `PROOF: PASS` and exited 0. One documented first-RDP-login `deploy_and_launch` transient self-resolved on retry. VM torn down and confirmed absent (`rdpilot-test` RG deleted; `rdpilot-mgmt` persists). PROOF-01 retired. See `09-04-SUMMARY.md`.
 
 ## Progress
 
@@ -259,7 +259,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8 →
 | 6. Window + Process Perception | 5/5 | Complete   | 2026-07-09 |
 | 7. UIA Tree Module | 5/5 | Complete   | 2026-07-09 |
 | 8. Public SDK API + WorldState | 3/3 | Complete   | 2026-07-09 |
-| 9. Scripted Proof Harness | 3/4 | In Progress|  |
+| 9. Scripted Proof Harness | 4/4 | Complete | 2026-07-10 |
 
 ## Backlog
 
