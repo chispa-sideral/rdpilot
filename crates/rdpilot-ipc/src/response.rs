@@ -12,6 +12,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::error::WireError;
+use crate::session_id::SessionId;
 use crate::transfer::TransferOutcome;
 
 /// The D-30 session lifecycle vocabulary, derived from the SDK keepalive
@@ -27,6 +28,11 @@ pub enum SessionLifecycle {
     Reconnecting,
     /// The session is no longer active.
     Disconnected,
+    /// A possibly-still-live remote Windows session left behind by a
+    /// crashed/restarted daemon (DAEMON-04, research Pitfall 9). Surfaced
+    /// distinctly, never silently forgotten or auto-torn-down — the daemon
+    /// requires an explicit reclaim/teardown of an `Orphaned` entry.
+    Orphaned,
 }
 
 /// A credential-free summary of one daemon-managed session (D-30/D-31).
@@ -54,6 +60,13 @@ pub struct SessionStatus {
 pub enum WireResponse {
     /// A generic success acknowledgement (`Ping`/`SetForeground`).
     Ack,
+    /// A successful `Connect` (D-29): carries the (possibly
+    /// auto-generated) [`SessionId`] the client should target in every
+    /// subsequent session-scoped request.
+    Connected {
+        /// The newly opened session's id.
+        session: SessionId,
+    },
     /// A launched process's id (`LaunchProcess`).
     Pid {
         /// The new process id.
@@ -79,6 +92,8 @@ pub enum WireResponse {
 
 #[cfg(test)]
 mod tests {
+    use std::str::FromStr;
+
     use super::*;
     use crate::error::WireErrorCode;
 
@@ -95,6 +110,9 @@ mod tests {
     fn sample_all_response_variants() -> Vec<WireResponse> {
         let samples = vec![
             WireResponse::Ack,
+            WireResponse::Connected {
+                session: SessionId::from_str("brave-otter").unwrap_or_else(|_| unreachable!()),
+            },
             WireResponse::Pid { pid: 4242 },
             WireResponse::Screenshot {
                 png_base64: "cGxhY2Vob2xkZXI=".to_owned(),
@@ -122,6 +140,7 @@ mod tests {
         for sample in &samples {
             match sample {
                 WireResponse::Ack
+                | WireResponse::Connected { .. }
                 | WireResponse::Pid { .. }
                 | WireResponse::Screenshot { .. }
                 | WireResponse::Transfer(_)
@@ -167,6 +186,7 @@ mod tests {
             (SessionLifecycle::Live, "\"Live\""),
             (SessionLifecycle::Reconnecting, "\"Reconnecting\""),
             (SessionLifecycle::Disconnected, "\"Disconnected\""),
+            (SessionLifecycle::Orphaned, "\"Orphaned\""),
         ];
         for (status, expected) in cases {
             let json = serde_json::to_string(&status)?;
