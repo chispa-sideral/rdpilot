@@ -192,6 +192,16 @@ None outstanding — v1.0 milestone is CLOSED as of 09-04 (2026-07-10). Phase 5 
 None outstanding for Phase 1. All ENV-01/02/03 requirements satisfied.
 Phase 2 Plan 02: pre-existing rustdoc intra-doc-link warnings in config.rs (Wave 1) logged in `.planning/phases/02-rdp-session-framebuffer-core/deferred-items.md` — out of scope, cargo doc still exits 0.
 
+### v1.0 Milestone Close — Acknowledged & Deferred (2026-07-10)
+
+Pre-close artifact audit surfaced 3 open items. Reviewed and explicitly acknowledged as non-blocking for v1.0 close (see MILESTONES.md):
+
+| Category | Item | Status |
+|----------|------|--------|
+| CONTEXT open questions | Phase 04 (04-CONTEXT.md): 3 open design questions — reply-channel design for `Session::ping()`, version-handshake wire format specifics, how the throwaway responder opens the server-side DVC channel | Non-blocking — DVC transport was live-proven in Phase 4 (165ms round trip); questions are implementation-detail notes, not unresolved capability gaps |
+| Verification gap | Phase 08 (08-VERIFICATION.md): marked `[human_needed]` | Non-blocking — API-01/API-02 are Complete and the Phase 8 live gate passed |
+| Unimplemented seed | SEED-001: "RDP view-only / session shadowing" | Out of v1 scope — already captured as Backlog Phase 999.4 (Remote Assistance / Shadowing) |
+
 ## Session Continuity
 
 Last session: 2026-07-10T15:30:00.000Z
