@@ -1,8 +1,9 @@
 // UiaTree DTOs for the RDPILOT_SENSOR wire protocol (PERC-03, 07-04-PLAN.md
-// Task 1). Wire schema is authoritatively defined by 07-01's Rust-side
-// `UiaElementWire` (crates/rdpilot/src/perception.rs) -- the JSON keys below
-// MUST match it EXACTLY (snake_case via [JsonPropertyName]):
-//   request payload:  {"hwnd": <u64>}
+// Task 1; `max_depth` added by 09-02-PLAN.md Task 2, D-9.1). Wire schema is
+// authoritatively defined by 09-02's Rust-side `Session::get_uia_tree`
+// (crates/rdpilot/src/session.rs) -- the JSON keys below MUST match it
+// EXACTLY (snake_case via [JsonPropertyName]):
+//   request payload:  {"hwnd": <u64>, "max_depth": <u32>}
 //   response payload: {"success":true,"data":[UiaElementRecord,...]} or
 //                      {"success":false,"error":"..."}
 //
@@ -23,11 +24,16 @@ using System.Text.Json.Serialization;
 
 namespace RdpilotSensor;
 
-/// The Uia request payload: `{"hwnd": <u64>}`.
+/// The Uia request payload: `{"hwnd": <u64>, "max_depth": <u32>}`
+/// (`max_depth` added by 09-02-PLAN.md Task 2, D-9.1 -- the caller-configurable
+/// deeper-walk bound; `1` is the D-7.4-default children-only walk).
 internal sealed record UiaTreeRequest
 {
     [JsonPropertyName("hwnd")]
     public required ulong Hwnd { get; init; }
+
+    [JsonPropertyName("max_depth")]
+    public required uint MaxDepth { get; init; }
 }
 
 /// One flat UIA element record (D-7.1's field set, minus `value`/`Pattern`
@@ -89,28 +95,43 @@ internal sealed record UiaTreeResponse
 
 internal static class UiaTree
 {
-    /// Builds the flat `UiaElementRecord[]` for `hwnd`'s direct children
-    /// (D-7.4): `ElementFromHandle(hwnd)` -> a single scoped
-    /// `FindAll(TreeScope.Children, trueCondition)` COM call -- NEVER a
-    /// tree-walker-style recursion. The ROOT element itself is included first
-    /// (`depth=0, parent_runtime_id=[]`) so `depth`/`parent_id` are
-    /// meaningfully populated (D-7.4's "depth ~0/1" flat-array bookkeeping),
-    /// followed by each direct child (`depth=1`, `parent_runtime_id` = the
-    /// root's RuntimeId).
+    /// Safety-cap on the deeper walk's clamped depth (D-9.1, 09-02-PLAN.md
+    /// Task 2, T-09-10): the effective walk depth is ALWAYS
+    /// `Math.Min(maxDepth, UIA_MAX_WALK_DEPTH)`, regardless of the caller's
+    /// requested `max_depth`. This protects the Phase 7 SC#3 500ms
+    /// sensor-side walk budget against a pathologically large caller-supplied
+    /// value. Conservative starting value; live-tuned at the 09-04 gate
+    /// against a real 7-Zip window if the budget is at risk.
+    private const uint UIA_MAX_WALK_DEPTH = 4;
+
+    /// Builds the flat `UiaElementRecord[]` for `hwnd`, walking BOUNDED,
+    /// LEVEL-BY-LEVEL from the root down to
+    /// `Math.Min(maxDepth, UIA_MAX_WALK_DEPTH)` levels (D-7.4's original
+    /// depth-1 default, extended by D-9.1's flagged deeper walk): each level
+    /// is its own scoped `FindAll(TreeScope.Children, trueCondition)` COM
+    /// call per parent discovered at the level above -- NEVER a single
+    /// uncapped whole-subtree walk (never `TreeScope` `.Subtree`, T-09-10). The ROOT element itself
+    /// is included first (`depth=0, parent_runtime_id=[]`), followed by each
+    /// level's children (`depth=d`, `parent_runtime_id` = that level's
+    /// parent's RuntimeId). `maxDepth` of `0` or `1` reproduces the exact
+    /// prior D-7.4 children-only behavior (root + depth-1 children, no
+    /// deeper levels walked).
     ///
     /// Never throws -- a per-element `COMException` (an element destroyed
-    /// between `FindAll` and the property read) skips ONLY that element
-    /// (D-7.6); the whole method body is wrapped in a top-level try/catch
-    /// that degrades to `Success=false` only on total failure (D-6.4),
-    /// mirroring `WindowEnumeration.BuildWindowListResponse`'s discipline
-    /// exactly. Program.cs's caller also wraps this in its own try/catch as
-    /// a second line of defense, same as every other handler in this file.
-    internal static UiaTreeResponse BuildUiaTreeResponse(ulong hwnd)
+    /// between a level's `FindAll` and the property read) skips ONLY that
+    /// element, at ANY level (D-7.6); the whole method body is wrapped in a
+    /// top-level try/catch that degrades to `Success=false` only on total
+    /// failure (D-6.4), mirroring `WindowEnumeration.BuildWindowListResponse`'s
+    /// discipline exactly. Program.cs's caller also wraps this in its own
+    /// try/catch as a second line of defense, same as every other handler in
+    /// this file.
+    internal static UiaTreeResponse BuildUiaTreeResponse(ulong hwnd, uint maxDepth)
     {
         try
         {
             IUIAutomation automation = UiaInterop.GetRootAutomation();
             IUIAutomationElement root = automation.ElementFromHandle((nint)hwnd);
+            IUIAutomationCondition trueCondition = automation.CreateTrueCondition();
 
             List<UiaElementRecord> records = [];
 
@@ -118,28 +139,64 @@ internal static class UiaTree
             int[] rootRuntimeId = UiaInterop.ReadRuntimeId(root);
             records.Add(BuildRecord(root, rootRuntimeId, depth: 0, parentRuntimeId: []));
 
-            // D-7.4: the SINGLE scoped call -- never recursive tree-walking.
-            IUIAutomationCondition trueCondition = automation.CreateTrueCondition();
-            IUIAutomationElementArray children = root.FindAll(TreeScope.Children, trueCondition);
-            int childCount = children.GetLength();
+            // T-09-10: clamp the caller-requested depth to the safety cap --
+            // regardless of what max_depth the wire request carries.
+            uint effectiveMaxDepth = Math.Min(maxDepth, UIA_MAX_WALK_DEPTH);
 
-            for (int i = 0; i < childCount; i++)
+            // Level-by-level BFS: `currentLevel` holds each (element,
+            // runtimeId) pair discovered at the PREVIOUS level (starting
+            // with just the root at depth 0). Each level performs one
+            // per-parent `FindAll(TreeScope.Children, ...)` call -- the same
+            // scoped D-7.4 primitive, reused at every depth (never a
+            // whole-subtree walk).
+            List<(IUIAutomationElement Element, int[] RuntimeId)> currentLevel = [(root, rootRuntimeId)];
+
+            for (uint depth = 1; depth <= effectiveMaxDepth && currentLevel.Count > 0; depth++)
             {
-                try
+                List<(IUIAutomationElement Element, int[] RuntimeId)> nextLevel = [];
+
+                foreach ((IUIAutomationElement parent, int[] parentRuntimeId) in currentLevel)
                 {
-                    IUIAutomationElement child = children.GetElement(i);
-                    int[] childRuntimeId = UiaInterop.ReadRuntimeId(child);
-                    records.Add(BuildRecord(child, childRuntimeId, depth: 1, parentRuntimeId: rootRuntimeId));
+                    IUIAutomationElementArray children;
+                    try
+                    {
+                        children = parent.FindAll(TreeScope.Children, trueCondition);
+                    }
+                    catch (System.Runtime.InteropServices.COMException)
+                    {
+                        // The parent itself was destroyed/unavailable between
+                        // being discovered at the level above and this
+                        // level's FindAll call -- skip its subtree, don't
+                        // fail the whole response over one stale branch
+                        // (D-7.6, same skip-and-continue discipline as the
+                        // per-element read below).
+                        continue;
+                    }
+
+                    int childCount = children.GetLength();
+                    for (int i = 0; i < childCount; i++)
+                    {
+                        try
+                        {
+                            IUIAutomationElement child = children.GetElement(i);
+                            int[] childRuntimeId = UiaInterop.ReadRuntimeId(child);
+                            records.Add(BuildRecord(child, childRuntimeId, depth, parentRuntimeId));
+                            nextLevel.Add((child, childRuntimeId));
+                        }
+                        catch (System.Runtime.InteropServices.COMException)
+                        {
+                            // Element destroyed/unavailable between FindAll
+                            // and here (e.g. UIA_E_ELEMENTNOTAVAILABLE) --
+                            // skip, don't fail the whole response over one
+                            // stale element (D-7.6, mirrors
+                            // WindowEnumeration's per-window "destroyed
+                            // between EnumWindows and here" skip pattern).
+                            continue;
+                        }
+                    }
                 }
-                catch (System.Runtime.InteropServices.COMException)
-                {
-                    // Element destroyed/unavailable between FindAll and here
-                    // (e.g. UIA_E_ELEMENTNOTAVAILABLE) -- skip, don't fail
-                    // the whole response over one stale element (D-7.6,
-                    // mirrors WindowEnumeration's per-window "destroyed
-                    // between EnumWindows and here" skip pattern).
-                    continue;
-                }
+
+                currentLevel = nextLevel;
             }
 
             return new UiaTreeResponse { Success = true, Data = [.. records], Error = null };

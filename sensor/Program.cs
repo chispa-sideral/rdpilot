@@ -515,7 +515,7 @@ internal static class Program
             UiaTreeRequest? request = payload?.Deserialize(EnvelopeJsonContext.Default.UiaTreeRequest);
             response = request is null
                 ? new UiaTreeResponse { Success = false, Data = null, Error = "missing/malformed Uia request payload" }
-                : UiaTree.BuildUiaTreeResponse(request.Hwnd);
+                : UiaTree.BuildUiaTreeResponse(request.Hwnd, request.MaxDepth);
         }
         catch (Exception ex)
         {
