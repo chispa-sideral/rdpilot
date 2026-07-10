@@ -4,13 +4,13 @@ milestone: v1.1
 milestone_name: — Consumer Surfaces & File Transfer
 status: Plan 10-01 executed — Rust-side error taxonomy, share_root config, resolve_under_root validator, generalized RdpilotDriveBackend, FILE-03 Rust adversarial suite all pass offline
 stopped_at: "v1.1 roadmap created — Phases 10-15 derived from the 27 v1.1 requirements (research-recommended dependency order: SDK file-transfer → ipc/config → daemon → CLI → MCP → proof). All 27 requirements mapped (0 unmapped); REQUIREMENTS.md traceability updated; ROADMAP.md and STATE.md reflect the new phase list."
-last_updated: "2026-07-10T17:41:51.513Z"
+last_updated: "2026-07-10T17:53:42.282Z"
 last_activity: 2026-07-10 — Plan 10-01 executed (3/3 tasks, 111/111 offline tests pass)
 progress:
   total_phases: 6
   completed_phases: 0
   total_plans: 5
-  completed_plans: 1
+  completed_plans: 2
   percent: 0
 ---
 
@@ -26,7 +26,7 @@ See: .planning/PROJECT.md (updated 2026-07-10)
 ## Current Position
 
 Phase: 10 — SDK File-Transfer Extension (in progress)
-Plan: 01 complete (of 5)
+Plan: 2 complete (of 5)
 Status: Plan 10-01 executed — Rust-side error taxonomy, share_root config, resolve_under_root validator, generalized RdpilotDriveBackend, FILE-03 Rust adversarial suite all pass offline
 Last activity: 2026-07-10 — Plan 10-01 executed (3/3 tasks, 111/111 offline tests pass)
 
@@ -93,6 +93,7 @@ Last activity: 2026-07-10 — Plan 10-01 executed (3/3 tasks, 111/111 offline te
 | Phase 09 P03 | 55min | 3 tasks | 3 files |
 | Phase 09-scripted-proof-harness P04 | ~2h | 1 tasks | 1 files (terminal live gate; sensor rebuild + 1 live bug fix + 1 live-tune) |
 | Phase 10 P01 | ~20min | 3 tasks | 5 files |
+| Phase 10 P03 | 35min | 3 tasks | 5 files |
 
 ## Accumulated Context
 
@@ -170,6 +171,9 @@ Recent decisions affecting current work:
 - [Phase ?]: 10-01: resolve_under_root deviates from 10-RESEARCH's naive trim-and-join example with an explicit host-independent looks_rooted() check (leading '/' or drive-letter prefix) -- Path::join's absolute-path-replace behavior is cfg(windows)-conditional and would not reject a Windows drive-letter string on this Linux test host without it (mutation-verified)
 - [Phase ?]: 10-01: RdpilotDriveBackend::new(sensor_path, sensor_name, share_root: Option<PathBuf>) -- share_root canonicalized fresh per resolve_under_root call, not cached at construction; connect.rs pre-creates <share_root>/.rdpilot-staging/ before constructing the backend
 - [Phase ?]: 10-01: plan frontmatter listed requirements:[FILE-01,FILE-03] but executor did NOT mark them fully Complete in REQUIREMENTS.md -- only the Rust-side foundation (validator + adversarial suite) is done; FILE-01 needs Session::upload_file + sensor trigger (later plans), FILE-03's D-10.2 BLOCKING criterion requires BOTH Rust AND C# sensor-side validators. Marked both 'In Progress' with a clarifying note instead.
+- [Phase ?]: 10-03: FileTransfer error_kind is a plain nullable string sentinel (path_traversal/io), not a typed enum, for snake_case wire symmetry with the intended Error::PathTraversal mapping
+- [Phase ?]: 10-03: Sensor-side file-transfer root is a fixed constant (%TEMP%/rdpilot-transfer-root), never caller-configurable -- Phase 13/14 CLI/MCP put/get must pass relative remote_path values only
+- [Phase ?]: 10-03: C# ValidateRemotePath adds an explicit LooksRooted() host-independent pre-check mirroring 10-01's Rust looks_rooted() fix, since Path.IsPathRooted only recognizes drive letters on an actual Windows runtime
 
 ### Pending Todos
 
@@ -215,7 +219,7 @@ Pre-close artifact audit surfaced 3 open items. Reviewed and explicitly acknowle
 
 ## Session Continuity
 
-Last session: 2026-07-10T17:41:01.370Z
+Last session: 2026-07-10T17:53:42.276Z
 Stopped at: v1.1 roadmap created — Phases 10-15 derived from the 27 v1.1 requirements (research-recommended dependency order: SDK file-transfer → ipc/config → daemon → CLI → MCP → proof). All 27 requirements mapped (0 unmapped); REQUIREMENTS.md traceability updated; ROADMAP.md and STATE.md reflect the new phase list.
 Resume file: .planning/ROADMAP.md (Phase Details, Phase 10)
 
