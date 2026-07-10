@@ -31,7 +31,9 @@
 //! Credentials and certificate material are never logged (Security V7, threat
 //! T-02-02). No `unwrap`/`expect`/`panic` in non-test code (API-01).
 
+use std::fs;
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::Arc;
 
 use ironrdp::connector::{ClientConnector, Config, ConnectionResult, Credentials, DesktopSize};
@@ -125,8 +127,28 @@ pub(crate) async fn connect(
     // connect path is byte-for-byte the pre-Phase-5 behavior (existing tests
     // stay green).
     if let Some(sensor_path) = cfg.get_sensor_binary_path() {
-        let drive_backend =
-            crate::rdpdr_backend::RdpilotDriveBackend::new(sensor_path.to_path_buf(), SENSOR_EXE_NAME);
+        // File-transfer share root (D-10.1, 10-01): pre-create the root AND
+        // its staging subdir (Plan 10-02's write path relies on the latter
+        // existing) BEFORE constructing the backend, so
+        // `resolve_under_root`'s `std::fs::canonicalize` of the root always
+        // has a real directory to resolve. `create_dir_all` creates both in
+        // one call (it creates every missing ancestor). A create failure
+        // maps to `Error::Config`, never a panic (API-01).
+        let share_root = cfg.get_share_root().map(Path::to_path_buf);
+        if let Some(root) = &share_root {
+            fs::create_dir_all(root.join(".rdpilot-staging")).map_err(|e| {
+                Error::Config(format!(
+                    "could not create share root '{}': {e}",
+                    root.display()
+                ))
+            })?;
+        }
+
+        let drive_backend = crate::rdpdr_backend::RdpilotDriveBackend::new(
+            sensor_path.to_path_buf(),
+            SENSOR_EXE_NAME,
+            share_root,
+        );
         let rdpdr = Rdpdr::new(Box::new(drive_backend), "rdpilot".to_owned())
             .with_drives(Some(vec![(0, "RDPILOT".to_owned())]));
         connector = connector.with_static_channel(rdpdr);

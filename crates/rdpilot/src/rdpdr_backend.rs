@@ -7,12 +7,15 @@
 //! and empty there, 05-RESEARCH Pitfall 2) -- this module supplies the SDK's
 //! own `std::fs`-based backend instead.
 //!
-//! [`RdpilotDriveBackend`] serves exactly ONE read-only file (the copied
-//! `rdpilot-sensor.exe`, wired up by Plan 03's launch bootstrap): the hard
-//! path allow-list in `handle_create` -- only the drive root or the one
-//! served filename resolves, any other server-supplied path is rejected with
-//! a not-found `NtStatus` and never touches `std::fs` -- IS the entire
-//! security posture of this backend (T-05-04, ASVS V4). No
+//! [`RdpilotDriveBackend`] serves the sensor exe read-only (the copied
+//! `rdpilot-sensor.exe`, wired up by Plan 03's launch bootstrap) and, when a
+//! share root is configured (D-10.1, 10-01), every path under it that
+//! resolves via [`RdpilotDriveBackend::resolve_under_root`] -- a
+//! canonicalize and component-wise ancestry check (D-10.2), never substring
+//! matching, run against every RDPDR-supplied path other than the fixed
+//! sensor exe name. Any path that fails to resolve is rejected with a
+//! not-found `NtStatus` and never touches `std::fs` -- this validator IS the
+//! entire security posture of this backend (T-05-04/T-10-01, ASVS V4). No
 //! `unwrap`/`expect`/`panic!` outside `#[cfg(test)]` (API-01): every
 //! `std::fs`/IO failure maps to an `NtStatus` response, never a panic
 //! (T-05-05).
@@ -26,7 +29,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::io::{Read as _, Seek as _, SeekFrom};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use ironrdp::core::impl_as_any;
 use ironrdp::pdu::PduResult;
@@ -47,27 +50,40 @@ use ironrdp_rdpdr::pdu::efs::{
 };
 use ironrdp_rdpdr::pdu::esc::{ScardCall, ScardIoCtlCode};
 
-/// What a previously-granted RDPDR file id refers to: the served drive root
-/// (a directory) or the one served file. `handle_read` only ever streams
-/// bytes for [`OpenEntry::File`] -- a `Read` against a root/directory handle
-/// (or an unknown handle) is rejected before any `std::fs` call (T-05-04).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// What a previously-granted RDPDR file id refers to: the drive root (a
+/// directory) or a resolved, absolute file path -- either the sensor exe
+/// (the pre-Phase-10 read-only special case) or a file under the configured
+/// share root, already validated by [`RdpilotDriveBackend::resolve_under_root`]
+/// at `Create` time (D-10.1/D-10.2). `handle_read` only ever streams bytes
+/// for [`OpenEntry::File`] -- a `Read` against a root/directory handle (or
+/// an unknown handle) is rejected before any `std::fs` call (T-05-04).
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum OpenEntry {
     Root,
-    File,
+    File(PathBuf),
 }
 
-/// A minimal, portable (`std::fs`-based) [`RdpdrBackend`] that serves
-/// exactly ONE read-only file over MS-RDPEFS (05-02, SENSOR-02).
+/// A `std::fs`-based [`RdpdrBackend`] that serves the sensor exe read-only
+/// (the pre-Phase-10 bootstrap special case) AND, when a share root is
+/// configured, an allow-listed share root generalized for bidirectional file
+/// transfer (05-02/10-01, SENSOR-02, D-10.1).
 ///
-/// Constructed once per connection (Plan 03 wires this into the connect
-/// path) with the local path of the file to serve and the name it should
-/// appear under in the redirected drive (e.g. under
-/// `\\tsclient\RDPILOT\<served_name>`).
+/// Constructed once per connection (`connect.rs`) with the local path of the
+/// sensor exe, the name it should appear under in the redirected drive
+/// (e.g. under `\\tsclient\RDPILOT\<sensor_name>`), and an optional share
+/// root. When `share_root` is `None`, every non-sensor-exe path is rejected
+/// -- the connect path is byte-for-byte the pre-Phase-10 behavior.
 #[derive(Debug)]
 pub(crate) struct RdpilotDriveBackend {
-    served_path: PathBuf,
-    served_name: String,
+    sensor_path: PathBuf,
+    sensor_name: String,
+    /// The configured share root, if any (D-10.1). Canonicalized fresh on
+    /// every [`RdpilotDriveBackend::resolve_under_root`] call rather than
+    /// cached at construction time -- cheap for a per-IRP validator, and
+    /// avoids `new()` needing to return a `Result` for a directory that may
+    /// not exist yet at construction (the caller, `connect.rs`, pre-creates
+    /// it before calling `new`, but this backend does not assume that).
+    share_root: Option<PathBuf>,
     open_files: HashMap<u32, OpenEntry>,
     next_file_id: u32,
 }
@@ -75,23 +91,89 @@ pub(crate) struct RdpilotDriveBackend {
 impl_as_any!(RdpilotDriveBackend);
 
 impl RdpilotDriveBackend {
-    /// Build a backend serving `served_path` under the name `served_name`.
-    /// `served_path` is read lazily (on each `Read` IRP) -- the file does
-    /// not need to exist yet at construction time.
-    pub(crate) fn new(served_path: PathBuf, served_name: impl Into<String>) -> Self {
+    /// Build a backend serving `sensor_path` read-only under `sensor_name`,
+    /// plus (when `share_root` is `Some`) every path under that root that
+    /// [`RdpilotDriveBackend::resolve_under_root`] accepts. `sensor_path` is
+    /// read lazily (on each `Read` IRP) -- the file does not need to exist
+    /// yet at construction time.
+    pub(crate) fn new(sensor_path: PathBuf, sensor_name: impl Into<String>, share_root: Option<PathBuf>) -> Self {
         Self {
-            served_path,
-            served_name: served_name.into(),
+            sensor_path,
+            sensor_name: sensor_name.into(),
+            share_root,
             open_files: HashMap::new(),
             next_file_id: 1,
         }
     }
 
     /// Strip the leading backslash(es) from an RDPDR wire path so the drive
-    /// root (`""`/`"\"`) and a bare filename (`"\served.bin"`) both compare
-    /// cleanly against [`RdpilotDriveBackend::served_name`].
+    /// root (`""`/`"\"`) and a bare filename (`"\sensor.exe"`) both compare
+    /// cleanly against [`RdpilotDriveBackend::sensor_name`].
     fn normalize(path: &str) -> &str {
         path.trim_start_matches('\\')
+    }
+
+    /// `true` if `normalized` would be treated as an absolute/rooted path on
+    /// EITHER Unix (leading `/`) or Windows (a drive-letter prefix, e.g.
+    /// `C:`) -- checked as our OWN host-independent string test, never via
+    /// `Path::is_absolute()`/`Path::join`'s absolute-replace semantics, which
+    /// are `cfg(windows)`-conditional and would NOT treat `"C:/Windows"` as
+    /// rooted on this offline Linux test host (a second, drive-letter-shaped
+    /// gap alongside 10-RESEARCH Pitfall 1's separator issue -- deliberately
+    /// closed here so the offline FILE-03 suite is a faithful proxy for the
+    /// real Windows target on this specific adversarial case too).
+    fn looks_rooted(normalized: &str) -> bool {
+        if normalized.starts_with('/') {
+            return true;
+        }
+        let bytes = normalized.as_bytes();
+        bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
+    }
+
+    /// Resolve an untrusted RDPDR-supplied relative path under the
+    /// configured share root, canonicalizing and ancestry-checking it before
+    /// any further `std::fs` call reaches it (D-10.2, FILE-03 BLOCKING).
+    ///
+    /// Returns `Err(())` for: no share root configured; a rooted input
+    /// (leading `/` or a drive-letter prefix, [`Self::looks_rooted`]); a
+    /// parent directory that does not exist/cannot be canonicalized under
+    /// the root (10-RESEARCH Pitfall 2 -- `std::fs::canonicalize` requires
+    /// existence, so the PARENT is canonicalized, never the full untrusted
+    /// leaf, which may not exist yet for a brand-new upload); or a
+    /// canonicalized parent that escapes the root (`Path::starts_with` is
+    /// component-aware, so this is immune to the C# `string.StartsWith`
+    /// sibling-directory prefix bug, 10-RESEARCH Pitfall 3, and is proven as
+    /// a Rust-side regression guard in Task 3's adversarial suite).
+    ///
+    /// `untrusted` MUST already have any leading RDPDR backslash stripped
+    /// (by [`Self::normalize`]) before being passed here; every remaining
+    /// `\` is normalized to `/` UNCONDITIONALLY, regardless of host OS,
+    /// BEFORE any `Path`/`PathBuf` construction (10-RESEARCH Pitfall 1) --
+    /// this is what makes a `\`-bearing adversarial test case faithful on
+    /// this Linux host, which does not otherwise treat `\` as a separator.
+    fn resolve_under_root(&self, untrusted: &str) -> std::result::Result<PathBuf, ()> {
+        let root = self.share_root.as_ref().ok_or(())?;
+        let root_canonical = fs::canonicalize(root).map_err(|_| ())?;
+
+        let normalized = untrusted.replace('\\', "/");
+        if Self::looks_rooted(&normalized) {
+            return Err(());
+        }
+
+        let candidate = root_canonical.join(&normalized);
+        // The parent, not the (possibly not-yet-existing) full candidate, is
+        // what gets canonicalized (Pitfall 2). A candidate whose last
+        // component is `..` (the trailing-`..`-no-separator adversarial
+        // case, CVE-2025-48817's off-by-one class) has NO `file_name()` --
+        // caught by the check below, not silently swallowed by `parent()`'s
+        // purely-syntactic last-component strip.
+        let parent = candidate.parent().ok_or(())?;
+        let parent_canonical = fs::canonicalize(parent).map_err(|_| ())?;
+        if !parent_canonical.starts_with(&root_canonical) {
+            return Err(());
+        }
+        let leaf = candidate.file_name().ok_or(())?;
+        Ok(parent_canonical.join(leaf))
     }
 
     /// A fresh, never-zero file id for a newly granted `Create`.
@@ -104,12 +186,13 @@ impl RdpilotDriveBackend {
         id
     }
 
-    /// [`ServerDriveIoRequest::ServerCreateDriveRequest`]: the hard path
-    /// allow-list (T-05-04) -- only the drive root or the one served
-    /// filename resolves; every other server-supplied path is rejected with
-    /// `NtStatus::NO_SUCH_FILE` (the not-found status this crate's `efs.rs`
-    /// actually defines -- RESEARCH Open Question #1) and never reaches
-    /// `std::fs`.
+    /// [`ServerDriveIoRequest::ServerCreateDriveRequest`]: the drive root
+    /// always resolves; the sensor exe name resolves to its fixed read-only
+    /// path (the pre-Phase-10 bootstrap special case, unchanged); every
+    /// other name is routed through [`Self::resolve_under_root`] (D-10.2) --
+    /// an escaping/unresolvable path is rejected with `NtStatus::NO_SUCH_FILE`
+    /// (the not-found status this crate's `efs.rs` actually defines --
+    /// RESEARCH Open Question #1) and never reaches `std::fs` (T-05-04).
     fn handle_create(&mut self, req: DeviceCreateRequest) -> PduResult<Vec<SvcMessage>> {
         let DeviceCreateRequest {
             device_io_request, path, ..
@@ -118,10 +201,10 @@ impl RdpilotDriveBackend {
 
         let entry = if normalized.is_empty() {
             Some(OpenEntry::Root)
-        } else if normalized.eq_ignore_ascii_case(&self.served_name) {
-            Some(OpenEntry::File)
+        } else if normalized.eq_ignore_ascii_case(&self.sensor_name) {
+            Some(OpenEntry::File(self.sensor_path.clone()))
         } else {
-            None
+            self.resolve_under_root(normalized).ok().map(OpenEntry::File)
         };
 
         let Some(entry) = entry else {
@@ -155,16 +238,17 @@ impl RdpilotDriveBackend {
         Ok(vec![SvcMessage::from(RdpdrPdu::DeviceCloseResponse(response))])
     }
 
-    /// [`ServerDriveIoRequest::DeviceReadRequest`]: stream bytes from
-    /// [`RdpilotDriveBackend::served_path`] via `std::fs` -- portable across
-    /// the windows-gnu target and any Linux test host (NOT
-    /// `ironrdp-rdpdr-native`). A `file_id` that was never granted a
+    /// [`ServerDriveIoRequest::DeviceReadRequest`]: stream bytes from the
+    /// per-handle resolved [`OpenEntry::File`] path via `std::fs` -- portable
+    /// across the windows-gnu target and any Linux test host (NOT
+    /// `ironrdp-rdpdr-native`). A `file_id` that was never granted an
     /// [`OpenEntry::File`] by `handle_create` (unknown id, or the root's
     /// directory handle) is rejected with `NtStatus::ACCESS_DENIED` *before*
     /// any `std::fs` call -- the access-control boundary this backend exists
     /// to enforce (T-05-04) is structural: no server-supplied string ever
     /// reaches `Read`, only a `file_id` this backend itself allocated after
-    /// validating the `Create` path.
+    /// validating (and, for share-root paths, canonicalizing/ancestry-
+    /// checking, D-10.2) the `Create` path.
     fn handle_read(&self, req: DeviceReadRequest) -> PduResult<Vec<SvcMessage>> {
         let DeviceReadRequest {
             device_io_request,
@@ -172,17 +256,17 @@ impl RdpilotDriveBackend {
             offset,
         } = req;
 
-        if !matches!(self.open_files.get(&device_io_request.file_id), Some(OpenEntry::File)) {
+        let Some(OpenEntry::File(path)) = self.open_files.get(&device_io_request.file_id) else {
             let response = DeviceReadResponse {
                 device_io_reply: DeviceIoResponse::new(device_io_request, NtStatus::ACCESS_DENIED),
                 read_data: Vec::new(),
             };
             return Ok(vec![SvcMessage::from(RdpdrPdu::DeviceReadResponse(response))]);
-        }
+        };
 
-        let (status, read_data) = match self.read_served_bytes(offset, length) {
+        let (status, read_data) = match Self::read_bytes_at(path, offset, length) {
             Ok(bytes) => (NtStatus::SUCCESS, bytes),
-            // Any IO failure (e.g. the served file having disappeared since
+            // Any IO failure (e.g. the file having disappeared since
             // Create) maps to a typed NtStatus response, never a panic
             // (API-01, T-05-05).
             Err(_io_error) => (NtStatus::UNSUCCESSFUL, Vec::new()),
@@ -195,14 +279,14 @@ impl RdpilotDriveBackend {
         Ok(vec![SvcMessage::from(RdpdrPdu::DeviceReadResponse(response))])
     }
 
-    /// Read up to `length` bytes of [`RdpilotDriveBackend::served_path`]
-    /// starting at `offset`. `Read::take` bounds the read to `length`
-    /// without ever preallocating a `length`-sized buffer up front (a
-    /// server-supplied `length` up to `u32::MAX` would otherwise be an
-    /// unbounded-allocation DoS vector, T-05-05) -- short reads near EOF
-    /// simply yield fewer bytes, never an error.
-    fn read_served_bytes(&self, offset: u64, length: u32) -> std::io::Result<Vec<u8>> {
-        let mut file = fs::File::open(&self.served_path)?;
+    /// Read up to `length` bytes of `path` starting at `offset`.
+    /// `Read::take` bounds the read to `length` without ever preallocating a
+    /// `length`-sized buffer up front (a server-supplied `length` up to
+    /// `u32::MAX` would otherwise be an unbounded-allocation DoS vector,
+    /// T-05-05) -- short reads near EOF simply yield fewer bytes, never an
+    /// error.
+    fn read_bytes_at(path: &Path, offset: u64, length: u32) -> std::io::Result<Vec<u8>> {
+        let mut file = fs::File::open(path)?;
         file.seek(SeekFrom::Start(offset))?;
         let mut buf = Vec::new();
         file.take(u64::from(length)).read_to_end(&mut buf)?;
@@ -234,18 +318,24 @@ impl RdpilotDriveBackend {
             ))]);
         }
 
-        // A `stat` failure (served file not present yet/anymore) degrades to
-        // a zero-size entry rather than a hard error -- Plan 03's launch
-        // bootstrap copies the file before enumerating it, so this is a
+        // The one entry this backend lists for ANY directory handle:
+        // the per-handle resolved `OpenEntry::File` path if the queried
+        // handle is one (share-root file or sensor exe), else the sensor
+        // exe entry (preserves pre-Phase-10 behavior byte-for-byte when the
+        // handle is the drive root or unrecognized -- true share-root
+        // directory enumeration is out of this plan's scope). A `stat`
+        // failure (file not present yet/anymore) degrades to a zero-size
+        // entry rather than a hard error -- Plan 03's launch bootstrap
+        // copies the sensor exe before enumerating it, so this is a
         // defensive fallback, not the expected path.
-        let file_size = fs::metadata(&self.served_path)
+        let (entry_path, entry_name) = match self.open_files.get(&device_io_request.file_id) {
+            Some(OpenEntry::File(path)) => (path.clone(), Self::display_name(path, &self.sensor_name)),
+            _ => (self.sensor_path.clone(), self.sensor_name.clone()),
+        };
+        let file_size = fs::metadata(&entry_path)
             .map(|meta| i64::try_from(meta.len()).unwrap_or(i64::MAX))
             .unwrap_or(0);
-        let buffer = Some(Self::directory_entry(
-            file_info_class_lvl,
-            file_size,
-            self.served_name.clone(),
-        ));
+        let buffer = Some(Self::directory_entry(file_info_class_lvl, file_size, entry_name));
 
         let response = ClientDriveQueryDirectoryResponse {
             device_io_reply: DeviceIoResponse::new(device_io_request, NtStatus::SUCCESS),
@@ -266,18 +356,19 @@ impl RdpilotDriveBackend {
     /// generic 7-variant reject list) makes the ENTIRE redirected drive
     /// unusable -- Explorer/`cmd`'s `dir`/`copy` all fail with "The device
     /// is not connected" the moment they try to stat the root they just
-    /// opened. A known/open `file_id` (root or the served file) always
-    /// succeeds; an unknown id is rejected with `NtStatus::ACCESS_DENIED`
-    /// (mirrors `handle_read`'s access-control discipline, T-05-04) with no
-    /// buffer, per this response's own doc comment ("if io_status has an
-    /// io_status besides SUCCESS, buffer can be omitted").
+    /// opened. A known/open `file_id` (root, the sensor exe, or a resolved
+    /// share-root file) always succeeds; an unknown id is rejected with
+    /// `NtStatus::ACCESS_DENIED` (mirrors `handle_read`'s access-control
+    /// discipline, T-05-04) with no buffer, per this response's own doc
+    /// comment ("if io_status has an io_status besides SUCCESS, buffer can
+    /// be omitted").
     fn handle_query_information(&self, req: ServerDriveQueryInformationRequest) -> PduResult<Vec<SvcMessage>> {
         let ServerDriveQueryInformationRequest {
             device_io_request,
             file_info_class_lvl,
         } = req;
 
-        let Some(entry) = self.open_files.get(&device_io_request.file_id).copied() else {
+        let Some(entry) = self.open_files.get(&device_io_request.file_id).cloned() else {
             let response = ClientDriveQueryInformationResponse {
                 device_io_response: DeviceIoResponse::new(device_io_request, NtStatus::ACCESS_DENIED),
                 buffer: None,
@@ -290,14 +381,13 @@ impl RdpilotDriveBackend {
         let is_dir = entry == OpenEntry::Root;
         // A `stat` failure degrades to a zero-size entry rather than a hard
         // error -- mirrors `handle_query_directory`'s defensive fallback
-        // (the served file may not exist yet/anymore); only meaningful for
+        // (the file may not exist yet/anymore); only meaningful for
         // `OpenEntry::File`, the root has no backing `std::fs` metadata.
-        let file_size = if is_dir {
-            0
-        } else {
-            fs::metadata(&self.served_path)
+        let file_size = match &entry {
+            OpenEntry::Root => 0,
+            OpenEntry::File(path) => fs::metadata(path)
                 .map(|meta| i64::try_from(meta.len()).unwrap_or(i64::MAX))
-                .unwrap_or(0)
+                .unwrap_or(0),
         };
         let attrs = if is_dir {
             FileAttributes::FILE_ATTRIBUTE_DIRECTORY
@@ -437,6 +527,17 @@ impl RdpilotDriveBackend {
         Ok(vec![SvcMessage::from(
             RdpdrPdu::ClientDriveQueryVolumeInformationResponse(response),
         )])
+    }
+
+    /// The display filename for a resolved [`OpenEntry::File`] path: its
+    /// final path component if it has one (share-root files), else
+    /// `fallback` (the sensor exe, whose display name is the fixed
+    /// `sensor_name`, not derived from its local on-disk path).
+    fn display_name(path: &Path, fallback: &str) -> String {
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .map(str::to_owned)
+            .unwrap_or_else(|| fallback.to_owned())
     }
 
     /// Build the single directory-listing entry in the shape the server
@@ -611,6 +712,7 @@ mod tests {
         let mut backend = RdpilotDriveBackend::new(
             std::env::temp_dir().join("rdpilot-rdpdr-red-placeholder"),
             "served.bin".to_owned(),
+            None,
         );
 
         let create = ServerDriveIoRequest::ServerCreateDriveRequest(create_req(1, "\\served.bin"));
@@ -645,7 +747,7 @@ mod tests {
     #[test]
     fn create_accepts_root_and_served_file_but_rejects_other_paths() {
         let served_path = write_temp_file(b"payload");
-        let mut backend = RdpilotDriveBackend::new(served_path.clone(), "served.bin".to_owned());
+        let mut backend = RdpilotDriveBackend::new(served_path.clone(), "served.bin".to_owned(), None);
 
         let root = backend
             .handle_drive_io_request(ServerDriveIoRequest::ServerCreateDriveRequest(create_req(1, "")))
@@ -688,7 +790,7 @@ mod tests {
     #[test]
     fn read_for_unopened_file_id_is_rejected_without_touching_filesystem() {
         let served_path = std::env::temp_dir().join("rdpilot-rdpdr-test-does-not-exist");
-        let mut backend = RdpilotDriveBackend::new(served_path, "served.bin".to_owned());
+        let mut backend = RdpilotDriveBackend::new(served_path, "served.bin".to_owned(), None);
 
         let read = ServerDriveIoRequest::DeviceReadRequest(DeviceReadRequest {
             device_io_request: dev_io_req(99, MajorFunction::Read),
@@ -711,7 +813,7 @@ mod tests {
     #[test]
     fn query_information_succeeds_for_known_file_ids_and_rejects_unknown() {
         let served_path = write_temp_file(b"0123456789");
-        let mut backend = RdpilotDriveBackend::new(served_path.clone(), "served.bin".to_owned());
+        let mut backend = RdpilotDriveBackend::new(served_path.clone(), "served.bin".to_owned(), None);
 
         let root_created = backend
             .handle_drive_io_request(ServerDriveIoRequest::ServerCreateDriveRequest(create_req(1, "")))
@@ -783,7 +885,7 @@ mod tests {
     #[test]
     fn query_volume_information_succeeds_for_known_file_id_and_rejects_unknown() {
         let served_path = write_temp_file(b"0123456789");
-        let mut backend = RdpilotDriveBackend::new(served_path.clone(), "served.bin".to_owned());
+        let mut backend = RdpilotDriveBackend::new(served_path.clone(), "served.bin".to_owned(), None);
 
         let root_created = backend
             .handle_drive_io_request(ServerDriveIoRequest::ServerCreateDriveRequest(create_req(1, "")))
@@ -831,7 +933,7 @@ mod tests {
     #[test]
     fn read_returns_exact_served_bytes_at_offset() {
         let served_path = write_temp_file(b"0123456789");
-        let mut backend = RdpilotDriveBackend::new(served_path.clone(), "served.bin".to_owned());
+        let mut backend = RdpilotDriveBackend::new(served_path.clone(), "served.bin".to_owned(), None);
 
         let created = backend
             .handle_drive_io_request(ServerDriveIoRequest::ServerCreateDriveRequest(create_req(
