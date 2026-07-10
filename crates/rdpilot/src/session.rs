@@ -31,7 +31,7 @@ use crate::connect;
 use crate::error::{Error, Result};
 use crate::framebuffer::SharedFrame;
 use crate::input::{Key, KeyAction, MouseAction};
-use crate::perception::{ProcessInfo, UiaElement, WindowInfo};
+use crate::perception::{ProcessInfo, UiaElement, UiaScope, WindowInfo};
 use crate::screenshot::Screenshot;
 use crate::sensor::SensorShared;
 use crate::session_loop::{self, RdpInputEvent};
@@ -618,8 +618,20 @@ impl Session {
             .collect())
     }
 
-    /// Retrieve a flat UI Automation tree, scoped to `TreeScope_Children`,
-    /// for the given window (PERC-03, SENSOR-backed).
+    /// Retrieve a flat UI Automation tree for the given window, at a
+    /// caller-configurable [`UiaScope`] (PERC-03, D-9.1, SENSOR-backed).
+    ///
+    /// `scope` maps to the wire `max_depth` field: [`UiaScope::Children`]
+    /// sends `max_depth: 1` (the original D-7.4-locked `TreeScope_Children`
+    /// walk — unchanged behavior/latency for every existing caller);
+    /// [`UiaScope::Subtree { max_depth }`](UiaScope::Subtree) sends that
+    /// `max_depth` for the D-9.1 HUMAN-APPROVED flagged deeper walk, which
+    /// the C# sensor performs as a bounded, level-by-level
+    /// `TreeScope_Children` walk (never an uncapped `TreeScope_Subtree`),
+    /// clamped sensor-side to a safety cap to protect the Phase 7 SC#3
+    /// 500ms sensor-side walk budget. This supersedes D-7.4's children-only
+    /// lock as an explicit, caller-opt-in capability — not a silent
+    /// redesign of the UIA subsystem.
     ///
     /// Round-trips a `Uia` request bounded at [`ENUMERATION_TIMEOUT_MS`]
     /// (the transport timeout — distinct from SC#3's 500ms sensor-side walk
@@ -635,11 +647,15 @@ impl Session {
     /// Returns [`Error::SensorRejected`] if the sensor answered but rejected
     /// the request (D-6.4), or [`Error::Dvc`] for a handshake mismatch, a
     /// closed channel, a malformed reply, or a timeout.
-    pub async fn get_uia_tree(&self, hwnd: u64) -> Result<Vec<UiaElement>> {
+    pub async fn get_uia_tree(&self, hwnd: u64, scope: UiaScope) -> Result<Vec<UiaElement>> {
+        let max_depth: u32 = match scope {
+            UiaScope::Children => 1,
+            UiaScope::Subtree { max_depth } => max_depth,
+        };
         let data = self
             .sensor_request(
                 crate::sensor::MsgType::Uia,
-                Some(serde_json::json!({ "hwnd": hwnd })),
+                Some(serde_json::json!({ "hwnd": hwnd, "max_depth": max_depth })),
                 ENUMERATION_TIMEOUT_MS,
             )
             .await?;
@@ -712,7 +728,7 @@ impl Session {
             UiaMode::Hwnd(hwnds) => {
                 let mut groups = Vec::with_capacity(hwnds.len());
                 for &hwnd in hwnds {
-                    groups.push((hwnd, self.get_uia_tree(hwnd).await?));
+                    groups.push((hwnd, self.get_uia_tree(hwnd, UiaScope::Children).await?));
                 }
                 Some(groups)
             }
@@ -724,7 +740,7 @@ impl Session {
                     // then minimum `z_order` among those.
                     let foreground = list.iter().filter(|w| !w.title.is_empty()).min_by_key(|w| w.z_order);
                     match foreground {
-                        Some(w) => Some(vec![(w.hwnd, self.get_uia_tree(w.hwnd).await?)]),
+                        Some(w) => Some(vec![(w.hwnd, self.get_uia_tree(w.hwnd, UiaScope::Children).await?)]),
                         None => Some(vec![]),
                     }
                 }
@@ -737,7 +753,7 @@ impl Session {
                 Some(list) => {
                     let mut groups = Vec::with_capacity(list.len());
                     for w in list {
-                        groups.push((w.hwnd, self.get_uia_tree(w.hwnd).await?));
+                        groups.push((w.hwnd, self.get_uia_tree(w.hwnd, UiaScope::Children).await?));
                     }
                     Some(groups)
                 }
@@ -1428,6 +1444,76 @@ mod tests {
             Err(Error::SensorRejected(msg)) => assert!(msg.contains("enum failed")),
             other => panic!("expected Err(Error::SensorRejected(_)) mentioning the reason, got {other:?}"),
         }
+    }
+
+    /// `get_uia_tree(hwnd, UiaScope::Children)` sends `max_depth: 1` on the
+    /// wire (the D-7.4 default, unchanged behavior for every existing
+    /// caller) -- Plan 09-02 Task 1's payload-shape coverage for the
+    /// children-scope mapping.
+    #[tokio::test]
+    async fn get_uia_tree_children_scope_sends_max_depth_one() {
+        let sensor = Arc::new(SensorShared::new());
+        let (session, mut input_rx) = test_session_with_sensor(sensor.clone());
+
+        let handle = tokio::spawn(async move { session.get_uia_tree(65536, UiaScope::Children).await });
+
+        let RdpInputEvent::Request(msg_type, req_id, payload) =
+            input_rx.recv().await.expect("a Request was sent")
+        else {
+            panic!("expected a Request event");
+        };
+        assert!(matches!(msg_type, crate::sensor::MsgType::Uia));
+        let payload = payload.expect("get_uia_tree sends a payload");
+        assert_eq!(payload["hwnd"], 65536);
+        assert_eq!(payload["max_depth"], 1);
+
+        let tx = {
+            let mut pending = sensor.pending.lock().expect("lock");
+            pending.remove(&req_id).expect("req_id registered in pending map")
+        };
+        tx.send(canned_uia_reply())
+            .expect("reply delivered before the receiver was dropped");
+
+        handle
+            .await
+            .expect("task did not panic")
+            .expect("get_uia_tree succeeds on a success:true reply");
+    }
+
+    /// `get_uia_tree(hwnd, UiaScope::Subtree { max_depth: 3 })` sends
+    /// `max_depth: 3` on the wire alongside `hwnd` -- Plan 09-02's D-9.1
+    /// flagged deeper-walk payload-shape coverage (mirrors the existing
+    /// `session.rs` payload-shape test pattern, e.g.
+    /// `launch_process_success_returns_pid`'s `payload["exe"]` assertion).
+    #[tokio::test]
+    async fn get_uia_tree_subtree_scope_sends_requested_max_depth() {
+        let sensor = Arc::new(SensorShared::new());
+        let (session, mut input_rx) = test_session_with_sensor(sensor.clone());
+
+        let handle =
+            tokio::spawn(async move { session.get_uia_tree(65536, UiaScope::Subtree { max_depth: 3 }).await });
+
+        let RdpInputEvent::Request(msg_type, req_id, payload) =
+            input_rx.recv().await.expect("a Request was sent")
+        else {
+            panic!("expected a Request event");
+        };
+        assert!(matches!(msg_type, crate::sensor::MsgType::Uia));
+        let payload = payload.expect("get_uia_tree sends a payload");
+        assert_eq!(payload["hwnd"], 65536);
+        assert_eq!(payload["max_depth"], 3);
+
+        let tx = {
+            let mut pending = sensor.pending.lock().expect("lock");
+            pending.remove(&req_id).expect("req_id registered in pending map")
+        };
+        tx.send(canned_uia_reply())
+            .expect("reply delivered before the receiver was dropped");
+
+        handle
+            .await
+            .expect("task did not panic")
+            .expect("get_uia_tree succeeds on a success:true reply");
     }
 
     /// `launch_process` on a `success:true` reply returns the PID read from

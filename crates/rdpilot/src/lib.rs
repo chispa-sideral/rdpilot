@@ -47,7 +47,7 @@ mod worldstate;
 pub use config::ConnectionConfig;
 pub use error::{Error, Result};
 pub use input::{Button, Key, KeyAction, MouseAction};
-pub use perception::{ProcessInfo, UiaElement, WindowInfo, WindowState};
+pub use perception::{ProcessInfo, UiaElement, UiaScope, WindowInfo, WindowState};
 pub use screenshot::{Rect, Screenshot};
 pub use session::Session;
 pub use worldstate::{UiaMode, WorldState, WorldStateOptions};
@@ -57,7 +57,7 @@ pub use worldstate::{UiaMode, WorldState, WorldStateOptions};
 // surface. The public API is exactly: `Session`, `ConnectionConfig`,
 // `Screenshot`, `Rect`, `Error`, `Result`, `MouseAction`, `KeyAction`,
 // `Button`, `Key`, `WindowInfo`, `WindowState`, `ProcessInfo`, `UiaElement`,
-// `WorldStateOptions`, `UiaMode`, `WorldState`
+// `UiaScope`, `WorldStateOptions`, `UiaMode`, `WorldState`
 // (owned SDK types only, D-09). `UiaElementWire` stays crate-internal and is
 // never re-exported (D-09). `worldstate` stays a private `mod` — only its
 // three named types are `pub use`-re-exported, matching `screenshot`.

@@ -184,6 +184,32 @@ impl ProcessInfoWire {
     }
 }
 
+/// The caller-configurable scope for a [`crate::Session::get_uia_tree`] walk
+/// (D-9.1) — an owned SDK type only, no wire/`ironrdp` leak (D-09).
+///
+/// `Children` is the original D-7.4-locked default: a depth-1
+/// `TreeScope_Children` walk (maps to wire `max_depth: 1`), preserving
+/// Phase 7/8 behavior and latency for every existing caller unchanged.
+///
+/// `Subtree { max_depth }` is the D-9.1 HUMAN-APPROVED flagged, scoped
+/// addition: a bounded, level-by-level deeper walk (never an uncapped
+/// `TreeScope_Subtree`) up to `max_depth` levels below the target window,
+/// clamped sensor-side to a safety cap (`UIA_MAX_WALK_DEPTH` in
+/// `sensor/UiaTree.cs`) to protect the Phase 7 SC#3 500ms sensor-side walk
+/// budget. This re-assesses D-7.4's children-only lock as an explicit,
+/// caller-opt-in capability -- not a silent redesign of the UIA subsystem.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub enum UiaScope {
+    /// The D-7.4 default: `TreeScope_Children` only (wire `max_depth: 1`).
+    Children,
+    /// The D-9.1 flagged deeper walk, bounded to `max_depth` levels
+    /// (sensor-side clamped to `UIA_MAX_WALK_DEPTH`).
+    Subtree {
+        /// How many levels below the target window to walk (wire `max_depth`).
+        max_depth: u32,
+    },
+}
+
 /// A single UI Automation element in a flat, `TreeScope_Children`-scoped
 /// tree walk (PERC-03, D-7.4).
 ///
@@ -573,5 +599,53 @@ mod tests {
         assert_eq!(obj.get("role").and_then(|v| v.as_str()), Some("Button"));
         let bbox = obj.get("bbox").and_then(|v| v.as_object()).expect("bbox is an object");
         assert_eq!(bbox.get("w").and_then(|v| v.as_u64()), Some(80));
+    }
+
+    /// A canned `Uia` `data` JSON record at `depth: 2` (one level deeper
+    /// than the Phase 7 `TreeScope_Children`-only walk ever produced) with a
+    /// non-empty `parent_runtime_id` deserializes and maps via `into_owned`
+    /// to a `UiaElement` with `depth == 2` and a non-empty `parent_id` --
+    /// proving the existing wire shape already supports Plan 09-02's D-9.1
+    /// deeper walk without any wire-struct change (only `session.rs`'s
+    /// request side gains `max_depth`).
+    #[test]
+    fn uia_element_wire_round_trips_at_depth_two_with_nonempty_parent() {
+        let data = serde_json::json!([
+            {
+                "runtime_id": [42, -3, 7, 9],
+                "control_type": 50011,
+                "name": "File",
+                "bbox": {"x": 5, "y": 6, "w": 40, "h": 18},
+                "enabled": true,
+                "visible": true,
+                "focusable": true,
+                "focused": false,
+                "depth": 2,
+                "parent_runtime_id": [42, -3, 7]
+            }
+        ]);
+
+        let wires: Vec<UiaElementWire> =
+            serde_json::from_value(data).expect("canned depth=2 Uia data deserializes");
+        let elements: Vec<UiaElement> = wires.into_iter().map(UiaElementWire::into_owned).collect();
+
+        assert_eq!(elements.len(), 1);
+        let e = &elements[0];
+        assert_eq!(e.depth, 2);
+        assert_eq!(e.parent_id, "42--3-7");
+        assert!(!e.parent_id.is_empty(), "a depth-2 record must carry a non-empty parent_id");
+        assert_eq!(e.role, "MenuItem");
+    }
+
+    /// `UiaScope::Children` and `UiaScope::Subtree { max_depth }` both
+    /// serialize without error (D-09 owned-type discipline sanity check;
+    /// the actual wire `max_depth` mapping lives in `session.rs`).
+    #[test]
+    fn uia_scope_variants_serialize() {
+        let children = serde_json::to_value(UiaScope::Children).expect("UiaScope::Children serializes");
+        assert_eq!(children, serde_json::json!("Children"));
+
+        let subtree = serde_json::to_value(UiaScope::Subtree { max_depth: 3 }).expect("UiaScope::Subtree serializes");
+        assert_eq!(subtree, serde_json::json!({"Subtree": {"max_depth": 3}}));
     }
 }

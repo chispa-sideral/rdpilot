@@ -19,7 +19,7 @@
 mod common;
 
 use rdpilot::{
-    Button, Key, KeyAction, MouseAction, ProcessInfo, Rect, Screenshot, UiaElement, UiaMode, WindowInfo,
+    Button, Key, KeyAction, MouseAction, ProcessInfo, Rect, Screenshot, UiaElement, UiaMode, UiaScope, WindowInfo,
     WindowState, WorldState, WorldStateOptions,
 };
 
@@ -1273,7 +1273,7 @@ fn uia_tree_returns_populated_elements() {
         let notepad = launch_notepad_and_find_window(&session).await;
 
         let elements: Vec<UiaElement> = session
-            .get_uia_tree(notepad.hwnd)
+            .get_uia_tree(notepad.hwnd, UiaScope::Children)
             .await
             .expect("get_uia_tree(notepad.hwnd) should round-trip successfully (SC#1)");
         assert!(!elements.is_empty(), "expected a non-empty UIA element tree for Notepad's hwnd");
@@ -1330,7 +1330,7 @@ fn uia_bbox_shares_window_pixel_space() {
         let notepad = launch_notepad_and_find_window(&session).await;
 
         let elements: Vec<UiaElement> = session
-            .get_uia_tree(notepad.hwnd)
+            .get_uia_tree(notepad.hwnd, UiaScope::Children)
             .await
             .expect("get_uia_tree(notepad.hwnd) should round-trip successfully (SC#2)");
         assert!(!elements.is_empty(), "expected a non-empty UIA element tree for Notepad's hwnd");
@@ -1401,13 +1401,13 @@ fn uia_tree_walk_within_500ms() {
         // the framebuffer/ping live tests measure steady-state round trips
         // elsewhere in this suite.
         let _ = session
-            .get_uia_tree(notepad.hwnd)
+            .get_uia_tree(notepad.hwnd, UiaScope::Children)
             .await
             .expect("get_uia_tree(notepad.hwnd) warm-up call should round-trip successfully");
 
         let start = std::time::Instant::now();
         let elements = session
-            .get_uia_tree(notepad.hwnd)
+            .get_uia_tree(notepad.hwnd, UiaScope::Children)
             .await
             .expect("get_uia_tree(notepad.hwnd) should round-trip successfully (SC#3)");
         let elapsed = start.elapsed();
@@ -1457,7 +1457,7 @@ fn uia_tree_round_trips_live() {
         let notepad = launch_notepad_and_find_window(&session).await;
 
         let elements: Vec<UiaElement> = session
-            .get_uia_tree(notepad.hwnd)
+            .get_uia_tree(notepad.hwnd, UiaScope::Children)
             .await
             .expect("get_uia_tree(notepad.hwnd) should round-trip successfully (SC#4 precondition)");
         assert!(!elements.is_empty(), "expected a non-empty UIA element tree for Notepad's hwnd");
