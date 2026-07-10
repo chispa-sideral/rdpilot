@@ -49,10 +49,10 @@ Full phase goals, success criteria, and plan-by-plan detail: `.planning/mileston
   3. **[BLOCKING]** An adversarial path-traversal test suite — trailing `..` with no separator, mixed `/`/`\` separators, and absolute-path-as-relative inputs — is rejected by full canonicalized ancestry validation under the share root (never substring matching), with no `Write`/`Create` IRP escaping the share root (FILE-03; Pitfall 8 / FreeRDP GHSA-3xpj-m4hx-8vmx / CVE-2025-48817).
   4. A file larger than one MS-RDPEFS per-IRP chunk transfers correctly (the chunked read/write loop actually loops), and an interrupted transfer surfaces a clean, detectable failure (staged-and-renamed) rather than silent corruption (FILE-04).
 
-**Plans**: 2/5 plans executed
+**Plans**: 3/5 plans executed
 
 - [x] 10-01-PLAN.md — Rust foundation: error taxonomy + share-root config + canonicalizing path validator + backend generalization + FILE-03 Rust adversarial suite (Wave 1)
-- [ ] 10-02-PLAN.md — Staged-write IRPs (DeviceWrite + SetInformation) + atomic-rename-on-Close + FILE-04 multi-IRP/interrupted offline proxy (Wave 2)
+- [x] 10-02-PLAN.md — Staged-write IRPs (DeviceWrite + SetInformation) + atomic-rename-on-Close + FILE-04 multi-IRP/interrupted offline proxy (Wave 2)
 - [x] 10-03-PLAN.md — Sensor FileTransfer wire variant + C# copy-with-inline-SHA256 handler + C# GetRelativePath validator + FILE-03 C# selftest (Wave 1)
 - [ ] 10-04-PLAN.md — Public Session::upload_file/download_file + TransferOutcome + SHA-256 verify / ChecksumMismatch (Wave 3)
 - [ ] 10-05-PLAN.md — Live Azure VM gate: FILE-01/02/04 end-to-end + FILE-03 live re-confirm + real chunk-size measurement (Wave 4)
@@ -139,7 +139,7 @@ Full phase goals, success criteria, and plan-by-plan detail: `.planning/mileston
 | 7. UIA Tree Module | v1.0 | 5/5 | Complete | 2026-07-09 |
 | 8. Public SDK API + WorldState | v1.0 | 3/3 | Complete | 2026-07-09 |
 | 9. Scripted Proof Harness | v1.0 | 4/4 | Complete | 2026-07-10 |
-| 10. SDK File-Transfer Extension | v1.1 | 2/5 | In Progress|  |
+| 10. SDK File-Transfer Extension | v1.1 | 3/5 | In Progress|  |
 | 11. Shared Wire Protocol & Config | v1.1 | 0/? | Not started | - |
 | 12. Session Daemon | v1.1 | 0/? | Not started | - |
 | 13. CLI Surface | v1.1 | 0/? | Not started | - |

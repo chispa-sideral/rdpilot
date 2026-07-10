@@ -4,13 +4,13 @@ milestone: v1.1
 milestone_name: — Consumer Surfaces & File Transfer
 status: Plan 10-01 executed — Rust-side error taxonomy, share_root config, resolve_under_root validator, generalized RdpilotDriveBackend, FILE-03 Rust adversarial suite all pass offline
 stopped_at: "v1.1 roadmap created — Phases 10-15 derived from the 27 v1.1 requirements (research-recommended dependency order: SDK file-transfer → ipc/config → daemon → CLI → MCP → proof). All 27 requirements mapped (0 unmapped); REQUIREMENTS.md traceability updated; ROADMAP.md and STATE.md reflect the new phase list."
-last_updated: "2026-07-10T17:53:42.282Z"
+last_updated: "2026-07-10T18:06:26.636Z"
 last_activity: 2026-07-10 — Plan 10-01 executed (3/3 tasks, 111/111 offline tests pass)
 progress:
   total_phases: 6
   completed_phases: 0
   total_plans: 5
-  completed_plans: 2
+  completed_plans: 3
   percent: 0
 ---
 
@@ -26,7 +26,7 @@ See: .planning/PROJECT.md (updated 2026-07-10)
 ## Current Position
 
 Phase: 10 — SDK File-Transfer Extension (in progress)
-Plan: 2 complete (of 5)
+Plan: 3 complete (of 5)
 Status: Plan 10-01 executed — Rust-side error taxonomy, share_root config, resolve_under_root validator, generalized RdpilotDriveBackend, FILE-03 Rust adversarial suite all pass offline
 Last activity: 2026-07-10 — Plan 10-01 executed (3/3 tasks, 111/111 offline tests pass)
 
@@ -94,6 +94,7 @@ Last activity: 2026-07-10 — Plan 10-01 executed (3/3 tasks, 111/111 offline te
 | Phase 09-scripted-proof-harness P04 | ~2h | 1 tasks | 1 files (terminal live gate; sensor rebuild + 1 live bug fix + 1 live-tune) |
 | Phase 10 P01 | ~20min | 3 tasks | 5 files |
 | Phase 10 P03 | 35min | 3 tasks | 5 files |
+| Phase 10 P02 | 35min | 2 tasks | 1 files |
 
 ## Accumulated Context
 
@@ -174,6 +175,7 @@ Recent decisions affecting current work:
 - [Phase ?]: 10-03: FileTransfer error_kind is a plain nullable string sentinel (path_traversal/io), not a typed enum, for snake_case wire symmetry with the intended Error::PathTraversal mapping
 - [Phase ?]: 10-03: Sensor-side file-transfer root is a fixed constant (%TEMP%/rdpilot-transfer-root), never caller-configurable -- Phase 13/14 CLI/MCP put/get must pass relative remote_path values only
 - [Phase ?]: 10-03: C# ValidateRemotePath adds an explicit LooksRooted() host-independent pre-check mirroring 10-01's Rust looks_rooted() fix, since Path.IsPathRooted only recognizes drive letters on an actual Windows runtime
+- [Phase ?]: 10-02: STRICT expected_len-match completeness rule for staged-write rename-on-Close -- a Close with no prior FILE_END_OF_FILE_INFORMATION SetInformation is treated as incomplete (no rename), flagged for 10-05 live-gate confirmation of real Windows Close/SetInformation ordering
 
 ### Pending Todos
 
@@ -219,7 +221,7 @@ Pre-close artifact audit surfaced 3 open items. Reviewed and explicitly acknowle
 
 ## Session Continuity
 
-Last session: 2026-07-10T17:53:42.276Z
+Last session: 2026-07-10T18:06:26.630Z
 Stopped at: v1.1 roadmap created — Phases 10-15 derived from the 27 v1.1 requirements (research-recommended dependency order: SDK file-transfer → ipc/config → daemon → CLI → MCP → proof). All 27 requirements mapped (0 unmapped); REQUIREMENTS.md traceability updated; ROADMAP.md and STATE.md reflect the new phase list.
 Resume file: .planning/ROADMAP.md (Phase Details, Phase 10)
 
