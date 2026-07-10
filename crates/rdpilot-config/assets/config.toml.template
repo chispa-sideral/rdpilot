@@ -1,0 +1,39 @@
+# rdpilot config.toml — layered configuration for the rdpilot daemon/CLI/MCP
+# surfaces (CONFIG-01/CONFIG-02, D-27).
+#
+# Location (platform convention, resolved via directories::BaseDirs — never
+# committed to the repo):
+#   Unix:    ~/.config/rdpilot/config.toml
+#   Windows: %APPDATA%\rdpilot\config.toml
+#
+# Every key below can also be set via an environment variable with the
+# RDPILOT_ prefix (e.g. RDPILOT_HOST) or via a CLI flag / MCP-init param
+# using the exact same key spelling. Precedence (lowest to highest):
+#   file (this document) -> env (RDPILOT_*) -> flag / MCP-init
+# The highest-precedence layer that sets a key always wins.
+#
+# All keys are commented out below; an unedited copy of this template
+# parses to an all-defaults ResolvedConfig (every field None/false).
+
+# Hostname or IP address of the RDP target.
+# host = "10.0.0.5"
+
+# TCP port of the RDP target (defaults to 3389 downstream if unset).
+# port = 3389
+
+# Username for NLA/CredSSP authentication.
+# username = "myuser"
+
+# Password for NLA/CredSSP authentication. Stored in PLAINTEXT in this file
+# (matching rdpilot's existing accepted risk posture, D-06/D-14) — a future
+# writer of this file must set 0600 permissions on Unix. Never commit a
+# populated copy of this file to any repository.
+# password = "mypassword"
+
+# Optional Windows domain for authentication.
+# domain = "CORP"
+
+# When true, the server certificate is accepted without validation. Risky —
+# intended only for a self-signed lab target you control (D-15). Defaults to
+# false.
+# accept_invalid_certs = false

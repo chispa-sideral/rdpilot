@@ -27,3 +27,12 @@ Thumbs.db
 # `git status` that never shows the NativeAOT publish artifacts as untracked.
 sensor/bin/
 sensor/obj/
+
+# rdpilot-config (Phase 11, CONFIG-02, D-27): the REAL config.toml lives at
+# the platform config dir (~/.config/rdpilot/config.toml on Unix,
+# %APPDATA%\rdpilot\config.toml on Windows) — structurally outside this repo
+# tree, so it can never be accidentally committed from its real location.
+# These entries are defensive-only, in case a contributor creates a
+# project-local override copy by convention for local dev/testing.
+config.toml
+.rdpilot.toml

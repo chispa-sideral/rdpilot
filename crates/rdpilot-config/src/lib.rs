@@ -25,6 +25,13 @@
 #![deny(clippy::unwrap_used)]
 #![deny(clippy::expect_used)]
 
+mod paths;
 mod resolved;
 
+pub use paths::config_file_path;
 pub use resolved::{ConfigError, ResolvedConfig};
+
+/// A fully-commented, self-explanatory `config.toml` template documenting
+/// every D-27 key (CONFIG-02). All keys ship commented out, so an unedited
+/// copy parses to an all-defaults [`ResolvedConfig`].
+pub const CONFIG_TEMPLATE: &str = include_str!("../assets/config.toml.template");
