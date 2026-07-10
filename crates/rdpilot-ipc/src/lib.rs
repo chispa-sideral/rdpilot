@@ -35,9 +35,11 @@
 #![deny(clippy::expect_used)]
 
 mod error;
+mod request;
 mod session_id;
 mod transfer;
 
 pub use error::{WireError, WireErrorCode};
+pub use request::{Request, SessionScoped};
 pub use session_id::SessionId;
 pub use transfer::TransferOutcome;
