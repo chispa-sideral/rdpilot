@@ -82,38 +82,38 @@ Which phases cover which requirements. Updated during roadmap creation.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| DAEMON-01 | TBD | Pending |
-| DAEMON-02 | TBD | Pending |
-| DAEMON-03 | TBD | Pending |
-| DAEMON-04 | TBD | Pending |
-| SESSION-01 | TBD | Pending |
-| SESSION-02 | TBD | Pending |
-| SESSION-03 | TBD | Pending |
-| SESSION-04 | TBD | Pending |
-| CLI-01 | TBD | Pending |
-| CLI-02 | TBD | Pending |
-| CLI-03 | TBD | Pending |
-| MCP-01 | TBD | Pending |
-| MCP-02 | TBD | Pending |
-| MCP-03 | TBD | Pending |
-| MCP-04 | TBD | Pending |
-| MCP-05 | TBD | Pending |
-| MCP-06 | TBD | Pending |
-| FILE-01 | TBD | Pending |
-| FILE-02 | TBD | Pending |
-| FILE-03 | TBD | Pending |
-| FILE-04 | TBD | Pending |
-| CONFIG-01 | TBD | Pending |
-| CONFIG-02 | TBD | Pending |
-| CONFIG-03 | TBD | Pending |
-| PROOF-02 | TBD | Pending |
-| PROOF-03 | TBD | Pending |
-| PROOF-04 | TBD | Pending |
+| FILE-01 | Phase 10 | Pending |
+| FILE-02 | Phase 10 | Pending |
+| FILE-03 | Phase 10 | Pending |
+| FILE-04 | Phase 10 | Pending |
+| SESSION-02 | Phase 11 | Pending |
+| CONFIG-01 | Phase 11 | Pending |
+| CONFIG-02 | Phase 11 | Pending |
+| CONFIG-03 | Phase 11 | Pending |
+| DAEMON-01 | Phase 12 | Pending |
+| DAEMON-02 | Phase 12 | Pending |
+| DAEMON-03 | Phase 12 | Pending |
+| DAEMON-04 | Phase 12 | Pending |
+| SESSION-01 | Phase 12 | Pending |
+| SESSION-03 | Phase 12 | Pending |
+| SESSION-04 | Phase 12 | Pending |
+| CLI-01 | Phase 13 | Pending |
+| CLI-02 | Phase 13 | Pending |
+| CLI-03 | Phase 13 | Pending |
+| MCP-01 | Phase 14 | Pending |
+| MCP-02 | Phase 14 | Pending |
+| MCP-03 | Phase 14 | Pending |
+| MCP-04 | Phase 14 | Pending |
+| MCP-05 | Phase 14 | Pending |
+| MCP-06 | Phase 14 | Pending |
+| PROOF-02 | Phase 15 | Pending |
+| PROOF-03 | Phase 15 | Pending |
+| PROOF-04 | Phase 15 | Pending |
 
 **Coverage:**
 - v1.1 requirements: 27 total
-- Mapped to phases: 0 (roadmap pending)
-- Unmapped: 27 ⚠️
+- Mapped to phases: 27 ✓
+- Unmapped: 0
 
 ---
 *Requirements defined: 2026-07-10*

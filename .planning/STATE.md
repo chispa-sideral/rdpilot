@@ -6,7 +6,7 @@ status: planning
 last_updated: "2026-07-10T16:07:43.046Z"
 last_activity: 2026-07-10
 progress:
-  total_phases: 0
+  total_phases: 6
   completed_phases: 0
   total_plans: 0
   completed_plans: 0
@@ -20,14 +20,25 @@ progress:
 See: .planning/PROJECT.md (updated 2026-07-10)
 
 **Core value:** A local AI agent can connect to a remote Windows desktop over RDP and read/inspect a program that is only reachable via RDP — using both screenshots and structured accessibility data, without installing or running the agent itself on the remote machine.
-**Current focus:** Planning next milestone (v2). v1.0 MVP shipped 2026-07-10 — all 9 phases (35/35 plans) done, PROOF-01 retired, terminal live gate PASSED.
+**Current focus:** Milestone v1.1 (Consumer Surfaces & File Transfer) — roadmap created (Phases 10-15, 27/27 requirements mapped). Next: plan Phase 10 (SDK File-Transfer Extension). v1.0 MVP shipped 2026-07-10.
 
 ## Current Position
 
-Phase: Not started (defining requirements)
+Phase: 10 — SDK File-Transfer Extension (not started)
 Plan: —
-Status: Defining requirements
-Last activity: 2026-07-10 — Milestone v1.1 started
+Status: Roadmap complete; ready for phase planning
+Last activity: 2026-07-10 — v1.1 roadmap created (6 phases, 27/27 requirements mapped)
+
+## Milestone v1.1 Phases
+
+| Phase | Goal | Requirements |
+|-------|------|--------------|
+| 10. SDK File-Transfer Extension | Bidirectional RDPDR file transfer + sensor upload/download, canonicalization-guarded | FILE-01/02/03/04 |
+| 11. Shared Wire Protocol & Config | `rdpilot-ipc` (required-session-id schema, credential-free DTOs) + `rdpilot-config` layered config | SESSION-02, CONFIG-01/02/03 |
+| 12. Session Daemon | Leak-free named-session registry, local-only IPC, auto-start/idle-shutdown, crash-restart orphan reconciliation | DAEMON-01/02/03/04, SESSION-01/03/04 |
+| 13. CLI Surface | Thin `rdpilot` CLI over the daemon; lifecycle + perception/input/launch/file verbs, explicit session targeting | CLI-01/02/03 |
+| 14. MCP Server Surface | `rmcp` server: computer-use mega-tool + native tools, coordinate-scaling bridge, non-blocking isolation | MCP-01/02/03/04/05/06 |
+| 15. Proof Harnesses & Live-LLM Capstone | Scripted per-surface proof + capstone live-LLM MCP demo | PROOF-02/03/04 |
 
 ## Performance Metrics
 
@@ -199,10 +210,10 @@ Pre-close artifact audit surfaced 3 open items. Reviewed and explicitly acknowle
 
 ## Session Continuity
 
-Last session: 2026-07-10T15:30:00.000Z
-Stopped at: Phase 9 Plan 4 (09-04) complete — terminal v1 live gate PASSED, PROOF-01 retired, v1.0 milestone CLOSED. No further v1 work outstanding; any next work is v2 (see `.planning/milestones/v1.0-REQUIREMENTS.md` "v2 Requirements (Deferred)") or backlog phases (see ROADMAP.md Backlog).
-Resume file: .planning/phases/09-scripted-proof-harness/09-04-SUMMARY.md
+Last session: 2026-07-10T16:07:43.046Z
+Stopped at: v1.1 roadmap created — Phases 10-15 derived from the 27 v1.1 requirements (research-recommended dependency order: SDK file-transfer → ipc/config → daemon → CLI → MCP → proof). All 27 requirements mapped (0 unmapped); REQUIREMENTS.md traceability updated; ROADMAP.md and STATE.md reflect the new phase list.
+Resume file: .planning/ROADMAP.md (Phase Details, Phase 10)
 
 ## Operator Next Steps
 
-- Start the next milestone with /gsd-new-milestone
+- Plan the first v1.1 phase with `/gsd-plan-phase 10`
