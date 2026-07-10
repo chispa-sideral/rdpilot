@@ -4,13 +4,13 @@ milestone: v1.0
 milestone_name: milestone
 status: completed
 stopped_at: Phase 9 Plan 1 (09-01) COMPLETE — D-9.1 7-Zip UIA fidelity spike live-ran and human-approved. 09-02 (real assertion harness, now scoped to include a deeper UIA-walk capability) unblocked.
-last_updated: "2026-07-10T12:16:56.941Z"
+last_updated: "2026-07-10T12:26:24.199Z"
 last_activity: "2026-07-10 -- 09-01 COMPLETE: D-9.1 7-Zip UIA fidelity spike live-ran against a real disposable Azure VM and was human-approved. 7-Zip stays the SC#2/SC#3 target; TreeScope_Children alone proved insufficient (5 depth-1 container elements only) so Plan 09-02 must add a scoped, caller-configurable deeper UIA-walk capability. Window predicate (class_name == "7-Zip::FM") and D-9.6 seeding form (full quoted 7zFM.exe path + quoted seed arg) confirmed. See 09-01-SUMMARY.md."
 progress:
   total_phases: 9
   completed_phases: 8
   total_plans: 35
-  completed_plans: 33
+  completed_plans: 34
   percent: 89
 ---
 
@@ -26,7 +26,7 @@ See: .planning/PROJECT.md (updated 2026-06-04)
 ## Current Position
 
 Phase: 9 (scripted-proof-harness) — IN PROGRESS
-Plan: 2 of 3 complete
+Plan: 3 of 3 complete
 Status: 09-01 complete (D-9.1 risk-gate spike, human-approved) — 09-02 (real assertion harness, scoped to include a deeper UIA-walk capability) unblocked
 Last activity: 2026-07-10 -- 09-01 COMPLETE: D-9.1 7-Zip UIA fidelity spike live-ran against a real disposable Azure VM and was human-approved. 7-Zip stays the SC#2/SC#3 target; TreeScope_Children alone proved insufficient (5 depth-1 container elements only) so Plan 09-02 must add a scoped, caller-configurable deeper UIA-walk capability. Window predicate (class_name == "7-Zip::FM") and D-9.6 seeding form (full quoted 7zFM.exe path + quoted seed arg) confirmed. See 09-01-SUMMARY.md.
 
@@ -83,6 +83,7 @@ Progress: [█████████░] 89% (Phase 9: 1/3 plans complete — 
 | Phase 08 P03 | 25min | 1 tasks | 1 files |
 | Phase 09 P01 | ~70min | 2 tasks | 1 files |
 | Phase 09-scripted-proof-harness P02 | ~25min | 2 tasks | 6 files |
+| Phase 09 P03 | 55min | 3 tasks | 3 files |
 
 ## Accumulated Context
 
@@ -153,6 +154,9 @@ Recent decisions affecting current work:
 - **Phase 9 Plan 1 (09-01, 2026-07-10, D-9.1 risk-gate spike, HUMAN-APPROVED):** 7-Zip File Manager stays the SC#2/SC#3 target (Notepad fallback explicitly NOT invoked). Live dump against a real disposable Azure VM showed `get_uia_tree(hwnd)`'s `TreeScope_Children`-only scope (D-7.4) returns just 5 depth-1 elements (Window/ToolBar/Pane/TitleBar/MenuBar) — none of the visible menu items, toolbar buttons, or listview rows are reachable at that depth. **Plan 09-02 must add a scoped, caller-configurable deeper UIA-walk capability** (flagged addition, not a silent absorption) before any SC#2/SC#3 assertion code is written. Confirmed window match predicate: exact `class_name == "7-Zip::FM"` (never a title substring — title reflects the currently-navigated folder). Confirmed D-9.6 seeding form (RESEARCH A1 resolved live): `launch_process` needs the FULL, individually-quoted exe path (`"C:\Program Files\7-Zip\7zFM.exe"`) plus a quoted seed-path argument — a bare `"7zFM.exe"` fails `CreateProcessW` with `LastError=2` since the sensor's `lpApplicationName` is null and 7-Zip's install dir is not on `PATH`. Reused the cached, hash-identical Phase 8 sensor build (no VM rebuild needed, sensor source unchanged since Phase 7-04). Throwaway spike file deleted per Pitfall 2; VM torn down and confirmed absent. See `09-01-SUMMARY.md`.
 - [Phase ?]: D-9.1 spike human-approved: 7-Zip stays SC#2/SC#3 target; TreeScope_Children insufficient, Plan 09-02 must add a scoped deeper UIA-walk capability; window predicate class_name=="7-Zip::FM"; D-9.6 seeding form confirmed (full quoted 7zFM.exe path + quoted seed arg, RESEARCH A1 resolved)
 - [Phase ?]: 09-02: Added owned UiaScope (Children | Subtree{max_depth}) to get_uia_tree, mapped to wire max_depth; sensor performs a bounded level-by-level FindAll(TreeScope.Children) BFS clamped to a named UIA_MAX_WALK_DEPTH=4 safety cap (never TreeScope.Subtree, T-09-10); world_state + all 5 live_session.rs callers migrated to UiaScope::Children with zero behavior change; UIA_MAX_WALK_DEPTH=4 is a conservative starting value, live-tuned at the 09-04 gate against the real Phase 7 SC#3 500ms budget.
+- [Phase ?]: SC2_MAX_DEPTH=4 requested for the 09-03 proof harness's UiaScope::Subtree walk (matches the 09-02-recorded sensor-side UIA_MAX_WALK_DEPTH cap); live-tune at the 09-04 gate
+- [Phase ?]: SC#2 assertion passes on any of menu item / toolbar button / listview row deeper elements present (not all three required)
+- [Phase ?]: D-9.2 navigation default: click deeper 'File' MenuItem if matched, else first matched deeper element
 
 ### Pending Todos
 
@@ -183,6 +187,6 @@ Phase 2 Plan 02: pre-existing rustdoc intra-doc-link warnings in config.rs (Wave
 
 ## Session Continuity
 
-Last session: 2026-07-10T12:16:56.935Z
+Last session: 2026-07-10T12:26:24.193Z
 Stopped at: Phase 9 Plan 1 (09-01) complete — D-9.1 spike human-approved, ready to plan/execute 09-02
 Resume file: .planning/phases/09-scripted-proof-harness/09-01-SUMMARY.md
