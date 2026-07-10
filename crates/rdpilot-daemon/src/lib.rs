@@ -43,5 +43,6 @@ mod registry;
 mod seams;
 mod server;
 
+pub use registry::Registry;
 pub use seams::{DaemonError, ManagedSession, ReconciliationSink, SessionConnector, SessionEntry};
 pub use server::run;
