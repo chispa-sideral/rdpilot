@@ -18,6 +18,7 @@
 //! `rustls`, or `tokio` type leaks (D-09). No `unwrap`/`expect`/`panic` (API-01).
 
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
@@ -275,18 +276,49 @@ pub struct Session {
 /// [`Session::download_file`] call (D-10.4).
 ///
 /// An owned, credential-free public type (D-09, D-10.4/T-10-08): no
-/// `ironrdp-rdpdr` or other third-party type ever appears here.
-///
-/// NOTE (interface-first, Plan 10-04 Task 1): `checksum` carries the
-/// sensor-reported SHA-256 as-is at this stage; Task 2 wires independent
-/// Rust-side recomputation and verification (D-10.5) on top of this same
-/// struct shape, so the public signature never changes between tasks.
+/// `ironrdp-rdpdr` or other third-party type ever appears here, and nothing
+/// beyond the byte count and the VERIFIED checksum is exposed.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct TransferOutcome {
     /// The number of bytes transferred, as reported by the sensor.
     pub bytes_transferred: u64,
-    /// The SHA-256 digest (lowercase hex, no separators).
+    /// The SHA-256 digest (lowercase hex, no separators), independently
+    /// recomputed on the Rust side and CONFIRMED to match the
+    /// sensor-reported digest (D-10.5) — never the sensor's raw claim
+    /// alone. A divergence never reaches this struct; it surfaces as
+    /// [`Error::ChecksumMismatch`] instead.
     pub checksum: String,
+}
+
+/// Streams `path` through SHA-256 with a bounded 64KiB buffer (never loads
+/// the whole file into memory, T-10-07/T-05-05 discipline) and returns the
+/// lowercase hex digest, no separators — matching the C# sensor's own
+/// `Convert.ToHexString(...).ToLowerInvariant()` output casing exactly
+/// (10-03-SUMMARY.md), so the two independently-computed digests (D-10.5 —
+/// neither side trusts the other's reported hash) can be compared
+/// byte-for-byte.
+///
+/// Never a custom hash loop (10-RESEARCH "Don't Hand-Roll") — uses
+/// `sha2::Sha256`, the RustCrypto reference implementation already a
+/// direct dependency (Plan 10-01).
+fn sha256_file(path: &Path) -> Result<String> {
+    use sha2::{Digest, Sha256};
+
+    let mut file = fs::File::open(path)
+        .map_err(|e| Error::dvc(format!("failed to open {} for checksum: {e}", path.display())))?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 65536];
+    loop {
+        let read = file
+            .read(&mut buf)
+            .map_err(|e| Error::dvc(format!("failed to read {} while hashing: {e}", path.display())))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buf[..read]);
+    }
+    let digest = hasher.finalize();
+    Ok(digest.iter().map(|b| format!("{b:02x}")).collect())
 }
 
 impl Session {
@@ -929,17 +961,17 @@ impl Session {
     /// configured at connect time (nothing is sent in that case);
     /// [`Error::PathTraversal`] if the sensor rejected `remote_name` as
     /// escaping its transfer root; [`Error::SensorRejected`] for any other
-    /// sensor-side rejection; or [`Error::Dvc`] for a handshake mismatch, a
+    /// sensor-side rejection; [`Error::Dvc`] for a handshake mismatch, a
     /// closed channel, a malformed reply, a timeout, or a local staging I/O
-    /// failure.
-    ///
-    /// NOTE (interface-first, Plan 10-04 Task 1): SHA-256 integrity
-    /// verification (D-10.5, [`Error::ChecksumMismatch`]) is wired by
-    /// Task 2 on top of this same method shape.
+    /// failure; and [`Error::ChecksumMismatch`] if the sensor-reported
+    /// SHA-256 of the written remote file does not match the independently
+    /// computed digest of `local` (D-10.5).
     pub async fn upload_file(&self, local: &Path, remote_name: &str) -> Result<TransferOutcome> {
         let share_root = self.share_root.as_deref().ok_or_else(|| {
             Error::Config("upload_file requires ConnectionConfig::share_root to be configured".to_owned())
         })?;
+
+        let local_hash = sha256_file(local)?;
 
         let share_name = self.unique_share_name();
         let staged = share_root.join(&share_name);
@@ -974,9 +1006,13 @@ impl Session {
             .ok_or_else(|| Error::dvc("FileTransfer reply missing/invalid \"sha256\" field"))?
             .to_owned();
 
+        if !local_hash.eq_ignore_ascii_case(&sensor_sha256) {
+            return Err(Error::checksum_mismatch(sensor_sha256, local_hash));
+        }
+
         Ok(TransferOutcome {
             bytes_transferred,
-            checksum: sensor_sha256,
+            checksum: local_hash,
         })
     }
 
@@ -1008,13 +1044,11 @@ impl Session {
     /// configured at connect time (nothing is sent in that case);
     /// [`Error::PathTraversal`] if the sensor rejected `remote_name` as
     /// escaping its transfer root; [`Error::SensorRejected`] for any other
-    /// sensor-side rejection; or [`Error::Dvc`] for a handshake mismatch, a
+    /// sensor-side rejection; [`Error::Dvc`] for a handshake mismatch, a
     /// closed channel, a malformed reply, a timeout, or a local move/I/O
-    /// failure.
-    ///
-    /// NOTE (interface-first, Plan 10-04 Task 1): SHA-256 integrity
-    /// verification (D-10.5, [`Error::ChecksumMismatch`]) is wired by
-    /// Task 2 on top of this same method shape.
+    /// failure; and [`Error::ChecksumMismatch`] if the sensor-reported
+    /// SHA-256 does not match the independently computed digest of the
+    /// downloaded local file (D-10.5).
     pub async fn download_file(&self, remote_name: &str, local: &Path) -> Result<TransferOutcome> {
         let share_root = self.share_root.as_deref().ok_or_else(|| {
             Error::Config("download_file requires ConnectionConfig::share_root to be configured".to_owned())
@@ -1055,9 +1089,14 @@ impl Session {
             let _ = fs::remove_file(&staged);
         }
 
+        let local_hash = sha256_file(local)?;
+        if !local_hash.eq_ignore_ascii_case(&sensor_sha256) {
+            return Err(Error::checksum_mismatch(sensor_sha256, local_hash));
+        }
+
         Ok(TransferOutcome {
             bytes_transferred,
-            checksum: sensor_sha256,
+            checksum: local_hash,
         })
     }
 
@@ -1932,6 +1971,30 @@ mod tests {
         (session, input_rx)
     }
 
+    /// `sha256_file` matches known SHA-256 test vectors (empty input and
+    /// `b"abc"`) -- never a custom hash loop (10-RESEARCH "Don't
+    /// Hand-Roll").
+    #[test]
+    fn sha256_file_matches_known_vectors() {
+        let dir = test_share_root_dir();
+
+        let empty_path = dir.join("empty.bin");
+        fs::write(&empty_path, b"").expect("write empty vector file");
+        assert_eq!(
+            sha256_file(&empty_path).expect("hash empty file"),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+
+        let abc_path = dir.join("abc.bin");
+        fs::write(&abc_path, b"abc").expect("write abc vector file");
+        assert_eq!(
+            sha256_file(&abc_path).expect("hash abc file"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// `upload_file` fails fast with `Error::Config` -- and sends nothing --
     /// when no `ConnectionConfig::share_root` was configured at connect
     /// time (D-10.4).
@@ -1998,7 +2061,7 @@ mod tests {
         assert!(!share_name.is_empty());
         assert_ne!(share_name, "nested/dest.txt", "the staging name must never reuse the caller's remote_name");
 
-        let expected_hash = "2d119f1cd272958a492a144af600b9dc36531f73027b34073967345b027021b1".to_owned();
+        let expected_hash = sha256_file(&local).expect("hash local source");
         let tx = {
             let mut pending = sensor.pending.lock().expect("lock");
             pending.remove(&req_id).expect("req_id registered in pending map")
@@ -2018,6 +2081,44 @@ mod tests {
 
         // The staged copy under share_root must be cleaned up, not left behind.
         assert!(!share_root.join(&share_name).exists());
+
+        let _ = fs::remove_dir_all(&share_root);
+    }
+
+    /// `upload_file` returns the distinct `Error::ChecksumMismatch` (never
+    /// `Error::SensorRejected`/`Error::Dvc`) when the sensor-reported
+    /// SHA-256 does not match the independently-computed digest of the
+    /// local source file (D-10.5).
+    #[tokio::test]
+    async fn upload_file_checksum_mismatch_returns_distinct_error() {
+        let sensor = Arc::new(SensorShared::new());
+        let share_root = test_share_root_dir();
+        let local = share_root.join("local-source.txt");
+        fs::write(&local, b"hello upload").expect("write local source");
+
+        let (session, mut input_rx) = test_session_with_sensor_and_share_root(sensor.clone(), share_root.clone());
+        let local_for_task = local.clone();
+
+        let handle = tokio::spawn(async move { session.upload_file(&local_for_task, "dest.txt").await });
+
+        let RdpInputEvent::Request(_, req_id, _) = input_rx.recv().await.expect("a Request was sent") else {
+            panic!("expected a Request event");
+        };
+        let tx = {
+            let mut pending = sensor.pending.lock().expect("lock");
+            pending.remove(&req_id).expect("req_id registered in pending map")
+        };
+        tx.send(serde_json::json!({
+            "success": true,
+            "data": { "bytes_transferred": 12, "sha256": "0".repeat(64) }
+        }))
+        .expect("reply delivered before the receiver was dropped");
+
+        let err = handle.await.expect("task did not panic");
+        assert!(
+            matches!(err, Err(Error::ChecksumMismatch { .. })),
+            "expected Error::ChecksumMismatch, got {err:?}"
+        );
 
         let _ = fs::remove_dir_all(&share_root);
     }
@@ -2091,7 +2192,7 @@ mod tests {
         // the time the sensor's DVC reply arrives.
         let staged_path = share_root.join(&share_name);
         fs::write(&staged_path, b"downloaded content").expect("simulate staged write");
-        let expected_hash = "f51bd38b46d76bbb6fa1b2236edea7997f6487777cb144497800a8d87f7dc1b8".to_owned();
+        let expected_hash = sha256_file(&staged_path).expect("hash staged file");
 
         let tx = {
             let mut pending = sensor.pending.lock().expect("lock");
@@ -2116,6 +2217,51 @@ mod tests {
         assert!(
             !staged_path.exists(),
             "the staged file must be moved to the destination, not left behind"
+        );
+
+        let _ = fs::remove_dir_all(&share_root);
+        let _ = fs::remove_dir_all(&dest_dir);
+    }
+
+    /// `download_file` returns the distinct `Error::ChecksumMismatch` when
+    /// the sensor-reported SHA-256 does not match the independently
+    /// computed digest of the downloaded local file (D-10.5).
+    #[tokio::test]
+    async fn download_file_checksum_mismatch_returns_distinct_error() {
+        let sensor = Arc::new(SensorShared::new());
+        let share_root = test_share_root_dir();
+        let dest_dir = test_share_root_dir();
+        let dest = dest_dir.join("downloaded.txt");
+
+        let (session, mut input_rx) = test_session_with_sensor_and_share_root(sensor.clone(), share_root.clone());
+        let dest_for_task = dest.clone();
+
+        let handle = tokio::spawn(async move { session.download_file("remote/file.txt", &dest_for_task).await });
+
+        let RdpInputEvent::Request(_, req_id, payload) = input_rx.recv().await.expect("a Request was sent") else {
+            panic!("expected a Request event");
+        };
+        let share_name = payload.expect("download_file sends a payload")["share_name"]
+            .as_str()
+            .expect("share_name present")
+            .to_owned();
+        let staged_path = share_root.join(&share_name);
+        fs::write(&staged_path, b"downloaded content").expect("simulate staged write");
+
+        let tx = {
+            let mut pending = sensor.pending.lock().expect("lock");
+            pending.remove(&req_id).expect("req_id registered in pending map")
+        };
+        tx.send(serde_json::json!({
+            "success": true,
+            "data": { "bytes_transferred": 19, "sha256": "0".repeat(64) }
+        }))
+        .expect("reply delivered before the receiver was dropped");
+
+        let err = handle.await.expect("task did not panic");
+        assert!(
+            matches!(err, Err(Error::ChecksumMismatch { .. })),
+            "expected Error::ChecksumMismatch, got {err:?}"
         );
 
         let _ = fs::remove_dir_all(&share_root);
