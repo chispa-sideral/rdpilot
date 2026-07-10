@@ -2,15 +2,15 @@
 gsd_state_version: 1.0
 milestone: v1.1
 milestone_name: — Consumer Surfaces & File Transfer
-status: verifying
+status: executing
 stopped_at: Phase 10 complete (5/5 plans). Plan 10-05's live gate found and fixed a Rule 1 bug in finalize_write's completeness rule (real Windows never sends FILE_END_OF_FILE_INFORMATION), measured the real per-IRP chunk size, and validated TRANSFER_TIMEOUT_MS. Ready to plan Phase 11 (Shared Wire Protocol & Config).
-last_updated: "2026-07-10T20:51:02.639Z"
-last_activity: "2026-07-10 — Plan 10-05 executed (live gate: 5/5 gated tests pass, 1 live-diagnosed Rule 1 bug fixed, VM torn down and confirmed absent)"
+last_updated: "2026-07-10T22:50:21.269Z"
+last_activity: 2026-07-10 -- Phase 11 execution started
 progress:
   total_phases: 6
   completed_phases: 1
-  total_plans: 5
-  completed_plans: 5
+  total_plans: 7
+  completed_plans: 6
   percent: 17
 ---
 
@@ -21,14 +21,14 @@ progress:
 See: .planning/PROJECT.md (updated 2026-07-10)
 
 **Core value:** A local AI agent can connect to a remote Windows desktop over RDP and read/inspect a program that is only reachable via RDP — using both screenshots and structured accessibility data, without installing or running the agent itself on the remote machine.
-**Current focus:** Milestone v1.1 (Consumer Surfaces & File Transfer) — roadmap created (Phases 10-15, 27/27 requirements mapped). Next: plan Phase 10 (SDK File-Transfer Extension). v1.0 MVP shipped 2026-07-10.
+**Current focus:** Phase 11 — Shared Wire Protocol & Config
 
 ## Current Position
 
-Phase: 10 — SDK File-Transfer Extension (COMPLETE)
-Plan: 5 complete (of 5)
-Status: Phase 10 COMPLETE — terminal live gate (10-05) passed against a real disposable Azure VM, FILE-01/02/03/04 all live-verified, VM torn down and confirmed absent
-Last activity: 2026-07-10 — Plan 10-05 executed (live gate: 5/5 gated tests pass, 1 live-diagnosed Rule 1 bug fixed, VM torn down and confirmed absent)
+Phase: 11 (Shared Wire Protocol & Config) — EXECUTING
+Plan: 2 of 2
+Status: Ready to execute
+Last activity: 2026-07-10 -- Phase 11 execution started
 
 ## Milestone v1.1 Phases
 
@@ -98,6 +98,7 @@ Last activity: 2026-07-10 — Plan 10-05 executed (live gate: 5/5 gated tests pa
 | Phase 10 P04 | 40min | 2 tasks | 3 files |
 | Phase 10 P05 | ~2h | 2 tasks (+1 checkpoint) | 4 files (incl. live gate + 1 live-diagnosed bug fix) |
 | Phase 10 P05 | ~2h | 2 tasks | 4 files |
+| Phase 11 P01 | ~35 min | 3 tasks | 7 files |
 
 ## Accumulated Context
 
@@ -184,6 +185,8 @@ Recent decisions affecting current work:
 - **Phase 10 terminal live gate (10-05, 2026-07-10):** All FILE-01/02/03/04 success criteria proven live against a real disposable Azure VM (`rdpilot-vm`, `Standard_B2s_v2`, westeurope). **LIVE-DIAGNOSED RULE 1 BUG (the critical finding):** `finalize_write`'s STRICT `expected_len`-only completeness rule (10-02) was FALSE on real Windows -- the C# sensor's plain `FileStream.Write`+`Dispose` copy never sends `FILE_END_OF_FILE_INFORMATION` before `Close` (a diagnostic tracing subscriber confirmed `had_expected_len=false` on every observed real `Close`), meaning every real transfer would have appeared "incomplete" and never renamed under the original rule -- fixed (commit `7101f2d`) by falling back to "clean Close is sufficient" when `expected_len` is `None`, keeping the exact-match gate only when it IS `Some`; FILE-04's interrupted-transfer guarantee remains intact because a genuinely severed connection never delivers a `Close` IRP at all. Real per-IRP chunk size measured (10-RESEARCH Open Question 1, never hardcoded): WRITE direction consistently 65,536 bytes (64 KiB); READ direction variable, max observed 524,288-614,400 bytes (512-600 KiB) -- read-ahead/caching behavior, no single dominant value. `TRANSFER_TIMEOUT_MS` (30s, 10-04) validated as adequate, not tuned -- the full 5-test suite (incl. an 8 MiB interrupted-transfer fixture and a 3 MiB round trip) completed in 74-85s total. **New prerequisite step this phase's live gate required** (not needed by Phase 5-9): a fresh WS2022 Datacenter VM has neither .NET 8 SDK nor a native C++ toolchain preinstalled -- both must be installed via a separate `az vm run-command invoke` (`dotnet-install.ps1 -Channel 8.0` + `vs_buildtools.exe --add Microsoft.VisualStudio.Workload.VCTools --quiet --wait`) BEFORE the sensor can be built on the VM. Sensor SHA-256 `5ea474dba5d50a00ed3aa2fcdeece0c88031e000b81cd0534427c508a6bc7cf7` (3,239,936 bytes) confirmed byte-identical VM-built vs relayed via Storage blob SAS. All five gated tests (`file_upload_roundtrip`, `file_download_checksum_matches`, `large_file_transfers_chunked`, `interrupted_transfer_is_detectable`, `traversal_rejected_live`) PASS; FILE-03's mixed-separator and Windows-drive-absolute adversarial cases both reject as `Error::PathTraversal` live, both directions. See `10-05-SUMMARY.md`. **Teardown pending developer authorization (blocking checkpoint) as of this STATE.md update.**
 - [Phase ?]: 10-05: finalize_write completeness rule changed to a two-tier rule (STRICT expected_len match when Some, clean-Close-is-sufficient fallback when None) after live-diagnosing that real Windows never sends FILE_END_OF_FILE_INFORMATION for a plain FileStream copy -- the original STRICT-only rule made every real transfer fail
 - [Phase ?]: 10-05: real per-IRP chunk size measured live -- write direction consistently 65536 bytes (64 KiB), read direction variable up to 512-600 KiB; TRANSFER_TIMEOUT_MS (30s) validated as adequate, not tuned
+- [Phase ?]: rdpilot-ipc: WireErrorCode Internal catch-all + type-only D-28 mapping (mapping deferred to Phase 12 daemon, per Decision 1) — Keeps rdpilot-ipc dependency-free of rdpilot/IronRDP; thin CLI/MCP clients never pull in the RDP stack
+- [Phase ?]: sample_all_response_variants() tightened with a trailing non-wildcard exhaustive match — Checker's hardening note: a future WireResponse variant added without updating this function is a compile error, not a code-review gap
 
 ### Pending Todos
 
@@ -230,8 +233,8 @@ Pre-close artifact audit surfaced 3 open items. Reviewed and explicitly acknowle
 
 ## Session Continuity
 
-Last session: 2026-07-10T20:51:02.633Z
-Stopped at: v1.1 milestone context gathered for phases 11-15 via /gsd-discuss-phase --milestone; 4 cross-cutting decisions recorded in DECISIONS-INDEX.md; ready to plan Phase 11
+Last session: 2026-07-10T22:50:21.263Z
+Stopped at: Phase 11 Plan 01 (rdpilot-ipc) complete — SESSION-02 and CONFIG-03 satisfied. Starting Plan 02 (rdpilot-config).
 Resume file: .planning/DECISIONS-INDEX.md
 
 ## Operator Next Steps
