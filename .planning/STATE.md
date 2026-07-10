@@ -2,10 +2,10 @@
 gsd_state_version: 1.0
 milestone: v1.1
 milestone_name: — Consumer Surfaces & File Transfer
-status: Phase 10 (SDK File-Transfer Extension) COMPLETE — Plan 10-05 terminal live gate passed against a real disposable Azure VM (all 5 gated tests pass, FILE-01/02/03/04 satisfied), VM torn down and confirmed absent
-stopped_at: "Phase 10 complete (5/5 plans). Plan 10-05's live gate found and fixed a Rule 1 bug in finalize_write's completeness rule (real Windows never sends FILE_END_OF_FILE_INFORMATION), measured the real per-IRP chunk size, and validated TRANSFER_TIMEOUT_MS. Ready to plan Phase 11 (Shared Wire Protocol & Config)."
-last_updated: "2026-07-10T19:21:03.110Z"
-last_activity: 2026-07-10 — Plan 10-05 executed (live gate: 2/2 auto tasks + 1 checkpoint, 5/5 gated live tests pass, 1 live-diagnosed Rule 1 bug fixed, VM torn down and confirmed absent)
+status: verifying
+stopped_at: Phase 10 complete (5/5 plans). Plan 10-05's live gate found and fixed a Rule 1 bug in finalize_write's completeness rule (real Windows never sends FILE_END_OF_FILE_INFORMATION), measured the real per-IRP chunk size, and validated TRANSFER_TIMEOUT_MS. Ready to plan Phase 11 (Shared Wire Protocol & Config).
+last_updated: "2026-07-10T20:51:02.639Z"
+last_activity: "2026-07-10 — Plan 10-05 executed (live gate: 5/5 gated tests pass, 1 live-diagnosed Rule 1 bug fixed, VM torn down and confirmed absent)"
 progress:
   total_phases: 6
   completed_phases: 1
@@ -230,9 +230,9 @@ Pre-close artifact audit surfaced 3 open items. Reviewed and explicitly acknowle
 
 ## Session Continuity
 
-Last session: 2026-07-10T18:25:46.933Z
-Stopped at: v1.1 roadmap created — Phases 10-15 derived from the 27 v1.1 requirements (research-recommended dependency order: SDK file-transfer → ipc/config → daemon → CLI → MCP → proof). All 27 requirements mapped (0 unmapped); REQUIREMENTS.md traceability updated; ROADMAP.md and STATE.md reflect the new phase list.
-Resume file: .planning/ROADMAP.md (Phase Details, Phase 10)
+Last session: 2026-07-10T20:51:02.633Z
+Stopped at: v1.1 milestone context gathered for phases 11-15 via /gsd-discuss-phase --milestone; 4 cross-cutting decisions recorded in DECISIONS-INDEX.md; ready to plan Phase 11
+Resume file: .planning/DECISIONS-INDEX.md
 
 ## Operator Next Steps
 
