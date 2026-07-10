@@ -18,6 +18,15 @@
 
 mod common;
 
+// D-9.3: the shared proof-harness module (tests/support/proof_harness.rs),
+// reused verbatim by examples/proof_harness.rs via its own #[path] decl.
+// Pitfall 5: this compiles the SAME source file as a SEPARATE module tree
+// inside THIS integration-test binary crate; the module reaches the SDK via
+// its own top-level `use rdpilot::{...}` (see that file's top doc comment),
+// never via this crate root's `use rdpilot::{...}` below.
+#[path = "support/proof_harness.rs"]
+mod proof_harness;
+
 use rdpilot::{
     Button, Key, KeyAction, MouseAction, ProcessInfo, Rect, Screenshot, UiaElement, UiaMode, UiaScope, WindowInfo,
     WindowState, WorldState, WorldStateOptions,
@@ -1641,6 +1650,44 @@ fn world_state_foreground_uia_matches_focused_window() {
             world.capture_span,
             world.capture_span.as_millis()
         );
+
+        session.close().await.expect("close");
+    });
+}
+
+/// Phase 9 SC#1-4 / PROOF-01: the full scripted proof-harness loop (D-9.3),
+/// shared verbatim with `examples/proof_harness.rs` via the `#[path]` decl
+/// above. Mirrors `uia_tree_returns_populated_elements`'s preamble: publish
+/// existence check, `sensor_binary_path`, `connect` -> `deploy_and_launch`,
+/// then the shared harness. This is the phase's terminal gate — it only
+/// PASSes against a live target running a freshly rebuilt sensor that has
+/// the 09-02 deeper-walk capability (`UiaScope::Subtree`).
+#[test]
+#[ignore = "live: requires a provisioned RDP target + published rdpilot-sensor.exe (RDPILOT_LIVE=1)"]
+fn proof_harness_end_to_end() {
+    let Some(cfg) = require_target!("proof_harness_end_to_end") else {
+        return;
+    };
+    let sensor_exe = common::sensor_exe_path();
+    assert!(
+        sensor_exe.exists(),
+        "published rdpilot-sensor.exe not found at {sensor_exe:?} — publish it first \
+         (`dotnet publish -r win-x64 -p:PublishAot=true --self-contained` on a Windows host \
+         with the .NET 8 SDK)"
+    );
+    let cfg = cfg.sensor_binary_path(sensor_exe);
+
+    block_on(async {
+        let session = rdpilot::Session::connect(&cfg)
+            .await
+            .expect("connect (RDPDR channel registers when sensor_binary_path is set)");
+        session
+            .deploy_and_launch()
+            .await
+            .expect("deploy_and_launch: sensor must be answering before window/process/UIA requests");
+
+        let report = proof_harness::run_proof_harness(&session).await.expect("harness");
+        assert!(report.passed, "proof harness failed: {:?}", report.steps);
 
         session.close().await.expect("close");
     });
