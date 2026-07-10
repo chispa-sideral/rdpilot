@@ -956,4 +956,142 @@ mod tests {
 
         let _ = std::fs::remove_file(&served_path);
     }
+
+    /// FILE-03 BLOCKING adversarial path-traversal suite (10-01 Task 3,
+    /// D-10.2). Drives `handle_drive_io_request(ServerCreateDriveRequest)`
+    /// against a real temp share root for the exact required matrix --
+    /// trailing `..` with no separator, mixed `/`+`\` separators,
+    /// absolute-path-as-relative, and the sibling-directory-prefix
+    /// regression guard (10-RESEARCH Pitfall 3, mirrored on the Rust side as
+    /// a regression guard even though `Path::starts_with` is not vulnerable
+    /// to it) -- plus one positive control proving the suite rejects
+    /// attacks WITHOUT over-rejecting a legitimate nested path (Pitfall 2
+    /// warning sign).
+    mod path_traversal {
+        use super::*;
+
+        /// A fresh temp share root for one test: `<base>/share` is the
+        /// configured root, pre-seeded with a `subdir` directory (so the
+        /// trailing-`..`-no-separator case's PARENT genuinely canonicalizes
+        /// -- proving the rejection comes from the trailing-`..` `file_name()`
+        /// check, D-10.2, not merely from a nonexistent directory) and a
+        /// `sub/dir` directory (for the positive-control nested-path case).
+        /// `<base>/share-evil` is a SIBLING directory holding `secret.txt`
+        /// (Pitfall 3's sibling-prefix regression guard: `share` is a strict
+        /// string prefix of `share-evil`, which a raw `StartsWith` -- but
+        /// not Rust's component-aware `Path::starts_with` -- would conflate).
+        /// Every caller removes `base` (and everything under it) once done.
+        fn setup() -> (RdpilotDriveBackend, std::path::PathBuf) {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let base = std::env::temp_dir().join(format!(
+                "rdpilot-rdpdr-traversal-{}-{nanos}",
+                std::process::id()
+            ));
+            let root = base.join("share");
+            std::fs::create_dir_all(root.join("subdir")).expect("share/subdir creates");
+            std::fs::create_dir_all(root.join("sub/dir")).expect("share/sub/dir creates");
+            let sibling = base.join("share-evil");
+            std::fs::create_dir_all(&sibling).expect("sibling share-evil creates");
+            std::fs::write(sibling.join("secret.txt"), b"top secret").expect("sibling secret writes");
+
+            let backend = RdpilotDriveBackend::new(
+                std::env::temp_dir().join("rdpilot-rdpdr-traversal-sensor-placeholder"),
+                "served.bin".to_owned(),
+                Some(root),
+            );
+            (backend, base)
+        }
+
+        /// Assert `path` is rejected: `NtStatus::NO_SUCH_FILE`, file id 0,
+        /// never granted a handle -- and that `handle_drive_io_request`
+        /// itself still returns `Ok` (a rejection is a typed response, never
+        /// a propagated `Err`, API-01).
+        fn assert_rejected(backend: &mut RdpilotDriveBackend, path: &str) {
+            let out = backend
+                .handle_drive_io_request(ServerDriveIoRequest::ServerCreateDriveRequest(create_req(1, path)))
+                .unwrap_or_else(|e| panic!("rejected create for {path:?} must still return Ok, got Err: {e}"));
+            let (status, file_id) = create_response_fields(&out[0]);
+            assert_eq!(status, NtStatus::NO_SUCH_FILE, "path {path:?} must be rejected with NO_SUCH_FILE");
+            assert_eq!(file_id, 0, "path {path:?} must not be granted a file id");
+        }
+
+        /// Assert `path` is accepted: `NtStatus::SUCCESS`, a nonzero file id
+        /// granted -- the positive control proving the validator does not
+        /// over-reject a legitimate nested path.
+        fn assert_accepted(backend: &mut RdpilotDriveBackend, path: &str) {
+            let out = backend
+                .handle_drive_io_request(ServerDriveIoRequest::ServerCreateDriveRequest(create_req(1, path)))
+                .unwrap_or_else(|e| panic!("accepted create for {path:?} must return Ok, got Err: {e}"));
+            let (status, file_id) = create_response_fields(&out[0]);
+            assert_eq!(status, NtStatus::SUCCESS, "legitimate nested path {path:?} must be accepted");
+            assert_ne!(file_id, 0, "legitimate nested path {path:?} must be granted a nonzero file id");
+        }
+
+        /// Case (1): trailing `..` with NO following separator -- the exact
+        /// FreeRDP `contains_dotdot()` off-by-one class (CVE-2025-48817,
+        /// GHSA-3xpj-m4hx-8vmx). `subdir` genuinely exists under the share
+        /// root (see `setup`), so this proves rejection comes from
+        /// `resolve_under_root`'s `candidate.file_name() == None` check on a
+        /// trailing `..` component, not from a missing directory.
+        #[test]
+        fn rejects_trailing_dotdot_with_no_separator() {
+            let (mut backend, base) = setup();
+            assert_rejected(&mut backend, "\\subdir\\..");
+            assert_rejected(&mut backend, "..");
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        /// Case (2): mixed `/`+`\` separators. Unconditional `\`-to-`/`
+        /// normalization BEFORE any `Path`/`PathBuf` construction (Pitfall
+        /// 1) makes these faithful on this Linux test host, which does not
+        /// otherwise treat `\` as a separator.
+        #[test]
+        fn rejects_mixed_separators() {
+            let (mut backend, base) = setup();
+            assert_rejected(&mut backend, "..\\../Windows\\System32");
+            assert_rejected(&mut backend, "foo/..\\..\\bar");
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        /// Case (3): absolute-path-as-relative inputs -- rejected by
+        /// `resolve_under_root`'s own host-independent `looks_rooted` check
+        /// (leading `/` or a drive-letter prefix), not by relying on
+        /// `Path::is_absolute()`'s `cfg(windows)`-conditional semantics
+        /// (which would NOT treat a drive-letter string as rooted on this
+        /// Linux test host).
+        #[test]
+        fn rejects_absolute_path_as_relative() {
+            let (mut backend, base) = setup();
+            assert_rejected(&mut backend, "\\C:\\Windows");
+            assert_rejected(&mut backend, "/etc/passwd");
+            assert_rejected(&mut backend, "C:\\Windows\\System32");
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        /// Case (4): sibling-directory-prefix regression guard (10-RESEARCH
+        /// Pitfall 3). The share root is named `share`; the resolved
+        /// candidate lands in the SIBLING `share-evil` directory, whose name
+        /// is a strict string prefix match of `share` -- a raw
+        /// `string.StartsWith`-style check would wrongly accept this, but
+        /// Rust's component-aware `Path::starts_with` correctly rejects it.
+        #[test]
+        fn rejects_sibling_directory_prefix() {
+            let (mut backend, base) = setup();
+            assert_rejected(&mut backend, "..\\share-evil\\secret.txt");
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        /// Positive control: a legitimate nested path is ACCEPTED -- proves
+        /// the suite rejects attacks WITHOUT over-rejecting valid nested
+        /// writes (Pitfall 2 warning sign).
+        #[test]
+        fn accepts_legitimate_nested_path() {
+            let (mut backend, base) = setup();
+            assert_accepted(&mut backend, "\\sub\\dir\\ok.bin");
+            let _ = std::fs::remove_dir_all(&base);
+        }
+    }
 }
