@@ -1,0 +1,13 @@
+[package]
+name = "rdpilot-ipc"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.78"
+license = "LGPL-3.0-or-later"
+description = "Daemon<->client wire protocol DTOs for rdpilot (session-scoped requests, credential-free responses, wire error taxonomy). Zero dependency on rdpilot/IronRDP — thin clients link this crate only."
+repository = "https://github.com/marcfargas/rdpilot"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
