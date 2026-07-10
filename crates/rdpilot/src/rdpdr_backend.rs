@@ -347,6 +347,20 @@ impl RdpilotDriveBackend {
             expected_len,
         }) = self.open_files.remove(&device_io_request.file_id)
         {
+            // 10-05 live-gate diagnostic only (Rule 1 investigation aid,
+            // zero cost when unsubscribed): records whether a
+            // FILE_END_OF_FILE_INFORMATION was ever received for this handle
+            // and the staged file's actual on-disk length at Close time --
+            // the exact two facts needed to diagnose the STRICT
+            // completeness rule's live-gate confirmation item
+            // (10-02-SUMMARY.md).
+            let staged_len = fs::metadata(&staging).map(|m| m.len()).ok();
+            trace!(
+                expected_len = expected_len.unwrap_or(u64::MAX),
+                had_expected_len = expected_len.is_some(),
+                staged_len = staged_len.unwrap_or(u64::MAX),
+                "rdpdr_close_writefile"
+            );
             Self::finalize_write(&staging, &dest, expected_len);
         }
         let response = DeviceCloseResponse {
@@ -359,38 +373,57 @@ impl RdpilotDriveBackend {
     /// `Close` (10-02, D-10.3, FILE-04). Atomically `fs::rename`s `staging`
     /// to `dest` -- a single syscall on the target filesystem, so no reader
     /// can ever observe a partially-written `dest` (Don't Hand-Roll,
-    /// 10-RESEARCH) -- ONLY when BOTH: (1) `expected_len` is `Some` (a prior
-    /// `FILE_END_OF_FILE_INFORMATION` `SetInformation` was received,
-    /// [`Self::handle_set_information`]) AND (2) the staged file's actual
-    /// on-disk length exactly matches it. This is the STRICT
-    /// completeness rule this plan adopts (see 10-02-SUMMARY.md): it
-    /// deliberately does NOT treat "no `SetInformation` ever sent, but bytes
-    /// were written" as complete, because without an authoritative signal
-    /// this backend cannot distinguish "the sensor finished writing" from
-    /// "the transfer was cut off mid-stream" -- the real Windows
-    /// Close/SetInformation ordering (does the OS always send
-    /// `FILE_END_OF_FILE_INFORMATION` before `Close` for a redirected-drive
-    /// write? RESEARCH flags this in the "Windows' write sequence issues
-    /// these" note) is a genuine live-gate confirmation item (Plan 10-05),
-    /// not something assumable offline.
+    /// 10-RESEARCH).
     ///
-    /// Any other outcome (`expected_len` still `None`, a length mismatch --
-    /// FILE-04's interrupted-transfer case -- or the `fs::rename` call
-    /// itself failing) leaves `staging` untouched: a stale `.part` file is
-    /// the clean, detectable failure signal FILE-04 requires, never a
-    /// partially-written `dest`. Never panics (API-01): every `std::fs`
-    /// failure here is silently absorbed into "stay staged, do not rename",
-    /// not propagated as an error -- `Close` itself always still succeeds
-    /// (see [`Self::handle_close`]'s doc comment).
+    /// **10-05 LIVE-GATE FIX (Rule 1 bug, supersedes the original STRICT
+    /// `expected_len`-only rule):** 10-02-SUMMARY.md's STRICT rule required
+    /// `expected_len` to be `Some` (a prior `FILE_END_OF_FILE_INFORMATION`
+    /// `SetInformation`) AND exactly match the staged length before ever
+    /// renaming. The 10-05 live gate proved this assumption FALSE against a
+    /// real Windows target: the C# sensor's plain sequential
+    /// `FileStream.Write`+`Dispose` copy (`FileTransfer.Transfer`, no
+    /// `SetLength`/truncate call) NEVER triggers a
+    /// `FILE_END_OF_FILE_INFORMATION` `SetInformation` IRP at all -- a live
+    /// diagnostic trace confirmed `had_expected_len=false` on every observed
+    /// `Close` for a completed transfer. Under the original STRICT rule,
+    /// EVERY real upload/download would appear "incomplete" and never
+    /// rename -- the exact live-only failure mode 10-02-SUMMARY.md flagged
+    /// as its own open question, now empirically resolved.
+    ///
+    /// Revised rule: when `expected_len` IS `Some` (some OTHER write path
+    /// DOES send it), keep the STRICT exact-match gate -- defense in depth,
+    /// free extra precision where the signal happens to exist. When
+    /// `expected_len` is `None` (the now-confirmed-common real case),
+    /// fall back to "clean Close is sufficient" (10-02-SUMMARY.md's own
+    /// anticipated fallback) and rename unconditionally. This remains safe
+    /// for FILE-04's interrupted-transfer guarantee: a genuinely severed
+    /// connection (session dropped, DVC channel closed) never delivers a
+    /// `Close` IRP for the in-flight handle at all -- MS-RDPEFS `Close` is a
+    /// normal protocol step in the still-connected shutdown sequence, not a
+    /// disconnect signal -- so an ABORTED transfer simply never reaches this
+    /// function, leaving the stale `.part` in staging exactly as before
+    /// (`interrupted_transfer_is_detectable`, 10-05 live-confirmed). A
+    /// sensor-side copy error (thrown mid-`FileStream` loop) still disposes
+    /// its handles and DOES reach `Close`, but is independently surfaced to
+    /// the SDK caller via the sensor's own `success:false`/`error_kind`
+    /// reply (`Session::upload_file`/`download_file` never touch the local
+    /// share_root on a non-success reply) -- the caller-visible contract
+    /// ("an interrupted transfer surfaces a clean, detectable failure") is
+    /// therefore preserved by the DVC-level reply, not solely by this
+    /// RDPDR-level rename gate.
+    ///
+    /// Never panics (API-01): every `std::fs` failure here is silently
+    /// absorbed into "stay staged, do not rename", not propagated as an
+    /// error -- `Close` itself always still succeeds (see
+    /// [`Self::handle_close`]'s doc comment).
     fn finalize_write(staging: &Path, dest: &Path, expected_len: Option<u64>) {
-        let Some(expected_len) = expected_len else {
-            return;
-        };
         let Ok(metadata) = fs::metadata(staging) else {
             return;
         };
-        if metadata.len() != expected_len {
-            return;
+        if let Some(expected_len) = expected_len {
+            if metadata.len() != expected_len {
+                return;
+            }
         }
         let _ = fs::rename(staging, dest);
     }
@@ -560,6 +593,9 @@ impl RdpilotDriveBackend {
                     if let Ok(len) = u64::try_from(*end_of_file) {
                         *expected_len = Some(len);
                     }
+                    trace!(end_of_file, "rdpdr_set_end_of_file");
+                } else {
+                    trace!("rdpdr_set_information_other_variant");
                 }
                 NtStatus::SUCCESS
             }
@@ -1673,13 +1709,23 @@ mod tests {
         }
 
         /// A `Close` on a WriteFile handle that NEVER received a
-        /// `SetInformation(FILE_END_OF_FILE_INFORMATION)` also does NOT
-        /// rename (the STRICT completeness rule, see `finalize_write`'s doc
-        /// comment) -- this specific ordering (does real Windows always send
-        /// end-of-file before Close?) is the live-gate confirmation item
-        /// this plan explicitly flags, not assumed here.
+        /// `SetInformation(FILE_END_OF_FILE_INFORMATION)` STILL renames (10-05
+        /// LIVE-GATE FIX, supersedes this test's original "STRICT rule"
+        /// assertion): the 10-05 live gate proved that a real Windows
+        /// redirected-drive write driven by a plain `FileStream`
+        /// write+dispose copy (no `SetLength`/truncate call) NEVER sends
+        /// `FILE_END_OF_FILE_INFORMATION` at all -- a live diagnostic trace
+        /// showed `had_expected_len=false` on every observed `Close` for a
+        /// genuinely complete, correct real transfer. Gating on
+        /// `expected_len` being `Some` as a HARD requirement would make every
+        /// real transfer appear "incomplete" forever. `finalize_write` now
+        /// falls back to "clean Close is sufficient" when `expected_len` is
+        /// `None` -- see `finalize_write`'s doc comment for why this remains
+        /// safe for FILE-04's interrupted-transfer guarantee (a genuinely
+        /// severed connection never delivers `Close` for the in-flight
+        /// handle at all).
         #[test]
-        fn close_without_any_set_information_never_renames() {
+        fn close_without_any_set_information_still_renames_on_clean_close() {
             let (mut backend, base) = setup();
             let root = base.join("share");
             let root_canonical = std::fs::canonicalize(&root).expect("root canonicalizes");
@@ -1695,8 +1741,9 @@ mod tests {
             let (status, file_id) = create_response_fields(&created[0]);
             assert_eq!(status, NtStatus::SUCCESS);
 
+            let payload = b"data";
             let write_out = backend
-                .handle_drive_io_request(ServerDriveIoRequest::DeviceWriteRequest(write_req(file_id, 0, b"data")))
+                .handle_drive_io_request(ServerDriveIoRequest::DeviceWriteRequest(write_req(file_id, 0, payload)))
                 .expect("write returns Ok");
             let (status, _length) = write_response_fields(&write_out[0]);
             assert_eq!(status, NtStatus::SUCCESS);
@@ -1708,7 +1755,12 @@ mod tests {
             let (status, _tail) = decode_io_status_and_tail(&close_out[0]);
             assert_eq!(status, NtStatus::SUCCESS);
 
-            assert!(!dest.exists(), "no SetInformation ever received means no authoritative completeness signal");
+            assert!(
+                dest.exists(),
+                "a clean Close with no SetInformation ever received must still rename (10-05 live-gate fix -- \
+                 real Windows never sends FILE_END_OF_FILE_INFORMATION for a plain FileStream copy)"
+            );
+            assert_eq!(std::fs::read(&dest).expect("destination reads"), payload);
 
             let _ = std::fs::remove_dir_all(&base);
         }
