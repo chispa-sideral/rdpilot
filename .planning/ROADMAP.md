@@ -28,7 +28,7 @@ Full phase goals, success criteria, and plan-by-plan detail: `.planning/mileston
 
 ### v1.1 — Consumer Surfaces & File Transfer (Phases 10-15)
 
-- [ ] **Phase 10: SDK File-Transfer Extension** — Generalize the RDPDR drive backend to bidirectional, allow-listed, canonicalization-guarded file transfer with sensor upload/download commands.
+- [x] **Phase 10: SDK File-Transfer Extension** — Generalize the RDPDR drive backend to bidirectional, allow-listed, canonicalization-guarded file transfer with sensor upload/download commands. (completed 2026-07-10)
 - [ ] **Phase 11: Shared Wire Protocol & Config** — `rdpilot-ipc` (required-session-id schema, credential-free DTOs) + `rdpilot-config` (layered file/env/flag resolution).
 - [ ] **Phase 12: Session Daemon** — Long-lived daemon with a leak-free named-session registry, local-only DACL/peer-scoped IPC, auto-start/idle-shutdown, and crash-restart orphan reconciliation.
 - [ ] **Phase 13: CLI Surface** — Thin `rdpilot` CLI over the daemon: lifecycle + perception/input/launch/file verbs, each explicitly targeting a named session.
@@ -49,13 +49,13 @@ Full phase goals, success criteria, and plan-by-plan detail: `.planning/mileston
   3. **[BLOCKING]** An adversarial path-traversal test suite — trailing `..` with no separator, mixed `/`/`\` separators, and absolute-path-as-relative inputs — is rejected by full canonicalized ancestry validation under the share root (never substring matching), with no `Write`/`Create` IRP escaping the share root (FILE-03; Pitfall 8 / FreeRDP GHSA-3xpj-m4hx-8vmx / CVE-2025-48817).
   4. A file larger than one MS-RDPEFS per-IRP chunk transfers correctly (the chunked read/write loop actually loops), and an interrupted transfer surfaces a clean, detectable failure (staged-and-renamed) rather than silent corruption (FILE-04).
 
-**Plans**: 4/5 plans executed
+**Plans**: 5/5 plans complete
 
 - [x] 10-01-PLAN.md — Rust foundation: error taxonomy + share-root config + canonicalizing path validator + backend generalization + FILE-03 Rust adversarial suite (Wave 1)
 - [x] 10-02-PLAN.md — Staged-write IRPs (DeviceWrite + SetInformation) + atomic-rename-on-Close + FILE-04 multi-IRP/interrupted offline proxy (Wave 2)
 - [x] 10-03-PLAN.md — Sensor FileTransfer wire variant + C# copy-with-inline-SHA256 handler + C# GetRelativePath validator + FILE-03 C# selftest (Wave 1)
 - [x] 10-04-PLAN.md — Public Session::upload_file/download_file + TransferOutcome + SHA-256 verify / ChecksumMismatch (Wave 3)
-- [ ] 10-05-PLAN.md — Live Azure VM gate: FILE-01/02/04 end-to-end + FILE-03 live re-confirm + real chunk-size measurement (Wave 4)
+- [x] 10-05-PLAN.md — Live Azure VM gate: FILE-01/02/04 end-to-end + FILE-03 live re-confirm + real chunk-size measurement (Wave 4)
 
 ### Phase 11: Shared Wire Protocol & Config
 
@@ -139,7 +139,7 @@ Full phase goals, success criteria, and plan-by-plan detail: `.planning/mileston
 | 7. UIA Tree Module | v1.0 | 5/5 | Complete | 2026-07-09 |
 | 8. Public SDK API + WorldState | v1.0 | 3/3 | Complete | 2026-07-09 |
 | 9. Scripted Proof Harness | v1.0 | 4/4 | Complete | 2026-07-10 |
-| 10. SDK File-Transfer Extension | v1.1 | 4/5 | In Progress|  |
+| 10. SDK File-Transfer Extension | v1.1 | 5/5 | Complete   | 2026-07-10 |
 | 11. Shared Wire Protocol & Config | v1.1 | 0/? | Not started | - |
 | 12. Session Daemon | v1.1 | 0/? | Not started | - |
 | 13. CLI Surface | v1.1 | 0/? | Not started | - |

@@ -2,16 +2,16 @@
 gsd_state_version: 1.0
 milestone: v1.1
 milestone_name: — Consumer Surfaces & File Transfer
-status: Plan 10-01 executed — Rust-side error taxonomy, share_root config, resolve_under_root validator, generalized RdpilotDriveBackend, FILE-03 Rust adversarial suite all pass offline
-stopped_at: "v1.1 roadmap created — Phases 10-15 derived from the 27 v1.1 requirements (research-recommended dependency order: SDK file-transfer → ipc/config → daemon → CLI → MCP → proof). All 27 requirements mapped (0 unmapped); REQUIREMENTS.md traceability updated; ROADMAP.md and STATE.md reflect the new phase list."
-last_updated: "2026-07-10T18:25:46.938Z"
-last_activity: 2026-07-10 — Plan 10-01 executed (3/3 tasks, 111/111 offline tests pass)
+status: Phase 10 (SDK File-Transfer Extension) COMPLETE — Plan 10-05 terminal live gate passed against a real disposable Azure VM (all 5 gated tests pass, FILE-01/02/03/04 satisfied), VM torn down and confirmed absent
+stopped_at: "Phase 10 complete (5/5 plans). Plan 10-05's live gate found and fixed a Rule 1 bug in finalize_write's completeness rule (real Windows never sends FILE_END_OF_FILE_INFORMATION), measured the real per-IRP chunk size, and validated TRANSFER_TIMEOUT_MS. Ready to plan Phase 11 (Shared Wire Protocol & Config)."
+last_updated: "2026-07-10T19:21:03.110Z"
+last_activity: 2026-07-10 — Plan 10-05 executed (live gate: 2/2 auto tasks + 1 checkpoint, 5/5 gated live tests pass, 1 live-diagnosed Rule 1 bug fixed, VM torn down and confirmed absent)
 progress:
   total_phases: 6
-  completed_phases: 0
+  completed_phases: 1
   total_plans: 5
-  completed_plans: 4
-  percent: 0
+  completed_plans: 5
+  percent: 17
 ---
 
 # Project State
@@ -25,10 +25,10 @@ See: .planning/PROJECT.md (updated 2026-07-10)
 
 ## Current Position
 
-Phase: 10 — SDK File-Transfer Extension (in progress)
-Plan: 4 complete (of 5)
-Status: Plan 10-01 executed — Rust-side error taxonomy, share_root config, resolve_under_root validator, generalized RdpilotDriveBackend, FILE-03 Rust adversarial suite all pass offline
-Last activity: 2026-07-10 — Plan 10-01 executed (3/3 tasks, 111/111 offline tests pass)
+Phase: 10 — SDK File-Transfer Extension (COMPLETE)
+Plan: 5 complete (of 5)
+Status: Phase 10 COMPLETE — terminal live gate (10-05) passed against a real disposable Azure VM, FILE-01/02/03/04 all live-verified, VM torn down and confirmed absent
+Last activity: 2026-07-10 — Plan 10-05 executed (live gate: 5/5 gated tests pass, 1 live-diagnosed Rule 1 bug fixed, VM torn down and confirmed absent)
 
 ## Milestone v1.1 Phases
 
@@ -97,6 +97,7 @@ Last activity: 2026-07-10 — Plan 10-01 executed (3/3 tasks, 111/111 offline te
 | Phase 10 P02 | 35min | 2 tasks | 1 files |
 | Phase 10 P04 | 40min | 2 tasks | 3 files |
 | Phase 10 P05 | ~2h | 2 tasks (+1 checkpoint) | 4 files (incl. live gate + 1 live-diagnosed bug fix) |
+| Phase 10 P05 | ~2h | 2 tasks | 4 files |
 
 ## Accumulated Context
 
@@ -181,6 +182,8 @@ Recent decisions affecting current work:
 - [Phase ?]: 10-04: sensor_request's success:false branch inspects error_kind before falling through to SensorRejected -- a path_traversal sentinel now surfaces as the distinct Error::PathTraversal end-to-end (D-10.4 BLOCKER fix)
 - [Phase ?]: 10-04: Session gained a share_root field (from ConnectionConfig::share_root) so upload_file/download_file can stage/retrieve transfer bytes locally via std::fs -- required for functional correctness, not explicit in the plan's action text
 - **Phase 10 terminal live gate (10-05, 2026-07-10):** All FILE-01/02/03/04 success criteria proven live against a real disposable Azure VM (`rdpilot-vm`, `Standard_B2s_v2`, westeurope). **LIVE-DIAGNOSED RULE 1 BUG (the critical finding):** `finalize_write`'s STRICT `expected_len`-only completeness rule (10-02) was FALSE on real Windows -- the C# sensor's plain `FileStream.Write`+`Dispose` copy never sends `FILE_END_OF_FILE_INFORMATION` before `Close` (a diagnostic tracing subscriber confirmed `had_expected_len=false` on every observed real `Close`), meaning every real transfer would have appeared "incomplete" and never renamed under the original rule -- fixed (commit `7101f2d`) by falling back to "clean Close is sufficient" when `expected_len` is `None`, keeping the exact-match gate only when it IS `Some`; FILE-04's interrupted-transfer guarantee remains intact because a genuinely severed connection never delivers a `Close` IRP at all. Real per-IRP chunk size measured (10-RESEARCH Open Question 1, never hardcoded): WRITE direction consistently 65,536 bytes (64 KiB); READ direction variable, max observed 524,288-614,400 bytes (512-600 KiB) -- read-ahead/caching behavior, no single dominant value. `TRANSFER_TIMEOUT_MS` (30s, 10-04) validated as adequate, not tuned -- the full 5-test suite (incl. an 8 MiB interrupted-transfer fixture and a 3 MiB round trip) completed in 74-85s total. **New prerequisite step this phase's live gate required** (not needed by Phase 5-9): a fresh WS2022 Datacenter VM has neither .NET 8 SDK nor a native C++ toolchain preinstalled -- both must be installed via a separate `az vm run-command invoke` (`dotnet-install.ps1 -Channel 8.0` + `vs_buildtools.exe --add Microsoft.VisualStudio.Workload.VCTools --quiet --wait`) BEFORE the sensor can be built on the VM. Sensor SHA-256 `5ea474dba5d50a00ed3aa2fcdeece0c88031e000b81cd0534427c508a6bc7cf7` (3,239,936 bytes) confirmed byte-identical VM-built vs relayed via Storage blob SAS. All five gated tests (`file_upload_roundtrip`, `file_download_checksum_matches`, `large_file_transfers_chunked`, `interrupted_transfer_is_detectable`, `traversal_rejected_live`) PASS; FILE-03's mixed-separator and Windows-drive-absolute adversarial cases both reject as `Error::PathTraversal` live, both directions. See `10-05-SUMMARY.md`. **Teardown pending developer authorization (blocking checkpoint) as of this STATE.md update.**
+- [Phase ?]: 10-05: finalize_write completeness rule changed to a two-tier rule (STRICT expected_len match when Some, clean-Close-is-sufficient fallback when None) after live-diagnosing that real Windows never sends FILE_END_OF_FILE_INFORMATION for a plain FileStream copy -- the original STRICT-only rule made every real transfer fail
+- [Phase ?]: 10-05: real per-IRP chunk size measured live -- write direction consistently 65536 bytes (64 KiB), read direction variable up to 512-600 KiB; TRANSFER_TIMEOUT_MS (30s) validated as adequate, not tuned
 
 ### Pending Todos
 

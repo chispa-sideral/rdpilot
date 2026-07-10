@@ -142,19 +142,19 @@ None beyond the plan's own stated Azure `az` CLI authentication prerequisite (al
 
 ## Teardown
 
-**Live-gate artifacts to review before authorizing teardown:**
+**Live-gate artifacts reviewed and human-approved (Task 3, blocking checkpoint):**
 - Sensor SHA-256: `5ea474dba5d50a00ed3aa2fcdeece0c88031e000b81cd0534427c508a6bc7cf7` (3,239,936 bytes), confirmed byte-identical VM-built vs relayed
 - All 5 gated live tests PASS (see Success Criteria Results table)
 - Rule 1 fix captured in commit `7101f2d`, re-verified live after the fix
 - Real per-IRP chunk size recorded (write: 65,536 bytes; read: max 524,288-614,400 bytes)
 
-**This is the plan's BLOCKING `checkpoint:human-verify` (Task 3) — teardown (`az group delete -n rdpilot-test`) requires explicit developer authorization before it runs.** Once approved: `pwsh infra/manage-env.ps1 -Action down`, then confirm `az group exists -n rdpilot-test` => `false` (management RG `rdpilot-mgmt` persists). The sensor-relay storage account (`rdpilotxferh2y17836`) lives in `rdpilot-test` and is destroyed automatically with the resource group.
+**Teardown executed and CONFIRMED:** `pwsh infra/manage-env.ps1 -Action down` ran to completion ("Resource group 'rdpilot-test' is fully deleted."). `az group exists -n rdpilot-test` => `false`. `az group exists -n rdpilot-mgmt` => `true` (persistent management RG correctly left in place). The sensor-relay storage account (`rdpilotxferh2y17836`) lived inside `rdpilot-test` and was destroyed automatically with the resource group — no orphaned billing resources remain.
 
 ## Next Phase Readiness
 
-- FILE-01/02/03/04 are now fully live-verified; Phase 10 (SDK File-Transfer Extension) is ready to close pending teardown authorization.
+- FILE-01/02/03/04 are fully live-verified. **Phase 10 (SDK File-Transfer Extension) is COMPLETE** — all 5 plans done, VM torn down and confirmed absent.
 - Phase 11 (`rdpilot-ipc`/`rdpilot-config`) can build on a PROVEN `Session::upload_file`/`download_file` public API — the live-diagnosed `finalize_write` fix means this is now genuinely correct against real Windows, not just offline-plausible.
-- No blockers to continuing to Phase 11 once this plan's checkpoint is resolved and the VM is torn down.
+- No blockers to continuing to Phase 11.
 
 ---
 *Phase: 10-sdk-file-transfer-extension*
