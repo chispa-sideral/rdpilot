@@ -48,6 +48,17 @@ const SCREENSHOT_PATH: &str = "spike_7zip_first_launch.png";
 /// confirmed or refuted.
 const SEED_PATH: &str = "C:\\Program Files";
 
+/// Full, absolute path to the installed 7-Zip File Manager
+/// (`infra/scripts/Configure-Target.ps1` installs it here verbatim). The
+/// sensor's `CreateProcessW` call passes `lpApplicationName = null`
+/// (`sensor/ProcessLaunch.cs`), so Win32's standard command-line search
+/// algorithm applies to `exe` — a bare `"7zFM.exe"` is NOT found (it is not
+/// on `PATH` and the sensor's own `cwd` is unrelated to 7-Zip's install
+/// dir). RULE-3 LIVE FIX (D-9.1 spike): the first live run failed with
+/// `CreateProcessW failed (LastError=2)` (`ERROR_FILE_NOT_FOUND`) using the
+/// bare filename — the full, quoted path is required.
+const EXE_PATH: &str = "C:\\Program Files\\7-Zip\\7zFM.exe";
+
 /// Bounded poll attempts (mirrors `launch_notepad_and_find_window`,
 /// `tests/live_session.rs:1222-1242`) waiting for the 7-Zip window to
 /// register after `launch_process` (fire-and-forget, D-6.2).
@@ -172,10 +183,17 @@ async fn run() -> Result<(), String> {
 /// obtain an hwnd for the dump. The real class_name/title are eprintln!'d by
 /// the caller once found, so the true match predicate is captured live.
 async fn launch_7zip_and_find_window(session: &Session) -> Result<WindowInfo, String> {
+    // `exe`/`args` are individually quoted (both contain spaces) because the
+    // sensor concatenates them as `"{exe} {args}"` before calling
+    // `CreateProcessW` with `lpApplicationName = null` (Win32 requires an
+    // unquoted-but-spaced token to be quoted so the ambiguous
+    // space-delimited search algorithm resolves correctly, D-9.1 live fix).
+    let quoted_exe = format!("\"{EXE_PATH}\"");
+    let quoted_seed = format!("\"{SEED_PATH}\"");
     session
-        .launch_process("7zFM.exe", Some(SEED_PATH), None)
+        .launch_process(&quoted_exe, Some(quoted_seed.as_str()), None)
         .await
-        .map_err(|e| format!("launch_process(7zFM.exe) failed: {e}"))?;
+        .map_err(|e| format!("launch_process({EXE_PATH:?}) failed: {e}"))?;
 
     for attempt in 0..POLL_ATTEMPTS {
         tokio::time::sleep(SETTLE).await;
