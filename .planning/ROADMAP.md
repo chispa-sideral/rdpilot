@@ -46,7 +46,12 @@ Full phase goals, success criteria, and plan-by-plan detail: `.planning/mileston
   2. A remote file downloads to a named local destination (`Session::download_file`) with matching size/checksum (FILE-02).
   3. **[BLOCKING]** An adversarial path-traversal test suite — trailing `..` with no separator, mixed `/`/`\` separators, and absolute-path-as-relative inputs — is rejected by full canonicalized ancestry validation under the share root (never substring matching), with no `Write`/`Create` IRP escaping the share root (FILE-03; Pitfall 8 / FreeRDP GHSA-3xpj-m4hx-8vmx / CVE-2025-48817).
   4. A file larger than one MS-RDPEFS per-IRP chunk transfers correctly (the chunked read/write loop actually loops), and an interrupted transfer surfaces a clean, detectable failure (staged-and-renamed) rather than silent corruption (FILE-04).
-**Plans**: TBD
+**Plans**: 5 plans across 4 waves
+- [ ] 10-01-PLAN.md — Rust foundation: error taxonomy + share-root config + canonicalizing path validator + backend generalization + FILE-03 Rust adversarial suite (Wave 1)
+- [ ] 10-02-PLAN.md — Staged-write IRPs (DeviceWrite + SetInformation) + atomic-rename-on-Close + FILE-04 multi-IRP/interrupted offline proxy (Wave 2)
+- [ ] 10-03-PLAN.md — Sensor FileTransfer wire variant + C# copy-with-inline-SHA256 handler + C# GetRelativePath validator + FILE-03 C# selftest (Wave 1)
+- [ ] 10-04-PLAN.md — Public Session::upload_file/download_file + TransferOutcome + SHA-256 verify / ChecksumMismatch (Wave 3)
+- [ ] 10-05-PLAN.md — Live Azure VM gate: FILE-01/02/04 end-to-end + FILE-03 live re-confirm + real chunk-size measurement (Wave 4)
 
 ### Phase 11: Shared Wire Protocol & Config
 **Goal**: One shared crate defines the daemon↔client wire protocol and another resolves layered configuration — with session-identity-as-required-field and credential-redaction enforced at the schema level *before* any consumer binary is built on top.
