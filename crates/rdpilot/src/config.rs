@@ -59,6 +59,14 @@ pub struct ConnectionConfig {
     /// behavior. Owned `PathBuf` (D-09 — no third-party type in the public
     /// signature).
     sensor_binary_path: Option<PathBuf>,
+    /// Local filesystem path of the share root the RDPDR drive backend
+    /// serves in addition to the sensor exe (D-10.1, FILE-01/FILE-02).
+    ///
+    /// `None` (the default) means [`crate::rdpdr_backend::RdpilotDriveBackend`]
+    /// serves ONLY the sensor exe, preserving the pre-Phase-10 behavior
+    /// byte-for-byte. Owned `PathBuf` (D-09 — no third-party type in the
+    /// public signature).
+    share_root: Option<PathBuf>,
 }
 
 impl ConnectionConfig {
@@ -82,6 +90,7 @@ impl ConnectionConfig {
             height: DEFAULT_HEIGHT,
             accept_invalid_certs: false,
             sensor_binary_path: None,
+            share_root: None,
         }
     }
 
@@ -128,6 +137,21 @@ impl ConnectionConfig {
     #[must_use]
     pub fn sensor_binary_path(mut self, path: impl Into<PathBuf>) -> Self {
         self.sensor_binary_path = Some(path.into());
+        self
+    }
+
+    /// Set the local filesystem path of the share root the RDPDR drive
+    /// backend serves in addition to the sensor exe (builder, D-10.1,
+    /// FILE-01/FILE-02).
+    ///
+    /// When set, every RDPDR-supplied path other than the sensor exe name is
+    /// canonicalized and ancestry-checked under this root before any
+    /// `std::fs` call (D-10.2/FILE-03). When unset (the default), the drive
+    /// backend continues serving ONLY the sensor exe, unchanged from
+    /// pre-Phase-10 behavior.
+    #[must_use]
+    pub fn share_root(mut self, path: impl Into<PathBuf>) -> Self {
+        self.share_root = Some(path.into());
         self
     }
 
@@ -182,6 +206,15 @@ impl ConnectionConfig {
     pub fn get_sensor_binary_path(&self) -> Option<&Path> {
         self.sensor_binary_path.as_deref()
     }
+
+    /// Local filesystem path of the share root the RDPDR drive backend
+    /// serves in addition to the sensor exe, if configured (D-10.1,
+    /// FILE-01/FILE-02).
+    ///
+    /// `None` means the drive backend serves ONLY the sensor exe.
+    pub fn get_share_root(&self) -> Option<&Path> {
+        self.share_root.as_deref()
+    }
 }
 
 /// Redacted `Debug`: never prints the password (D-14, threat T-02-02).
@@ -197,6 +230,7 @@ impl fmt::Debug for ConnectionConfig {
             .field("height", &self.height)
             .field("accept_invalid_certs", &self.accept_invalid_certs)
             .field("sensor_binary_path", &self.sensor_binary_path)
+            .field("share_root", &self.share_root)
             .finish()
     }
 }
@@ -216,6 +250,8 @@ mod tests {
         assert!(!cfg.get_accept_invalid_certs());
         // No RDPDR channel is registered unless a sensor path is configured.
         assert_eq!(cfg.get_sensor_binary_path(), None);
+        // No share root is served unless explicitly configured (D-10.1).
+        assert_eq!(cfg.get_share_root(), None);
     }
 
     #[test]
@@ -225,6 +261,12 @@ mod tests {
             cfg.get_sensor_binary_path(),
             Some(std::path::Path::new("/tmp/rdpilot-sensor.exe"))
         );
+    }
+
+    #[test]
+    fn share_root_builder_and_getter_roundtrip() {
+        let cfg = ConnectionConfig::new("h", "u", "p").share_root("/tmp/rdpilot-share");
+        assert_eq!(cfg.get_share_root(), Some(std::path::Path::new("/tmp/rdpilot-share")));
     }
 
     #[test]

@@ -58,6 +58,11 @@ thiserror = "2"
 tracing = "0.1"
 x509-cert = "0.2"
 rustls-native-certs = "0.8.4"
+# SHA-256 checksum verification for file transfer (D-10.5, FILE-02). Already
+# resolved transitively in Cargo.lock at 0.11.0 (pulled by the TLS/x509 chain)
+# -- promoting to a direct dependency introduces no new supply-chain node
+# (10-RESEARCH Package Legitimacy Audit: slopcheck [OK]).
+sha2 = "0.11"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

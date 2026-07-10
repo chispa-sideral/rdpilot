@@ -104,6 +104,25 @@ pub enum Error {
     /// reply's `success` field was `false`.
     #[error("sensor rejected the request: {0}")]
     SensorRejected(String),
+
+    /// A file-transfer path (Rust-side `RdpilotDriveBackend` validator,
+    /// D-10.2/FILE-03) resolved outside the configured share root, or could
+    /// not be resolved under it at all. Distinct from [`Error::Dvc`]/
+    /// [`Error::SensorRejected`] (transport/semantic failures) so a rejected
+    /// path is never conflated with a transient transfer failure (D-10.4).
+    #[error("path rejected: {0}")]
+    PathTraversal(String),
+
+    /// A downloaded/uploaded file's computed SHA-256 digest did not match
+    /// the expected digest (D-10.5, FILE-02). Carries both hex digests so
+    /// the caller can report the mismatch without recomputing anything.
+    #[error("checksum mismatch: expected {expected}, actual {actual}")]
+    ChecksumMismatch {
+        /// The expected SHA-256 digest, hex-encoded.
+        expected: String,
+        /// The actual computed SHA-256 digest, hex-encoded.
+        actual: String,
+    },
 }
 
 /// Convenience alias for results returned by the `rdpilot` public API.
@@ -168,6 +187,26 @@ impl Error {
     pub(crate) fn sensor_rejected(msg: impl Into<String>) -> Self {
         Error::SensorRejected(msg.into())
     }
+
+    /// Construct a [`Error::PathTraversal`] from any message displayable as
+    /// a string (D-10.2/D-10.4) — mirrors [`Error::sensor_rejected`]'s role
+    /// as the single call-site-friendly constructor for its variant.
+    #[allow(dead_code)] // Consumed by Plan 10-01 Task 2's resolve_under_root and Plan 10-02's write path.
+    pub(crate) fn path_traversal(msg: impl Into<String>) -> Self {
+        Error::PathTraversal(msg.into())
+    }
+
+    /// Construct a [`Error::ChecksumMismatch`] from the expected and actual
+    /// hex-encoded SHA-256 digests (D-10.5) — mirrors
+    /// [`Error::path_traversal`]'s role as the single call-site-friendly
+    /// constructor for its variant.
+    #[allow(dead_code)] // Consumed by Plan 10-04's checksum verification (interface-first).
+    pub(crate) fn checksum_mismatch(expected: impl Into<String>, actual: impl Into<String>) -> Self {
+        Error::ChecksumMismatch {
+            expected: expected.into(),
+            actual: actual.into(),
+        }
+    }
 }
 
 /// Ensure the error renders without leaking any internal/third-party detail
@@ -188,6 +227,8 @@ impl Error {
             Error::Dvc(_) => "dvc",
             Error::Bootstrap(_) => "bootstrap",
             Error::SensorRejected(_) => "sensor_rejected",
+            Error::PathTraversal(_) => "path_traversal",
+            Error::ChecksumMismatch { .. } => "checksum_mismatch",
         }
     }
 }
@@ -228,5 +269,34 @@ mod tests {
         let rendered = format!("{err}");
         assert!(rendered.contains("sensor rejected the request"));
         assert!(rendered.contains("window closed"));
+    }
+
+    /// `Error::path_traversal` reports the `"path_traversal"` category
+    /// (D-10.2/D-10.4), matches `Error::PathTraversal(_)`, and its `Display`
+    /// contains the rejection reason -- mirrors the existing
+    /// `sensor_rejected_category_and_message_render` coverage pattern for a
+    /// new call-site-friendly variant.
+    #[test]
+    fn path_traversal_category_and_message_render() {
+        let err = Error::path_traversal("escapes share root");
+        assert_eq!(err.category(), "path_traversal");
+        assert!(matches!(err, Error::PathTraversal(_)));
+        let rendered = format!("{err}");
+        assert!(rendered.contains("path rejected"));
+        assert!(rendered.contains("escapes share root"));
+    }
+
+    /// `Error::checksum_mismatch` reports the `"checksum_mismatch"` category
+    /// (D-10.5) and its `Display` names both the expected and actual hex
+    /// digests -- mirrors `path_traversal_category_and_message_render`.
+    #[test]
+    fn checksum_mismatch_category_and_message_render() {
+        let err = Error::checksum_mismatch("aaaa", "bbbb");
+        assert_eq!(err.category(), "checksum_mismatch");
+        assert!(matches!(err, Error::ChecksumMismatch { .. }));
+        let rendered = format!("{err}");
+        assert!(rendered.contains("checksum mismatch"));
+        assert!(rendered.contains("aaaa"));
+        assert!(rendered.contains("bbbb"));
     }
 }
