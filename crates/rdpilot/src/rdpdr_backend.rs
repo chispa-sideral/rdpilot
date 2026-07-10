@@ -28,7 +28,7 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::io::{Read as _, Seek as _, SeekFrom};
+use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
 
 use ironrdp::core::impl_as_any;
@@ -38,29 +38,56 @@ use ironrdp_rdpdr::backend::RdpdrBackend;
 use ironrdp_rdpdr::pdu::RdpdrPdu;
 use ironrdp_rdpdr::pdu::efs::{
     Boolean, Characteristics, ClientDriveQueryDirectoryResponse, ClientDriveQueryInformationResponse,
-    ClientDriveQueryVolumeInformationResponse, DeviceCloseRequest, DeviceCloseResponse, DeviceControlRequest,
-    DeviceCreateRequest, DeviceCreateResponse, DeviceIoRequest, DeviceIoResponse, DeviceReadRequest,
-    DeviceReadResponse, FileAttributeTagInformation, FileAttributes, FileBasicInformation,
-    FileBothDirectoryInformation, FileDirectoryInformation, FileFsAttributeInformation, FileFsDeviceInformation,
-    FileFsFullSizeInformation, FileFsSizeInformation, FileFsVolumeInformation, FileFullDirectoryInformation,
-    FileInformationClass, FileInformationClassLevel, FileNamesInformation, FileStandardInformation,
-    FileSystemAttributes, FileSystemInformationClass, FileSystemInformationClassLevel, Information, NtStatus,
-    ServerDeviceAnnounceResponse, ServerDriveIoRequest, ServerDriveQueryDirectoryRequest,
-    ServerDriveQueryInformationRequest, ServerDriveQueryVolumeInformationRequest,
+    ClientDriveQueryVolumeInformationResponse, ClientDriveSetInformationResponse, CreateDisposition,
+    DeviceCloseRequest, DeviceCloseResponse, DeviceControlRequest, DeviceCreateRequest, DeviceCreateResponse,
+    DeviceIoRequest, DeviceIoResponse, DeviceReadRequest, DeviceReadResponse, DeviceWriteRequest,
+    DeviceWriteResponse, FileAttributeTagInformation, FileAttributes, FileBasicInformation,
+    FileBothDirectoryInformation, FileDirectoryInformation, FileEndOfFileInformation, FileFsAttributeInformation,
+    FileFsDeviceInformation, FileFsFullSizeInformation, FileFsSizeInformation, FileFsVolumeInformation,
+    FileFullDirectoryInformation, FileInformationClass, FileInformationClassLevel, FileNamesInformation,
+    FileStandardInformation, FileSystemAttributes, FileSystemInformationClass, FileSystemInformationClassLevel,
+    Information, NtStatus, ServerDeviceAnnounceResponse, ServerDriveIoRequest, ServerDriveQueryDirectoryRequest,
+    ServerDriveQueryInformationRequest, ServerDriveQueryVolumeInformationRequest, ServerDriveSetInformationRequest,
 };
 use ironrdp_rdpdr::pdu::esc::{ScardCall, ScardIoCtlCode};
 
 /// What a previously-granted RDPDR file id refers to: the drive root (a
-/// directory) or a resolved, absolute file path -- either the sensor exe
-/// (the pre-Phase-10 read-only special case) or a file under the configured
-/// share root, already validated by [`RdpilotDriveBackend::resolve_under_root`]
-/// at `Create` time (D-10.1/D-10.2). `handle_read` only ever streams bytes
-/// for [`OpenEntry::File`] -- a `Read` against a root/directory handle (or
-/// an unknown handle) is rejected before any `std::fs` call (T-05-04).
+/// directory), a resolved read-only file path, or an in-progress staged
+/// write (10-02, D-10.3).
+///
+/// [`OpenEntry::File`] is either the sensor exe (the pre-Phase-10 read-only
+/// special case) or a file under the configured share root, already
+/// validated by [`RdpilotDriveBackend::resolve_under_root`] at `Create`
+/// time (D-10.1/D-10.2). `handle_read` only ever streams bytes for
+/// [`OpenEntry::File`] -- a `Read` against a root/directory/write handle
+/// (or an unknown handle) is rejected before any `std::fs` call (T-05-04).
+///
+/// [`OpenEntry::WriteFile`] is granted when `handle_create` sees a
+/// create/overwrite `CreateDisposition` (D-10.3): `dest` is the
+/// `resolve_under_root`-validated, not-yet-existing final destination;
+/// `staging` is a fresh `<share_root>/.rdpilot-staging/<uuid>.part` path
+/// this backend allocates and creates itself (never server-derived, so no
+/// additional validation is needed on it); `expected_len` is `None` until a
+/// `FILE_END_OF_FILE_INFORMATION` `SetInformation` records the
+/// authoritative total-size signal (`handle_set_information`) -- the STRICT
+/// completeness rule `handle_close`'s `finalize_write` enforces: a clean
+/// Close only renames `staging` to `dest` when `expected_len` is `Some` AND
+/// the staged file's actual length matches it exactly; any other outcome
+/// (no `SetInformation` ever received, or a short/interrupted transfer)
+/// leaves the stale `.part` in staging -- a clean, detectable failure
+/// (FILE-04) rather than a partially-written destination file. See
+/// 10-02-SUMMARY.md for why this rule was chosen and what remains a
+/// live-gate confirmation item (real Windows Close/SetInformation
+/// ordering).
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum OpenEntry {
     Root,
     File(PathBuf),
+    WriteFile {
+        staging: PathBuf,
+        dest: PathBuf,
+        expected_len: Option<u64>,
+    },
 }
 
 /// A `std::fs`-based [`RdpdrBackend`] that serves the sensor exe read-only
@@ -86,6 +113,12 @@ pub(crate) struct RdpilotDriveBackend {
     share_root: Option<PathBuf>,
     open_files: HashMap<u32, OpenEntry>,
     next_file_id: u32,
+    /// A fresh counter (10-02, D-10.3) mixed into every staged `.part`
+    /// filename alongside a nanosecond timestamp and the process id --
+    /// guarantees a unique staging name per `Create` within one backend's
+    /// lifetime without pulling in a `uuid` crate dependency (mirrors the
+    /// existing test helper's `nanos`+pid scheme).
+    next_staging_id: u64,
 }
 
 impl_as_any!(RdpilotDriveBackend);
@@ -103,6 +136,7 @@ impl RdpilotDriveBackend {
             share_root,
             open_files: HashMap::new(),
             next_file_id: 1,
+            next_staging_id: 1,
         }
     }
 
@@ -186,16 +220,72 @@ impl RdpilotDriveBackend {
         id
     }
 
+    /// `true` for the four `CreateDisposition` values that signal
+    /// create/overwrite WRITE intent (D-10.3 Task 1 action): `FILE_CREATE`,
+    /// `FILE_OPEN_IF`, `FILE_OVERWRITE_IF`, `FILE_SUPERSEDE`. Plain
+    /// `FILE_OPEN` (and `FILE_OVERWRITE`, which -- like `FILE_OPEN` --
+    /// requires the target to already exist) fall through to the existing
+    /// read-oriented [`OpenEntry::File`] path unchanged, preserving every
+    /// pre-10-02 Read/QueryInformation/QueryDirectory behavior byte-for-byte
+    /// for those dispositions.
+    fn is_write_disposition(disposition: CreateDisposition) -> bool {
+        disposition == CreateDisposition::FILE_CREATE
+            || disposition == CreateDisposition::FILE_OPEN_IF
+            || disposition == CreateDisposition::FILE_OVERWRITE_IF
+            || disposition == CreateDisposition::FILE_SUPERSEDE
+    }
+
+    /// Allocate and create (empty, truncated) a fresh
+    /// `<share_root>/.rdpilot-staging/<uuid>.part` file for a new
+    /// [`OpenEntry::WriteFile`] handle (D-10.3). The "uuid" is a
+    /// nanosecond-timestamp + process-id + monotonic-counter combination
+    /// (mirrors the existing test helpers' scheme; no new crate dependency)
+    /// -- collision-free for any realistic number of concurrent transfers
+    /// within one backend's lifetime. Returns `None` (never panics, API-01)
+    /// if no share root is configured, the root fails to canonicalize, or
+    /// the staging file fails to create (e.g. `.rdpilot-staging/` missing --
+    /// `connect.rs` is responsible for pre-creating it, 10-01) -- any of
+    /// which reject the `Create` with `NtStatus::NO_SUCH_FILE`, same as an
+    /// unresolvable share-root path.
+    fn allocate_staging_path(&mut self) -> Option<PathBuf> {
+        let root = self.share_root.as_ref()?;
+        let root_canonical = fs::canonicalize(root).ok()?;
+
+        let id = self.next_staging_id;
+        self.next_staging_id = self.next_staging_id.wrapping_add(1);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let staging = root_canonical
+            .join(".rdpilot-staging")
+            .join(format!("{nanos}-{}-{id}.part", std::process::id()));
+
+        fs::File::create(&staging).ok()?;
+        Some(staging)
+    }
+
     /// [`ServerDriveIoRequest::ServerCreateDriveRequest`]: the drive root
     /// always resolves; the sensor exe name resolves to its fixed read-only
-    /// path (the pre-Phase-10 bootstrap special case, unchanged); every
-    /// other name is routed through [`Self::resolve_under_root`] (D-10.2) --
-    /// an escaping/unresolvable path is rejected with `NtStatus::NO_SUCH_FILE`
-    /// (the not-found status this crate's `efs.rs` actually defines --
-    /// RESEARCH Open Question #1) and never reaches `std::fs` (T-05-04).
+    /// path (the pre-Phase-10 bootstrap special case, unchanged); a
+    /// create/overwrite disposition ([`Self::is_write_disposition`], D-10.3)
+    /// against any other name resolves the destination via
+    /// [`Self::resolve_under_root`] (ancestry-validated BEFORE any staging
+    /// file is created) and, on success, allocates a fresh staged
+    /// [`OpenEntry::WriteFile`] handle ([`Self::allocate_staging_path`]);
+    /// every other (read-oriented) name is routed through
+    /// [`Self::resolve_under_root`] (D-10.2) into the existing
+    /// [`OpenEntry::File`] path unchanged. An escaping/unresolvable path, or
+    /// a staging-file allocation failure, is rejected with
+    /// `NtStatus::NO_SUCH_FILE` (the not-found status this crate's `efs.rs`
+    /// actually defines -- RESEARCH Open Question #1) and never reaches
+    /// `std::fs` for the destination (T-05-04).
     fn handle_create(&mut self, req: DeviceCreateRequest) -> PduResult<Vec<SvcMessage>> {
         let DeviceCreateRequest {
-            device_io_request, path, ..
+            device_io_request,
+            create_disposition,
+            path,
+            ..
         } = req;
         let normalized = Self::normalize(&path);
 
@@ -203,6 +293,15 @@ impl RdpilotDriveBackend {
             Some(OpenEntry::Root)
         } else if normalized.eq_ignore_ascii_case(&self.sensor_name) {
             Some(OpenEntry::File(self.sensor_path.clone()))
+        } else if Self::is_write_disposition(create_disposition) {
+            match self.resolve_under_root(normalized) {
+                Ok(dest) => self.allocate_staging_path().map(|staging| OpenEntry::WriteFile {
+                    staging,
+                    dest,
+                    expected_len: None,
+                }),
+                Err(()) => None,
+            }
         } else {
             self.resolve_under_root(normalized).ok().map(OpenEntry::File)
         };
@@ -291,6 +390,66 @@ impl RdpilotDriveBackend {
         let mut buf = Vec::new();
         file.take(u64::from(length)).read_to_end(&mut buf)?;
         Ok(buf)
+    }
+
+    /// [`ServerDriveIoRequest::DeviceWriteRequest`] (10-02, D-10.3): one
+    /// bounded `seek`+`write` per IRP into the handle's staged `.part` file
+    /// -- never buffers/accumulates the whole transfer in memory (T-05-05).
+    /// `offset`/`write_data.len()` come entirely from the IRP; no per-IRP
+    /// chunk-size constant is assumed or hardcoded anywhere (10-RESEARCH
+    /// Item 1) -- the OS-chosen real chunk size is only observable at the
+    /// 10-05 live gate, and this loop-per-IRP design already handles
+    /// whatever size it turns out to be.
+    ///
+    /// A `file_id` that is unknown, or was granted [`OpenEntry::Root`]/
+    /// [`OpenEntry::File`] (read-only, including the sensor exe) rather than
+    /// [`OpenEntry::WriteFile`], is rejected with `NtStatus::ACCESS_DENIED`
+    /// *before* any `std::fs` call -- mirrors [`Self::handle_read`]'s
+    /// access-control discipline (T-05-04). Any IO failure on the actual
+    /// `seek`+`write` maps to `NtStatus::UNSUCCESSFUL`, never a panic
+    /// (API-01).
+    fn handle_write(&self, req: DeviceWriteRequest) -> PduResult<Vec<SvcMessage>> {
+        let DeviceWriteRequest {
+            device_io_request,
+            offset,
+            write_data,
+        } = req;
+
+        let Some(OpenEntry::WriteFile { staging, .. }) = self.open_files.get(&device_io_request.file_id) else {
+            let response = DeviceWriteResponse {
+                device_io_reply: DeviceIoResponse::new(device_io_request, NtStatus::ACCESS_DENIED),
+                length: 0,
+            };
+            return Ok(vec![SvcMessage::from(RdpdrPdu::DeviceWriteResponse(response))]);
+        };
+
+        let (status, length) = match Self::write_bytes_at(staging, offset, &write_data) {
+            Ok(written) => (NtStatus::SUCCESS, written),
+            // Any IO failure maps to a typed NtStatus response, never a
+            // panic (API-01, T-05-05).
+            Err(_io_error) => (NtStatus::UNSUCCESSFUL, 0),
+        };
+
+        let response = DeviceWriteResponse {
+            device_io_reply: DeviceIoResponse::new(device_io_request, status),
+            length,
+        };
+        Ok(vec![SvcMessage::from(RdpdrPdu::DeviceWriteResponse(response))])
+    }
+
+    /// `seek` to `offset` and write exactly `data` into `path` (the staged
+    /// `.part` file) -- one bounded write, no unbounded preallocation
+    /// (T-05-05, D-10.3). Returns the number of bytes written (always
+    /// `data.len()` on success, per `DeviceWriteResponse::length`'s "MUST
+    /// echo the number of bytes actually written" contract -- RESEARCH Code
+    /// Examples); `u32::try_from` degrades to `u32::MAX` rather than
+    /// panicking in the (practically unreachable, IRPs are not that large)
+    /// event `data.len()` exceeds `u32::MAX` (API-01).
+    fn write_bytes_at(path: &Path, offset: u64, data: &[u8]) -> std::io::Result<u32> {
+        let mut file = fs::OpenOptions::new().write(true).open(path)?;
+        file.seek(SeekFrom::Start(offset))?;
+        file.write_all(data)?;
+        Ok(u32::try_from(data.len()).unwrap_or(u32::MAX))
     }
 
     /// [`ServerDriveIoRequest::ServerDriveQueryDirectoryRequest`]: on the
@@ -386,6 +545,12 @@ impl RdpilotDriveBackend {
         let file_size = match &entry {
             OpenEntry::Root => 0,
             OpenEntry::File(path) => fs::metadata(path)
+                .map(|meta| i64::try_from(meta.len()).unwrap_or(i64::MAX))
+                .unwrap_or(0),
+            // Report the CURRENT staged size for an in-progress WriteFile
+            // handle (10-02) -- the same defensive stat-failure-degrades-
+            // to-zero fallback as the File arm above.
+            OpenEntry::WriteFile { staging, .. } => fs::metadata(staging)
                 .map(|meta| i64::try_from(meta.len()).unwrap_or(i64::MAX))
                 .unwrap_or(0),
         };
@@ -588,9 +753,11 @@ impl RdpdrBackend for RdpilotDriveBackend {
     }
 
     /// Dispatch on the exactly-11-variant `ServerDriveIoRequest` enum
-    /// (`efs.rs`, read at execution time): the four variants this backend
-    /// implements (Create/Close/Read/QueryDirectory) plus the seven it
-    /// rejects with a typed `NOT_SUPPORTED` completion.
+    /// (`efs.rs`, read at execution time): the five variants this backend
+    /// implements (Create/Close/Read/Write/QueryDirectory/QueryInformation/
+    /// QueryVolumeInformation -- 10-02 Task 1 adds Write to Plan 05/10-01's
+    /// set) plus the remaining variants it rejects with a typed
+    /// `NOT_SUPPORTED` completion.
     fn handle_drive_io_request(&mut self, req: ServerDriveIoRequest) -> PduResult<Vec<SvcMessage>> {
         match req {
             ServerDriveIoRequest::ServerCreateDriveRequest(r) => self.handle_create(r),
@@ -605,7 +772,7 @@ impl RdpdrBackend for RdpilotDriveBackend {
                 self.handle_query_volume_information(r)
             }
             ServerDriveIoRequest::DeviceControlRequest(r) => Self::reject_unsupported(r.header),
-            ServerDriveIoRequest::DeviceWriteRequest(r) => Self::reject_unsupported(r.device_io_request),
+            ServerDriveIoRequest::DeviceWriteRequest(r) => self.handle_write(r),
             ServerDriveIoRequest::ServerDriveSetInformationRequest(r) => {
                 Self::reject_unsupported(r.device_io_request)
             }
@@ -622,10 +789,12 @@ mod tests {
     use ironrdp::svc::SvcMessage;
     use ironrdp_rdpdr::backend::RdpdrBackend as _;
     use ironrdp_rdpdr::pdu::efs::{
-        CreateDisposition, CreateOptions, DesiredAccess, DeviceCloseRequest, DeviceCreateRequest, DeviceIoRequest,
-        DeviceIoResponse, DeviceReadRequest, FileAttributes, FileInformationClassLevel, FileSystemInformationClassLevel,
-        MajorFunction, MinorFunction, NtStatus, ServerDriveIoRequest, ServerDriveQueryDirectoryRequest,
-        ServerDriveQueryInformationRequest, ServerDriveQueryVolumeInformationRequest, SharedAccess,
+        ClientDriveSetInformationResponse, CreateDisposition, CreateOptions, DesiredAccess, DeviceCloseRequest,
+        DeviceCreateRequest, DeviceIoRequest, DeviceIoResponse, DeviceReadRequest, DeviceWriteRequest,
+        FileAttributes, FileEndOfFileInformation, FileInformationClass, FileInformationClassLevel,
+        FileSystemInformationClassLevel, MajorFunction, MinorFunction, NtStatus, ServerDriveIoRequest,
+        ServerDriveQueryDirectoryRequest, ServerDriveQueryInformationRequest,
+        ServerDriveQueryVolumeInformationRequest, ServerDriveSetInformationRequest, SharedAccess,
     };
 
     use super::RdpilotDriveBackend;
@@ -1091,6 +1260,169 @@ mod tests {
         fn accepts_legitimate_nested_path() {
             let (mut backend, base) = setup();
             assert_accepted(&mut backend, "\\sub\\dir\\ok.bin");
+            let _ = std::fs::remove_dir_all(&base);
+        }
+    }
+
+    /// 10-02 Task 1: staged-write path (`DeviceWriteRequest` into
+    /// `<uuid>.part`, D-10.3) offline tests -- FILE-04's "chunked loop
+    /// actually loops" proxy plus the write-side access-control regression
+    /// guard mirroring `read_for_unopened_file_id_is_rejected_without_touching_filesystem`.
+    mod write_path {
+        use super::*;
+
+        /// A fresh temp share root, WITH `.rdpilot-staging/` pre-created
+        /// (mirrors `connect.rs`'s real pre-Create setup, 10-01-SUMMARY.md)
+        /// -- without it, `allocate_staging_path` would fail to create the
+        /// `.part` file and every write-disposition `Create` in these tests
+        /// would be rejected.
+        fn setup() -> (RdpilotDriveBackend, std::path::PathBuf) {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let base = std::env::temp_dir().join(format!(
+                "rdpilot-rdpdr-write-{}-{nanos}",
+                std::process::id()
+            ));
+            let root = base.join("share");
+            std::fs::create_dir_all(root.join(".rdpilot-staging")).expect("share/.rdpilot-staging creates");
+
+            let backend = RdpilotDriveBackend::new(
+                std::env::temp_dir().join("rdpilot-rdpdr-write-sensor-placeholder"),
+                "served.bin".to_owned(),
+                Some(root),
+            );
+            (backend, base)
+        }
+
+        fn create_write_req(file_id: u32, path: &str, disposition: CreateDisposition) -> DeviceCreateRequest {
+            DeviceCreateRequest {
+                create_disposition: disposition,
+                ..create_req(file_id, path)
+            }
+        }
+
+        fn write_req(file_id: u32, offset: u64, data: &[u8]) -> DeviceWriteRequest {
+            DeviceWriteRequest {
+                device_io_request: dev_io_req(file_id, MajorFunction::Write),
+                offset,
+                write_data: data.to_vec(),
+            }
+        }
+
+        /// `(io_status, length)` from a `DeviceWriteResponse`-wrapped message.
+        fn write_response_fields(msg: &SvcMessage) -> (NtStatus, u32) {
+            let (status, tail) = decode_io_status_and_tail(msg);
+            let mut cursor = ReadCursor::new(&tail);
+            let length = cursor.read_u32();
+            (status, length)
+        }
+
+        /// The single staged `.part` file's on-disk bytes -- there is
+        /// exactly one entry under `.rdpilot-staging/` per test in this
+        /// module (one `Create` each), so reading the sole directory entry
+        /// is a faithful, encapsulation-respecting way to inspect what
+        /// `handle_write` actually wrote without exposing `OpenEntry`'s
+        /// private `staging` field to tests.
+        fn read_sole_staged_file(root: &std::path::Path) -> Vec<u8> {
+            let staging_dir = root.join(".rdpilot-staging");
+            let mut entries: Vec<_> = std::fs::read_dir(&staging_dir)
+                .expect("staging dir reads")
+                .filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .collect();
+            assert_eq!(entries.len(), 1, "expected exactly one staged .part file");
+            std::fs::read(entries.remove(0)).expect("staged file reads")
+        }
+
+        /// Three sequential `DeviceWriteRequest` IRPs at increasing offsets
+        /// (0, N, 2N with DIFFERENT chunk lengths -- deliberately NOT a
+        /// fixed/hardcoded chunk size, 10-RESEARCH Item 1) reassemble into
+        /// one staged file with the concatenated bytes in the exact order
+        /// written; each `DeviceWriteResponse` echoes the exact per-IRP
+        /// bytes-written length -- the chunked write loop actually loops
+        /// (FILE-04's offline proxy).
+        #[test]
+        fn multi_irp_write_reassembles_in_order() {
+            let (mut backend, base) = setup();
+            let root = base.join("share");
+
+            let created = backend
+                .handle_drive_io_request(ServerDriveIoRequest::ServerCreateDriveRequest(create_write_req(
+                    1,
+                    "\\upload.bin",
+                    CreateDisposition::FILE_OPEN_IF,
+                )))
+                .expect("write-disposition create returns Ok");
+            let (status, file_id) = create_response_fields(&created[0]);
+            assert_eq!(status, NtStatus::SUCCESS);
+            assert_ne!(file_id, 0);
+
+            // Three chunks of DIFFERENT lengths -- proves no assumed/fixed
+            // chunk-size constant is baked into the write path.
+            let chunks: [&[u8]; 3] = [b"AAAA", b"BB", b"CCCCCC"];
+            let mut offset = 0u64;
+            let mut expected = Vec::new();
+            for chunk in chunks {
+                let out = backend
+                    .handle_drive_io_request(ServerDriveIoRequest::DeviceWriteRequest(write_req(
+                        file_id, offset, chunk,
+                    )))
+                    .expect("write returns Ok");
+                let (status, length) = write_response_fields(&out[0]);
+                assert_eq!(status, NtStatus::SUCCESS);
+                assert_eq!(length as usize, chunk.len(), "response must echo bytes actually written");
+                offset += chunk.len() as u64;
+                expected.extend_from_slice(chunk);
+            }
+
+            let staged_bytes = read_sole_staged_file(&root);
+            assert_eq!(staged_bytes, expected, "staged file must reassemble the writes in exact order");
+
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        /// A `Write` against a file id that was never granted an
+        /// `OpenEntry::WriteFile` -- unknown id, OR a plain read-only
+        /// `OpenEntry::File` handle (the sensor exe) -- is rejected with
+        /// `NtStatus::ACCESS_DENIED` and touches no `std::fs` write (mirrors
+        /// `read_for_unopened_file_id_is_rejected_without_touching_filesystem`'s
+        /// access-control discipline, T-05-04).
+        #[test]
+        fn write_against_read_only_or_unknown_handle_is_rejected() {
+            let (mut backend, base) = setup();
+
+            // Unknown file id entirely.
+            let unknown = backend
+                .handle_drive_io_request(ServerDriveIoRequest::DeviceWriteRequest(write_req(9999, 0, b"x")))
+                .expect("rejected write still returns Ok");
+            let (status, length) = write_response_fields(&unknown[0]);
+            assert_eq!(status, NtStatus::ACCESS_DENIED);
+            assert_eq!(length, 0);
+
+            // A read-only OpenEntry::File handle (the sensor exe special
+            // case, FILE_OPEN disposition) must also reject a Write.
+            let sensor_created = backend
+                .handle_drive_io_request(ServerDriveIoRequest::ServerCreateDriveRequest(create_req(
+                    1,
+                    "\\served.bin",
+                )))
+                .expect("sensor-exe create returns Ok");
+            let (status, sensor_file_id) = create_response_fields(&sensor_created[0]);
+            assert_eq!(status, NtStatus::SUCCESS);
+
+            let rejected = backend
+                .handle_drive_io_request(ServerDriveIoRequest::DeviceWriteRequest(write_req(
+                    sensor_file_id,
+                    0,
+                    b"x",
+                )))
+                .expect("rejected write still returns Ok");
+            let (status, length) = write_response_fields(&rejected[0]);
+            assert_eq!(status, NtStatus::ACCESS_DENIED);
+            assert_eq!(length, 0);
+
             let _ = std::fs::remove_dir_all(&base);
         }
     }
