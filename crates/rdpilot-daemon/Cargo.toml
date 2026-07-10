@@ -1,0 +1,35 @@
+[package]
+name = "rdpilot-daemon"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.78"
+license = "LGPL-3.0-or-later"
+description = "Long-lived local IPC daemon that owns rdpilot's in-memory session registry (DAEMON-01/02/03/04, SESSION-01/03/04). The only crate legitimately depending on both rdpilot and rdpilot-ipc."
+repository = "https://github.com/marcfargas/rdpilot"
+
+[lib]
+name = "rdpilot_daemon"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rdpilot-daemon"
+path = "src/main.rs"
+
+[dependencies]
+rdpilot = { path = "../rdpilot" }
+rdpilot-ipc = { path = "../rdpilot-ipc" }
+rdpilot-config = { path = "../rdpilot-config" }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+directories = "6.0.0"
+thiserror = "2"
+
+[target.'cfg(unix)'.dependencies]
+# Fallback for effective-uid retrieval if tokio's peer_cred() needs a
+# companion (Plan 12-04, DAEMON-02's Unix path).
+libc = "0.2.186"
+
+[dev-dependencies]
+# DAEMON-01 soak-test RSS baseline/return-to-baseline assertion (Plan 12-03).
+sysinfo = "0.39.6"
