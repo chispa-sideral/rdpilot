@@ -233,12 +233,12 @@ Plans:
   3. The harness injects a navigation action (e.g. menu open, button click, or text entry) and verifies the result via a follow-up screenshot or UIA query
   4. The harness completes the full loop (connect → screenshot → get_windows → get_uia_tree → navigate → verify) and exits with a pass/fail report, all assertions documented
 
-**Plans**: 1/4 plans executed
+**Plans**: 2/4 plans executed
 
 - Wave 1 (D-9.1 fidelity risk gate, spike-first):
   - [x] 09-01-PLAN.md — Throwaway live 7-Zip UIA dump spike (launch 7zFM.exe, dump get_uia_tree flat UiaElement[], record SC#2 elements + D-9.2 nav target + seeding/depth decision) + blocking human-verify; mirrors the Phase 7 D-7.5 gate
 - Wave 2 (scoped deeper-walk capability, blocked on 09-01 findings — flagged D-9.1/D-7.4 scoped addition):
-  - [ ] 09-02-PLAN.md — Add a bounded, caller-configurable deeper UIA walk the 09-01 spike proved necessary: owned UiaScope on get_uia_tree + max_depth wire field (Rust) + depth-capped level-by-level FindAll walk (C# sensor) + offline unit/AOT-trim tests; migrates existing children-scoped callers
+  - [x] 09-02-PLAN.md — Add a bounded, caller-configurable deeper UIA walk the 09-01 spike proved necessary: owned UiaScope on get_uia_tree + max_depth wire field (Rust) + depth-capped level-by-level FindAll walk (C# sensor) + offline unit/AOT-trim tests; migrates existing children-scoped callers
 - Wave 3 (composition, blocked on 09-02 capability):
   - [ ] 09-03-PLAN.md — Shared run_proof_harness + ProofReport (tests/support/), examples/proof_harness.rs (main -> ExitCode), gated proof_harness_end_to_end test — wired via #[path]; asserts real DEEPER 7-Zip elements via UiaScope::Subtree, exact "7-Zip::FM" predicate, D-9.6 seeding, D-9.3/D-9.4/D-9.5
 - Wave 4 (terminal v1 live gate, blocked on 09-03):
@@ -259,7 +259,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8 →
 | 6. Window + Process Perception | 5/5 | Complete   | 2026-07-09 |
 | 7. UIA Tree Module | 5/5 | Complete   | 2026-07-09 |
 | 8. Public SDK API + WorldState | 3/3 | Complete   | 2026-07-09 |
-| 9. Scripted Proof Harness | 1/4 | In Progress|  |
+| 9. Scripted Proof Harness | 2/4 | In Progress|  |
 
 ## Backlog
 
