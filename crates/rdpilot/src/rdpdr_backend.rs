@@ -327,14 +327,70 @@ impl RdpilotDriveBackend {
 
     /// [`ServerDriveIoRequest::DeviceCloseRequest`]: drop the handle. Always
     /// succeeds, including for an already-closed/unknown file id (closing
-    /// twice is not an error worth surfacing to the remote peer).
+    /// twice is not an error worth surfacing to the remote peer). Closing an
+    /// [`OpenEntry::WriteFile`] handle additionally runs
+    /// [`Self::finalize_write`] (10-02, D-10.3/FILE-04) BEFORE this
+    /// completion is sent -- a clean, complete transfer atomically renames
+    /// the staged `.part` to its destination; an interrupted one leaves the
+    /// stale `.part` in staging. Either outcome still replies
+    /// `NtStatus::SUCCESS` -- a `Close` always succeeds per MS-RDPEFS
+    /// regardless of the transfer's own outcome; FILE-04's "clean, detectable
+    /// failure" is the ABSENCE of the destination file plus the PRESENCE of
+    /// the stale `.part`, not an error status on this response.
     fn handle_close(&mut self, req: DeviceCloseRequest) -> PduResult<Vec<SvcMessage>> {
         let DeviceCloseRequest { device_io_request } = req;
-        self.open_files.remove(&device_io_request.file_id);
+        if let Some(OpenEntry::WriteFile {
+            staging,
+            dest,
+            expected_len,
+        }) = self.open_files.remove(&device_io_request.file_id)
+        {
+            Self::finalize_write(&staging, &dest, expected_len);
+        }
         let response = DeviceCloseResponse {
             device_io_response: DeviceIoResponse::new(device_io_request, NtStatus::SUCCESS),
         };
         Ok(vec![SvcMessage::from(RdpdrPdu::DeviceCloseResponse(response))])
+    }
+
+    /// Complete a [`OpenEntry::WriteFile`] handle's staged transfer on
+    /// `Close` (10-02, D-10.3, FILE-04). Atomically `fs::rename`s `staging`
+    /// to `dest` -- a single syscall on the target filesystem, so no reader
+    /// can ever observe a partially-written `dest` (Don't Hand-Roll,
+    /// 10-RESEARCH) -- ONLY when BOTH: (1) `expected_len` is `Some` (a prior
+    /// `FILE_END_OF_FILE_INFORMATION` `SetInformation` was received,
+    /// [`Self::handle_set_information`]) AND (2) the staged file's actual
+    /// on-disk length exactly matches it. This is the STRICT
+    /// completeness rule this plan adopts (see 10-02-SUMMARY.md): it
+    /// deliberately does NOT treat "no `SetInformation` ever sent, but bytes
+    /// were written" as complete, because without an authoritative signal
+    /// this backend cannot distinguish "the sensor finished writing" from
+    /// "the transfer was cut off mid-stream" -- the real Windows
+    /// Close/SetInformation ordering (does the OS always send
+    /// `FILE_END_OF_FILE_INFORMATION` before `Close` for a redirected-drive
+    /// write? RESEARCH flags this in the "Windows' write sequence issues
+    /// these" note) is a genuine live-gate confirmation item (Plan 10-05),
+    /// not something assumable offline.
+    ///
+    /// Any other outcome (`expected_len` still `None`, a length mismatch --
+    /// FILE-04's interrupted-transfer case -- or the `fs::rename` call
+    /// itself failing) leaves `staging` untouched: a stale `.part` file is
+    /// the clean, detectable failure signal FILE-04 requires, never a
+    /// partially-written `dest`. Never panics (API-01): every `std::fs`
+    /// failure here is silently absorbed into "stay staged, do not rename",
+    /// not propagated as an error -- `Close` itself always still succeeds
+    /// (see [`Self::handle_close`]'s doc comment).
+    fn finalize_write(staging: &Path, dest: &Path, expected_len: Option<u64>) {
+        let Some(expected_len) = expected_len else {
+            return;
+        };
+        let Ok(metadata) = fs::metadata(staging) else {
+            return;
+        };
+        if metadata.len() != expected_len {
+            return;
+        }
+        let _ = fs::rename(staging, dest);
     }
 
     /// [`ServerDriveIoRequest::DeviceReadRequest`]: stream bytes from the
@@ -450,6 +506,60 @@ impl RdpilotDriveBackend {
         file.seek(SeekFrom::Start(offset))?;
         file.write_all(data)?;
         Ok(u32::try_from(data.len()).unwrap_or(u32::MAX))
+    }
+
+    /// [`ServerDriveIoRequest::ServerDriveSetInformationRequest`] (10-02,
+    /// D-10.3): `efs.rs`'s `decode()` only ever admits 5
+    /// `FileInformationClassLevel` sub-variants for this IRP (Basic/
+    /// EndOfFile/Disposition/Rename/Allocation, RESEARCH Code Examples) --
+    /// Windows' standard write sequence issues this IRP as a matter of
+    /// course, so ALL 5 must return a well-formed
+    /// `ClientDriveSetInformationResponse`, never `NOT_SUPPORTED`.
+    ///
+    /// Only [`FileInformationClass::EndOfFile`] carries semantic weight for
+    /// this minimal backend: its `end_of_file` value is stored as the
+    /// [`OpenEntry::WriteFile`] handle's `expected_len` -- the authoritative
+    /// "expected total bytes" signal [`Self::finalize_write`] later checks
+    /// on `Close` (D-10.3, FILE-04's completeness rule -- see that fn's doc
+    /// comment for the STRICT rule chosen and why). The other 4 sub-variants
+    /// reply success with no side effect: this backend does not model
+    /// rename/disposition/allocation-size semantics, only end-of-file.
+    ///
+    /// A `file_id` that is unknown, or was granted [`OpenEntry::Root`]/
+    /// [`OpenEntry::File`] (read-only) rather than [`OpenEntry::WriteFile`],
+    /// is rejected with `NtStatus::ACCESS_DENIED` (mirrors
+    /// [`Self::handle_write`]'s access-control discipline, T-05-04) --
+    /// still via a well-formed `ClientDriveSetInformationResponse`, per its
+    /// own doc comment ("length MUST be equal to the Length field in the
+    /// ... Request" regardless of the reported `io_status`).
+    /// `ClientDriveSetInformationResponse::new`'s own `cast_length!` can, in
+    /// principle, fail to encode (an oversized `set_buffer.size()`) -- that
+    /// case falls back to a generic reject completion rather than
+    /// unwrapping/panicking (API-01).
+    fn handle_set_information(&mut self, req: ServerDriveSetInformationRequest) -> PduResult<Vec<SvcMessage>> {
+        let file_id = req.device_io_request.file_id;
+
+        let status = match self.open_files.get_mut(&file_id) {
+            Some(OpenEntry::WriteFile { expected_len, .. }) => {
+                if let FileInformationClass::EndOfFile(FileEndOfFileInformation { end_of_file }) = &req.set_buffer {
+                    if let Ok(len) = u64::try_from(*end_of_file) {
+                        *expected_len = Some(len);
+                    }
+                }
+                NtStatus::SUCCESS
+            }
+            _ => NtStatus::ACCESS_DENIED,
+        };
+
+        match ClientDriveSetInformationResponse::new(&req, status) {
+            Ok(resp) => Ok(vec![SvcMessage::from(RdpdrPdu::ClientDriveSetInformationResponse(resp))]),
+            // Encoding failure maps to a typed reject completion, never a
+            // panic (API-01) -- practically unreachable for the 5 small,
+            // fixed-size FileInformationClass payloads this IRP admits.
+            Err(_encode_error) => Ok(vec![SvcMessage::from(RdpdrPdu::DeviceCloseResponse(DeviceCloseResponse {
+                device_io_response: DeviceIoResponse::new(req.device_io_request, NtStatus::UNSUCCESSFUL),
+            }))]),
+        }
     }
 
     /// [`ServerDriveIoRequest::ServerDriveQueryDirectoryRequest`]: on the
@@ -753,11 +863,11 @@ impl RdpdrBackend for RdpilotDriveBackend {
     }
 
     /// Dispatch on the exactly-11-variant `ServerDriveIoRequest` enum
-    /// (`efs.rs`, read at execution time): the five variants this backend
-    /// implements (Create/Close/Read/Write/QueryDirectory/QueryInformation/
-    /// QueryVolumeInformation -- 10-02 Task 1 adds Write to Plan 05/10-01's
-    /// set) plus the remaining variants it rejects with a typed
-    /// `NOT_SUPPORTED` completion.
+    /// (`efs.rs`, read at execution time): the eight variants this backend
+    /// implements -- Create/Close/Read/QueryDirectory/QueryInformation/
+    /// QueryVolumeInformation (Plan 05/10-01) plus Write/SetInformation
+    /// (10-02, D-10.3) -- plus the remaining variants it rejects with a
+    /// typed `NOT_SUPPORTED` completion.
     fn handle_drive_io_request(&mut self, req: ServerDriveIoRequest) -> PduResult<Vec<SvcMessage>> {
         match req {
             ServerDriveIoRequest::ServerCreateDriveRequest(r) => self.handle_create(r),
@@ -773,9 +883,7 @@ impl RdpdrBackend for RdpilotDriveBackend {
             }
             ServerDriveIoRequest::DeviceControlRequest(r) => Self::reject_unsupported(r.header),
             ServerDriveIoRequest::DeviceWriteRequest(r) => self.handle_write(r),
-            ServerDriveIoRequest::ServerDriveSetInformationRequest(r) => {
-                Self::reject_unsupported(r.device_io_request)
-            }
+            ServerDriveIoRequest::ServerDriveSetInformationRequest(r) => self.handle_set_information(r),
             ServerDriveIoRequest::ServerDriveLockControlRequest(r) => Self::reject_unsupported(r.device_io_request),
         }
     }
@@ -789,12 +897,12 @@ mod tests {
     use ironrdp::svc::SvcMessage;
     use ironrdp_rdpdr::backend::RdpdrBackend as _;
     use ironrdp_rdpdr::pdu::efs::{
-        ClientDriveSetInformationResponse, CreateDisposition, CreateOptions, DesiredAccess, DeviceCloseRequest,
-        DeviceCreateRequest, DeviceIoRequest, DeviceIoResponse, DeviceReadRequest, DeviceWriteRequest,
-        FileAttributes, FileEndOfFileInformation, FileInformationClass, FileInformationClassLevel,
-        FileSystemInformationClassLevel, MajorFunction, MinorFunction, NtStatus, ServerDriveIoRequest,
-        ServerDriveQueryDirectoryRequest, ServerDriveQueryInformationRequest,
-        ServerDriveQueryVolumeInformationRequest, ServerDriveSetInformationRequest, SharedAccess,
+        CreateDisposition, CreateOptions, DesiredAccess, DeviceCloseRequest, DeviceCreateRequest, DeviceIoRequest,
+        DeviceIoResponse, DeviceReadRequest, DeviceWriteRequest, FileAttributes, FileEndOfFileInformation,
+        FileInformationClass, FileInformationClassLevel, FileSystemInformationClassLevel, MajorFunction,
+        MinorFunction, NtStatus, ServerDriveIoRequest, ServerDriveQueryDirectoryRequest,
+        ServerDriveQueryInformationRequest, ServerDriveQueryVolumeInformationRequest, ServerDriveSetInformationRequest,
+        SharedAccess,
     };
 
     use super::RdpilotDriveBackend;
@@ -1422,6 +1530,190 @@ mod tests {
             let (status, length) = write_response_fields(&rejected[0]);
             assert_eq!(status, NtStatus::ACCESS_DENIED);
             assert_eq!(length, 0);
+
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        /// `SetInformation(FILE_END_OF_FILE_INFORMATION)` + `Close` on a
+        /// WriteFile handle whose staged bytes fully account for the
+        /// declared `end_of_file` (10-02 Task 2, D-10.3, FILE-04 clean
+        /// path): the `.part` is atomically renamed to the resolved
+        /// destination; the destination exists with the exact full content;
+        /// no stale `.part` remains in staging.
+        #[test]
+        fn set_information_end_of_file_then_close_renames_on_complete_transfer() {
+            let (mut backend, base) = setup();
+            let root = base.join("share");
+            let root_canonical = std::fs::canonicalize(&root).expect("root canonicalizes");
+            let dest = root_canonical.join("upload.bin");
+
+            let created = backend
+                .handle_drive_io_request(ServerDriveIoRequest::ServerCreateDriveRequest(create_write_req(
+                    1,
+                    "\\upload.bin",
+                    CreateDisposition::FILE_OPEN_IF,
+                )))
+                .expect("write-disposition create returns Ok");
+            let (status, file_id) = create_response_fields(&created[0]);
+            assert_eq!(status, NtStatus::SUCCESS);
+
+            let payload = b"the-quick-brown-fox";
+            let write_out = backend
+                .handle_drive_io_request(ServerDriveIoRequest::DeviceWriteRequest(write_req(file_id, 0, payload)))
+                .expect("write returns Ok");
+            let (status, length) = write_response_fields(&write_out[0]);
+            assert_eq!(status, NtStatus::SUCCESS);
+            assert_eq!(length as usize, payload.len());
+
+            let set_info = ServerDriveIoRequest::ServerDriveSetInformationRequest(ServerDriveSetInformationRequest {
+                device_io_request: dev_io_req(file_id, MajorFunction::SetInformation),
+                set_buffer: FileInformationClass::EndOfFile(FileEndOfFileInformation {
+                    end_of_file: payload.len() as i64,
+                }),
+            });
+            let set_info_out = backend
+                .handle_drive_io_request(set_info)
+                .expect("set-information returns Ok");
+            let (status, _tail) = decode_io_status_and_tail(&set_info_out[0]);
+            assert_eq!(status, NtStatus::SUCCESS);
+
+            let close = ServerDriveIoRequest::DeviceCloseRequest(DeviceCloseRequest {
+                device_io_request: dev_io_req(file_id, MajorFunction::Close),
+            });
+            let close_out = backend.handle_drive_io_request(close).expect("close returns Ok");
+            let (status, _tail) = decode_io_status_and_tail(&close_out[0]);
+            assert_eq!(status, NtStatus::SUCCESS);
+
+            assert!(dest.exists(), "clean transfer must rename staging to the destination");
+            assert_eq!(std::fs::read(&dest).expect("destination reads"), payload);
+
+            let staging_dir = root.join(".rdpilot-staging");
+            let remaining: Vec<_> = std::fs::read_dir(&staging_dir)
+                .expect("staging dir reads")
+                .filter_map(|e| e.ok())
+                .collect();
+            assert!(remaining.is_empty(), "no stale .part should remain after a clean rename");
+
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        /// A `Close` on a WriteFile handle that is INCOMPLETE -- fewer
+        /// staged bytes than the declared `end_of_file` (10-02 Task 2,
+        /// D-10.3, FILE-04 interrupted-transfer detection) -- does NOT
+        /// rename: the destination name never appears, and the stale
+        /// `.part` remains in staging for detection. This is FILE-04's
+        /// "clean, detectable failure" proven offline.
+        #[test]
+        fn close_on_incomplete_transfer_never_renames_and_leaves_stale_part() {
+            let (mut backend, base) = setup();
+            let root = base.join("share");
+            let root_canonical = std::fs::canonicalize(&root).expect("root canonicalizes");
+            let dest = root_canonical.join("upload.bin");
+
+            let created = backend
+                .handle_drive_io_request(ServerDriveIoRequest::ServerCreateDriveRequest(create_write_req(
+                    1,
+                    "\\upload.bin",
+                    CreateDisposition::FILE_OPEN_IF,
+                )))
+                .expect("write-disposition create returns Ok");
+            let (status, file_id) = create_response_fields(&created[0]);
+            assert_eq!(status, NtStatus::SUCCESS);
+
+            // Declare a total size of 20 bytes but only ever write 5 --
+            // the interrupted-transfer case.
+            let set_info = ServerDriveIoRequest::ServerDriveSetInformationRequest(ServerDriveSetInformationRequest {
+                device_io_request: dev_io_req(file_id, MajorFunction::SetInformation),
+                set_buffer: FileInformationClass::EndOfFile(FileEndOfFileInformation { end_of_file: 20 }),
+            });
+            let set_info_out = backend
+                .handle_drive_io_request(set_info)
+                .expect("set-information returns Ok");
+            let (status, _tail) = decode_io_status_and_tail(&set_info_out[0]);
+            assert_eq!(status, NtStatus::SUCCESS);
+
+            let write_out = backend
+                .handle_drive_io_request(ServerDriveIoRequest::DeviceWriteRequest(write_req(file_id, 0, b"first")))
+                .expect("write returns Ok");
+            let (status, _length) = write_response_fields(&write_out[0]);
+            assert_eq!(status, NtStatus::SUCCESS);
+
+            let close = ServerDriveIoRequest::DeviceCloseRequest(DeviceCloseRequest {
+                device_io_request: dev_io_req(file_id, MajorFunction::Close),
+            });
+            let close_out = backend.handle_drive_io_request(close).expect("close returns Ok");
+            let (status, _tail) = decode_io_status_and_tail(&close_out[0]);
+            assert_eq!(status, NtStatus::SUCCESS, "Close itself always succeeds per MS-RDPEFS");
+
+            assert!(!dest.exists(), "an interrupted transfer must NEVER produce the destination file");
+
+            let staging_dir = root.join(".rdpilot-staging");
+            let remaining: Vec<_> = std::fs::read_dir(&staging_dir)
+                .expect("staging dir reads")
+                .filter_map(|e| e.ok())
+                .collect();
+            assert_eq!(remaining.len(), 1, "the stale .part must remain in staging for detection");
+
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        /// A `Close` on a WriteFile handle that NEVER received a
+        /// `SetInformation(FILE_END_OF_FILE_INFORMATION)` also does NOT
+        /// rename (the STRICT completeness rule, see `finalize_write`'s doc
+        /// comment) -- this specific ordering (does real Windows always send
+        /// end-of-file before Close?) is the live-gate confirmation item
+        /// this plan explicitly flags, not assumed here.
+        #[test]
+        fn close_without_any_set_information_never_renames() {
+            let (mut backend, base) = setup();
+            let root = base.join("share");
+            let root_canonical = std::fs::canonicalize(&root).expect("root canonicalizes");
+            let dest = root_canonical.join("upload.bin");
+
+            let created = backend
+                .handle_drive_io_request(ServerDriveIoRequest::ServerCreateDriveRequest(create_write_req(
+                    1,
+                    "\\upload.bin",
+                    CreateDisposition::FILE_OPEN_IF,
+                )))
+                .expect("write-disposition create returns Ok");
+            let (status, file_id) = create_response_fields(&created[0]);
+            assert_eq!(status, NtStatus::SUCCESS);
+
+            let write_out = backend
+                .handle_drive_io_request(ServerDriveIoRequest::DeviceWriteRequest(write_req(file_id, 0, b"data")))
+                .expect("write returns Ok");
+            let (status, _length) = write_response_fields(&write_out[0]);
+            assert_eq!(status, NtStatus::SUCCESS);
+
+            let close = ServerDriveIoRequest::DeviceCloseRequest(DeviceCloseRequest {
+                device_io_request: dev_io_req(file_id, MajorFunction::Close),
+            });
+            let close_out = backend.handle_drive_io_request(close).expect("close returns Ok");
+            let (status, _tail) = decode_io_status_and_tail(&close_out[0]);
+            assert_eq!(status, NtStatus::SUCCESS);
+
+            assert!(!dest.exists(), "no SetInformation ever received means no authoritative completeness signal");
+
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        /// `SetInformation` on an unknown/read-only handle is rejected with
+        /// `NtStatus::ACCESS_DENIED`, never a panic (mirrors
+        /// `write_against_read_only_or_unknown_handle_is_rejected`).
+        #[test]
+        fn set_information_against_read_only_or_unknown_handle_is_rejected() {
+            let (mut backend, base) = setup();
+
+            let unknown = ServerDriveIoRequest::ServerDriveSetInformationRequest(ServerDriveSetInformationRequest {
+                device_io_request: dev_io_req(9999, MajorFunction::SetInformation),
+                set_buffer: FileInformationClass::EndOfFile(FileEndOfFileInformation { end_of_file: 4 }),
+            });
+            let out = backend
+                .handle_drive_io_request(unknown)
+                .expect("rejected set-information still returns Ok");
+            let (status, _tail) = decode_io_status_and_tail(&out[0]);
+            assert_eq!(status, NtStatus::ACCESS_DENIED);
 
             let _ = std::fs::remove_dir_all(&base);
         }
