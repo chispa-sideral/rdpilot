@@ -31,6 +31,8 @@ use std::fs;
 use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
 
+use tracing::trace;
+
 use ironrdp::core::impl_as_any;
 use ironrdp::pdu::PduResult;
 use ironrdp::svc::SvcMessage;
@@ -419,6 +421,13 @@ impl RdpilotDriveBackend {
             return Ok(vec![SvcMessage::from(RdpdrPdu::DeviceReadResponse(response))]);
         };
 
+        // 10-05 live-gate diagnostic only (Rule 2 addition, 10-RESEARCH Open
+        // Question 1): records the real per-IRP offset/length the remote
+        // Windows OS actually requests -- zero cost when unsubscribed
+        // (`tracing`'s whole design point), never asserted on in production
+        // code, only observed by the live-gate test's own subscriber.
+        trace!(offset, len = length, "rdpdr_read_irp");
+
         let (status, read_data) = match Self::read_bytes_at(path, offset, length) {
             Ok(bytes) => (NtStatus::SUCCESS, bytes),
             // Any IO failure (e.g. the file having disappeared since
@@ -478,6 +487,12 @@ impl RdpilotDriveBackend {
             };
             return Ok(vec![SvcMessage::from(RdpdrPdu::DeviceWriteResponse(response))]);
         };
+
+        // 10-05 live-gate diagnostic only (Rule 2 addition, 10-RESEARCH Open
+        // Question 1): records the real per-IRP offset/length the remote
+        // Windows OS actually requests -- zero cost when unsubscribed, never
+        // asserted on in production code.
+        trace!(offset, len = write_data.len() as u64, "rdpdr_write_irp");
 
         let (status, length) = match Self::write_bytes_at(staging, offset, &write_data) {
             Ok(written) => (NtStatus::SUCCESS, written),

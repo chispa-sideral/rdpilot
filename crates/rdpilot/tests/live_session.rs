@@ -28,9 +28,20 @@ mod common;
 mod proof_harness;
 
 use rdpilot::{
-    Button, Key, KeyAction, MouseAction, ProcessInfo, Rect, Screenshot, UiaElement, UiaMode, UiaScope, WindowInfo,
-    WindowState, WorldState, WorldStateOptions,
+    Button, Key, KeyAction, MouseAction, ProcessInfo, Rect, Screenshot, TransferOutcome, UiaElement, UiaMode,
+    UiaScope, WindowInfo, WindowState, WorldState, WorldStateOptions,
 };
+
+// Phase 10 (FILE-01/02/03/04) live-gate additions: local std::fs staging
+// inspection, SHA-256 independent verification (`sha2` is already a direct
+// [dependencies] entry of this crate -- available to integration tests
+// without a new dependency, same as `serde_json` above), and the
+// process-global chunk-observation subscriber (`large_file_transfers_chunked`
+// / `interrupted_transfer_is_detectable`).
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+
+use sha2::{Digest, Sha256};
 
 /// Skip helper: returns the live config or prints a skip note and returns `None`.
 /// Each test uses `let Some(cfg) = require_target!() else { return };`.
@@ -1689,6 +1700,599 @@ fn proof_harness_end_to_end() {
         let report = proof_harness::run_proof_harness(&session).await.expect("harness");
         assert!(report.passed, "proof harness failed: {:?}", report.steps);
 
+        session.close().await.expect("close");
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Phase 10 (FILE-01/02/03/04) LIVE GATE — the terminal, BLOCKING re-
+// confirmation for the SDK File-Transfer Extension phase (10-05-PLAN.md).
+// Exercises the PUBLIC API only (`Session::upload_file`/`download_file`,
+// `TransferOutcome`, `Error::PathTraversal`) — no `ironrdp-rdpdr`/DVC wire
+// type appears here, matching this suite's existing D-09 discipline.
+// ---------------------------------------------------------------------------
+
+/// Deterministic, non-repeating-enough pseudo-random byte content for local
+/// file-transfer fixtures (xorshift32, a fixed non-zero seed) — avoids both
+/// a new `rand` crate dependency and degenerate all-zero/all-same content
+/// that could mask a read/write correctness bug behind a sparse-file
+/// coincidence. Not a cryptographic requirement here, only "varied enough
+/// to make a byte-for-byte comparison meaningful."
+fn deterministic_bytes(len: usize) -> Vec<u8> {
+    let mut state: u32 = 0x9E37_79B9;
+    (0..len)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            (state & 0xFF) as u8
+        })
+        .collect()
+}
+
+/// Lowercase hex SHA-256 of `bytes`, matching both `TransferOutcome::checksum`'s
+/// documented casing and the C# sensor's `Convert.ToHexString(...).ToLowerInvariant()`
+/// output (10-03-SUMMARY.md) — computed independently of the SDK's own
+/// internal `sha256_file()` helper (session.rs) so this test never merely
+/// re-checks the SDK against itself.
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hasher.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Shared preamble for every Phase 10 file-transfer live test: requires the
+/// published sensor exe (mirrors every Phase 6+ sensor-mediated test above),
+/// configures the local [`common::share_root_dir`] (D-10.1), connects, and
+/// deploys the sensor. Returns a ready-to-use [`rdpilot::Session`].
+async fn connect_with_transfer(cfg: rdpilot::ConnectionConfig) -> rdpilot::Session {
+    let sensor_exe = common::sensor_exe_path();
+    assert!(
+        sensor_exe.exists(),
+        "published rdpilot-sensor.exe not found at {sensor_exe:?} — publish it first \
+         (`dotnet publish -r win-x64 -p:PublishAot=true --self-contained` on a Windows host \
+         with the .NET 8 SDK)"
+    );
+    let cfg = cfg.sensor_binary_path(sensor_exe).share_root(common::share_root_dir());
+
+    let session = rdpilot::Session::connect(&cfg)
+        .await
+        .expect("connect (RDPDR channel registers when sensor_binary_path is set)");
+    session
+        .deploy_and_launch()
+        .await
+        .expect("deploy_and_launch: sensor must be answering before file-transfer requests");
+    session
+}
+
+/// A fresh per-call local scratch directory under the system temp dir for a
+/// given test's own fixtures — cleaned up (`fs::remove_dir_all`, best
+/// effort) by each test after use. Distinct from [`common::share_root_dir`]
+/// (the SDK's own local staging directory, D-10.1) — this is the CALLER's
+/// side of `upload_file`/`download_file`'s `local: &Path` argument.
+fn scratch_dir(name: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("rdpilot-live-{name}"));
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
+// --- Chunk-observation instrumentation (FILE-04, 10-RESEARCH Open Question 1) ---
+//
+// `rdpdr_backend.rs`'s `handle_read`/`handle_write` (10-05 Rule 2 addition)
+// each emit a `tracing::trace!` event carrying `offset`/`len` fields —
+// zero-cost when unsubscribed (the whole design point of `tracing`), never
+// asserted on in production code. This subscriber captures those events SO
+// THIS LIVE GATE can measure and record the REAL per-IRP chunk size instead
+// of hardcoding an assumed constant (10-RESEARCH Item 1/Open Question 1) —
+// run with `--nocapture` to see the printed log lines.
+//
+// Installed via `tracing::subscriber::set_global_default` (NOT the
+// thread-local `set_default`): the session loop's IRP handling runs on
+// `Session`'s own DEDICATED OS THREAD (session.rs threading model), not the
+// test's calling thread, so a thread-local default would silently capture
+// nothing.
+
+/// One observed IRP event: `(offset, len, message)`. `message` is the
+/// literal `"rdpdr_read_irp"`/`"rdpdr_write_irp"` string so callers can tell
+/// read-direction (upload, sensor reads the UNC path) from write-direction
+/// (download, sensor writes the UNC path) progression apart.
+type ChunkEvent = (u64, u64, String);
+
+#[derive(Clone)]
+struct ChunkCapture(std::sync::Arc<Mutex<Vec<ChunkEvent>>>);
+
+impl ChunkCapture {
+    fn new() -> Self {
+        Self(std::sync::Arc::new(Mutex::new(Vec::new())))
+    }
+
+    fn clear(&self) {
+        self.0.lock().expect("chunk capture mutex").clear();
+    }
+
+    fn snapshot(&self) -> Vec<ChunkEvent> {
+        self.0.lock().expect("chunk capture mutex").clone()
+    }
+}
+
+#[derive(Default)]
+struct ChunkVisitor {
+    offset: Option<u64>,
+    len: Option<u64>,
+    message: Option<String>,
+}
+
+impl tracing::field::Visit for ChunkVisitor {
+    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+        match field.name() {
+            "offset" => self.offset = Some(value),
+            "len" => self.len = Some(value),
+            _ => {}
+        }
+    }
+
+    fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
+        self.record_u64(field, u64::try_from(value).unwrap_or(0));
+    }
+
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "message" {
+            self.message = Some(format!("{value:?}"));
+        }
+    }
+}
+
+impl tracing::Subscriber for ChunkCapture {
+    fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+
+    fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+
+    fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+    fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+    fn event(&self, event: &tracing::Event<'_>) {
+        let mut visitor = ChunkVisitor::default();
+        event.record(&mut visitor);
+        let Some(message) = &visitor.message else { return };
+        if message != "rdpdr_read_irp" && message != "rdpdr_write_irp" {
+            return;
+        }
+        if let (Some(offset), Some(len)) = (visitor.offset, visitor.len) {
+            self.0.lock().expect("chunk capture mutex").push((offset, len, message.clone()));
+        }
+    }
+
+    fn enter(&self, _span: &tracing::span::Id) {}
+    fn exit(&self, _span: &tracing::span::Id) {}
+}
+
+/// Lazily installs the process-global [`ChunkCapture`] subscriber (once —
+/// `tracing` only permits ONE global default per process) and returns a
+/// handle to it. Safe to call from multiple tests: `--test-threads=1`
+/// serializes the gated live suite, and every OTHER test's ordinary
+/// `tracing::debug!`/`trace!` events (e.g. `session_loop.rs`) are silently
+/// ignored by this subscriber's message-text filter.
+fn chunk_capture() -> ChunkCapture {
+    static CAPTURE: OnceLock<ChunkCapture> = OnceLock::new();
+    CAPTURE
+        .get_or_init(|| {
+            let capture = ChunkCapture::new();
+            let _ = tracing::subscriber::set_global_default(capture.clone());
+            capture
+        })
+        .clone()
+}
+
+/// Phase 10 SC#1+SC#2 / FILE-01+FILE-02: `Session::upload_file` moves a
+/// local file to a named destination under the sensor's fixed remote
+/// transfer root, and `Session::download_file` reads it back byte-identical.
+/// The round trip is the only way to observe "verified present on the
+/// target" from the public API — the sensor's remote transfer root
+/// (`%TEMP%/rdpilot-transfer-root`, 10-03-SUMMARY.md) is not independently
+/// inspectable from this Linux test host, so a successful download of the
+/// exact uploaded bytes back IS the live proof FILE-01's upload landed.
+#[test]
+#[ignore = "live: requires a provisioned RDP target + published rdpilot-sensor.exe + share_root (RDPILOT_LIVE=1)"]
+fn file_upload_roundtrip() {
+    let Some(cfg) = require_target!("file_upload_roundtrip") else {
+        return;
+    };
+    block_on(async {
+        let session = connect_with_transfer(cfg).await;
+
+        let local_dir = scratch_dir("file-upload-roundtrip");
+        let source_path = local_dir.join("source.bin");
+        let content = deterministic_bytes(64 * 1024); // 64 KiB — small, fast positive-path proof
+        std::fs::write(&source_path, &content).expect("write local source fixture");
+        let source_hash = sha256_hex(&content);
+
+        let remote_name = format!("rdpilot-live-upload-{}.bin", std::process::id());
+        let upload_outcome: TransferOutcome = session
+            .upload_file(&source_path, &remote_name)
+            .await
+            .expect("upload_file should round-trip successfully (FILE-01)");
+        assert_eq!(
+            upload_outcome.bytes_transferred,
+            content.len() as u64,
+            "upload byte count matches the source file length"
+        );
+        assert_eq!(
+            upload_outcome.checksum.to_ascii_lowercase(),
+            source_hash,
+            "upload checksum matches the independently-hashed source (FILE-01)"
+        );
+
+        let dest_path = local_dir.join("downloaded.bin");
+        let download_outcome: TransferOutcome = session
+            .download_file(&remote_name, &dest_path)
+            .await
+            .expect(
+                "download_file should round-trip successfully (FILE-02) — a successful download \
+                 of the exact uploaded bytes is the live proof FILE-01's upload was verified \
+                 present on the target",
+            );
+        assert_eq!(
+            download_outcome.bytes_transferred,
+            content.len() as u64,
+            "download byte count matches the source file length"
+        );
+
+        let downloaded = std::fs::read(&dest_path).expect("downloaded file should exist locally");
+        assert_eq!(
+            downloaded, content,
+            "round-tripped bytes are byte-identical to the original local source (FILE-01 present + FILE-02 match)"
+        );
+        assert_eq!(
+            download_outcome.checksum.to_ascii_lowercase(),
+            source_hash,
+            "download checksum matches the original source's independently-computed digest"
+        );
+
+        let _ = std::fs::remove_dir_all(&local_dir);
+        session.close().await.expect("close");
+    });
+}
+
+/// Phase 10 SC#2 / FILE-02 (dedicated): `Session::download_file`'s returned
+/// [`TransferOutcome`] carries `bytes_transferred` equal to the actual file
+/// length AND a `checksum` equal to an INDEPENDENTLY computed SHA-256 of the
+/// resulting local file — verifying the checksum contract on its own,
+/// distinct from [`file_upload_roundtrip`]'s combined upload+download proof.
+#[test]
+#[ignore = "live: requires a provisioned RDP target + published rdpilot-sensor.exe + share_root (RDPILOT_LIVE=1)"]
+fn file_download_checksum_matches() {
+    let Some(cfg) = require_target!("file_download_checksum_matches") else {
+        return;
+    };
+    block_on(async {
+        let session = connect_with_transfer(cfg).await;
+
+        let local_dir = scratch_dir("file-download-checksum");
+        let source_path = local_dir.join("source.bin");
+        // A different size/seed offset from file_upload_roundtrip's fixture
+        // so the two tests' remote artifacts never collide in content.
+        let content = deterministic_bytes(96 * 1024);
+        std::fs::write(&source_path, &content).expect("write local source fixture");
+
+        let remote_name = format!("rdpilot-live-download-checksum-{}.bin", std::process::id());
+        session
+            .upload_file(&source_path, &remote_name)
+            .await
+            .expect("setup upload should succeed before the checksum-focused download");
+
+        let dest_path = local_dir.join("downloaded.bin");
+        let outcome: TransferOutcome = session
+            .download_file(&remote_name, &dest_path)
+            .await
+            .expect("download_file should round-trip successfully (FILE-02)");
+
+        let on_disk_len = std::fs::metadata(&dest_path)
+            .expect("downloaded file should exist locally")
+            .len();
+        assert_eq!(
+            outcome.bytes_transferred, on_disk_len,
+            "TransferOutcome.bytes_transferred must equal the actual on-disk file length (FILE-02)"
+        );
+
+        let downloaded = std::fs::read(&dest_path).expect("read downloaded file");
+        let independent_hash = sha256_hex(&downloaded);
+        assert_eq!(
+            outcome.checksum.to_ascii_lowercase(),
+            independent_hash,
+            "TransferOutcome.checksum must equal an independently-computed SHA-256 of the \
+             resulting local file (FILE-02) — never merely echo the sensor's own claim"
+        );
+
+        let _ = std::fs::remove_dir_all(&local_dir);
+        session.close().await.expect("close");
+    });
+}
+
+/// Size of the fixture for [`large_file_transfers_chunked`] — comfortably in
+/// the "low hundreds of KB to a few MB" range 10-RESEARCH Assumption A1
+/// recommends for reliably exercising more than one MS-RDPEFS IRP. A single
+/// named const, never inlined (10-RESEARCH Open Question 1: never hardcode
+/// an assumed CHUNK size — this is the FIXTURE size, a knob this test
+/// controls, not a claim about the real per-IRP chunk size, which is
+/// measured and logged below, never assumed).
+const LARGE_FILE_BYTES: usize = 3 * 1024 * 1024; // 3 MiB
+
+/// Phase 10 SC#4 / FILE-04 (BLOCKING): a file larger than one real MS-RDPEFS
+/// per-IRP chunk transfers correctly in both directions, and the REAL
+/// observed per-IRP offset/length progression is measured and logged (never
+/// a hardcoded chunk-size assertion, 10-RESEARCH Open Question 1) — run with
+/// `--nocapture` to see the full per-IRP log and the measured max chunk
+/// length this live gate must record in STATE.md.
+#[test]
+#[ignore = "live: requires a provisioned RDP target + published rdpilot-sensor.exe + share_root (RDPILOT_LIVE=1)"]
+fn large_file_transfers_chunked() {
+    let Some(cfg) = require_target!("large_file_transfers_chunked") else {
+        return;
+    };
+    let capture = chunk_capture();
+    capture.clear();
+
+    block_on(async {
+        let session = connect_with_transfer(cfg).await;
+
+        let local_dir = scratch_dir("large-file");
+        let source_path = local_dir.join("large-source.bin");
+        let content = deterministic_bytes(LARGE_FILE_BYTES);
+        std::fs::write(&source_path, &content).expect("write local large-file fixture");
+
+        let remote_name = format!("rdpilot-live-large-{}.bin", std::process::id());
+        let upload_outcome = session
+            .upload_file(&source_path, &remote_name)
+            .await
+            .expect("upload_file(large) should round-trip successfully (FILE-04)");
+        assert_eq!(upload_outcome.bytes_transferred, LARGE_FILE_BYTES as u64);
+
+        let dest_path = local_dir.join("large-downloaded.bin");
+        let download_outcome = session
+            .download_file(&remote_name, &dest_path)
+            .await
+            .expect("download_file(large) should round-trip successfully (FILE-04)");
+        assert_eq!(download_outcome.bytes_transferred, LARGE_FILE_BYTES as u64);
+
+        let downloaded = std::fs::read(&dest_path).expect("downloaded large file should exist locally");
+        assert_eq!(
+            downloaded, content,
+            "large-file round trip is byte-identical (FILE-04 correctness, the loop reassembled correctly)"
+        );
+
+        session.close().await.expect("close");
+        let _ = std::fs::remove_dir_all(&local_dir);
+    });
+
+    // FILE-04's "the chunked loop actually loops": report the REAL observed
+    // per-IRP offset/length progression instead of asserting an assumed
+    // byte constant (10-RESEARCH Open Question 1).
+    let events = capture.snapshot();
+    let reads: Vec<_> = events.iter().filter(|(_, _, msg)| msg == "rdpdr_read_irp").collect();
+    let writes: Vec<_> = events.iter().filter(|(_, _, msg)| msg == "rdpdr_write_irp").collect();
+    eprintln!(
+        "large_file_transfers_chunked: {} read IRPs (upload direction), {} write IRPs (download \
+         direction) observed for a {LARGE_FILE_BYTES}-byte file",
+        reads.len(),
+        writes.len()
+    );
+    for (offset, len, _) in &reads {
+        eprintln!("  [read]  offset={offset} len={len}");
+    }
+    for (offset, len, _) in &writes {
+        eprintln!("  [write] offset={offset} len={len}");
+    }
+    let max_chunk = events.iter().map(|(_, len, _)| *len).max().unwrap_or(0);
+    eprintln!(
+        "large_file_transfers_chunked: MEASURED real per-IRP chunk length (max observed) = \
+         {max_chunk} bytes — record this in STATE.md (10-RESEARCH Open Question 1)"
+    );
+    assert!(
+        reads.len() > 1 || writes.len() > 1,
+        "expected the {LARGE_FILE_BYTES}-byte file to require MORE THAN ONE IRP in at least one \
+         direction (FILE-04 'the loop actually loops') — observed {} reads, {} writes; if this \
+         genuinely fails, LARGE_FILE_BYTES is smaller than the real Windows per-IRP chunk size and \
+         should be increased at the live gate (10-RESEARCH Assumption A1)",
+        reads.len(),
+        writes.len()
+    );
+}
+
+/// Size of the fixture for [`interrupted_transfer_is_detectable`] — large
+/// enough that a multi-IRP write sequence is virtually certain to still be
+/// in flight when this test interrupts it.
+const INTERRUPTED_TRANSFER_FILE_BYTES: usize = 8 * 1024 * 1024; // 8 MiB
+
+/// Phase 10 SC#4 / FILE-04 (BLOCKING, interrupted half): a DOWNLOAD that is
+/// deliberately cut off mid-flight leaves NO final-named destination file —
+/// neither the caller's own requested `local` path nor a new top-level entry
+/// under the SDK's local `share_root` (D-10.1) — proving the staged-temp-
+/// file + atomic-rename design (D-10.3, 10-02) surfaces a clean, detectable
+/// failure rather than silent partial-write corruption, confirmed against
+/// the REAL Windows redirected-drive write sequence (the STRICT
+/// `expected_len`-match completeness rule's live-gate confirmation item,
+/// 10-02-SUMMARY.md).
+///
+/// There is no cancel/abort knob on `download_file` itself (D-09: it either
+/// completes or errors) — the only way to genuinely interrupt an in-flight
+/// RDPDR IRP sequence from the public API is to sever the RDP connection
+/// itself. This test races `download_file` against a "wait for the first
+/// observed write IRP" signal (via [`chunk_capture`]) using `tokio::select!`
+/// — once at least one write IRP is confirmed in flight, it ABRUPTLY DROPS
+/// (never gracefully `close()`s) the [`rdpilot::Session`], exercising the
+/// D-07 best-effort `Drop` teardown path.
+#[test]
+#[ignore = "live: requires a provisioned RDP target + published rdpilot-sensor.exe + share_root (RDPILOT_LIVE=1)"]
+fn interrupted_transfer_is_detectable() {
+    let Some(cfg) = require_target!("interrupted_transfer_is_detectable") else {
+        return;
+    };
+    let capture = chunk_capture();
+    capture.clear();
+
+    block_on(async {
+        let session = connect_with_transfer(cfg).await;
+        let share_root = common::share_root_dir();
+
+        let local_dir = scratch_dir("interrupted-transfer");
+        let source_path = local_dir.join("interrupt-source.bin");
+        let content = deterministic_bytes(INTERRUPTED_TRANSFER_FILE_BYTES);
+        std::fs::write(&source_path, &content).expect("write local fixture for interrupted-transfer setup");
+
+        let remote_name = format!("rdpilot-live-interrupt-{}.bin", std::process::id());
+        session
+            .upload_file(&source_path, &remote_name)
+            .await
+            .expect("setup upload should succeed before the deliberately-interrupted download");
+
+        // Baseline: share_root's own top-level entries (excluding the
+        // .rdpilot-staging staging subdir) BEFORE the interrupted attempt —
+        // used below to prove no NEW final-named file appears as a result
+        // of this interrupted download, without needing to know the
+        // SDK-internal staging filename it would have used (D-09: that name
+        // is never returned to the caller).
+        let before_entries = top_level_entries(&share_root);
+
+        let dest_path = local_dir.join("interrupt-downloaded.bin");
+        let download_fut = session.download_file(&remote_name, &dest_path);
+        let wait_for_first_write = async {
+            loop {
+                if capture.snapshot().iter().any(|(_, _, msg)| msg == "rdpdr_write_irp") {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        };
+
+        let interrupted = tokio::select! {
+            result = download_fut => {
+                eprintln!(
+                    "[soft] interrupted_transfer_is_detectable: the {INTERRUPTED_TRANSFER_FILE_BYTES}-byte \
+                     download completed ({result:?}) before it could be interrupted — \
+                     INTERRUPTED_TRANSFER_FILE_BYTES may need to grow at a faster live target; \
+                     this run did not exercise the interruption path"
+                );
+                false
+            }
+            () = wait_for_first_write => true,
+        };
+
+        if interrupted {
+            // Abruptly sever the connection (D-07's best-effort Drop
+            // teardown) WHILE the download is still mid-flight — the only
+            // way to genuinely interrupt an in-flight RDPDR IRP sequence
+            // from the public API. Deliberately NOT `session.close()`
+            // (which awaits a graceful shutdown and would let the transfer
+            // finish first).
+            drop(session);
+            // Session::drop cannot join the dedicated OS thread (D-07) —
+            // give the abrupt teardown a moment to settle before inspecting
+            // the filesystem state below.
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+            assert!(
+                !dest_path.exists(),
+                "an interrupted download must never produce the final local destination file \
+                 (FILE-04) — found unexpectedly at {dest_path:?}"
+            );
+            let after_entries = top_level_entries(&share_root);
+            assert_eq!(
+                before_entries, after_entries,
+                "an interrupted download must never add a new top-level entry under share_root \
+                 (FILE-04) — the atomic rename-on-clean-Close must not have fired for a transfer \
+                 that never received a matching FILE_END_OF_FILE_INFORMATION + clean Close"
+            );
+            let staging_dir = share_root.join(".rdpilot-staging");
+            let stale_parts = top_level_entries(&staging_dir).len();
+            eprintln!(
+                "interrupted_transfer_is_detectable: {stale_parts} entries remain under \
+                 .rdpilot-staging/ after the interrupted transfer (a stale .part is expected, \
+                 not asserted hard — best-effort observational record only)"
+            );
+        } else {
+            let session = session; // keep alive for a normal close below
+            session.close().await.expect("close");
+        }
+
+        let _ = std::fs::remove_dir_all(&local_dir);
+    });
+}
+
+/// File-name-only snapshot of `dir`'s immediate (non-recursive) entries, as
+/// a sorted `Vec<String>` for stable equality comparison. Returns an empty
+/// `Vec` if `dir` does not exist (never panics — this is a test-only
+/// diagnostic helper, not production code, but still API-01-flavored).
+fn top_level_entries(dir: &Path) -> Vec<String> {
+    let Ok(read_dir) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = read_dir
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+/// Phase 10 SC#3 / FILE-03 (BLOCKING live re-confirm): the two adversarial
+/// cases 10-01-SUMMARY.md (Decision #1) and 10-03-SUMMARY.md (FILE-03
+/// selftest table) flagged as needing re-confirmation against REAL Windows
+/// path semantics — a mixed `/`/`\` separator escape (Pitfall 1 warning-sign
+/// closure) and a Windows-drive-absolute path — must both be rejected as the
+/// DISTINCT `Error::PathTraversal` (never a generic `SensorRejected`), for
+/// BOTH `upload_file` and `download_file`, against the real sensor/target.
+/// Same literal adversarial strings 10-03-SUMMARY.md's C# selftest table
+/// uses, for direct before/after (offline vs. live) comparability.
+#[test]
+#[ignore = "live: requires a provisioned RDP target + published rdpilot-sensor.exe + share_root (RDPILOT_LIVE=1)"]
+fn traversal_rejected_live() {
+    let Some(cfg) = require_target!("traversal_rejected_live") else {
+        return;
+    };
+    const MIXED_SEPARATOR_ESCAPE: &str = r"subdir\../../evil.txt";
+    const WINDOWS_DRIVE_ABSOLUTE: &str = r"C:\Windows\System32\evil.txt";
+
+    block_on(async {
+        let session = connect_with_transfer(cfg).await;
+
+        let local_dir = scratch_dir("traversal");
+        let harmless_source = local_dir.join("harmless.bin");
+        std::fs::write(&harmless_source, b"not a real payload").expect("write harmless local fixture");
+        let harmless_dest = local_dir.join("harmless-download.bin");
+
+        for adversarial in [MIXED_SEPARATOR_ESCAPE, WINDOWS_DRIVE_ABSOLUTE] {
+            let upload_err = session.upload_file(&harmless_source, adversarial).await.expect_err(&format!(
+                "upload_file({adversarial:?}) must be rejected live, not silently accepted (FILE-03 BLOCKING)"
+            ));
+            assert!(
+                matches!(upload_err, rdpilot::Error::PathTraversal(_)),
+                "expected Error::PathTraversal for upload_file({adversarial:?}), got {upload_err:?} \
+                 (FILE-03 BLOCKING — must be the distinct end-to-end producer, never a generic \
+                 SensorRejected)"
+            );
+
+            let download_err =
+                session.download_file(adversarial, &harmless_dest).await.expect_err(&format!(
+                    "download_file({adversarial:?}) must be rejected live, not silently accepted \
+                     (FILE-03 BLOCKING)"
+                ));
+            assert!(
+                matches!(download_err, rdpilot::Error::PathTraversal(_)),
+                "expected Error::PathTraversal for download_file({adversarial:?}), got \
+                 {download_err:?} (FILE-03 BLOCKING)"
+            );
+            assert!(
+                !harmless_dest.exists(),
+                "a rejected download must never produce a local destination file (adversarial input {adversarial:?})"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&local_dir);
         session.close().await.expect("close");
     });
 }

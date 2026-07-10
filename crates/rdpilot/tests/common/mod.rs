@@ -149,3 +149,23 @@ pub fn idle_secs() -> u64 {
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(DEFAULT_IDLE_SECS)
 }
+
+/// Name of the env var that overrides the default local file-transfer
+/// share-root directory for [`share_root_dir`] (Phase 10 live gate,
+/// FILE-01/02/03/04) -- lets a live-gate run point at a different local
+/// staging location without editing test code, mirroring [`SENSOR_EXE_ENV`].
+pub const SHARE_ROOT_ENV: &str = "RDPILOT_SHARE_ROOT";
+
+/// Locate the LOCAL directory `Session::upload_file`/`download_file` stage
+/// bytes through (`ConnectionConfig::share_root`, D-10.1) -- honors
+/// [`SHARE_ROOT_ENV`] if set, otherwise defaults to a fixed subdirectory
+/// under the system temp dir. Callers do NOT need to pre-create this
+/// directory: `connect.rs` (10-01) already `create_dir_all`s
+/// `<share_root>/.rdpilot-staging/` at connect time, which transitively
+/// creates the share root itself.
+pub fn share_root_dir() -> PathBuf {
+    if let Some(over) = std::env::var_os(SHARE_ROOT_ENV) {
+        return PathBuf::from(over);
+    }
+    std::env::temp_dir().join("rdpilot-live-share")
+}
