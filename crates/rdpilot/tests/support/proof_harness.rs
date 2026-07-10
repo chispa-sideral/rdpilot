@@ -59,7 +59,16 @@ const SEVEN_ZIP_CLASS: &str = "7-Zip::FM";
 /// under `Pane`) — the caller-supplied value never bypasses the sensor's own
 /// cap, so this cannot regress the Phase 7 SC#3 latency budget beyond what
 /// 09-02 already bounds.
-const SC2_MAX_DEPTH: u32 = 4;
+/// LIVE-TUNED (09-04 gate): the initial value of 4 (the sensor's full
+/// `UIA_MAX_WALK_DEPTH` cap) measured a real deeper-walk latency of 555.2ms
+/// against 7-Zip's actual tree (179 total elements) — over the Phase 7 SC#3
+/// 500ms sensor-side budget (T-09-12). All SC#2-recorded deeper elements
+/// (menu items, toolbar buttons) were observed at depth=2, so the walk does
+/// not need to reach depth 4 to satisfy SC#2. Tuned down to 3 (one level of
+/// headroom past the observed depth=2 matches, in case a listview row sits
+/// one level deeper under `Pane` than the menu/toolbar items do) and
+/// re-measured live — see 09-04-SUMMARY.md for the re-measured latency.
+const SC2_MAX_DEPTH: u32 = 3;
 
 /// Menu-bar item names the 09-01 spike's captured screenshot showed present
 /// on 7zFM's menu bar (`File Edit View Favorites Tools Help`) but ABSENT from
@@ -148,9 +157,15 @@ pub async fn run_proof_harness(session: &Session) -> rdpilot::Result<ProofReport
     // deeper elements (menu items / toolbar buttons / listview rows) are
     // present — NOT just the 5 depth-1 containers the 09-01 spike proved are
     // all `TreeScope_Children` returns.
+    // [Rule 2] Timed independently of the surrounding poll/launch steps so the
+    // SUMMARY can record the deeper-walk latency against the Phase 7 SC#3
+    // 500ms sensor-side budget (T-09-12 mitigation) — measures exactly the
+    // get_uia_tree round-trip, not the whole harness run.
+    let uia_walk_start = std::time::Instant::now();
     let elements = session
         .get_uia_tree(window.hwnd, UiaScope::Subtree { max_depth: SC2_MAX_DEPTH })
         .await?;
+    let uia_walk_elapsed = uia_walk_start.elapsed();
     let deeper = find_deeper_elements(&elements, window.rect);
     if deeper.is_empty() {
         steps.push((
@@ -171,13 +186,15 @@ pub async fn run_proof_harness(session: &Session) -> rdpilot::Result<ProofReport
         true,
         format!(
             "found {} deeper element(s) beyond the depth-1 containers (e.g. {} {:?} depth={} \
-             bbox={:?}) out of {} total elements",
+             bbox={:?}) out of {} total elements — get_uia_tree latency {:.1}ms (Subtree \
+             max_depth={SC2_MAX_DEPTH}, Phase 7 SC#3 budget 500ms)",
             deeper.len(),
             deeper[0].role,
             deeper[0].name,
             deeper[0].depth,
             deeper[0].bbox,
-            elements.len()
+            elements.len(),
+            uia_walk_elapsed.as_secs_f64() * 1000.0
         ),
     ));
 
@@ -185,6 +202,25 @@ pub async fn run_proof_harness(session: &Session) -> rdpilot::Result<ProofReport
     // (prefer "File" if present; else the first recorded deeper element).
     let target = pick_navigation_target(&deeper);
     let (cx, cy) = bbox_center(target.bbox);
+
+    // [Rule 1 fix] Ensure the 7-Zip window actually holds OS foreground focus
+    // before clicking. `launch_process` is fire-and-forget (D-6.2) and does
+    // NOT guarantee focus — Phase 6 SC#3's live diagnosis
+    // (`set_foreground_window_confirmed_by_followup_query`) established that
+    // a freshly launched window can sit topmost-but-unfocused, and a single
+    // click on a menu-bar item of an unfocused window is commonly consumed
+    // as a pure activation click (bringing the window forward) rather than
+    // also opening the menu. Every other live navigation test in this crate
+    // (`live_session.rs`) explicitly focuses+settles before clicking; this
+    // harness omitted that step.
+    if let Err(e) = session.set_foreground_window(window.hwnd).await {
+        eprintln!(
+            "[proof] note: set_foreground_window before navigate failed \
+             (non-fatal, click may still land): {e}"
+        );
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
     let before = session.screenshot().await?;
     match session
         .send_mouse(MouseAction::Click {
