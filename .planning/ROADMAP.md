@@ -233,10 +233,10 @@ Plans:
   3. The harness injects a navigation action (e.g. menu open, button click, or text entry) and verifies the result via a follow-up screenshot or UIA query
   4. The harness completes the full loop (connect → screenshot → get_windows → get_uia_tree → navigate → verify) and exits with a pass/fail report, all assertions documented
 
-**Plans**: 3 plans
+**Plans**: 1/3 plans executed
 
 - Wave 1 (D-9.1 fidelity risk gate, spike-first):
-  - [ ] 09-01-PLAN.md — Throwaway live 7-Zip UIA dump spike (launch 7zFM.exe, dump get_uia_tree flat UiaElement[], record SC#2 elements + D-9.2 nav target + seeding/depth decision) + blocking human-verify; mirrors the Phase 7 D-7.5 gate
+  - [x] 09-01-PLAN.md — Throwaway live 7-Zip UIA dump spike (launch 7zFM.exe, dump get_uia_tree flat UiaElement[], record SC#2 elements + D-9.2 nav target + seeding/depth decision) + blocking human-verify; mirrors the Phase 7 D-7.5 gate
 - Wave 2 (composition, blocked on 09-01 findings):
   - [ ] 09-02-PLAN.md — Shared run_proof_harness + ProofReport (tests/support/), examples/proof_harness.rs (main -> ExitCode), and gated proof_harness_end_to_end test — wired via #[path], D-9.3/D-9.4/D-9.5
 - Wave 3 (terminal v1 live gate, blocked on 09-02):
@@ -257,7 +257,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8 →
 | 6. Window + Process Perception | 5/5 | Complete   | 2026-07-09 |
 | 7. UIA Tree Module | 5/5 | Complete   | 2026-07-09 |
 | 8. Public SDK API + WorldState | 3/3 | Complete   | 2026-07-09 |
-| 9. Scripted Proof Harness | 0/? | Not started | - |
+| 9. Scripted Proof Harness | 1/3 | In Progress|  |
 
 ## Backlog
 

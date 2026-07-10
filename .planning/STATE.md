@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: completed
-stopped_at: Phase 8 Wave 1 (08-01) COMPLETE — strict lint gates + owned-type Serialize derives shipped. 08-02 (WorldState + world_state()) unblocked.
-last_updated: "2026-07-09T21:42:09.433Z"
-last_activity: "2026-07-09 -- 08-01 (Wave 1) COMPLETE: lib.rs strict lint gates (API-01/SC#4 compiler-enforced) + Serialize derives on all five owned SDK types (Rect, dims-only Screenshot, WindowInfo, WindowState-lowercase, ProcessInfo, UiaElement). cargo clippy -p rdpilot --lib exits 0; cargo test -p rdpilot --lib passes 94/94. See 08-01-SUMMARY.md."
+stopped_at: Phase 9 Plan 1 (09-01) COMPLETE — D-9.1 7-Zip UIA fidelity spike live-ran and human-approved. 09-02 (real assertion harness, now scoped to include a deeper UIA-walk capability) unblocked.
+last_updated: "2026-07-10T11:56:55.455Z"
+last_activity: "2026-07-10 -- 09-01 COMPLETE: D-9.1 7-Zip UIA fidelity spike live-ran against a real disposable Azure VM and was human-approved. 7-Zip stays the SC#2/SC#3 target; TreeScope_Children alone proved insufficient (5 depth-1 container elements only) so Plan 09-02 must add a scoped, caller-configurable deeper UIA-walk capability. Window predicate (class_name == "7-Zip::FM") and D-9.6 seeding form (full quoted 7zFM.exe path + quoted seed arg) confirmed. See 09-01-SUMMARY.md."
 progress:
   total_phases: 9
-  completed_phases: 7
-  total_plans: 31
-  completed_plans: 31
-  percent: 78
+  completed_phases: 8
+  total_plans: 34
+  completed_plans: 32
+  percent: 89
 ---
 
 # Project State
@@ -21,18 +21,18 @@ progress:
 See: .planning/PROJECT.md (updated 2026-06-04)
 
 **Core value:** A local AI agent can connect to a remote Windows desktop over RDP and read/inspect a program that is only reachable via RDP — using both screenshots and structured accessibility data, without installing or running the agent itself on the remote machine.
-**Current focus:** Phase 8 — public-sdk-api-worldstate (Wave 1 complete, Wave 2 next)
+**Current focus:** Phase 9 — scripted-proof-harness (Plan 1 of 3 complete, Plan 2 next)
 
 ## Current Position
 
-Phase: 8 (public-sdk-api-worldstate) — IN PROGRESS
-Plan: 3 of 3 (Wave 1 complete)
-Status: 08-01 complete — 08-02 (WorldState + world_state()) unblocked
-Last activity: 2026-07-09 -- 08-01 (Wave 1) COMPLETE: lib.rs strict lint gates (API-01/SC#4 compiler-enforced) + Serialize derives on all five owned SDK types (Rect, dims-only Screenshot, WindowInfo, WindowState-lowercase, ProcessInfo, UiaElement). cargo clippy -p rdpilot --lib exits 0; cargo test -p rdpilot --lib passes 94/94. See 08-01-SUMMARY.md.
+Phase: 9 (scripted-proof-harness) — IN PROGRESS
+Plan: 1 of 3 complete
+Status: 09-01 complete (D-9.1 risk-gate spike, human-approved) — 09-02 (real assertion harness, scoped to include a deeper UIA-walk capability) unblocked
+Last activity: 2026-07-10 -- 09-01 COMPLETE: D-9.1 7-Zip UIA fidelity spike live-ran against a real disposable Azure VM and was human-approved. 7-Zip stays the SC#2/SC#3 target; TreeScope_Children alone proved insufficient (5 depth-1 container elements only) so Plan 09-02 must add a scoped, caller-configurable deeper UIA-walk capability. Window predicate (class_name == "7-Zip::FM") and D-9.6 seeding form (full quoted 7zFM.exe path + quoted seed arg) confirmed. See 09-01-SUMMARY.md.
 
 Note: Phase 3 remains `status: verifying` (pending /gsd-verify-work) in the frontmatter above; Phase 4/5/6/7 planning/execution began before that gate ran.
 
-Progress: [█████████░] 94% (Phase 8: 1/3 plans complete — see 08-01-SUMMARY.md)
+Progress: [█████████░] 89% (Phase 9: 1/3 plans complete — see 09-01-SUMMARY.md)
 
 ## Performance Metrics
 
@@ -81,6 +81,7 @@ Progress: [█████████░] 94% (Phase 8: 1/3 plans complete — 
 | Phase 08 P01 | ~5min | 2 tasks | 3 files |
 | Phase 08-public-sdk-api-worldstate P02 | 1200 | 2 tasks | 3 files |
 | Phase 08 P03 | 25min | 1 tasks | 1 files |
+| Phase 09 P01 | ~70min | 2 tasks | 1 files |
 
 ## Accumulated Context
 
@@ -148,6 +149,8 @@ Recent decisions affecting current work:
 - [Phase ?]: D-8.1/D-8.2/D-8.4 applied verbatim: WorldStateOptions a-la-carte defaults to screenshot+window_list+no-UIA (SC#2-compliant); capture_span is SystemTime/Duration (never Instant) with the 500ms bound checked only at the Plan 03 live gate, never in code
 - [Phase ?]: Live VM measurement for SC#2 (08-03) deferred — no disposable Azure VM currently reachable; gated test authored and compiles clean offline
 - **Phase 8 live gate (2026-07-10, PASSED):** SC#2 empirically CLOSED. Provisioned a fresh disposable Azure VM (rdpilot-vm, Standard_B2s_v2), built the win-x64 NativeAOT sensor ON the VM via `az vm run-command invoke` (WinRM still unavailable from this Linux host — same Phase 5/6/7 substitution), relayed the exe back via a short-lived Storage blob SAS (SHA256 byte-identical, 7a775b990cca3b40e72d4cd8ce910ebfc8e14262dd660089a4e5c62355ec34c2). Both gated `world_state` tests ran live and PASSED: default-options `capture_span` measured 23.524043ms (23ms); `UiaMode::Foreground` `capture_span` measured 73.194179ms (73ms) after one retry of the documented first-RDP-login `deploy_and_launch` transient (Phase 6/7 finding, self-resolved, no code change). One `az vm run-command` gotcha newly found: passing the sensor source tarball via `--parameters` (as opposed to embedding it directly in the script body) failed near-instantly, consistent with an undocumented CLI parameter-size limit — embedding the base64 payload directly in the script body (the Phase 6/7 pattern) is the durable approach; do not use `--parameters` for large payloads. VM torn down and confirmed absent (`az group exists -n rdpilot-test` => false; `rdpilot-mgmt` persists).
+- **Phase 9 Plan 1 (09-01, 2026-07-10, D-9.1 risk-gate spike, HUMAN-APPROVED):** 7-Zip File Manager stays the SC#2/SC#3 target (Notepad fallback explicitly NOT invoked). Live dump against a real disposable Azure VM showed `get_uia_tree(hwnd)`'s `TreeScope_Children`-only scope (D-7.4) returns just 5 depth-1 elements (Window/ToolBar/Pane/TitleBar/MenuBar) — none of the visible menu items, toolbar buttons, or listview rows are reachable at that depth. **Plan 09-02 must add a scoped, caller-configurable deeper UIA-walk capability** (flagged addition, not a silent absorption) before any SC#2/SC#3 assertion code is written. Confirmed window match predicate: exact `class_name == "7-Zip::FM"` (never a title substring — title reflects the currently-navigated folder). Confirmed D-9.6 seeding form (RESEARCH A1 resolved live): `launch_process` needs the FULL, individually-quoted exe path (`"C:\Program Files\7-Zip\7zFM.exe"`) plus a quoted seed-path argument — a bare `"7zFM.exe"` fails `CreateProcessW` with `LastError=2` since the sensor's `lpApplicationName` is null and 7-Zip's install dir is not on `PATH`. Reused the cached, hash-identical Phase 8 sensor build (no VM rebuild needed, sensor source unchanged since Phase 7-04). Throwaway spike file deleted per Pitfall 2; VM torn down and confirmed absent. See `09-01-SUMMARY.md`.
+- [Phase ?]: D-9.1 spike human-approved: 7-Zip stays SC#2/SC#3 target; TreeScope_Children insufficient, Plan 09-02 must add a scoped deeper UIA-walk capability; window predicate class_name=="7-Zip::FM"; D-9.6 seeding form confirmed (full quoted 7zFM.exe path + quoted seed arg, RESEARCH A1 resolved)
 
 ### Pending Todos
 
@@ -157,7 +160,7 @@ Recent decisions affecting current work:
 
 ### Blockers/Concerns
 
-- Phase 7/9: Target application UIA fidelity is unknown — identify and test before Phase 9 harness assertion design
+- Phase 9 (new, from 09-01): `TreeScope_Children` alone (D-7.4) is insufficient for 7-Zip's meaningful SC#2 elements — Plan 09-02 must design and add a scoped, caller-configurable deeper UIA-walk capability before writing assertion code. Not a blocker to proceeding, but a required scope addition to track.
 - Phase 5 residual (non-blocking, carried forward): `deploy_and_launch`'s `SESSION_SETTLE` + chunked-typing fixes are empirically-tuned timing workarounds, not root-caused to a specific Windows readiness signal — may need revisiting on a differently-provisioned target
 - Phase 5 residual (non-blocking, carried forward): the `rdpsnd` stub channel is intentionally non-functional (presence-only) — correct for v1 scope but a permanent architectural addition, not a temporary hack
 
@@ -167,6 +170,10 @@ Recent decisions affecting current work:
 - ~~Drive redirection GPO policy on target unknown~~ — resolved: no block encountered live, no policy remediation needed (05-04)
 - ~~NativeAOT binary size unknown (5-30+ MB range)~~ — resolved: 2,699,264 bytes (~2.57 MiB) (05-01)
 
+**Resolved during Phase 9 Plan 1 (previously listed here):**
+
+- ~~Phase 7/9: Target application UIA fidelity is unknown — identify and test before Phase 9 harness assertion design~~ — resolved: D-9.1 spike live-ran, human-approved; 7-Zip confirmed adequate (with the deeper-walk capability addition noted above), see 09-01-SUMMARY.md
+
 ## Deferred Items
 
 None outstanding for Phase 1. All ENV-01/02/03 requirements satisfied.
@@ -174,6 +181,6 @@ Phase 2 Plan 02: pre-existing rustdoc intra-doc-link warnings in config.rs (Wave
 
 ## Session Continuity
 
-Last session: 2026-07-09T21:42:09.424Z
-Stopped at: Phase 8 context gathered
-Resume file: .planning/phases/08-public-sdk-api-worldstate/08-CONTEXT.md
+Last session: 2026-07-10T11:56:55.449Z
+Stopped at: Phase 9 Plan 1 (09-01) complete — D-9.1 spike human-approved, ready to plan/execute 09-02
+Resume file: .planning/phases/09-scripted-proof-harness/09-01-SUMMARY.md
