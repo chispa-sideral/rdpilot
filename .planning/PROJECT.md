@@ -17,6 +17,19 @@ The deliberately rejected alternative is the "obvious" path of running the AI ag
 
 A local AI agent can connect to a remote Windows desktop over RDP and **read/inspect a program that is only reachable via RDP** — navigating it and reporting what it sees — using both screenshots and structured accessibility data, without installing or running the agent itself on the remote machine.
 
+## Current Milestone: v1.1 — Consumer Surfaces & File Transfer
+
+**Goal:** Turn the proven rdpilot SDK into agent- and human-drivable surfaces — an MCP server and a CLI over a persistent session daemon — with bidirectional file transfer, proven both by scripted per-surface harnesses and a live-LLM MCP demo.
+
+**Target features:**
+- Session daemon: long-lived background service holding live RDP sessions + keepalive, exposing a local IPC (socket/named pipe); a shared session registry keyed by name-or-auto-id.
+- Session identity: sessions referenced by user-supplied name (else auto-generated id); no implicit default target — every command explicitly names its session.
+- CLI surface: thin client over the daemon — session lifecycle (connect/list/disconnect) + perception/input/launch/file verbs, each explicitly targeting a session.
+- MCP server surface: dual tool surface — Anthropic computer-use-compatible tools plus rdpilot-native tools; a daemon client.
+- Bidirectional file transfer: upload local→remote and download remote→local, exposed through both surfaces.
+- Layered connection config: config file + env + flags for target host + credentials.
+- Proof: scripted proof harness per surface plus a capstone live-LLM demo driving a read/inspect + file-transfer task through the MCP surface.
+
 ## Context
 
 - **Author / audience:** Solo author (Marc). **Personal tooling first** — built for real use, clean enough to open-source later (LGPL-3.0 leaning), but v1 does not carry the burden of public API stability or polished published-package docs.
@@ -54,7 +67,13 @@ All 20 v1 requirements validated. v1.0 milestone shipped 2026-07-10.
 
 ### Active
 
-(None yet for v2 — next milestone requirements to be defined via `/gsd-new-milestone`)
+- [ ] Session daemon: long-lived background service holding live RDP sessions + keepalive, exposing a local IPC (socket/named pipe); a shared session registry keyed by name-or-auto-id
+- [ ] Session identity: sessions referenced by user-supplied name (else auto-generated id); no implicit default target
+- [ ] CLI surface: thin client over the daemon — session lifecycle + perception/input/launch/file verbs, each explicitly targeting a session
+- [ ] MCP server surface: dual tool surface — Anthropic computer-use-compatible tools plus rdpilot-native tools; a daemon client
+- [ ] Bidirectional file transfer: upload local→remote and download remote→local, exposed through both surfaces
+- [ ] Layered connection config: config file + env + flags for target host + credentials
+- [ ] Proof: scripted proof harness per surface plus a capstone live-LLM demo through the MCP surface
 
 ### Out of Scope
 
@@ -112,4 +131,4 @@ This document evolves at phase transitions and milestone boundaries.
 The full read/inspect loop (connect → screenshot → enumerate windows/processes → read UIA tree → navigate → verify) was proven live end-to-end against a real, remote-only Windows program (7-Zip File Manager) with no LLM involved (PROOF-01), closing the v1.0 milestone. Next: define v2 scope (candidates already recorded in REQUIREMENTS.md "v2 Requirements (Deferred)": clipboard/CLIPRDR, file transfer, MCP/CLI packaging, PyO3/NAPI-RS bindings) or promote a Backlog item (see ROADMAP.md Backlog, 999.1-999.4).
 
 ---
-*Last updated: 2026-07-10 after v1.0 milestone*
+*Last updated: 2026-07-10 after milestone v1.1 started*
