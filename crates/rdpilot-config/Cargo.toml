@@ -1,0 +1,14 @@
+[package]
+name = "rdpilot-config"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.78"
+license = "LGPL-3.0-or-later"
+description = "Layered (file -> env -> flag/MCP-init) configuration resolution for rdpilot. Zero dependency on rdpilot/IronRDP — thin clients link this crate only."
+repository = "https://github.com/marcfargas/rdpilot"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+config = { version = "0.15.25", default-features = false, features = ["toml"] }
+directories = "6.0.0"
+thiserror = "2"
