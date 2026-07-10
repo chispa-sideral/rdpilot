@@ -36,10 +36,12 @@
 
 mod error;
 mod request;
+mod response;
 mod session_id;
 mod transfer;
 
 pub use error::{WireError, WireErrorCode};
 pub use request::{Request, SessionScoped};
+pub use response::{SessionLifecycle, SessionStatus, WireResponse};
 pub use session_id::SessionId;
 pub use transfer::TransferOutcome;
