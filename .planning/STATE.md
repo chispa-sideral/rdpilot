@@ -2,15 +2,15 @@
 gsd_state_version: 1.0
 milestone: v1.1
 milestone_name: — Consumer Surfaces & File Transfer
-status: executing
+status: verifying
 stopped_at: Phase 10 complete (5/5 plans). Plan 10-05's live gate found and fixed a Rule 1 bug in finalize_write's completeness rule (real Windows never sends FILE_END_OF_FILE_INFORMATION), measured the real per-IRP chunk size, and validated TRANSFER_TIMEOUT_MS. Ready to plan Phase 11 (Shared Wire Protocol & Config).
-last_updated: "2026-07-10T22:50:21.269Z"
+last_updated: "2026-07-10T22:56:11.687Z"
 last_activity: 2026-07-10 -- Phase 11 execution started
 progress:
   total_phases: 6
   completed_phases: 1
   total_plans: 7
-  completed_plans: 6
+  completed_plans: 7
   percent: 17
 ---
 
@@ -27,7 +27,7 @@ See: .planning/PROJECT.md (updated 2026-07-10)
 
 Phase: 11 (Shared Wire Protocol & Config) — EXECUTING
 Plan: 2 of 2
-Status: Ready to execute
+Status: Phase complete — ready for verification
 Last activity: 2026-07-10 -- Phase 11 execution started
 
 ## Milestone v1.1 Phases
@@ -99,6 +99,7 @@ Last activity: 2026-07-10 -- Phase 11 execution started
 | Phase 10 P05 | ~2h | 2 tasks (+1 checkpoint) | 4 files (incl. live gate + 1 live-diagnosed bug fix) |
 | Phase 10 P05 | ~2h | 2 tasks | 4 files |
 | Phase 11 P01 | ~35 min | 3 tasks | 7 files |
+| Phase 11 P02 | ~30 min | 3 tasks | 6 files |
 
 ## Accumulated Context
 
@@ -187,6 +188,8 @@ Recent decisions affecting current work:
 - [Phase ?]: 10-05: real per-IRP chunk size measured live -- write direction consistently 65536 bytes (64 KiB), read direction variable up to 512-600 KiB; TRANSFER_TIMEOUT_MS (30s) validated as adequate, not tuned
 - [Phase ?]: rdpilot-ipc: WireErrorCode Internal catch-all + type-only D-28 mapping (mapping deferred to Phase 12 daemon, per Decision 1) — Keeps rdpilot-ipc dependency-free of rdpilot/IronRDP; thin CLI/MCP clients never pull in the RDP stack
 - [Phase ?]: sample_all_response_variants() tightened with a trailing non-wildcard exhaustive match — Checker's hardening note: a future WireResponse variant added without updating this function is a compile error, not a code-review gap
+- [Phase ?]: rdpilot-config: ResolvedConfig derives ONLY Debug/Clone/Deserialize, never Serialize — Structural credential-leak prevention one layer before the rdpilot-ipc wire boundary (extends D-31)
+- [Phase ?]: rdpilot-config: flag/MCP-init override layer implemented as a plain Option-based apply_overrides pass, not routed through config::Source — clap (Phase 13) / rmcp (Phase 14) already hand over typed values; re-stringifying through Source would lose type safety for no benefit
 
 ### Pending Todos
 
@@ -233,8 +236,8 @@ Pre-close artifact audit surfaced 3 open items. Reviewed and explicitly acknowle
 
 ## Session Continuity
 
-Last session: 2026-07-10T22:50:21.263Z
-Stopped at: Phase 11 Plan 01 (rdpilot-ipc) complete — SESSION-02 and CONFIG-03 satisfied. Starting Plan 02 (rdpilot-config).
+Last session: 2026-07-10T22:56:11.682Z
+Stopped at: Phase 11 complete (2/2 plans). rdpilot-ipc (SESSION-02, CONFIG-03) and rdpilot-config (CONFIG-01, CONFIG-02) both built, verified, and workspace-integrated. Ready for Phase 12 (Session Daemon).
 Resume file: .planning/DECISIONS-INDEX.md
 
 ## Operator Next Steps

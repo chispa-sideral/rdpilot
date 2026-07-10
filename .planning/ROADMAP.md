@@ -29,7 +29,7 @@ Full phase goals, success criteria, and plan-by-plan detail: `.planning/mileston
 ### v1.1 — Consumer Surfaces & File Transfer (Phases 10-15)
 
 - [x] **Phase 10: SDK File-Transfer Extension** — Generalize the RDPDR drive backend to bidirectional, allow-listed, canonicalization-guarded file transfer with sensor upload/download commands. (completed 2026-07-10)
-- [ ] **Phase 11: Shared Wire Protocol & Config** — `rdpilot-ipc` (required-session-id schema, credential-free DTOs) + `rdpilot-config` (layered file/env/flag resolution).
+- [x] **Phase 11: Shared Wire Protocol & Config** — `rdpilot-ipc` (required-session-id schema, credential-free DTOs) + `rdpilot-config` (layered file/env/flag resolution). (completed 2026-07-10)
 - [ ] **Phase 12: Session Daemon** — Long-lived daemon with a leak-free named-session registry, local-only DACL/peer-scoped IPC, auto-start/idle-shutdown, and crash-restart orphan reconciliation.
 - [ ] **Phase 13: CLI Surface** — Thin `rdpilot` CLI over the daemon: lifecycle + perception/input/launch/file verbs, each explicitly targeting a named session.
 - [ ] **Phase 14: MCP Server Surface** — `rmcp` server exposing a computer-use `computer` mega-tool + rdpilot-native tools, with a tested coordinate-scaling bridge and non-blocking per-call isolation.
@@ -69,10 +69,10 @@ Full phase goals, success criteria, and plan-by-plan detail: `.planning/mileston
   3. The config file follows common CLI-tool convention (platform config dir / clearly-named `.rdpilot.*`), is gitignored, and is discoverable and self-explanatory (CONFIG-02).
   4. **[BLOCKING]** Serializing every wire response type and grepping the output for a planted secret sentinel finds nothing — credential-free status DTOs, no plaintext password on the wire or in logs (CONFIG-03; Pitfall 4, closing the v1.0 D-14 Debug-only redaction gap).
 
-**Plans**: 1/2 plans executed
+**Plans**: 2/2 plans complete
 
 - [x] 11-01-PLAN.md — `rdpilot-ipc` crate: required-session Request schema (SESSION-02) + credential-free WireResponse DTOs (CONFIG-03) + WireError taxonomy types + TransferOutcome mirror; zero rdpilot dependency (Wave 1)
-- [ ] 11-02-PLAN.md — `rdpilot-config` crate: platform-config-dir path via BaseDirs (CONFIG-02) + layered file→env→override resolution (CONFIG-01) + commented template; Serialize-free ResolvedConfig, zero rdpilot dependency (Wave 2)
+- [x] 11-02-PLAN.md — `rdpilot-config` crate: platform-config-dir path via BaseDirs (CONFIG-02) + layered file→env→override resolution (CONFIG-01) + commented template; Serialize-free ResolvedConfig, zero rdpilot dependency (Wave 2)
 
 ### Phase 12: Session Daemon
 
@@ -143,7 +143,7 @@ Full phase goals, success criteria, and plan-by-plan detail: `.planning/mileston
 | 8. Public SDK API + WorldState | v1.0 | 3/3 | Complete | 2026-07-09 |
 | 9. Scripted Proof Harness | v1.0 | 4/4 | Complete | 2026-07-10 |
 | 10. SDK File-Transfer Extension | v1.1 | 5/5 | Complete   | 2026-07-10 |
-| 11. Shared Wire Protocol & Config | v1.1 | 1/2 | In Progress|  |
+| 11. Shared Wire Protocol & Config | v1.1 | 2/2 | Complete   | 2026-07-10 |
 | 12. Session Daemon | v1.1 | 0/? | Not started | - |
 | 13. CLI Surface | v1.1 | 0/? | Not started | - |
 | 14. MCP Server Surface | v1.1 | 0/? | Not started | - |

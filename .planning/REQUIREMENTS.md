@@ -45,8 +45,8 @@ Requirements for the v1.1 milestone. Each maps to roadmap phases.
 
 ### Connection Config
 
-- [ ] **CONFIG-01**: Consumers supply target host + credentials via layered config — a clearly-named gitignored file, overridable by env vars and CLI flags / MCP init params
-- [ ] **CONFIG-02**: The config file follows common CLI-tool convention (platform config dir / clearly-named `.rdpilot.*`), discoverable and self-explanatory
+- [x] **CONFIG-01**: Consumers supply target host + credentials via layered config — a clearly-named gitignored file, overridable by env vars and CLI flags / MCP init params
+- [x] **CONFIG-02**: The config file follows common CLI-tool convention (platform config dir / clearly-named `.rdpilot.*`), discoverable and self-explanatory
 - [x] **CONFIG-03**: Credentials never leak through IPC/MCP wire responses or logs — Serialize paths redact secrets (closing the v1.0 D-14 Debug-only redaction gap)
 
 ### Proof
@@ -87,8 +87,8 @@ Which phases cover which requirements. Updated during roadmap creation.
 | FILE-03 | Phase 10 | Complete (live-verified 10-05, BLOCKING re-confirm passed) |
 | FILE-04 | Phase 10 | Complete (live-verified 10-05, BLOCKING re-confirm passed) |
 | SESSION-02 | Phase 11 | Complete |
-| CONFIG-01 | Phase 11 | Pending |
-| CONFIG-02 | Phase 11 | Pending |
+| CONFIG-01 | Phase 11 | Complete |
+| CONFIG-02 | Phase 11 | Complete |
 | CONFIG-03 | Phase 11 | Complete |
 | DAEMON-01 | Phase 12 | Pending |
 | DAEMON-02 | Phase 12 | Pending |
