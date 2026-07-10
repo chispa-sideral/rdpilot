@@ -26,9 +26,11 @@
 #![deny(clippy::expect_used)]
 
 mod paths;
+mod resolve;
 mod resolved;
 
 pub use paths::config_file_path;
+pub use resolve::{apply_overrides, resolve};
 pub use resolved::{ConfigError, ResolvedConfig};
 
 /// A fully-commented, self-explanatory `config.toml` template documenting
