@@ -69,7 +69,10 @@ Full phase goals, success criteria, and plan-by-plan detail: `.planning/mileston
   3. The config file follows common CLI-tool convention (platform config dir / clearly-named `.rdpilot.*`), is gitignored, and is discoverable and self-explanatory (CONFIG-02).
   4. **[BLOCKING]** Serializing every wire response type and grepping the output for a planted secret sentinel finds nothing — credential-free status DTOs, no plaintext password on the wire or in logs (CONFIG-03; Pitfall 4, closing the v1.0 D-14 Debug-only redaction gap).
 
-**Plans**: TBD
+**Plans**: 2 plans
+
+- [ ] 11-01-PLAN.md — `rdpilot-ipc` crate: required-session Request schema (SESSION-02) + credential-free WireResponse DTOs (CONFIG-03) + WireError taxonomy types + TransferOutcome mirror; zero rdpilot dependency (Wave 1)
+- [ ] 11-02-PLAN.md — `rdpilot-config` crate: platform-config-dir path via BaseDirs (CONFIG-02) + layered file→env→override resolution (CONFIG-01) + commented template; Serialize-free ResolvedConfig, zero rdpilot dependency (Wave 2)
 
 ### Phase 12: Session Daemon
 
