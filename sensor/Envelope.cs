@@ -18,11 +18,14 @@ internal static class ProtocolVersion
 }
 
 /// The set of message types (D-4.3/D-5.4 handshake+heartbeat, Phase 6
-/// perception/control requests). `System.Text.Json` writes this as the bare
-/// string form ("Version"/"Ping"/"Pong"/"WindowList"/...) via
+/// perception/control requests, Phase 10 file transfer). `System.Text.Json`
+/// writes this as the bare string form
+/// ("Version"/"Ping"/"Pong"/"WindowList"/.../"FileTransfer") via
 /// `JsonStringEnumConverter` wired through `EnvelopeJsonContext` — matching
 /// the Rust side's serde externally-tagged unit-variant wire shape exactly.
-/// Order/names mirror `crates/rdpilot/src/sensor.rs`'s `MsgType` (06-01).
+/// Order/names mirror `crates/rdpilot/src/sensor.rs`'s `MsgType` (06-01,
+/// extended 10-03) — `FileTransfer` MUST stay the last variant in the same
+/// ordinal position as the Rust side.
 internal enum MsgType
 {
     Version,
@@ -33,6 +36,7 @@ internal enum MsgType
     SetForegroundWindow,
     LaunchProcess,
     Uia,
+    FileTransfer,
 }
 
 /// The durable request/response envelope carried over `RDPILOT_SENSOR`:

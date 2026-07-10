@@ -43,14 +43,23 @@ pub(crate) struct Envelope {
 }
 
 /// The set of message types this crate can send/receive over the
-/// `RDPILOT_SENSOR` DVC (D-4.3, Phase 6 wire contract, extended by Phase 7):
-/// the version handshake, the ping/pong heartbeat, the four Phase 6
-/// request/response types, and Phase 7's `Uia` tree-walk request. Serializes
-/// as the bare externally-tagged unit string form — `"Version"`, `"Ping"`,
-/// `"Pong"`, `"WindowList"`, `"ProcessTree"`, `"SetForegroundWindow"`,
-/// `"LaunchProcess"`, `"Uia"` — matching the wire shape verified in RESEARCH
-/// Q2. `Uia` reuses the existing generic non-`Version` fulfilment path
-/// (RESEARCH Pattern 1) with zero dispatch/correlation changes.
+/// `RDPILOT_SENSOR` DVC (D-4.3, Phase 6 wire contract, extended by Phase 7,
+/// Phase 10): the version handshake, the ping/pong heartbeat, the four
+/// Phase 6 request/response types, Phase 7's `Uia` tree-walk request, and
+/// Phase 10's `FileTransfer` sensor-mediated upload/download trigger.
+/// Serializes as the bare externally-tagged unit string form — `"Version"`,
+/// `"Ping"`, `"Pong"`, `"WindowList"`, `"ProcessTree"`,
+/// `"SetForegroundWindow"`, `"LaunchProcess"`, `"Uia"`, `"FileTransfer"` —
+/// matching the wire shape verified in RESEARCH Q2. `Uia`/`FileTransfer`
+/// reuse the existing generic non-`Version` fulfilment path (RESEARCH
+/// Pattern 1) with zero dispatch/correlation changes. `FileTransfer` carries
+/// a single request/reply pair with an upload/download discriminant in the
+/// payload (10-CONTEXT Claude's Discretion) rather than two separate
+/// variants — matches the `{op, remote_path, share_name}` request /
+/// `{success, data, error, error_kind}` reply shape (10-03-PLAN Task 1); the
+/// payload DTOs live sensor-side only (`sensor/FileTransfer.cs`) since this
+/// crate's `sensor_request` returns the raw `serde_json::Value` reply for
+/// Plan 10-04 to interpret (D-09 crate-internal-only).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum MsgType {
     Version,
@@ -61,6 +70,7 @@ pub(crate) enum MsgType {
     SetForegroundWindow,
     LaunchProcess,
     Uia,
+    FileTransfer,
 }
 
 #[cfg(test)]
@@ -106,6 +116,24 @@ mod tests {
         let garbage: &[u8] = b"{not valid json";
         let result: Result<Envelope, _> = serde_json::from_slice(garbage);
         assert!(result.is_err());
+    }
+
+    /// Serializing a `FileTransfer` envelope produces the exact wire shape
+    /// (10-03-PLAN Task 1 acceptance criterion): `type` is the bare string
+    /// `"FileTransfer"`, matching `sensor/Envelope.cs`'s `MsgType` enum in
+    /// the same ordinal position (last variant).
+    #[test]
+    fn file_transfer_envelope_serializes_with_bare_type_string() {
+        let env = Envelope {
+            version: PROTOCOL_VERSION,
+            req_id: 3,
+            msg_type: MsgType::FileTransfer,
+            payload: None,
+        };
+        let value = serde_json::to_value(&env).expect("envelope serializes");
+        assert_eq!(value["type"], "FileTransfer");
+        assert_eq!(value["req_id"], 3);
+        assert_eq!(value["version"], PROTOCOL_VERSION);
     }
 }
 

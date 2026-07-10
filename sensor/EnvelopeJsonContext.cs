@@ -34,6 +34,9 @@ namespace RdpilotSensor;
 [JsonSerializable(typeof(UiaTreeRequest))]
 [JsonSerializable(typeof(UiaElementRecord))]
 [JsonSerializable(typeof(UiaTreeResponse))]
+[JsonSerializable(typeof(FileTransferRequest))]
+[JsonSerializable(typeof(FileTransferData))]
+[JsonSerializable(typeof(FileTransferResponse))]
 internal partial class EnvelopeJsonContext : JsonSerializerContext
 {
 }
