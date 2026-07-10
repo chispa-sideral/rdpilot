@@ -2,9 +2,23 @@
 
 ## v1.0 MVP (Shipped: 2026-07-10)
 
-**Phases completed:** 9 phases, 35 plans, 68 tasks
+**Delivered:** A local AI agent can connect to a remote Windows desktop over RDP and read/inspect a program that is only reachable via RDP — using both screenshots and structured accessibility data (window list, process tree, UI Automation tree) — proven live end-to-end against a real remote-only Windows program (7-Zip File Manager), with no live LLM required to call it done.
 
-**Key accomplishments:**
+**Phases completed:** 9 phases, 35 plans, 68 tasks
+**Timeline:** 2026-06-04 → 2026-07-10 (36 days)
+**Git range:** `b960c29`..`e410437` (~188 commits, 168 files changed, +41,877/-5 LOC)
+**Known deferred items at close:** 3 (see STATE.md Deferred Items)
+
+**Summary accomplishments:**
+
+1. Disposable Azure Windows test environment — Bicep + up/down script + scheduled auto-destroy (Phase 1).
+2. IronRDP session with live framebuffer screenshots + 10-minute keepalive (Phase 2).
+3. Mouse/keyboard input injection with an enforced 96-DPI physical-pixel coordinate contract (Phase 3).
+4. RDPILOT_SENSOR DVC transport + C# NativeAOT sensor build/deploy via RDPDR and WinRM (Phases 4-5).
+5. Window list / process tree / focus / launch + flat UIA element tree over DVC (Phases 6-7).
+6. Clean typed SDK API + timestamped WorldState + scripted proof harness proven live against real 7-Zip (Phases 8-9).
+
+**Full per-plan accomplishments (raw, extracted from SUMMARY.md one-liners):**
 
 - 1. [Rule 3 - Blocking] `infra/tests/` did not exist for Task 1's verify command
 - 1. [Rule 3 - Blocking] Verify gate tripped on the literal "0.0.0.0/0" inside a Bicep comment
