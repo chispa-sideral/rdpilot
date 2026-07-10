@@ -18,10 +18,10 @@ progress:
 
 ## Project Reference
 
-See: .planning/PROJECT.md (updated 2026-06-04)
+See: .planning/PROJECT.md (updated 2026-07-10)
 
 **Core value:** A local AI agent can connect to a remote Windows desktop over RDP and read/inspect a program that is only reachable via RDP — using both screenshots and structured accessibility data, without installing or running the agent itself on the remote machine.
-**Current focus:** v1.0 milestone COMPLETE — all 9 phases (35/35 plans) done, PROOF-01 retired, terminal live gate PASSED 2026-07-10.
+**Current focus:** Planning next milestone (v2). v1.0 MVP shipped 2026-07-10 — all 9 phases (35/35 plans) done, PROOF-01 retired, terminal live gate PASSED.
 
 ## Current Position
 
@@ -201,7 +201,7 @@ Pre-close artifact audit surfaced 3 open items. Reviewed and explicitly acknowle
 ## Session Continuity
 
 Last session: 2026-07-10T15:30:00.000Z
-Stopped at: Phase 9 Plan 4 (09-04) complete — terminal v1 live gate PASSED, PROOF-01 retired, v1.0 milestone CLOSED. No further v1 work outstanding; any next work is v2 (see REQUIREMENTS.md "v2 Requirements (Deferred)") or backlog phases (see ROADMAP.md Backlog).
+Stopped at: Phase 9 Plan 4 (09-04) complete — terminal v1 live gate PASSED, PROOF-01 retired, v1.0 milestone CLOSED. No further v1 work outstanding; any next work is v2 (see `.planning/milestones/v1.0-REQUIREMENTS.md` "v2 Requirements (Deferred)") or backlog phases (see ROADMAP.md Backlog).
 Resume file: .planning/phases/09-scripted-proof-harness/09-04-SUMMARY.md
 
 ## Operator Next Steps
