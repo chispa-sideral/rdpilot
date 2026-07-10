@@ -29,43 +29,60 @@ A local AI agent can connect to a remote Windows desktop over RDP and **read/ins
 
 ### Validated
 
-- [x] **SESS-01** Connect to and authenticate (NLA / credentials) an RDP session to a Windows target — *Validated in Phase 2: rdp-session-framebuffer-core*
-- [x] **SESS-02** Manage the session lifecycle (open, keepalive, teardown); keep session rendered so perception stays live — *Validated in Phase 2: rdp-session-framebuffer-core*
-- [x] **CAP-01** Capture a full-desktop screenshot from the RDP framebuffer — *Validated in Phase 2: rdp-session-framebuffer-core*
+- ✓ **ENV-01** Bicep template provisions an Azure Windows VM configured for RDP automation — v1.0 (live-verified 2026-06-04, all six ENV-01 assertions green)
+- ✓ **ENV-02** A `.ps1` script brings the test environment up and tears it down on demand — v1.0 (live-verified 2026-06-04)
+- ✓ **ENV-03** Scheduled auto-destroy safeguard tears down the VM/resource group automatically — v1.0 (live-verified 2026-06-05, runbook fired unattended and reaped `rdpilot-test`)
+- ✓ **SESS-01** Connect to and authenticate (NLA / credentials) an RDP session to a Windows target — v1.0
+- ✓ **SESS-02** Manage the session lifecycle (open, keepalive, teardown); keep session rendered so perception stays live — v1.0
+- ✓ **CAP-01** Capture a full-desktop screenshot from the RDP framebuffer — v1.0
+- ✓ **CAP-02** Capture a per-window cropped screenshot — v1.0
+- ✓ **INPUT-01** Inject mouse actions (move, click variants, scroll, drag) at remote coordinates — v1.0 (10/10 live tests pass, 2026-07-08)
+- ✓ **INPUT-02** Inject keyboard input (type text and key combinations/modifiers) — v1.0 (10/10 live tests pass, 2026-07-08)
+- ✓ **SENSOR-03** DVC request/response transport channel carries structured-perception data — v1.0 (live round trip 165ms, 2026-07-09)
+- ✓ **SENSOR-01** Thin C# .NET 8 NativeAOT sensor helper exposes structured-perception queries — v1.0 (self-contained, 2.57 MiB, no external runtime, 2026-07-09)
+- ✓ **SENSOR-02** SDK bootstraps/deploys and launches the sensor on the target (RDPDR primary, WinRM fallback) — v1.0 (RDPDR 22.61ms, WinRM 21.62ms, both live-verified 2026-07-09)
+- ✓ **PERC-01** Enumerate the remote process tree — v1.0
+- ✓ **PERC-02** Enumerate remote windows (titles, geometry, foreground/z-order) — v1.0
+- ✓ **PERC-04** Query and set the foreground window (focus) — v1.0
+- ✓ **PROC-01** Launch and observe a remote process — v1.0
+- ✓ **PERC-03** Retrieve the UI Automation tree as a flat `UiaElement[]` — v1.0 (30.36ms TreeScope_Children walk, live-verified 2026-07-09)
+- ✓ **API-01** Clean, typed SDK API surface exposing control + perception — v1.0
+- ✓ **API-02** Coherent `WorldState` correlating screenshot + window list + UIA snapshot in one coordinate space — v1.0 (capture_span 23-73ms, live-verified 2026-07-10)
+- ✓ **PROOF-01** Scripted harness proves the full read/inspect loop end-to-end against a real remote-only Windows program — v1.0 (live-verified against real 7-Zip File Manager, 2026-07-10, `PROOF: PASS`)
+
+All 20 v1 requirements validated. v1.0 milestone shipped 2026-07-10.
 
 ### Active
 
-- [ ] Capture a per-window cropped screenshot
-- [ ] Inject mouse and keyboard input mapped to remote desktop/window coordinates
-- [ ] Enumerate the remote process tree
-- [ ] Enumerate remote windows (list, titles, geometry, foreground/z-order)
-- [ ] Retrieve the UI Automation / accessibility tree for the desktop or a specified window
-- [ ] Launch and observe a remote process (e.g. `pwsh.exe`)
-- [ ] Bootstrap/deploy the thin remote sensor helper and establish its transport (RDP virtual channel and/or out-of-band)
-- [ ] Expose a clean SDK API surface that an AI computer-use consumer (later) can drive
-- [ ] Scripted proof harness: connect → screenshot → read UIA tree → navigate a real remote-only program → report findings
+(None yet for v2 — next milestone requirements to be defined via `/gsd-new-milestone`)
 
 ### Out of Scope
 
 - Running the AI agent on the remote session — explicitly rejected; intelligence stays local
-- MCP server / Anthropic computer-use shim / CLI packaging — a later milestone; v1's first consumer is a scripted harness
-- Non-Windows RDP targets (Linux/xrdp, macOS) — Windows-only v1 to lean on UIA/WinRM/WMI/RAIL
-- Heavy write/destructive automation and its guardrails — beyond what read/inspect needs
-- Published-package polish — public API stability guarantees, comprehensive docs, multi-registry distribution
-- Multi-session orchestration / concurrency at scale
-- Remote-assist co-driving UX
+- MCP server / Anthropic computer-use shim / CLI packaging — deferred to v2 (see REQUIREMENTS.md v2 Requirements); v1's first consumer was a scripted harness
+- Non-Windows RDP targets (Linux/xrdp, macOS) — Windows-only v1 to lean on UIA/WinRM/WMI/RAIL; reasoning still valid, no v1.0 finding invalidated it
+- Heavy write/destructive automation and its guardrails — beyond what read/inspect needs; reasoning still valid
+- Published-package polish — public API stability guarantees, comprehensive docs, multi-registry distribution; reasoning still valid, this remains personal tooling first
+- Multi-session orchestration / concurrency at scale — reasoning still valid, not exercised by v1.0's single-session proof harness
+- Remote-assist co-driving UX — reasoning still valid; captured as Backlog Phase 999.4 (Remote Assistance / Shadowing) for future consideration, not silently dropped
+- Clipboard read/write over CLIPRDR — deferred to v2 (see REQUIREMENTS.md v2 Requirements)
+- File transfer to/from the remote target — deferred to v2 (see REQUIREMENTS.md v2 Requirements)
+- PyO3 / NAPI-RS bindings for TypeScript/Python consumers — deferred to v2 (see REQUIREMENTS.md v2 Requirements)
 
 ## Key Decisions
 
 | Decision | Rationale | Outcome |
 |----------|-----------|---------|
-| The SDK/library is the product; AI is its first consumer | Decouples core RDP perception/control from packaging (MCP/shim/CLI), which become later concerns | — Pending |
-| A thin remote "sensor" helper is permitted on the target | Only viable way to get structured perception (process/UIA tree) over RDP; it is a dumb sensor, not the agent | — Pending |
-| Windows-only for v1 | Lets the SDK use Windows-native APIs (UI Automation, WinRM, WMI, RAIL, pwsh) instead of lowest-common-denominator pixel scraping | — Pending |
-| Pixels + structured perception (not vision-only) | Richer grounding for the agent than screenshots alone | — Pending |
-| **Primary language: Rust + IronRDP** | IronRDP is the only actively-maintained library giving programmatic framebuffer + input injection + custom DVC cleanly, with zero FFI on the hot path. FreeRDP rejected (stale Rust bindings, unsafe C, painful Windows builds); MS ActiveX rejected (rendering control only — headless framebuffer + custom DVC + input are inadequate for an SDK). Rust surface kept thin; typed consumer API exposed later via PyO3/Python or JSON-RPC socket. | ✅ Decided (2026-06-04) |
-| **Sensor language: C# .NET 8 NativeAOT vs all-Rust** | C# NativeAOT: most ergonomic UIA, self-contained native exe, no runtime on target; cost: 2nd language + .NET SDK in build. All-Rust (`windows` crate + `uiautomation-rs`): one toolchain, no .NET dependency; cost: rougher UIA/COM code. DVC channel (Phase 4) and sensor (Phase 5) are several phases out — best decided with hands-on context. | ⏳ Deferred — decide during Phase 4/5 |
-| v1 "done" = scripted proof, no live LLM | Isolates the genuinely hard problem (RDP perception fidelity) from agent/packaging work | — Pending |
+| The SDK/library is the product; AI is its first consumer | Decouples core RDP perception/control from packaging (MCP/shim/CLI), which become later concerns | ✅ Good — v1.0 proof harness consumed the SDK with zero IronRDP/sensor-protocol leakage (API-01) |
+| A thin remote "sensor" helper is permitted on the target | Only viable way to get structured perception (process/UIA tree) over RDP; it is a dumb sensor, not the agent | ✅ Good — C# NativeAOT sensor shipped, DVC+RDPDR+WinRM transport all live-proven |
+| Windows-only for v1 | Lets the SDK use Windows-native APIs (UI Automation, WinRM, WMI, RAIL, pwsh) instead of lowest-common-denominator pixel scraping | ✅ Good — UIA/RDPDR/WinRM all used directly with no abstraction tax |
+| Pixels + structured perception (not vision-only) | Richer grounding for the agent than screenshots alone | ✅ Good — WorldState correlates screenshot + window list + UIA tree in one coordinate space (API-02) |
+| **Primary language: Rust + IronRDP** | IronRDP is the only actively-maintained library giving programmatic framebuffer + input injection + custom DVC cleanly, with zero FFI on the hot path. FreeRDP rejected (stale Rust bindings, unsafe C, painful Windows builds); MS ActiveX rejected (rendering control only — headless framebuffer + custom DVC + input are inadequate for an SDK). Rust surface kept thin; typed consumer API exposed later via PyO3/Python or JSON-RPC socket. | ✅ Decided (2026-06-04) — held for the whole milestone; IronRDP versions turned out non-uniform across crates (corrected in Phase 2 Plan 01), otherwise no regrets |
+| **Sensor language: C# .NET 8 NativeAOT vs all-Rust** | C# NativeAOT: most ergonomic UIA, self-contained native exe, no runtime on target; cost: 2nd language + .NET SDK in build. All-Rust (`windows` crate + `uiautomation-rs`): one toolchain, no .NET dependency; cost: rougher UIA/COM code. DVC channel (Phase 4) and sensor (Phase 5) are several phases out — best decided with hands-on context. | ✅ Good — C# NativeAOT chosen at Phase 5; shipped as a 2.57 MiB self-contained win-x64 exe with no external .NET runtime; UIA COM interop (Phase 7) would have been materially rougher in raw Rust |
+| v1 "done" = scripted proof, no live LLM | Isolates the genuinely hard problem (RDP perception fidelity) from agent/packaging work | ✅ Good — `examples/proof_harness.rs` proved the full connect→screenshot→UIA→navigate→verify loop against real 7-Zip with zero LLM involvement (PROOF-01) |
+| Build toolchain: `x86_64-pc-windows-gnu` (MinGW) not `-msvc` | Host is ARM64 Windows with no MSVC/Windows SDK; GNU cross-toolchain produces functionally equivalent x64 artifacts for a pure-Rust RDP client | ✅ Good — held for the whole milestone, no MSVC-only blocker ever surfaced |
+| `rdpsnd` stub static channel required alongside RDPDR | MS-RDPEFS Appendix A footnote: a Windows RDP server withholds the RDPDR Server Announce Request unless `rdpsnd` is also advertised/joined — discovered live during the Phase 5 gate | ✅ Good, but a permanent architectural addition (non-functional presence-only stub), not a temporary hack — carried forward as a Phase 5 residual note |
+| `UiaScope::Subtree{max_depth}` added mid-milestone (Phase 9 Plan 02) | `TreeScope_Children`-only (D-7.4, Phase 7) proved insufficient for 7-Zip's meaningful UI elements — discovered live at the Phase 9 D-9.1 spike gate | ✅ Good — bounded BFS walk (`UIA_MAX_WALK_DEPTH` cap), live-tuned from depth 4 to 3 at the terminal gate to bring latency from 555.2ms to 130.2ms with zero coverage loss |
 
 ## Evolution
 
@@ -86,7 +103,13 @@ This document evolves at phase transitions and milestone boundaries.
 
 ## Current State
 
-Phase 2 complete — live RDP session + framebuffer core proven end-to-end (5/5 live tests). IronRDP async session loop, NLA authentication, framebuffer decoding, and PNG screenshot capture all verified against a real Windows target. Next: Phase 3 (input-injection).
+**v1.0 MVP shipped 2026-07-10.** All 9 phases (35/35 plans, 68 tasks) complete; all 20 v1 requirements validated, most proven live against a real disposable Azure Windows VM. ~41,877 LOC added over 36 days (2026-06-04 → 2026-07-10, 188 commits, 168 files touched) across two languages:
+
+- **Rust SDK** (`crates/rdpilot`): IronRDP-based session management, framebuffer capture, mouse/keyboard input injection with an enforced 96-DPI physical-pixel coordinate contract, DVC/RDPDR transport, and a typed public API (`Session`, `WorldState`) with strict lint gates (no `unsafe`, no `unwrap`/`expect` in library code).
+- **C# .NET 8 NativeAOT sensor** (`sensor/`): a self-contained win-x64 executable (2.57 MiB, no external runtime) exposing window enumeration, process-tree enumeration, foreground focus control, process launch, and a bounded/depth-capped UI Automation tree walk, all served over the RDPILOT_SENSOR DVC channel.
+- **Disposable test infrastructure** (`infra/`): Bicep-provisioned Azure Windows VM with scheduled auto-destroy, used as the live validation target for every phase gate.
+
+The full read/inspect loop (connect → screenshot → enumerate windows/processes → read UIA tree → navigate → verify) was proven live end-to-end against a real, remote-only Windows program (7-Zip File Manager) with no LLM involved (PROOF-01), closing the v1.0 milestone. Next: define v2 scope (candidates already recorded in REQUIREMENTS.md "v2 Requirements (Deferred)": clipboard/CLIPRDR, file transfer, MCP/CLI packaging, PyO3/NAPI-RS bindings) or promote a Backlog item (see ROADMAP.md Backlog, 999.1-999.4).
 
 ---
-*Last updated: 2026-06-05 after Phase 2 completion*
+*Last updated: 2026-07-10 after v1.0 milestone*

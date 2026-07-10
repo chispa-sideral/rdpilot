@@ -1,265 +1,43 @@
 # Roadmap: rdpilot
 
-## Overview
+## Milestones
 
-Nine dependency-ordered phases build rdpilot from the ground up: a disposable Azure Windows test environment, an IronRDP session with live framebuffer, input injection, a DVC transport channel, sensor bootstrap and deployment, Win32 window/process perception, UIA tree retrieval, a clean public SDK API with WorldState, and finally a scripted proof harness that exercises the full read/inspect loop against a real remote-only Windows program.
+- ✅ **v1.0 MVP** — Phases 1-9 (shipped 2026-07-10)
 
 ## Phases
 
-**Phase Numbering:**
-
-- Integer phases (1, 2, 3): Planned milestone work
-- Decimal phases (2.1, 2.2): Urgent insertions (marked with INSERTED)
-
-Decimal phases appear between their surrounding integers in numeric order.
-
-- [x] **Phase 1: Test Environment** - Provision a disposable Azure Windows VM pre-configured for RDP automation, with up/down script and scheduled auto-destroy — ENV-01/02/03 all verified (ENV-01/02 live gate 2026-06-04; ENV-03 auto-destroy validated 2026-06-05)
-- [x] **Phase 2: RDP Session + Framebuffer Core** - Connect, authenticate, keep session rendered, and produce full-desktop screenshots — all 5 success criteria proven live (canonical run 5/5 pass on a real Azure VM with the full 10-min idle, 2026-06-05; SESS-01/SESS-02/CAP-01)
-- [x] **Phase 3: Input Injection** - Inject mouse and keyboard actions at remote coordinates with a locked DPI contract (completed 2026-07-08)
-- [x] **Phase 4: DVC Transport Channel** - Establish and verify the RDPILOT_SENSOR dynamic virtual channel before any sensor modules exist — all 3 success criteria proven live (canonical run: sensor_ping_pong_under_500ms PASSED, measured round trip 165ms, on a real disposable Azure VM, 2026-07-09)
-- [x] **Phase 5: Sensor Bootstrap + Deployment** - Build the C# NativeAOT sensor helper and deploy it onto a real target via drive redirection or WinRM — all 4 success criteria proven live (canonical run: RDPDR primary 22.61ms, WinRM fallback 21.62ms, both < 1s bound, NativeAOT binary 2.57 MiB, on a real disposable Azure VM, 2026-07-09)
-- [x] **Phase 6: Window + Process Perception** - Retrieve window list, process tree, per-window screenshots, focus control, and remote process launch over DVC (completed 2026-07-09)
-- [x] **Phase 7: UIA Tree Module** - Add the UI Automation sensor module and return a flat UiaElement[] over DVC — all 4 success criteria proven live (canonical run: SC#3 TreeScope_Children walk measured 30.36ms, well under the 500ms bound, on a real disposable Azure VM against a launched Notepad window, 2026-07-09; PERC-03)
-- [x] **Phase 8: Public SDK API + WorldState** - Expose a clean typed Session API and a coherent WorldState snapshot correlating framebuffer, windows, and UIA (completed 2026-07-09)
-- [x] **Phase 9: Scripted Proof Harness** - Prove the full read/inspect loop end-to-end against a real remote-only Windows program — all 4 success criteria proven live (canonical run: sensor AOT-rebuilt on the VM (SHA256 `41a35f8c...`, confirmed ≠ Phase 8 cache), SC#2 deeper UIA walk 130.2ms after a live-tune from 555.2ms, `PROOF: PASS` exit code 0, on a real disposable Azure VM against the real 7-Zip File Manager, 2026-07-10; PROOF-01). **v1.0 milestone CLOSED.**
-
-## Phase Details
-
-### Phase 1: Test Environment
-
-**Goal**: A disposable, reproducible Azure Windows target, provisioned via Bicep + a `.ps1` up/down script, pre-configured for RDP automation, with scheduled auto-destroy — so every later phase has a real box to test against
-**Depends on**: Nothing (first phase)
-**Requirements**: ENV-01, ENV-02, ENV-03
-**Success Criteria** (what must be TRUE):
-
-  1. `bicep`/`.ps1` provisions an Azure Windows VM and outputs its connection details
-  2. The VM is reachable over RDP with NLA and authenticates with the provisioned credentials
-  3. Automation prerequisites are verified on the VM: `RemoteDesktop_SuppressWhenMinimized=2`, 96 DPI for the automation user, WinRM enabled/reachable, sample remote-only program present
-  4. The `.ps1` teardown removes all provisioned resources cleanly
-  5. The scheduled auto-destroy fires and removes the resource group without manual action**Plans**: 4 plans
-
-**Wave 1**
-
-  - [x] 01-01-PLAN.md — Repo baseline (.gitignore) + validation scaffolding (Pester, Validate-Target skeleton)
-
-**Wave 2** *(blocked on Wave 1 completion)*
-
-  - [x] 01-02-PLAN.md — Core infra Bicep: network + NSG (IP-scoped 3389/5986) + WS2022 VM + CustomScriptExtension
-  - [x] 01-03-PLAN.md — In-guest Configure-Target.ps1: WinRM HTTPS, default-hive DPI + SuppressWhenMinimized, SHA-verified 7-Zip
-
-**Wave 3** *(blocked on Wave 2 completion)*
-
-  - [x] 01-04-PLAN.md — Auto-destroy (runbook + schedule + RBAC) + manage-env.ps1 up/down + phase-gate live run *(all complete; live up→validate→down passed 2026-06-04; ENV-03 auto-destroy validated 2026-06-05 — schedule fired runbook unattended, MI reaped rdpilot-test)*
-
-### Phase 2: RDP Session + Framebuffer Core
-
-**Goal**: A working IronRDP session produces live screenshots of the remote desktop and stays rendered while the local window is minimized or hidden
-**Depends on**: Phase 1
-**Requirements**: SESS-01, SESS-02, CAP-01
-**Success Criteria** (what must be TRUE):
-
-  1. The SDK connects and authenticates (NLA/CredSSP) to a Windows target and the session reaches an active, interactive state
-  2. A screenshot PNG of the full remote desktop is produced from the IronRDP DecodedImage framebuffer with correct colors (RGB, not YUV-grey)
-  3. A per-window cropped screenshot is produced by cropping the framebuffer to a given bounding rect
-  4. The session stays full-resolution and non-blank with no visible client window, verified behaviorally (RemoteDesktop_SuppressWhenMinimized is mstsc-only and does not apply to a headless IronRDP client, so this is satisfied by construction)
-  5. Session keepalive prevents idle-timeout disconnection during a 10-minute idle period
-
-**Plans**: 3 plans
-Plans:
-**Wave 1**
-
-- [x] 02-01-PLAN.md — Toolchain + workspace scaffold + no-VM foundation types (Error, ConnectionConfig, Screenshot/crop)
-
-**Wave 2** *(blocked on Wave 1 completion)*
-
-- [x] 02-02-PLAN.md — Connect/auth (TLS/CredSSP, DVC seam) + SDK-owned session loop + framebuffer snapshot + keepalive + Session handle
-
-**Wave 3** *(blocked on Wave 2 completion)*
-
-- [x] 02-03-PLAN.md — Example binary + gated 5-criteria integration suite + canonical live validation run *(complete; canonical run on a fresh Azure VM passed 5/5 with the full 10-min idle 2026-06-05; A1 zero-delta keepalive sufficient; VM torn down)*
-
-### Phase 3: Input Injection
-
-**Goal**: Mouse and keyboard actions are delivered to the remote session at the correct coordinates, and the DPI coordinate contract is defined and enforced for all future phases
-**Depends on**: Phase 2
-**Requirements**: INPUT-01, INPUT-02
-**Success Criteria** (what must be TRUE):
-
-  1. A mouse click sent to a known remote coordinate activates the target element (e.g. clicking a Notepad menu opens it)
-  2. All mouse action types work: move, left/right/middle click, double-click, scroll, and drag
-  3. Typed text and key combinations (e.g. Ctrl+A, Alt+F4) are received by the remote application
-  4. The coordinate contract is documented and enforced: remote session is forced to 96 DPI (100%), and all coordinate values are in physical virtual-desktop pixels
-
-**Plans**: 4/4 plans complete
-Plans:
-**Wave 1**
-
-- [x] 03-01-PLAN.md — Owned input vocabulary (MouseAction/KeyAction/Button/Key) + Set-1 scancode table + pure Operation translation with the wheel-truncation and MouseMove-before-Wheel guards + Error::CoordinateOutOfBounds (offline, no VM)
-
-**Wave 2** *(blocked on Wave 1 completion)*
-
-- [x] 03-02-PLAN.md — Session input seam (RdpInputEvent::FastPath + Mutex<Database> + desktop_size accessor + coordinate bounds check) and send_mouse: move/click/double-click/scroll/drag with caller-side timing
-
-**Wave 3** *(blocked on Wave 2 completion)*
-
-- [x] 03-03-PLAN.md — Session::send_key: Type (Unicode) + Combo (scancode, modifier ordering) — Ctrl+A / Alt+F4 expressible
-
-**Wave 4** *(blocked on Wave 3 completion)*
-
-- [x] 03-04-PLAN.md — Gated live screenshot-diff suite covering all 4 success criteria + canonical live-validation checkpoint (double-click / drag empirically tuned)
-
-### Phase 4: DVC Transport Channel
-
-**Goal**: The RDPILOT_SENSOR dynamic virtual channel is open and bidirectional by the time the RDP session is fully established, confirmed by a ping/heartbeat round-trip before any sensor modules exist
-**Depends on**: Phase 2
-**Requirements**: SENSOR-03
-**Success Criteria** (what must be TRUE):
-
-  1. The DVC client plugin (DvcProcessor) is registered with DrdynvcClient before connector.connect() completes (IronRDP hard constraint met)
-  2. A ping request sent over the RDPILOT_SENSOR channel returns a pong response from the server-side endpoint within 500 ms
-  3. A version handshake is the first message on the channel, and a mismatch causes the channel to close with a clear error (not silent data corruption)
-
-**Plans**: 3/3 plans complete; live gate PASSED (canonical run 2026-07-09)
-
-Plans:
-
-- [x] 04-01-PLAN.md — Offline foundation: JSON envelope (Version/Ping/Pong), RdpilotSensorProcessor + handshake state machine, Error::Dvc, serde promotion (Wave 1)
-- [x] 04-02-PLAN.md — Wiring: register the processor before connect_begin (SC#1), RdpInputEvent::Ping arm + Session::ping() with handshake fast-fail + 500ms timeout (SC#2/SC#3) (Wave 2)
-- [x] 04-03-PLAN.md — Live gate artifacts: throwaway WTS PowerShell responder + WinRM deploy helper + gated sensor_ping_pong_under_500ms test (Wave 3). **Live run against the Azure VM PASSED** (2026-07-09): measured round trip 165ms (SC#2), Version handshake proven first (SC#3 positive). Two live-run bugs found and fixed: session_loop.rs (transient DVC-not-ready Ping no longer kills the whole session) and sensor-responder.ps1 (JSON-start scan past a DVC framing prefix); test's setup-retry budget widened 15s→60s. VM torn down after the run.
-
-### Phase 5: Sensor Bootstrap + Deployment
-
-**Goal**: The C# NativeAOT sensor helper is built as a self-contained executable, deployed to a real remote Windows target, and confirms the DVC channel is live from its end
-**Depends on**: Phase 4
-**Requirements**: SENSOR-01, SENSOR-02
-**Success Criteria** (what must be TRUE):
-
-  1. The rdpilot-sensor.exe binary builds as a NativeAOT self-contained executable with no external runtime dependency
-  2. The SDK deploys the sensor binary to the remote target via drive-redirection copy and launches it within the RDP session
-  3. When WinRM is available, the WinRM bootstrap path also successfully deploys and launches the sensor
-  4. The deployed sensor opens the RDPILOT_SENSOR DVC channel and responds to a ping within 1 second of launch
-
-**Plans**: 4/4 plans complete; live gate PASSED (canonical run 2026-07-09)
-
-Plans:
-
-- [x] 05-01-PLAN.md — C# .NET 8 NativeAOT rdpilot-sensor.exe (Version/Ping/Pong server, SENSOR-01 / SC1). **Live SC1 PASSED**: self-contained publish, 2,699,264 bytes (~2.57 MiB), no external .NET runtime dependency.
-- [x] 05-02-PLAN.md — Rust foundation: Key::Win + minimal RdpilotDriveBackend + ironrdp-rdpdr dep (SENSOR-02 / SC2 foundation)
-- [x] 05-03-PLAN.md — RDPDR static-channel registration + Session::deploy_and_launch Win+R poll-and-retry (SENSOR-02 / SC2, SC4)
-- [x] 05-04-PLAN.md — WinRM fallback fixture + both gated live tests + throwaway cleanup + live gate (SC2/SC3/SC4, D-5.7). **Live gate PASSED** (2026-07-09): SC2 (RDPDR primary, mandatory) measured 22.612044ms; SC3 (WinRM fallback) measured 21.62078ms; SC4 (<1s) met on both. Bugs found and fixed live: rdpsnd stub channel required for Windows to start the RDPDR handshake (MS-RDPEFS Appendix A footnote <1>), QueryInformation/QueryVolumeInformation IRP support, deploy_and_launch timing fixes (session settle + chunked typing). AV/EDR and drive-redirection GPO risks did not materialize. VM torn down after the run (`rdpilot-test` RG deleted).
-
-### Phase 6: Window + Process Perception
-
-**Goal**: The sensor returns window list, process tree, per-window screenshots, process launch, and window focus over DVC, proving the request/response protocol with real data before the UIA module is added
-**Depends on**: Phase 5
-**Requirements**: PERC-01, PERC-02, PERC-04, PROC-01, CAP-02
-**Success Criteria** (what must be TRUE):
-
-  1. A get_window_list() call returns HWND, title, bounding rect, z-order, and state for all visible windows in the remote session
-  2. A get_process_tree() call returns PID, parent PID, name, and path for all running processes
-  3. The SDK brings a specified window to the foreground (set_foreground_window) and confirms the focus change in a subsequent window list query
-  4. A launch_process() call starts a remote process (e.g. notepad.exe) and the new process appears in a subsequent process tree query
-
-**Plans**: 5/5 plans complete
-
-- [x] 06-01-PLAN.md — (wave 1) Rust DVC request/response generalization + owned perception types + Error::SensorRejected + wire contract
-- [x] 06-02-PLAN.md — (wave 2, needs 01) Four sensor-backed Session methods (window list / process tree / focus / launch) + D-6.1 per-window screenshot crop
-- [x] 06-03-PLAN.md — (wave 2, needs 01) C# Envelope.Payload→JsonElement AOT smoke-test FIRST, then the WindowList handler (EnumWindows, no COM)
-- [x] 06-04-PLAN.md — (wave 3, needs 03) C# ProcessTree (Toolhelp32, never WMI) + SetForegroundWindow + fire-and-forget CreateProcessW launch
-- [x] 06-05-PLAN.md — (wave 4, needs 02+04) Four gated live tests (one per success criterion) + end-of-phase live gate against a real Azure VM
-
-### Phase 7: UIA Tree Module
-
-**Goal**: The sensor's UIA module returns a flat UiaElement[] for a specified window handle with correct bounding boxes, scoped by default to direct children to stay within latency bounds
-**Depends on**: Phase 6
-**Requirements**: PERC-03
-**Success Criteria** (what must be TRUE):
-
-  1. A get_uia_tree(hwnd) call for a Notepad window returns a flat UiaElement[] with id, role, name, bounding rect, enabled, visible, focusable, and depth populated
-  2. All bounding box coordinates in the UIA response are in the same physical virtual-desktop pixel space as the framebuffer and window list (coordinate alignment verified)
-  3. A tree walk scoped to TreeScope_Children completes within 500 ms for a standard Win32 application
-  4. The response is valid JSON-serializable UiaElement[] (round-trips through serde_json without loss)
-
-**Plans**: 5/5 plans complete
-
-- Wave 1 (offline, parallel):
-  - [x] 07-01-PLAN.md — Rust wire extension: MsgType::Uia, owned UiaElement + UiaElementWire (RuntimeId join D-7.2 / ControlType→role map D-7.3, Rust-side), Session::get_uia_tree(hwnd), offline unit tests (SC#4/D-7.2/D-7.3)
-  - [x] 07-02-PLAN.md — C# [GeneratedComInterface] UIA interop (4 GUID-verified interfaces, CoCreateInstance, SAFEARRAY decode) + --smoke-test-uia scaffolding; offline AOT-trim publish check (D-7.5)
-- Wave 2 (RISK GATE):
-  - [x] 07-03-PLAN.md — win-x64 AOT-publish + run --smoke-test-uia on a real Windows VM; resolve SAFEARRAY/BSTR/BOOL marshalling (A1/A2/A3) before any handler code (D-7.5 spike gate)
-- Wave 3 (real handler):
-  - [x] 07-04-PLAN.md — UiaTree.cs handler: ElementFromHandle → FindAll(TreeScope_Children) → per-element reads with per-element COMException skip (D-7.4/D-7.6/D-7.7) + Program.cs dispatch arm + EnvelopeJsonContext registrations
-- Wave 4 (live gate):
-  - [x] 07-05-PLAN.md — Four gated live tests (one per SC) + end-of-phase live gate against a real Notepad window on a disposable Azure VM. **Live gate PASSED** (2026-07-09): SC#1 field-complete UiaElement[] confirmed; SC#2 bbox coordinates confirmed in the same physical pixel space as get_window_list; SC#3 measured 30.36ms (>16x under the 500ms budget — D-7.7's CreateCacheRequest optimization correctly not needed); SC#4 live serde_json round trip lossless. Sensor AOT-published win-x64 ON the VM (SHA256 fa5d3e3c8d45c351e0d577cf654c6c524c8ecab9e4203917ef6637c053ce6e16, verified byte-identical relay). One transient first-RDP-login deploy_and_launch timeout (documented 07-03 condition) self-resolved on retry, no code change. VM torn down after the run (rdpilot-test RG deleted).
-
-### Phase 8: Public SDK API + WorldState
-
-**Goal**: A clean typed Session struct hides all IronRDP internals and sensor protocol details, and a WorldState snapshot combines framebuffer, window list, and optional UIA tree in one timestamped structure with a single enforced coordinate space
-**Depends on**: Phase 7
-**Requirements**: API-01, API-02
-**Success Criteria** (what must be TRUE):
-
-  1. A consumer can drive a full read/inspect workflow using only the public Session API without importing any IronRDP types or sensor protocol details
-  2. Session::world_state() returns a WorldState struct containing a screenshot, window list, and optional UIA tree captured within 500 ms of each other
-  3. All coordinate values in WorldState (screenshot dimensions, window rects, UIA bounding boxes, mouse input targets) are in the same virtual-desktop pixel space with no silent scaling
-  4. The API compiles clean under strict Rust settings (no `unsafe` in public surface, no `unwrap` in library code)
-
-**Plans**: 3/3 plans complete
-**UI hint**: yes (the SDK API ergonomics ARE the surface — no visual UI contract needed, per 08-CONTEXT)
-
-Plans:
-
-**Wave 1** *(offline, mechanical)*
-
-- [x] 08-01-PLAN.md — Strict `#![deny]` lint gates in lib.rs (SC#4) + `Serialize` derives across owned types (Rect/WindowInfo/WindowState/ProcessInfo/UiaElement) + dims-only Screenshot serde (D-8.4)
-
-**Wave 2** *(blocked on Wave 1 — shares lib.rs + composes Plan 01's Serialize)*
-
-- [x] 08-02-PLAN.md — New `worldstate.rs` (WorldStateOptions/UiaMode/WorldState, SystemTime+Duration, grouped-by-hwnd UIA) + `Session::world_state()` sequencing (Pitfall-3 internal list fetch, Pitfall-4 error propagation) + offline unit tests (API-02, SC#2/SC#3)
-
-**Wave 3** *(blocked on Wave 2 — thin live gate)*
-
-- [x] 08-03-PLAN.md — Gated live `world_state` capture-span test(s) in tests/live_session.rs + end-of-phase live gate (SC#2, best-effort span per D-8.2; SC#1/SC#3/SC#4 already close offline). **Live gate PASSED** (2026-07-10): both gated tests ran against a real launched Notepad window on a disposable Azure VM — default-options `capture_span` measured 23ms, `UiaMode::Foreground` `capture_span` measured 73ms (one retry of the documented first-RDP-login `deploy_and_launch` transient), both >6x under the 500ms best-effort bound. SC#2 now empirically CLOSED. VM torn down and confirmed absent (`rdpilot-test` RG deleted; `rdpilot-mgmt` persists).
-
-### Phase 9: Scripted Proof Harness
-
-**Goal**: A scripted harness connects to a real remote-only Windows program, takes screenshots, reads the UIA tree, performs navigation actions, and asserts that expected UI elements and behaviors are found — with no live LLM involved
-**Depends on**: Phase 8
-**Requirements**: PROOF-01
-**Success Criteria** (what must be TRUE):
-
-  1. The harness connects, authenticates, and produces a screenshot of a real remote-only Windows program (not a toy or localhost target)
-  2. The harness reads the UIA tree for the target program's main window and asserts specific named elements are present with valid bounding boxes
-  3. The harness injects a navigation action (e.g. menu open, button click, or text entry) and verifies the result via a follow-up screenshot or UIA query
-  4. The harness completes the full loop (connect → screenshot → get_windows → get_uia_tree → navigate → verify) and exits with a pass/fail report, all assertions documented
-
-**Plans**: 4/4 plans complete; live gate PASSED (canonical run 2026-07-10)
-
-- Wave 1 (D-9.1 fidelity risk gate, spike-first):
-  - [x] 09-01-PLAN.md — Throwaway live 7-Zip UIA dump spike (launch 7zFM.exe, dump get_uia_tree flat UiaElement[], record SC#2 elements + D-9.2 nav target + seeding/depth decision) + blocking human-verify; mirrors the Phase 7 D-7.5 gate
-- Wave 2 (scoped deeper-walk capability, blocked on 09-01 findings — flagged D-9.1/D-7.4 scoped addition):
-  - [x] 09-02-PLAN.md — Add a bounded, caller-configurable deeper UIA walk the 09-01 spike proved necessary: owned UiaScope on get_uia_tree + max_depth wire field (Rust) + depth-capped level-by-level FindAll walk (C# sensor) + offline unit/AOT-trim tests; migrates existing children-scoped callers
-- Wave 3 (composition, blocked on 09-02 capability):
-  - [x] 09-03-PLAN.md — Shared run_proof_harness + ProofReport (tests/support/), examples/proof_harness.rs (main -> ExitCode), gated proof_harness_end_to_end test — wired via #[path]; asserts real DEEPER 7-Zip elements via UiaScope::Subtree, exact "7-Zip::FM" predicate, D-9.6 seeding, D-9.3/D-9.4/D-9.5
-- Wave 4 (terminal v1 live gate, blocked on 09-03):
-  - [x] 09-04-PLAN.md — End-of-phase live gate against a real disposable Azure VM: AOT-REBUILD the changed sensor ON the VM (not the Phase 8 cache), run the armed test + the example binary against real 7-Zip, prove SC#1-4, retire PROOF-01, tear down. **Live gate PASSED** (2026-07-10): sensor AOT-rebuilt on the (reused, healthy) VM, SHA256 `41a35f8cc60e0a1ab38c62b8736246518c84c0f7dc8220c25940f1ab9c313f6e`, confirmed byte-identical VM-built vs relayed and confirmed different from the Phase 8 cache (`7a775b990c...`). SC#1 screenshot 1920x1080; SC#2 deeper walk found 30 named elements, latency 130.2ms after a live-tune of `SC2_MAX_DEPTH` 4→3 (555.2ms→130.2ms, same element coverage), well under the Phase 7 500ms budget; SC#3 navigation click + verified screenshot-diff change, after a live-diagnosed fix (the navigate step now calls `set_foreground_window` before clicking — a freshly-launched window isn't guaranteed OS focus, same root cause Phase 6 SC#3 diagnosed); SC#4 `examples/proof_harness` printed `PROOF: PASS` and exited 0. One documented first-RDP-login `deploy_and_launch` transient self-resolved on retry. VM torn down and confirmed absent (`rdpilot-test` RG deleted; `rdpilot-mgmt` persists). PROOF-01 retired. See `09-04-SUMMARY.md`.
+Phase details for shipped milestones are archived. Full phase directories now live under `.planning/milestones/v1.0-phases/`.
+
+<details>
+<summary>✅ v1.0 MVP (Phases 1-9) — SHIPPED 2026-07-10</summary>
+
+- [x] Phase 1: Test Environment (4/4 plans) — completed 2026-06-05
+- [x] Phase 2: RDP Session + Framebuffer Core (3/3 plans) — completed 2026-06-05
+- [x] Phase 3: Input Injection (4/4 plans) — completed 2026-07-08
+- [x] Phase 4: DVC Transport Channel (3/3 plans) — completed 2026-07-09
+- [x] Phase 5: Sensor Bootstrap + Deployment (4/4 plans) — completed 2026-07-09
+- [x] Phase 6: Window + Process Perception (5/5 plans) — completed 2026-07-09
+- [x] Phase 7: UIA Tree Module (5/5 plans) — completed 2026-07-09
+- [x] Phase 8: Public SDK API + WorldState (3/3 plans) — completed 2026-07-09
+- [x] Phase 9: Scripted Proof Harness (4/4 plans) — completed 2026-07-10
+
+Full phase goals, success criteria, and plan-by-plan detail: `.planning/milestones/v1.0-ROADMAP.md`.
+
+</details>
 
 ## Progress
 
-**Execution Order:**
-Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8 → 9
-
-| Phase | Plans Complete | Status | Completed |
-|-------|----------------|--------|-----------|
-| 1. Test Environment | 4/4 | Complete | 2026-06-05 |
-| 2. RDP Session + Framebuffer Core | 3/3 | Complete    | 2026-06-05 |
-| 3. Input Injection | 4/4 | Complete   | 2026-07-08 |
-| 4. DVC Transport Channel | 3/3 | Complete | 2026-07-09 |
-| 5. Sensor Bootstrap + Deployment | 4/4 | Complete   | 2026-07-09 |
-| 6. Window + Process Perception | 5/5 | Complete   | 2026-07-09 |
-| 7. UIA Tree Module | 5/5 | Complete   | 2026-07-09 |
-| 8. Public SDK API + WorldState | 3/3 | Complete   | 2026-07-09 |
-| 9. Scripted Proof Harness | 4/4 | Complete | 2026-07-10 |
+| Phase | Milestone | Plans Complete | Status | Completed |
+|-------|-----------|-----------------|--------|-----------|
+| 1. Test Environment | v1.0 | 4/4 | Complete | 2026-06-05 |
+| 2. RDP Session + Framebuffer Core | v1.0 | 3/3 | Complete | 2026-06-05 |
+| 3. Input Injection | v1.0 | 4/4 | Complete | 2026-07-08 |
+| 4. DVC Transport Channel | v1.0 | 3/3 | Complete | 2026-07-09 |
+| 5. Sensor Bootstrap + Deployment | v1.0 | 4/4 | Complete | 2026-07-09 |
+| 6. Window + Process Perception | v1.0 | 5/5 | Complete | 2026-07-09 |
+| 7. UIA Tree Module | v1.0 | 5/5 | Complete | 2026-07-09 |
+| 8. Public SDK API + WorldState | v1.0 | 3/3 | Complete | 2026-07-09 |
+| 9. Scripted Proof Harness | v1.0 | 4/4 | Complete | 2026-07-10 |
 
 ## Backlog
 

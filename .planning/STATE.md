@@ -2,10 +2,10 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-status: completed
-stopped_at: Phase 9 Plan 4 (09-04) COMPLETE — terminal v1 live gate PASSED against a real disposable Azure VM (sensor AOT-rebuilt, all 4 PROOF-01 SCs proven live). PROOF-01 retired. v1.0 milestone CLOSED.
-last_updated: "2026-07-10T15:30:00.000Z"
-last_activity: "2026-07-10 -- 09-04 COMPLETE: terminal v1 live gate PASSED. Reused the existing healthy rdpilot-vm (no reprovision); mandatory sensor AOT-rebuild on the VM from current 09-02 source (SHA256 41a35f8c..., confirmed byte-identical VM-built vs relayed, confirmed different from the Phase 8 cache 7a775b99...). All four PROOF-01 SCs PASS against the real 7-Zip File Manager: SC#1 screenshot 1920x1080; SC#2 deeper UiaScope::Subtree walk found 30 named elements, latency 130.2ms after live-tuning SC2_MAX_DEPTH 4->3 (555.2ms->130.2ms, zero coverage loss, under the Phase 7 500ms budget); SC#3 navigation click + verified screenshot-diff change (after live-diagnosing and fixing a missing set_foreground_window call before the click -- Rule 1); SC#4 examples/proof_harness printed PROOF: PASS and exited 0. One documented first-RDP-login deploy_and_launch transient self-resolved on retry. VM torn down and confirmed absent. PROOF-01 retired in REQUIREMENTS.md; Phase 9 marked complete in ROADMAP.md; v1.0 milestone CLOSED. See 09-04-SUMMARY.md."
+status: Awaiting next milestone
+stopped_at: v1.0 milestone complete — 9 phases, 35 plans
+last_updated: "2026-07-10T15:14:56.614Z"
+last_activity: 2026-07-10 — Milestone v1.0 completed and archived
 progress:
   total_phases: 9
   completed_phases: 9
@@ -25,14 +25,10 @@ See: .planning/PROJECT.md (updated 2026-06-04)
 
 ## Current Position
 
-Phase: 9 (scripted-proof-harness) — COMPLETE
-Plan: 4 of 4 complete
-Status: v1.0 MILESTONE CLOSED. 09-04 terminal live gate PASSED (2026-07-10): all four PROOF-01 success criteria proven live against a real disposable Azure VM running a freshly AOT-rebuilt sensor and the real 7-Zip File Manager. No further Phase 9 work outstanding.
-Last activity: 2026-07-10 -- 09-04 COMPLETE: terminal v1 live gate PASSED against a real disposable Azure VM (reused, healthy). Sensor AOT-rebuilt on the VM from current 09-02 source (SHA256 41a35f8c..., confirmed different from the Phase 8 cache 7a775b99...). SC#1 screenshot 1920x1080; SC#2 deeper UiaScope::Subtree walk found 30 named elements at 130.2ms (live-tuned SC2_MAX_DEPTH 4->3, zero coverage loss, under the Phase 7 500ms budget); SC#3 navigation click + verified change (after a live-diagnosed set_foreground_window fix); SC#4 PROOF: PASS, exit code 0. VM torn down and confirmed absent. PROOF-01 retired; v1.0 milestone CLOSED. See 09-04-SUMMARY.md.
-
-Note: Phase 3 remains `status: verifying` (pending /gsd-verify-work) in the frontmatter above; Phase 4/5/6/7 planning/execution began before that gate ran.
-
-Progress: [██████████] 100% (Phase 9: 4/4 plans complete — v1.0 milestone CLOSED, see 09-04-SUMMARY.md)
+Phase: Milestone v1.0 complete
+Plan: —
+Status: Awaiting next milestone
+Last activity: 2026-07-10 — Milestone v1.0 completed and archived
 
 ## Performance Metrics
 
@@ -207,3 +203,7 @@ Pre-close artifact audit surfaced 3 open items. Reviewed and explicitly acknowle
 Last session: 2026-07-10T15:30:00.000Z
 Stopped at: Phase 9 Plan 4 (09-04) complete — terminal v1 live gate PASSED, PROOF-01 retired, v1.0 milestone CLOSED. No further v1 work outstanding; any next work is v2 (see REQUIREMENTS.md "v2 Requirements (Deferred)") or backlog phases (see ROADMAP.md Backlog).
 Resume file: .planning/phases/09-scripted-proof-harness/09-04-SUMMARY.md
+
+## Operator Next Steps
+
+- Start the next milestone with /gsd-new-milestone
