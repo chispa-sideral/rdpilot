@@ -48,6 +48,14 @@ internal static class Program
     /// <see cref="RunUiaAotSmokeTest"/>.
     private const string UiaSmokeTestArg = "--smoke-test-uia";
 
+    /// Argument that selects the FILE-03 BLOCKING adversarial
+    /// path-traversal selftest (10-03-PLAN.md Task 3) — sibling to
+    /// <see cref="SmokeTestArg"/>/<see cref="UiaSmokeTestArg"/>. Drives
+    /// <see cref="FileTransfer.ValidateRemotePath"/> against the FILE-03
+    /// matrix offline via `dotnet run` (linux-x64 JIT — needs no Windows and
+    /// no NativeAOT publish), see <see cref="RunFileTraversalSelfTest"/>.
+    private const string FileTraversalSelfTestArg = "--file-traversal-selftest";
+
     private static int Main(string[] args)
     {
         if (args.Length > 0 && args[0] == SmokeTestArg)
@@ -58,6 +66,11 @@ internal static class Program
         if (args.Length > 0 && args[0] == UiaSmokeTestArg)
         {
             return RunUiaAotSmokeTest();
+        }
+
+        if (args.Length > 0 && args[0] == FileTraversalSelfTestArg)
+        {
+            return RunFileTraversalSelfTest();
         }
 
         nint handle = OpenChannelWithRetry();
@@ -267,6 +280,86 @@ internal static class Program
     {
         Console.WriteLine($"[smoke-test-uia] step: {message}");
         Console.Out.Flush();
+    }
+
+    /// The FILE-03 BLOCKING C#-side adversarial path-traversal selftest
+    /// (10-03-PLAN.md Task 3, D-10.2's C# validator half). Drives
+    /// <see cref="FileTransfer.ValidateRemotePath"/> against a fresh
+    /// temp-directory test root (never the real <see cref="FileTransfer.ShareRoot"/>)
+    /// over the FILE-03 required matrix: trailing `..` with no separator,
+    /// mixed `/`+`\` separators, sibling-directory prefix (a directory whose
+    /// name is a strict superstring of the root's own name — proves
+    /// `ValidateRemotePath` is NOT doing a naive `string.StartsWith`,
+    /// Pitfall 3), POSIX-absolute-as-relative, and a Windows-drive-absolute
+    /// case. The Windows-drive-absolute case is annotated below: this
+    /// validator's explicit <c>LooksRooted</c> pre-check (mirroring the
+    /// Rust-side `looks_rooted()` fix, 10-01-SUMMARY.md Decision #1) makes
+    /// it deterministic on both this offline linux-x64 host and the real
+    /// win-x64 target, but per the plan's own discipline it is still
+    /// RE-CONFIRMED at the 10-05 live gate rather than silently trusted
+    /// offline (mirrors the FILE-04 chunk-size "confirm live" precedent). A
+    /// final positive-control case (a legitimate nested path) guards against
+    /// over-rejection.
+    ///
+    /// Exit 0 + "PASS" per case on success, exit 1 if ANY case's actual
+    /// accept/reject outcome does not match its expectation — never throws
+    /// out of Main (mirrors the RunAotSmokeTest/RunUiaAotSmokeTest
+    /// never-crash discipline).
+    private static int RunFileTraversalSelfTest()
+    {
+        try
+        {
+            string testRootParent = Path.Combine(Path.GetTempPath(), "rdpilot-selftest-" + Guid.NewGuid().ToString("N"));
+            string testRoot = Path.Combine(testRootParent, "share");
+            Directory.CreateDirectory(testRoot);
+
+            // A sibling directory whose name is a strict superstring of the
+            // root's own directory name ("share-evil" vs "share") — the
+            // classic .NET StartsWith prefix-bypass footgun (Pitfall 3):
+            // "/tmp/.../share-evil".StartsWith("/tmp/.../share") is `true`
+            // even though it is a SIBLING, not a descendant.
+            string siblingDir = Path.Combine(testRootParent, "share-evil");
+            Directory.CreateDirectory(siblingDir);
+
+            (string Name, string Candidate, bool ExpectAccept, string? LiveReconfirmNote)[] cases =
+            [
+                ("trailing-dotdot-no-separator", "..", false, null),
+                ("mixed-separator-escape", "subdir\\../../evil.txt", false, null),
+                ("sibling-directory-prefix", "../share-evil/secret.txt", false, null),
+                ("posix-absolute-as-relative", "/etc/passwd", false, null),
+                ("windows-drive-absolute", "C:\\Windows\\System32",
+                    false, "faithfulness re-confirmed at the 10-05 live gate — Path.IsPathRooted alone is platform-dependent for drive letters; this offline PASS is backed by the explicit host-independent LooksRooted() check, not by Path.IsPathRooted"),
+                ("legitimate-nested-path (positive control)", "nested/legit.txt", true, null),
+            ];
+
+            bool allPassed = true;
+            foreach ((string name, string candidate, bool expectAccept, string? liveReconfirmNote) in cases)
+            {
+                bool accepted = FileTransfer.ValidateRemotePath(testRoot, candidate, out _);
+                bool casePassed = accepted == expectAccept;
+                allPassed &= casePassed;
+
+                string status = casePassed ? "PASS" : "FAIL";
+                string noteSuffix = liveReconfirmNote is null ? string.Empty : $" [LIVE-RECONFIRM: {liveReconfirmNote}]";
+                Console.WriteLine(
+                    $"[file-traversal-selftest] {status}: {name} candidate='{candidate}' " +
+                    $"expectAccept={expectAccept} actualAccept={accepted}{noteSuffix}");
+            }
+
+            if (allPassed)
+            {
+                Console.WriteLine("[file-traversal-selftest] PASS: all FILE-03 adversarial cases matched expectations");
+                return 0;
+            }
+
+            Console.Error.WriteLine("[file-traversal-selftest] FAIL: one or more cases did not match expectations");
+            return 1;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[file-traversal-selftest] FAIL: unexpected exception: {ex}");
+            return 1;
+        }
     }
 
     /// Open the RDPILOT_SENSOR channel, retrying up to <see cref="OpenRetries"/>
