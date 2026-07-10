@@ -65,5 +65,8 @@ rustls-native-certs = "0.8.4"
 sha2 = "0.11"
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+# "test-util" enables Tokio's paused/mocked clock (`#[tokio::test(start_paused
+# = true)]`), used by session.rs's TRANSFER_TIMEOUT_MS (30s) offline timeout
+# test (Plan 10-04) so it proves the bound without a real 30-second wait.
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util"] }
 serial_test = "3"

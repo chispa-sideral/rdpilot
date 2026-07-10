@@ -17,6 +17,8 @@
 //! Only owned SDK types appear in the public signatures — no `ironrdp`, `image`,
 //! `rustls`, or `tokio` type leaks (D-09). No `unwrap`/`expect`/`panic` (API-01).
 
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -135,6 +137,24 @@ const ENUMERATION_TIMEOUT_MS: u64 = 2000;
 /// need different bounds.
 const ACTION_TIMEOUT_MS: u64 = 500;
 
+/// Timeout for [`Session::upload_file`]/[`Session::download_file`]'s
+/// `FileTransfer` round trip (D-10.4). Deliberately much wider than
+/// [`ENUMERATION_TIMEOUT_MS`]/[`ACTION_TIMEOUT_MS`] because the sensor does
+/// not reply until its OWN `FileStream` copy loop (a blocking read/write
+/// pass against a potentially multi-MB file, 10-03-SUMMARY.md) has fully
+/// completed -- unlike every other sensor-mediated call, whose reply is
+/// near-instant relative to the round trip itself.
+///
+/// **UNVALIDATED initial guess (30s), NOT yet live-tuned** -- this plan
+/// (10-04) is offline-only; the live gate is Plan 10-05. This value MUST be
+/// exercised against a real multi-MB transfer's actual latency at the
+/// 10-05 live gate and adjusted if it proves too tight (a large file over a
+/// slow RDP link) or unnecessarily wide -- do NOT treat this constant as
+/// settled just because it compiles and offline tests pass, exactly
+/// mirroring how [`ENUMERATION_TIMEOUT_MS`]/[`ACTION_TIMEOUT_MS`] were
+/// themselves flagged as LIVE-VERIFY tuning targets.
+const TRANSFER_TIMEOUT_MS: u64 = 30_000;
+
 /// Split `s` into `max_len`-character (not byte) chunks, preserving order.
 /// Pure and offline-testable. Never panics on empty input, non-ASCII input,
 /// or `max_len == 0` (treated as "one char per chunk" to avoid an infinite
@@ -236,6 +256,37 @@ pub struct Session {
     /// Starts at 1 — `req_id` 0 is reserved for the version handshake
     /// (RESEARCH Q2, D-4.3).
     next_req_id: AtomicU64,
+    /// The configured local file-transfer share root
+    /// ([`ConnectionConfig::share_root`], D-10.1), captured once at connect
+    /// time — mirrors `desktop_size`'s static-capture rationale. This is
+    /// the SAME directory `RdpilotDriveBackend` serves as the
+    /// RDPDR-redirected `RDPILOT` drive (`connect.rs`), so
+    /// [`Session::upload_file`]/[`Session::download_file`] can stage/
+    /// retrieve transfer bytes with a plain `std::fs` call on THIS machine
+    /// — no RDPDR IRP round trip is needed for the SDK's own side of the
+    /// staging directory, only for the remote Windows machine's side.
+    /// `None` when the caller never configured a share root, in which case
+    /// `upload_file`/`download_file` fail fast with [`Error::Config`]
+    /// before sending anything (Plan 10-04).
+    share_root: Option<PathBuf>,
+}
+
+/// The outcome of a completed [`Session::upload_file`] or
+/// [`Session::download_file`] call (D-10.4).
+///
+/// An owned, credential-free public type (D-09, D-10.4/T-10-08): no
+/// `ironrdp-rdpdr` or other third-party type ever appears here.
+///
+/// NOTE (interface-first, Plan 10-04 Task 1): `checksum` carries the
+/// sensor-reported SHA-256 as-is at this stage; Task 2 wires independent
+/// Rust-side recomputation and verification (D-10.5) on top of this same
+/// struct shape, so the public signature never changes between tasks.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct TransferOutcome {
+    /// The number of bytes transferred, as reported by the sensor.
+    pub bytes_transferred: u64,
+    /// The SHA-256 digest (lowercase hex, no separators).
+    pub checksum: String,
 }
 
 impl Session {
@@ -294,6 +345,7 @@ impl Session {
             desktop_size,
             sensor,
             next_req_id: AtomicU64::new(1),
+            share_root: cfg.get_share_root().map(Path::to_path_buf),
         })
     }
 
@@ -551,7 +603,22 @@ impl Session {
                         .get("error")
                         .and_then(serde_json::Value::as_str)
                         .unwrap_or("unknown");
-                    Err(Error::sensor_rejected(reason))
+                    // D-10.4 BLOCKER fix: a structured `error_kind` sentinel
+                    // of "path_traversal" (the sole authoritative producer
+                    // is the C# sensor's own `ValidateRemotePath`
+                    // rejection, 10-03-SUMMARY.md) surfaces as the distinct
+                    // `Error::PathTraversal`, NOT the generic
+                    // `Error::SensorRejected` every other semantic
+                    // rejection maps to. Other callers (WindowList/Uia/
+                    // LaunchProcess) never set `error_kind` on their
+                    // replies, so this branch is inert for them — the
+                    // fall-through below is byte-for-byte unchanged.
+                    let error_kind = value.get("error_kind").and_then(serde_json::Value::as_str);
+                    if error_kind == Some("path_traversal") {
+                        Err(Error::path_traversal(reason))
+                    } else {
+                        Err(Error::sensor_rejected(reason))
+                    }
                 }
             }
             Ok(Err(_recv)) => Err(Error::dvc("sensor channel closed before replying")),
@@ -830,6 +897,186 @@ impl Session {
         u32::try_from(pid).map_err(|_| Error::dvc("LaunchProcess reply \"pid\" exceeds u32 range"))
     }
 
+    /// Upload a local file to a named destination under the sensor's fixed
+    /// remote transfer root (FILE-01, D-10.4).
+    ///
+    /// `remote_name` is relative to the sensor-owned, FIXED
+    /// `%TEMP%/rdpilot-transfer-root` directory on the REMOTE machine
+    /// (10-03-SUMMARY.md) — it is NEVER an arbitrary absolute path
+    /// elsewhere on the remote disk; the sensor's own `ValidateRemotePath`
+    /// rejects any candidate that looks rooted before touching
+    /// `System.IO` (D-10.2). Passing a value that escapes this transfer
+    /// root surfaces as [`Error::PathTraversal`] (the distinct end-to-end
+    /// producer this plan wires, D-10.4/BLOCKER fix), never
+    /// [`Error::SensorRejected`].
+    ///
+    /// `local` is copied into the configured
+    /// [`ConnectionConfig::share_root`] under a fresh SDK-generated staging
+    /// name (never `remote_name` itself, to avoid any collision with a
+    /// caller-chosen name) so the RDPDR-redirected `RDPILOT` drive can
+    /// serve it to the sensor at `\\tsclient\RDPILOT\<staging-name>`; the
+    /// sensor then copies those bytes to the validated `remote_name`
+    /// destination (10-RESEARCH architecture diagram).
+    ///
+    /// Rides the existing async [`Session::sensor_request`] extension point
+    /// exactly like [`Session::launch_process`] — no `tokio::spawn`, no
+    /// change to the dedicated-OS-thread + current-thread-Tokio session
+    /// loop (threading model UNTOUCHABLE).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Config`] if no [`ConnectionConfig::share_root`] was
+    /// configured at connect time (nothing is sent in that case);
+    /// [`Error::PathTraversal`] if the sensor rejected `remote_name` as
+    /// escaping its transfer root; [`Error::SensorRejected`] for any other
+    /// sensor-side rejection; or [`Error::Dvc`] for a handshake mismatch, a
+    /// closed channel, a malformed reply, a timeout, or a local staging I/O
+    /// failure.
+    ///
+    /// NOTE (interface-first, Plan 10-04 Task 1): SHA-256 integrity
+    /// verification (D-10.5, [`Error::ChecksumMismatch`]) is wired by
+    /// Task 2 on top of this same method shape.
+    pub async fn upload_file(&self, local: &Path, remote_name: &str) -> Result<TransferOutcome> {
+        let share_root = self.share_root.as_deref().ok_or_else(|| {
+            Error::Config("upload_file requires ConnectionConfig::share_root to be configured".to_owned())
+        })?;
+
+        let share_name = self.unique_share_name();
+        let staged = share_root.join(&share_name);
+        fs::copy(local, &staged).map_err(|e| {
+            Error::dvc(format!(
+                "failed to stage {} into the share root for upload: {e}",
+                local.display()
+            ))
+        })?;
+
+        let payload = serde_json::json!({
+            "op": "Upload",
+            "remote_path": remote_name,
+            "share_name": share_name,
+        });
+        let result = self
+            .sensor_request(crate::sensor::MsgType::FileTransfer, Some(payload), TRANSFER_TIMEOUT_MS)
+            .await;
+
+        // Best-effort cleanup regardless of outcome — never leave the
+        // staged copy behind under the share root.
+        let _ = fs::remove_file(&staged);
+
+        let data = result?;
+        let bytes_transferred = data
+            .get("bytes_transferred")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| Error::dvc("FileTransfer reply missing/invalid \"bytes_transferred\" field"))?;
+        let sensor_sha256 = data
+            .get("sha256")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| Error::dvc("FileTransfer reply missing/invalid \"sha256\" field"))?
+            .to_owned();
+
+        Ok(TransferOutcome {
+            bytes_transferred,
+            checksum: sensor_sha256,
+        })
+    }
+
+    /// Download a file from the sensor's fixed remote transfer root to a
+    /// local destination (FILE-02, D-10.4).
+    ///
+    /// `remote_name` is relative to the sensor-owned, FIXED
+    /// `%TEMP%/rdpilot-transfer-root` directory on the REMOTE machine
+    /// (10-03-SUMMARY.md) — see [`Session::upload_file`]'s doc comment for
+    /// the full constraint and the [`Error::PathTraversal`] producer this
+    /// shares.
+    ///
+    /// The sensor copies the validated `remote_name` file to a fresh
+    /// SDK-generated staging name under the RDPDR-redirected `RDPILOT`
+    /// drive (`\\tsclient\RDPILOT\<staging-name>`), which lands at
+    /// `<share_root>/<staging-name>` on THIS machine via the staged-write +
+    /// atomic-rename path (Plan 10-02); once the sensor's DVC reply
+    /// confirms success, that staged file is moved to the caller-requested
+    /// `local` destination with a plain `std::fs` call (no further RDPDR
+    /// round trip needed for the SDK's own side).
+    ///
+    /// Rides the existing async [`Session::sensor_request`] extension point
+    /// exactly like [`Session::launch_process`] — no `tokio::spawn`, no
+    /// change to the session loop's threading model (UNTOUCHABLE).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Config`] if no [`ConnectionConfig::share_root`] was
+    /// configured at connect time (nothing is sent in that case);
+    /// [`Error::PathTraversal`] if the sensor rejected `remote_name` as
+    /// escaping its transfer root; [`Error::SensorRejected`] for any other
+    /// sensor-side rejection; or [`Error::Dvc`] for a handshake mismatch, a
+    /// closed channel, a malformed reply, a timeout, or a local move/I/O
+    /// failure.
+    ///
+    /// NOTE (interface-first, Plan 10-04 Task 1): SHA-256 integrity
+    /// verification (D-10.5, [`Error::ChecksumMismatch`]) is wired by
+    /// Task 2 on top of this same method shape.
+    pub async fn download_file(&self, remote_name: &str, local: &Path) -> Result<TransferOutcome> {
+        let share_root = self.share_root.as_deref().ok_or_else(|| {
+            Error::Config("download_file requires ConnectionConfig::share_root to be configured".to_owned())
+        })?;
+
+        let share_name = self.unique_share_name();
+        let staged = share_root.join(&share_name);
+
+        let payload = serde_json::json!({
+            "op": "Download",
+            "remote_path": remote_name,
+            "share_name": share_name,
+        });
+        let data = self
+            .sensor_request(crate::sensor::MsgType::FileTransfer, Some(payload), TRANSFER_TIMEOUT_MS)
+            .await?;
+
+        let bytes_transferred = data
+            .get("bytes_transferred")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| Error::dvc("FileTransfer reply missing/invalid \"bytes_transferred\" field"))?;
+        let sensor_sha256 = data
+            .get("sha256")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| Error::dvc("FileTransfer reply missing/invalid \"sha256\" field"))?
+            .to_owned();
+
+        // The sensor's own DVC reply only confirms ITS side of the copy
+        // completed; the bytes it wrote landed at <share_root>/<share_name>
+        // via the staged-write + atomic-rename path (Plan 10-02), not at
+        // `local` yet — move them there now with a plain std::fs call.
+        if fs::rename(&staged, local).is_err() {
+            // Cross-device destinations can't be renamed (EXDEV) — fall
+            // back to copy+remove, same net effect.
+            fs::copy(&staged, local).map_err(|e| {
+                Error::dvc(format!("failed to move the downloaded file to {}: {e}", local.display()))
+            })?;
+            let _ = fs::remove_file(&staged);
+        }
+
+        Ok(TransferOutcome {
+            bytes_transferred,
+            checksum: sensor_sha256,
+        })
+    }
+
+    /// Generate a fresh, collision-free filename for staging file-transfer
+    /// bytes under the configured [`ConnectionConfig::share_root`] (mirrors
+    /// `rdpdr_backend.rs`'s own `allocate_staging_path` naming scheme —
+    /// nanosecond timestamp + process id + a monotonic counter, no new
+    /// crate dependency). Deliberately distinct from any caller-supplied
+    /// `remote_name`/`local` name so two concurrent transfers on the same
+    /// `Session` can never collide under the share root.
+    fn unique_share_name(&self) -> String {
+        let counter = self.next_req_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        format!("rdpilot-transfer-{nanos}-{}-{counter}.tmp", std::process::id())
+    }
+
     /// Deploy and launch the sensor exe in-band over RDPDR + injected input
     /// (D-5.1/D-5.2, SENSOR-02).
     ///
@@ -1050,6 +1297,7 @@ mod tests {
             desktop_size: TEST_DESKTOP_SIZE,
             sensor: test_sensor(),
             next_req_id: AtomicU64::new(1),
+            share_root: None,
         };
 
         let err = session.screenshot().await;
@@ -1072,6 +1320,7 @@ mod tests {
             desktop_size: TEST_DESKTOP_SIZE,
             sensor: test_sensor(),
             next_req_id: AtomicU64::new(1),
+            share_root: None,
         };
 
         let shot = session.screenshot().await.expect("frame present");
@@ -1092,6 +1341,7 @@ mod tests {
             desktop_size: TEST_DESKTOP_SIZE,
             sensor: test_sensor(),
             next_req_id: AtomicU64::new(1),
+            share_root: None,
         };
         drop(session); // must not panic
     }
@@ -1108,6 +1358,7 @@ mod tests {
             desktop_size: (1920, 1080),
             sensor: test_sensor(),
             next_req_id: AtomicU64::new(1),
+            share_root: None,
         };
         assert_eq!(session.desktop_size(), (1920, 1080));
     }
@@ -1126,6 +1377,7 @@ mod tests {
             desktop_size: (1920, 1080),
             sensor: test_sensor(),
             next_req_id: AtomicU64::new(1),
+            share_root: None,
         };
 
         let out_of_range = MouseAction::Click {
@@ -1158,6 +1410,7 @@ mod tests {
             desktop_size,
             sensor: test_sensor(),
             next_req_id: AtomicU64::new(1),
+            share_root: None,
         };
         (session, input_rx)
     }
@@ -1325,6 +1578,7 @@ mod tests {
             desktop_size: TEST_DESKTOP_SIZE,
             sensor,
             next_req_id: AtomicU64::new(1),
+            share_root: None,
         };
         (session, input_rx)
     }
@@ -1569,6 +1823,330 @@ mod tests {
             pending.is_empty(),
             "the pending entry must be removed on timeout, not leaked"
         );
+    }
+
+    // --- Task 1/2 (10-04): upload_file/download_file -- FileTransfer wiring,
+    // error_kind mapping, SHA-256 verification (D-10.4/D-10.5) ---
+
+    /// `sensor_request`'s success:false branch maps a reply carrying
+    /// `error_kind:"path_traversal"` to the DISTINCT `Error::PathTraversal`
+    /// (D-10.4 BLOCKER fix), never the generic `Error::SensorRejected` --
+    /// the direct offline proof of the end-to-end producer this plan wires
+    /// (C# `ValidateRemotePath` rejection -> `error_kind` -> here).
+    #[tokio::test]
+    async fn sensor_request_maps_path_traversal_error_kind_to_distinct_error() {
+        let sensor = Arc::new(SensorShared::new());
+        let (session, mut input_rx) = test_session_with_sensor(sensor.clone());
+
+        let handle =
+            tokio::spawn(async move { session.sensor_request(crate::sensor::MsgType::FileTransfer, None, TRANSFER_TIMEOUT_MS).await });
+
+        let RdpInputEvent::Request(_, req_id, _) = input_rx.recv().await.expect("a Request was sent") else {
+            panic!("expected a Request event");
+        };
+        let tx = {
+            let mut pending = sensor.pending.lock().expect("lock");
+            pending.remove(&req_id).expect("req_id registered in pending map")
+        };
+        tx.send(serde_json::json!({
+            "success": false,
+            "error": "remote_path failed ancestry validation under the sensor transfer root",
+            "error_kind": "path_traversal"
+        }))
+        .expect("reply delivered before the receiver was dropped");
+
+        let err = handle.await.expect("task did not panic");
+        assert!(
+            matches!(err, Err(Error::PathTraversal(_))),
+            "expected Error::PathTraversal, got {err:?}"
+        );
+    }
+
+    /// A `success:false` reply with NO `error_kind` (or any value other
+    /// than `"path_traversal"`) still maps to `Error::SensorRejected` --
+    /// proves the new branch is ADDITIVE, not a blanket reclassification
+    /// (WindowList/Uia/LaunchProcess never set `error_kind` and must be
+    /// completely unaffected).
+    #[tokio::test]
+    async fn sensor_request_failure_without_path_traversal_error_kind_still_maps_to_sensor_rejected() {
+        let sensor = Arc::new(SensorShared::new());
+        let (session, mut input_rx) = test_session_with_sensor(sensor.clone());
+
+        let handle =
+            tokio::spawn(async move { session.sensor_request(crate::sensor::MsgType::FileTransfer, None, TRANSFER_TIMEOUT_MS).await });
+
+        let RdpInputEvent::Request(_, req_id, _) = input_rx.recv().await.expect("a Request was sent") else {
+            panic!("expected a Request event");
+        };
+        let tx = {
+            let mut pending = sensor.pending.lock().expect("lock");
+            pending.remove(&req_id).expect("req_id registered in pending map")
+        };
+        tx.send(serde_json::json!({ "success": false, "error": "copy failed", "error_kind": "io" }))
+            .expect("reply delivered before the receiver was dropped");
+
+        let err = handle.await.expect("task did not panic");
+        assert!(
+            matches!(err, Err(Error::SensorRejected(_))),
+            "expected Error::SensorRejected for a non-path_traversal error_kind, got {err:?}"
+        );
+    }
+
+    /// Creates a fresh, empty temp directory to use as a file-transfer
+    /// `share_root` in offline tests (mirrors `rdpdr_backend.rs`'s own
+    /// `nanos + pid` temp-dir naming scheme; no new crate dependency).
+    /// Callers are responsible for `fs::remove_dir_all` cleanup.
+    fn test_share_root_dir() -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let mut dir = std::env::temp_dir();
+        dir.push(format!("rdpilot-session-test-share-{nanos}-{}", std::process::id()));
+        fs::create_dir_all(&dir).expect("create test share root");
+        dir
+    }
+
+    /// Build a `Session` wired to a real (undrained) channel with a
+    /// caller-supplied `SensorShared` AND a configured `share_root` --
+    /// extends `test_session_with_sensor` for the `upload_file`/
+    /// `download_file` tests, which need real local `std::fs` I/O against a
+    /// share root (no VM involved -- the RDPDR IRP plane is not exercised
+    /// by these offline tests, only the DVC control-plane round trip plus
+    /// the SDK's own local staging step).
+    fn test_session_with_sensor_and_share_root(
+        sensor: Arc<SensorShared>,
+        share_root: PathBuf,
+    ) -> (Session, mpsc::Receiver<RdpInputEvent>) {
+        let (input_tx, input_rx) = mpsc::channel(INPUT_CHANNEL_CAPACITY);
+        let session = Session {
+            thread: None,
+            input_tx,
+            frame: SharedFrame::new(),
+            input_db: test_input_db(),
+            desktop_size: TEST_DESKTOP_SIZE,
+            sensor,
+            next_req_id: AtomicU64::new(1),
+            share_root: Some(share_root),
+        };
+        (session, input_rx)
+    }
+
+    /// `upload_file` fails fast with `Error::Config` -- and sends nothing --
+    /// when no `ConnectionConfig::share_root` was configured at connect
+    /// time (D-10.4).
+    #[tokio::test]
+    async fn upload_file_without_configured_share_root_returns_config_error_without_sending() {
+        let sensor = Arc::new(SensorShared::new());
+        let (session, mut input_rx) = test_session_with_sensor(sensor);
+
+        let err = session.upload_file(Path::new("/does/not/matter"), "dest.txt").await;
+        assert!(matches!(err, Err(Error::Config(_))));
+        assert!(
+            input_rx.try_recv().is_err(),
+            "must not send a Request without a configured share root"
+        );
+    }
+
+    /// `download_file` fails fast with `Error::Config` -- and sends nothing
+    /// -- when no `ConnectionConfig::share_root` was configured at connect
+    /// time (D-10.4), mirroring `upload_file`'s same-shaped precondition
+    /// check.
+    #[tokio::test]
+    async fn download_file_without_configured_share_root_returns_config_error_without_sending() {
+        let sensor = Arc::new(SensorShared::new());
+        let (session, mut input_rx) = test_session_with_sensor(sensor);
+
+        let err = session.download_file("remote.txt", Path::new("/does/not/matter")).await;
+        assert!(matches!(err, Err(Error::Config(_))));
+        assert!(
+            input_rx.try_recv().is_err(),
+            "must not send a Request without a configured share root"
+        );
+    }
+
+    /// `upload_file` sends a `FileTransfer` Request with `op:"Upload"`, the
+    /// caller's `remote_name` as `remote_path`, and a non-empty generated
+    /// `share_name`; on a matching-checksum success reply it returns a
+    /// `TransferOutcome` carrying the independently-verified digest
+    /// (D-10.4/D-10.5).
+    #[tokio::test]
+    async fn upload_file_sends_filetransfer_request_and_verifies_checksum_on_success() {
+        let sensor = Arc::new(SensorShared::new());
+        let share_root = test_share_root_dir();
+        let local = share_root.join("local-source.txt");
+        fs::write(&local, b"hello upload").expect("write local source");
+
+        let (session, mut input_rx) = test_session_with_sensor_and_share_root(sensor.clone(), share_root.clone());
+        let local_for_task = local.clone();
+
+        let handle = tokio::spawn(async move { session.upload_file(&local_for_task, "nested/dest.txt").await });
+
+        let RdpInputEvent::Request(msg_type, req_id, payload) =
+            input_rx.recv().await.expect("a Request was sent")
+        else {
+            panic!("expected a Request event");
+        };
+        assert!(matches!(msg_type, crate::sensor::MsgType::FileTransfer));
+        let payload = payload.expect("upload_file sends a payload");
+        assert_eq!(payload["op"], "Upload");
+        assert_eq!(payload["remote_path"], "nested/dest.txt");
+        let share_name = payload["share_name"]
+            .as_str()
+            .expect("share_name present")
+            .to_owned();
+        assert!(!share_name.is_empty());
+        assert_ne!(share_name, "nested/dest.txt", "the staging name must never reuse the caller's remote_name");
+
+        let expected_hash = "2d119f1cd272958a492a144af600b9dc36531f73027b34073967345b027021b1".to_owned();
+        let tx = {
+            let mut pending = sensor.pending.lock().expect("lock");
+            pending.remove(&req_id).expect("req_id registered in pending map")
+        };
+        tx.send(serde_json::json!({
+            "success": true,
+            "data": { "bytes_transferred": 12, "sha256": expected_hash }
+        }))
+        .expect("reply delivered before the receiver was dropped");
+
+        let outcome = handle
+            .await
+            .expect("task did not panic")
+            .expect("upload_file succeeds on a matching-checksum success reply");
+        assert_eq!(outcome.bytes_transferred, 12);
+        assert_eq!(outcome.checksum, expected_hash);
+
+        // The staged copy under share_root must be cleaned up, not left behind.
+        assert!(!share_root.join(&share_name).exists());
+
+        let _ = fs::remove_dir_all(&share_root);
+    }
+
+    /// A `FileTransfer` success reply missing `bytes_transferred`/`sha256`
+    /// surfaces as `Error::Dvc` with a clear message -- mirrors
+    /// `launch_process`'s missing-`"pid"` handling.
+    #[tokio::test]
+    async fn upload_file_malformed_reply_missing_fields_returns_dvc_error() {
+        let sensor = Arc::new(SensorShared::new());
+        let share_root = test_share_root_dir();
+        let local = share_root.join("local-source.txt");
+        fs::write(&local, b"hello upload").expect("write local source");
+
+        let (session, mut input_rx) = test_session_with_sensor_and_share_root(sensor.clone(), share_root.clone());
+        let local_for_task = local.clone();
+
+        let handle = tokio::spawn(async move { session.upload_file(&local_for_task, "dest.txt").await });
+
+        let RdpInputEvent::Request(_, req_id, _) = input_rx.recv().await.expect("a Request was sent") else {
+            panic!("expected a Request event");
+        };
+        let tx = {
+            let mut pending = sensor.pending.lock().expect("lock");
+            pending.remove(&req_id).expect("req_id registered in pending map")
+        };
+        tx.send(serde_json::json!({ "success": true, "data": {} }))
+            .expect("reply delivered before the receiver was dropped");
+
+        let err = handle.await.expect("task did not panic");
+        assert!(matches!(err, Err(Error::Dvc(_))), "expected Error::Dvc, got {err:?}");
+
+        let _ = fs::remove_dir_all(&share_root);
+    }
+
+    /// `download_file` sends a `FileTransfer` Request with `op:"Download"`
+    /// and the caller's `remote_name` as `remote_path`; once the sensor's
+    /// reply confirms success, the bytes already staged (by Plan 10-02's
+    /// staged-write path, simulated here) at
+    /// `<share_root>/<share_name>` are moved to the caller-requested
+    /// destination and the independently-recomputed checksum matches
+    /// (D-10.4/D-10.5).
+    #[tokio::test]
+    async fn download_file_sends_filetransfer_request_and_moves_staged_file_to_destination() {
+        let sensor = Arc::new(SensorShared::new());
+        let share_root = test_share_root_dir();
+        let dest_dir = test_share_root_dir(); // an independent temp dir standing in for an arbitrary caller destination
+        let dest = dest_dir.join("downloaded.txt");
+
+        let (session, mut input_rx) = test_session_with_sensor_and_share_root(sensor.clone(), share_root.clone());
+        let dest_for_task = dest.clone();
+
+        let handle = tokio::spawn(async move { session.download_file("remote/file.txt", &dest_for_task).await });
+
+        let RdpInputEvent::Request(msg_type, req_id, payload) =
+            input_rx.recv().await.expect("a Request was sent")
+        else {
+            panic!("expected a Request event");
+        };
+        assert!(matches!(msg_type, crate::sensor::MsgType::FileTransfer));
+        let payload = payload.expect("download_file sends a payload");
+        assert_eq!(payload["op"], "Download");
+        assert_eq!(payload["remote_path"], "remote/file.txt");
+        let share_name = payload["share_name"]
+            .as_str()
+            .expect("share_name present")
+            .to_owned();
+
+        // Simulate the RDPDR staged-write path (Plan 10-02) having already
+        // deposited the downloaded bytes at <share_root>/<share_name> by
+        // the time the sensor's DVC reply arrives.
+        let staged_path = share_root.join(&share_name);
+        fs::write(&staged_path, b"downloaded content").expect("simulate staged write");
+        let expected_hash = "f51bd38b46d76bbb6fa1b2236edea7997f6487777cb144497800a8d87f7dc1b8".to_owned();
+
+        let tx = {
+            let mut pending = sensor.pending.lock().expect("lock");
+            pending.remove(&req_id).expect("req_id registered in pending map")
+        };
+        tx.send(serde_json::json!({
+            "success": true,
+            "data": { "bytes_transferred": 19, "sha256": expected_hash }
+        }))
+        .expect("reply delivered before the receiver was dropped");
+
+        let outcome = handle
+            .await
+            .expect("task did not panic")
+            .expect("download_file succeeds on a matching-checksum success reply");
+        assert_eq!(outcome.bytes_transferred, 19);
+        assert_eq!(outcome.checksum, expected_hash);
+        assert_eq!(
+            fs::read(&dest).expect("destination file was written"),
+            b"downloaded content"
+        );
+        assert!(
+            !staged_path.exists(),
+            "the staged file must be moved to the destination, not left behind"
+        );
+
+        let _ = fs::remove_dir_all(&share_root);
+        let _ = fs::remove_dir_all(&dest_dir);
+    }
+
+    /// `upload_file`'s round trip is bounded at `TRANSFER_TIMEOUT_MS`
+    /// (30s) -- mirrors `set_foreground_window_times_out_and_removes_pending_entry`,
+    /// but uses Tokio's paused/mocked clock (`start_paused = true`) instead
+    /// of a real 30-second wall-clock wait, so this offline test stays fast
+    /// while still proving `upload_file` passes `TRANSFER_TIMEOUT_MS` (not
+    /// some other bound) into the shared `sensor_request` helper -- a
+    /// deliberately UNVALIDATED initial guess (see `TRANSFER_TIMEOUT_MS`'s
+    /// doc comment) that must be live-tuned at the 10-05 gate.
+    #[tokio::test(start_paused = true)]
+    async fn upload_file_times_out_after_transfer_timeout_and_removes_pending_entry() {
+        let sensor = Arc::new(SensorShared::new());
+        let share_root = test_share_root_dir();
+        let local = share_root.join("local-source.txt");
+        fs::write(&local, b"hello").expect("write local source");
+
+        let (session, _input_rx) = test_session_with_sensor_and_share_root(sensor.clone(), share_root.clone());
+
+        let err = session.upload_file(&local, "dest.txt").await;
+        assert!(matches!(err, Err(Error::Dvc(_))), "expected a timeout Error::Dvc, got {err:?}");
+
+        let pending = sensor.pending.lock().expect("lock");
+        assert!(pending.is_empty(), "the pending entry must be removed on timeout, not leaked");
+        drop(pending);
+
+        let _ = fs::remove_dir_all(&share_root);
     }
 
     // --- Task 2 (08-02): world_state() -- composite snapshot aggregation ---
@@ -1925,6 +2503,7 @@ mod tests {
             desktop_size: TEST_DESKTOP_SIZE,
             sensor: test_sensor(),
             next_req_id: AtomicU64::new(1),
+            share_root: None,
         };
         let window = test_window(crate::Rect { x: 1, y: 1, w: 2, h: 2 });
 
@@ -1998,6 +2577,7 @@ mod tests {
             desktop_size: TEST_DESKTOP_SIZE,
             sensor: test_sensor(),
             next_req_id: AtomicU64::new(1),
+            share_root: None,
         };
 
         let err = session.deploy_and_launch().await;
