@@ -1,451 +1,274 @@
-# Domain Pitfalls: AI-Driven Computer Use over RDP
+# Pitfalls Research
 
-**Domain:** RDP + Windows perception SDK (pixels + UIA, thin sensor helper, local agent)
-**Researched:** 2026-06-04
-**Overall confidence:** HIGH — most pitfalls confirmed by Microsoft documentation, RPA vendor documentation, and open-source project issue trackers
+**Domain:** Session daemon + CLI + MCP server over a stateful Rust RDP-perception SDK (rdpilot v1.1: Consumer Surfaces & File Transfer)
+**Researched:** 2026-07-10
+**Confidence:** MEDIUM-HIGH (grounded in this codebase's own v1.0 live-gate findings + verified external sources for MCP/CLIPRDR/RDPDR/Unix-socket security; a few items flagged LOW pending live validation)
 
----
+This research assumes the v1.0 SDK is DONE (IronRDP session core, C# NativeAOT sensor over DVC, RDPDR drive backend with Create/Close/Read/QueryDirectory implemented, WorldState API). Pitfalls below are specific to the NEW v1.1 surfaces: a persistent daemon holding live `Session`s, a stateless CLI client, a dual-mode MCP server, and bidirectional file transfer — not generic SDK advice. (v1.0's RDP-perception-domain pitfalls, e.g. minimized-window framebuffer loss, remain valid and are not repeated here; see git history for the prior PITFALLS.md if needed.)
 
 ## Critical Pitfalls
 
-Mistakes that cause silent failures, full rewrites, or security incidents.
-
----
-
-### Pitfall C1: Minimized or Disconnected RDP Window Kills UI Automation and Screenshots
+### Pitfall 1: Session-per-OS-thread leak in the daemon
 
 **What goes wrong:**
-When the local RDP client window is minimized, the Windows RDP client by default disconnects the remote display buffer to conserve resources. On the remote machine, the result is that the display pipeline stops rendering — the desktop resolution may drop to 1024×768 or 640×480, applications stop painting, and any automation relying on screen coordinates, screenshot capture, or UI Automation element geometry fails silently or with timeout exceptions. When the session is fully disconnected (not just minimized), the remote session locks, showing the logon screen on the virtual desktop, which means no GUI exists for automation to interact with at all.
-
-This is the single most-documented failure mode across all RPA platforms (UiPath, TestComplete, Ranorex, Power Automate Desktop, pywinauto) operating over RDP. It is not an edge case — it is the default behavior.
+Each `Session` already runs its session loop on a dedicated OS thread with a current-thread Tokio runtime (a Phase 2 architectural decision, forced by an `!Send` borrow across `.await` in the reactivation path — see PROJECT.md Key Decisions / STATE.md Phase 2 Plan 02). A daemon that holds N concurrent sessions is therefore managing N raw OS threads outside any async task pool. If `disconnect` (explicit or reaped) doesn't positively signal the thread to exit its `select!` loop and `join()` it, the thread — and the `Session`'s framebuffer/input-database memory it owns — leaks silently. Under long daemon uptime with many connect/disconnect cycles this is a slow, hard-to-see resource leak, not a crash.
 
 **Why it happens:**
-- The RDP client (`mstsc.exe`) uses an optimization called "suppress when minimized" — it signals the server to stop sending graphics updates when the local window is not visible.
-- The remote DWM (Desktop Window Manager) stops compositing when there is no display consumer.
-- UI Automation's `IUIAutomation` queries depend on the element actually being rendered — `BoundingRectangle` returns empty, `FindAll` returns zero results, and cached elements go stale.
-- On disconnect, `winlogon.exe` switches the interactive desktop to a locked (non-input) desktop. `SendInput` and `SetCursorPos` require `DESKTOP_JOURNALPLAYBACK` access on the *input* desktop; on a locked desktop, this returns `ERROR_ACCESS_DENIED (5)`.
+The OS-thread-per-session design was chosen for a single always-connected session in v1.0's proof harness, where the process exits and the OS reclaims everything. A long-lived daemon is the first place this design has to actually tear sessions down cleanly and repeatedly, and that teardown path did not exist before v1.1.
+
+**How to avoid:**
+Give every `Session` an explicit shutdown channel (e.g. a `oneshot`/watch signal into the thread's `select!`) and make the daemon's disconnect path `join()` the thread with a bounded timeout before removing the registry entry. Add a debug-only "session count vs. live-thread count" assertion or metric so a leak surfaces as a divergence, not just growing memory.
 
 **Warning signs:**
-- Automation works while RDP window is visible, fails the moment it is minimized
-- Screenshots come back blank or at a wrong resolution (640×480 or 1024×768)
-- `FindAll` returns zero results despite elements being visible before minimization
-- `SetCursorPos` / `SendInput` raises access denied after session disconnects
+Thread count reported by `/proc` (or equivalent) growing across repeated connect/disconnect cycles in a soak test; daemon RSS climbing with no matching increase in the session registry's reported entries.
 
-**Prevention strategy:**
-1. **Client-side registry key** (apply on the machine running the RDP client, not the target):
-   ```
-   HKLM\SOFTWARE\Microsoft\Terminal Server Client
-   HKLM\SOFTWARE\Wow6432Node\Microsoft\Terminal Server Client
-   RemoteDesktop_SuppressWhenMinimized = DWORD:2
-   ```
-   This prevents the client from signaling the server to pause the display pipeline when minimized. Confirmed fix by UiPath, TestComplete, and SmartBear documentation.
-
-2. **Never close the RDP session with the normal disconnect button** when automation must persist. Use `tscon.exe` to hand the session back to the console without locking it:
-   ```bat
-   for /f "skip=1 tokens=3" %%s in ('query user %USERNAME%') do (
-     %windir%\System32\tscon.exe %%s /dest:console
-   )
-   ```
-   This leaves the remote session active and the desktop unlocked. Run with elevated privileges.
-
-3. **Disable the screen saver and power-off timer** on the remote target — both trigger desktop switching to a non-input desktop, producing identical failures.
-
-4. **Disable session idle timeout** (Group Policy: `Set time limit for active but idle RDS sessions`) or implement a keep-alive that sends synthetic input at an interval shorter than the timeout.
-
-5. **For rdpilot specifically:** the SDK must document and enforce the `RemoteDesktop_SuppressWhenMinimized` key as a prerequisite. The scripted proof harness should verify session state before asserting UIA results.
-
-**Phase:** Phase 1 (session lifecycle) and Phase 2 (UIA integration). If not addressed in Phase 1, every UIA test will produce flaky results in Phase 2.
+**Phase to address:**
+Session Daemon phase (the phase that introduces the registry and connect/disconnect lifecycle) — must include a soak test (connect/disconnect N times, assert thread/memory return to baseline) as an explicit success criterion, not just "disconnect works once."
 
 ---
 
-### Pitfall C2: RDP Session Semantics — Console vs. Virtual Session Collision
+### Pitfall 2: Implicit default session creeps back in for CLI/MCP convenience
 
 **What goes wrong:**
-On Windows workstations (Home, Pro, Enterprise), there is **exactly one interactive console session (Session 1)**. When you connect via RDP, one of two things happens depending on whether anyone is physically logged in:
+The requirement is explicit: "no implicit default target — every command explicitly names its session." The realistic way this gets violated is not a deliberate decision but convenience creep during CLI ergonomics work — e.g. falling back to "the only session if there's exactly one," or "the most recently connected session," when the name argument is omitted. This is the single most damaging mistake for the MCP surface specifically: an AI agent operating multiple remote sessions (e.g. one "prod-like" target and one throwaway scratch VM) that omits or fuzzes a session identifier will silently get routed to *some* session and act on the wrong desktop — clicking, typing, or launching processes on a target the agent never intended to touch.
 
-- If no one is logged in locally: RDP creates a new virtual session (Session 2+) OR takes over the console session.
-- If someone is physically logged in as the same user: RDP **disconnects the physical console** and reconnects the same session remotely. The physical monitor goes dark.
-- If someone is logged in as a different user: RDP either fails ("session access denied") or forces a logoff, depending on policy.
+**Why it happens:**
+"Just default to the only one" feels harmless when there's exactly one session during development and testing, so it slips in as a quality-of-life shortcut and is never revisited once a second session exists.
 
-For Windows Server, each RDP user gets their own virtual session (Session 1, 2, 3...). Only two simultaneous remote sessions are licensed without RDS CALs.
-
-The automation trap: if your SDK reconnects as the same user account from a different client, the *previous* session (which may have been running the automation) gets silently disconnected. All in-flight UIA calls hang or return stale data.
+**How to avoid:**
+Make the session identifier a required, non-optional field in the wire protocol (IPC schema) and MCP tool schema — not a convention enforced only by CLI argument parsing. A missing session id must be a hard schema-validation error at the IPC boundary, before any handler code runs, so no code path can accidentally supply a default. Write a test that calls every verb with the session field omitted and asserts a rejection, not a fallback.
 
 **Warning signs:**
-- UIA calls that previously succeeded suddenly return `COMException` with `RPC_E_DISCONNECTED` or `E_FAIL`
-- The previous RDP connection silently closes when a new one opens
-- Automation works for the first run but breaks on reconnect
+Any handler code with `.unwrap_or_else(|| registry.only_session())` or `.unwrap_or(registry.most_recent())`; MCP tool JSON schemas that mark `session_id` as optional "for convenience."
 
-**Prevention strategy:**
-- Never share the automation user account with interactive logins on the same target.
-- Use a **dedicated service account** for rdpilot that is never used for interactive sessions.
-- On Windows Server, verify the target is licensed for the session count required.
-- The SDK must detect session ID at connect time and assert it matches on each command to detect silent session replacement.
-- For workstations: do not connect to the console session (`/admin` or `/console` flag in mstsc) unless you own that machine exclusively — this forcibly disconnects any physical user.
-
-**Phase:** Phase 1 (session management design). The session account model must be decided before any other component is built on top.
+**Phase to address:**
+Session Identity phase — the wire protocol / MCP tool schema design step, verified before CLI or MCP surfaces are built on top of it (a schema-level fix here is far cheaper than retrofitting after both consumers exist).
 
 ---
 
-### Pitfall C3: NLA/CredSSP Authentication — Certificate Trust Failures
+### Pitfall 3: Registry check-then-insert race on session names
 
 **What goes wrong:**
-NLA (Network Level Authentication) authenticates the user before the RDP session is established, using CredSSP over TLS. Most modern Windows targets enforce NLA by default. The failure modes are:
+Two concurrent `connect --name foo` calls (plausible from an AI agent that fires parallel tool calls, or a human CLI script) both check "does `foo` exist?", both see "no," and both proceed to open a real RDP connection and insert into the registry. One insert wins and the other's live `Session` (and its OS thread, per Pitfall 1) becomes orphaned — leaked and unreachable by name, silently consuming a connection slot on the remote target with nothing ever able to address or reap it.
 
-1. **Self-signed or untrusted certificate:** If the target uses a self-signed RDP certificate (the default for non-domain machines), the standard RDP client prompts the user to accept it. In an automated/headless context, this prompt blocks the connection entirely or silently fails.
-2. **TLS version mismatch:** If TLS 1.0/1.1 is disabled on the target (increasingly common as a hardening measure) but the client library negotiates only older TLS, the handshake fails before NLA completes.
-3. **CredSSP encryption oracle patch:** After MS17-010 and related patches, CredSSP has an `AllowEncryptionOracle` policy. A patched client connecting to an unpatched server (or vice versa) will be blocked with "CredSSP Encryption Oracle Remediation" errors.
-4. **Domain vs. workgroup:** NLA on domain-joined machines goes through Kerberos. On workgroup machines, it uses NTLM. An automation client running off-domain connecting to a domain-joined server will fall back to NTLM, which some hardened environments explicitly block. If the domain controller is unreachable, NLA will fail even if credentials are correct.
-5. **IronRDP note:** TLS session resumption is explicitly not supported in IronRDP's CredSSP implementation — every connection performs a full handshake.
+**Why it happens:**
+A registry implemented as `Mutex<HashMap<String, Session>>` with separate "check" and "insert" operations under two different lock acquisitions (rather than one atomic `entry()`-style operation) is the natural first implementation and looks correct in every single-request test.
+
+**How to avoid:**
+Route all registry mutation through a single-writer actor (one task/thread owning the `HashMap`, all callers send requests over a channel) or use `HashMap::entry(name).or_insert_with(...)` inside one lock acquisition so check-and-insert is atomic. Add a concurrency test that fires N simultaneous `connect --name foo` calls and asserts exactly one live session results and N-1 clean rejections (not N-1 silent no-ops).
 
 **Warning signs:**
-- "CredSSP Encryption Oracle Remediation" error on connect
-- Connection immediately fails after TLS negotiation with no error message
-- Works on one network, fails on another (domain connectivity issue)
-- Connection hangs at "Securing remote connection" phase indefinitely
+Registry entry count and live-RDP-connection count diverging under concurrent load; a name that "exists" per `list` but whose commands intermittently fail as if talking to a different underlying connection.
 
-**Prevention strategy:**
-- Store the expected certificate thumbprint at connect time and pin it for subsequent connections; reject on mismatch rather than prompt.
-- Always negotiate TLS 1.2+ explicitly in the RDP client library.
-- Support `DisableNLA` mode as a fallback for lab/test targets, but log a prominent warning.
-- For NTLM fallback: verify that the automation service account exists locally on the target if it is not domain-joined, with a matching password.
-- Keep `AllowEncryptionOracle` policies aligned between client and server — document the required GPO setting in SDK prerequisites.
-- Do not store credentials in the SDK's configuration files. Use OS credential stores (Windows Credential Manager, DPAPI-encrypted secrets) or environment variables read at connect time.
-
-**Phase:** Phase 1 (authentication and connection). Must be resolved before any integration test can run.
+**Phase to address:**
+Session Daemon phase, registry design — the same phase as Pitfall 1's shutdown-signal work, since both are the registry's core correctness properties.
 
 ---
 
-### Pitfall C4: UIPI (User Interface Privilege Isolation) Blocks Input Injection and UIA
+### Pitfall 4: Debug redaction does not protect the wire protocol
 
 **What goes wrong:**
-Windows Vista+ enforces UIPI: a process cannot send window messages or simulate input to a process running at a *higher* integrity level. This means:
+v1.0 already established a real discipline here: `ConnectionConfig`'s `Debug` impl redacts the password (D-14), and this was verified sufficient for library-internal logging. The daemon's IPC wire protocol, however, needs `Serialize`/`Deserialize` (or an equivalent JSON DTO) to move connection configs and session metadata between CLI/MCP and the daemon — and `derive(Serialize)` does **not** inherit a hand-written `Debug` redaction. A "list sessions" or "status" verb that serializes a `ConnectionConfig`-shaped struct straight to JSON for the IPC response will put the plaintext password on the wire and potentially into any client-side logging of that response (CLI `--verbose`, MCP tool result content shown to the model/user), even though `{:?}` on the same struct still looks perfectly redacted everywhere else in the codebase.
 
-- If the automation helper or the SDK client runs as a standard user and the target application runs elevated (e.g., an admin-required setup program), `SendInput`, `PostMessage`, and most UIA interaction patterns will silently fail with `ERROR_ACCESS_DENIED`.
-- Even when running at the same integrity level, if the helper is not signed with a UIAccess certificate and installed to `%ProgramFiles%` or `%SystemRoot%`, Windows blocks it from bypassing UIPI to interact with secure desktops (UAC prompt dialogs, Ctrl+Alt+Del screen).
-- UAC dialogs appear on the **secure desktop**, which is a completely separate desktop object. No automation can interact with a UAC dialog without `UIAccess=true` and the binary being signed and in a trusted location.
+**Why it happens:**
+The existing redaction pattern is `Debug`-specific and was correct for v1.0's scope (library-internal error/debug output only). It is easy to assume "we already solved credential redaction" and reuse the same struct for the new IPC/MCP boundary without re-auditing which trait actually governs serialization there.
+
+**How to avoid:**
+Define a distinct, deliberately-thin DTO for anything that crosses the IPC/MCP boundary (session id, host, connected-since, status — never the secret), so there is no `Serialize` impl on any type that also holds a credential. Add a boundary test that serializes every response type used by the daemon protocol and greps the output for known test-secret sentinel values.
 
 **Warning signs:**
-- Input events appear to be sent (no API exception) but the target application does not respond
-- UIA `Invoke()` on a button in an elevated process raises `COMException`
-- Automation works for standard applications but fails for anything that launches elevated
-- UAC dialogs freeze the automation loop
+Any `#[derive(Serialize)]` on (or near) `ConnectionConfig` or a struct containing it; an IPC response schema that includes a `config` or `connection` field typed as the full internal config rather than a status-only view.
 
-**Prevention strategy:**
-- For v1 (read/inspect): avoid invoking elevated processes. Scope the v1 harness to applications that run at standard user integrity.
-- If elevation is needed: the remote sensor helper must itself run elevated (as the session user with admin rights) and use `SendInput` from that elevated context.
-- For UAC dialogs: the only safe approach is to disable UAC on the automation target (acceptable for dedicated lab/automation VMs, not for shared machines) or use `UIAccess=true` signed binary.
-- Document as a hard requirement: the automation target user must be able to run the target application at the same or lower integrity as the helper.
-
-**Phase:** Phase 2 (input injection). v1 read/inspect scope limits exposure, but the constraint must be documented.
+**Phase to address:**
+Layered Connection Config phase (or wherever the IPC wire protocol/DTOs are first defined) — should be caught at schema-design time, verified with the grep-for-secret test before the MCP/CLI phases consume the protocol.
 
 ---
 
-### Pitfall C5: AV/EDR Flagging the Sensor Helper as Malware
+### Pitfall 5: Unauthenticated local IPC socket/pipe — another local user drives the session
 
 **What goes wrong:**
-A custom Windows executable that: (a) is not code-signed by a known certificate authority, (b) enumerates processes, (c) walks the accessibility tree, (d) injects keyboard/mouse input via `SendInput`, and (e) communicates over a custom channel — will match behavioral signatures used to detect RATs (Remote Access Trojans) and keyloggers. This is not hypothetical: commercial RPA agents (UiPath Robot, Power Automate Desktop, Automation Anywhere) regularly appear in AV/EDR incident queues and require explicit allow-listing.
+A Unix domain socket created with default umask, or a Windows named pipe created with the default security descriptor, is frequently readable/writable by every local user on the machine, not just the user who started the daemon. Since the daemon holds live, authenticated RDP sessions (potentially to a real corporate or otherwise sensitive target), any other local account on a shared workstation could connect to the socket/pipe and issue mouse/keyboard/file-transfer commands against that session — a full session hijack with no RDP credentials of their own, just local access to the machine running rdpilot.
 
-Specific behaviors that trigger detection:
-- Process tree enumeration (matches reconnaissance behavior)
-- `SetWindowsHookEx` (keyboard hooking) — used by some UIA approaches
-- `SendInput` with inhuman timing (key-down/key-up intervals measured in microseconds, unlike human input)
-- Writing an executable to a temp directory and launching it (bootstrap path)
-- Unsigned PE with network I/O on a custom port
+**Why it happens:**
+Socket/pipe creation APIs default to permissive access unless the developer explicitly restricts them, and this is invisible in single-user development/testing (where "another local user" never exists to reveal the gap).
+
+**How to avoid:**
+On Unix: create the socket inside a directory created with `0700` permissions (not just `chmod` the socket file itself, which is subject to a TOCTOU window between `bind()` and `chmod()`), owned by the current user; verify with `SO_PEERCRED`/`LOCAL_PEERCRED` on every accepted connection that the calling uid matches the daemon's uid, not just at listen time. On Windows: construct the named pipe with an explicit DACL restricting access to the creating user's SID (do not rely on `CreateNamedPipe`'s default security descriptor). Add a defense-in-depth per-daemon-instance random token (written to a `0600` file alongside the socket/pipe) required on every request, so a filesystem-permission mistake alone is not sufficient for takeover.
 
 **Warning signs:**
-- Helper executable is quarantined on first deploy
-- Helper deploys successfully but input injection silently fails (EDR intercepts the call)
-- Process is killed mid-session without error
-- AV logs show "suspicious process injection" or "potential keylogger" alerts
+`ls -la` on the socket path showing group/other bits set; a fresh daemon instance accepting connections from a test process running under a different uid in CI.
 
-**Prevention strategy:**
-- Code-sign the helper binary with an Extended Validation (EV) certificate if the tool will be deployed to machines with EDR. For personal/lab use, add to the AV exclusion list explicitly.
-- Keep the helper as minimal as possible — single responsibility (sensor + relay), no self-update, no network listener on unexpected ports.
-- Use `SendInput` with realistic human-like timing jitter when operating in environments with behavioral EDR. Synthetic input with microsecond precision is a known detection heuristic.
-- Bootstrap via a trusted channel (WinRM/PowerShell remoting, not a dropped executable in `%TEMP%`).
-- Document the AV exclusion requirement as part of the deployment guide from day one.
-- Avoid `SetWindowsHookEx` entirely; prefer UIAutomation's `InvokePattern` and `ValuePattern` for structured interaction.
-
-**Phase:** Phase 3 (sensor helper bootstrap). Must be designed around this constraint; retrofitting is painful.
+**Phase to address:**
+Session Daemon phase (IPC transport implementation) — this is a launch-blocking security property, not a later hardening pass; verify with an explicit "different-uid client is rejected" test before any CLI/MCP surface is built on the same transport.
 
 ---
 
-### Pitfall C6: DPI Scaling and Coordinate System Mismatch
+### Pitfall 6: MCP computer-use screenshot resolution/coordinate mismatch
 
 **What goes wrong:**
-RDP in high-DPI environments has two independent scaling factors:
+Anthropic's computer-use tool convention expects screenshots downscaled to XGA (1024x768) or WXGA (1280x800) — sending higher resolutions "relying on the API's own resizing" measurably degrades click accuracy and latency (Anthropic's own guidance). rdpilot's native screenshots are full remote-desktop resolution (e.g. 1920x1080) under an already-enforced 96-DPI physical-pixel coordinate contract. If the MCP server passes the native screenshot straight through to the computer-use tool without a deliberate downscale-and-remap step, the model reasons about click coordinates in the *native* pixel space it was shown, and if the server does not consistently rescale those coordinates back before calling `Session::send_mouse`, clicks land offset from what the model intended — a "looks fine" bug that only shows up as slightly-wrong clicks, which is exactly the kind of failure that erodes trust in a live-LLM demo without an obvious root cause.
 
-1. **Local display scaling:** The machine running the RDP client may have 150% or 200% DPI scaling. The RDP client window renders at the local physical resolution.
-2. **Remote display scaling:** The remote session inherits the client's DPI setting by default (controlled by `IgnoreClientDesktopScaleFactor` registry key on the server). If the remote session also scales at 150%, all UIA `BoundingRectangle` coordinates are in scaled logical pixels, not physical pixels.
-3. **Screenshot vs. UIA coordinate mismatch:** If the screenshot is captured at the RDP wire resolution (unscaled) but UIA reports coordinates in the scaled logical space, click coordinates calculated from UIA geometry will miss by a factor equal to the DPI scale ratio.
+**Why it happens:**
+The SDK's own 96-DPI physical-pixel contract (already correct and load-bearing for the native tools) creates a false sense that "coordinates are already solved" — but the computer-use tool surface introduces a *second*, independent coordinate space (whatever resolution the server advertises to the model) that must be explicitly bridged, not assumed to be the same space.
 
-On dynamic resolution changes (user resizes the RDP window, or the connection is established with different geometry than expected), the remote desktop resizes and all coordinate mappings become invalid until remeasured.
+**How to avoid:**
+Pick one fixed advertised resolution (e.g. 1280x800) for the computer-use tool surface, resize every screenshot to it before sending, and implement a single, tested `scale_to_native(x, y)` function used on every click/move/type-target coordinate before it reaches `Session::send_mouse` — with a round-trip test (native rect corners -> advertised space -> back to native) asserting sub-pixel-class accuracy. Keep this scaling entirely separate from the native-tool surface, which should continue to expose true native coordinates unscaled.
 
 **Warning signs:**
-- Clicks land at consistently wrong positions (offset by a predictable factor like 1.25x or 1.5x)
-- UIA `BoundingRectangle` dimensions are physically smaller than what the screenshot shows
-- Works on a 1080p machine, breaks on a 4K laptop
-- Correct coordinates after fresh connect, wrong coordinates after RDP window resize
+Clicks in the live-LLM demo consistently landing near but not on the intended UI element, worse at the edges/corners of the screen than the center (a classic linear-scaling-error signature).
 
-**Prevention strategy:**
-- At connect time, force a specific desktop resolution that is known and fixed. Negotiate the resolution explicitly in the RDP connection parameters; do not inherit the client's display geometry.
-- Set `IgnoreClientDesktopScaleFactor=1` on the remote target to decouple server DPI from client DPI.
-- Force 100% DPI scaling on the remote session for the automation user account (registry: `HKCU\Control Panel\Desktop\LogPixels = 96`).
-- When capturing screenshots, record the wire-level resolution and pixel dimensions. When querying UIA, record the DPI-aware logical resolution. Emit both in the SDK's perception data structure, and let the consumer perform the mapping.
-- After any resolution change event (RDP resize notification), invalidate the coordinate cache and re-query display info before the next action.
-
-**Phase:** Phase 2 (screenshot + UIA integration). The coordinate normalization contract must be defined before any consumer uses coordinates.
+**Phase to address:**
+MCP Server Surface phase — needs its own explicit success criterion ("click a specific button reliably via the computer-use tool schema, verified live"), not folded silently into a generic "screenshot tool works" check.
 
 ---
 
-## Moderate Pitfalls
-
----
-
-### Pitfall M1: RDP Session Idle Timeout and Reconnect Disruption
+### Pitfall 7: MCP tool call blocks the transport event loop on a slow RDP round trip
 
 **What goes wrong:**
-Windows RDP sessions have two independent timeout policies: idle timeout (no user input for N minutes → disconnect) and disconnected session timeout (session has been disconnected for N hours → logoff). Most hardened Windows Server environments set idle timeout to 15–30 minutes. An agent loop that is "thinking" (no RDP input) for longer than the idle timeout will find its session disconnected when it next attempts an action.
+v1.0's measured RDP/sensor round trips are all comfortably sub-second (sensor ping ~165ms, UIA subtree walk ~130ms, WorldState capture 23-73ms) — but v1.1 introduces genuinely long operations: file transfer of an arbitrarily large file, `launch_process` waiting for a slow application to actually appear, or a daemon call against a session whose underlying connection has silently died and is retrying. If the MCP server implementation handles each tool call synchronously on the same task/thread that services the transport (stdio or socket), one slow or hung call blocks the server from responding to *any* other tool call, including unrelated fast ones (e.g. a `list_sessions` call queued behind a stuck file transfer), and can make the whole MCP server appear hung to the host application.
 
-On reconnect, if the session has not yet been logged off, the SDK can re-attach. However:
-- The desktop may now be locked (requiring a credential re-entry)
-- The resolution may have changed on reconnect
-- Any in-flight UIA subscriptions or event hooks are dead
-- The remote process the agent was operating may have shown a dialog while the session was disconnected (e.g., "save unsaved changes?") — the automation is now blocked waiting for user input with no way to detect it except by screenshot
+**Why it happens:**
+The naive, obviously-correct-looking implementation is "await the daemon IPC call inline in the tool-call handler" — this works perfectly in every manual test where operations are fast, and only breaks under either a genuinely slow operation or a degraded connection, neither of which shows up in a quick smoke test.
+
+**How to avoid:**
+Run each tool-call handler on its own task, independent of the transport's read/dispatch loop, with a bounded, explicit timeout per call (distinct from and larger than the SDK's internal per-primitive timeouts — e.g. tens of seconds for a UI action, an explicit longer bound with progress reporting for file transfer) that surfaces as a normal MCP tool error rather than a hang. Use MCP progress notifications for file transfer so the host application (and a human watching) can distinguish "still working" from "stuck."
 
 **Warning signs:**
-- Automation fails exactly at the idle timeout interval
-- Session reconnect succeeds but subsequent UIA calls return stale handles
-- Screenshot shows a lock screen after reconnect
+A live-LLM demo where one slow tool call (e.g. a large file upload) makes an unrelated subsequent tool call in the same conversation appear to hang rather than fail or queue visibly.
 
-**Prevention strategy:**
-- Send a synthetic keep-alive every ~60 seconds: a null mouse move within the remote desktop coordinate space, or a `VK_NONAME` key to prevent idle timeout.
-- Configure idle timeout policy on the target to "Never" for the automation service account, or extend it significantly.
-- After every reconnect, treat the session as fresh: re-query display info, re-enumerate windows, re-build the UIA snapshot.
-- Subscribe to session state change events if the RDP library exposes them; treat a disconnect notification as a hard reset point.
-
-**Phase:** Phase 1 (session lifecycle). Keep-alive must be part of the session management loop.
+**Phase to address:**
+MCP Server Surface phase for the isolation/timeout architecture; Bidirectional File Transfer phase for the specific progress-reporting need once transfer exists.
 
 ---
 
-### Pitfall M2: UI Automation Full-Tree Walk Performance
+### Pitfall 8: Extending the RDPDR drive backend to writes reopens a known path-traversal CVE class
 
 **What goes wrong:**
-`IUIAutomation::FindAll` with `TreeScope_Descendants` on a complex application (browser, Office, modern Electron app) can take 5–30 seconds and block the COM thread. The underlying reason is documented by Microsoft: UIA caches the entire descendant scope before applying the search predicate — every node in the tree is marshalled across the in-process boundary.
+The existing `RdpilotDriveBackend` (Phase 5) implements 4 of 11 `ServerDriveIoRequest` IRP variants (Create/Close/Read/QueryDirectory); v1.1's upload path requires adding `Write` (and likely richer `Create` semantics for new-file creation). This is precisely the code shape where real, disclosed vulnerabilities have occurred in other RDP drive-redirection implementations: FreeRDP's `contains_dotdot()` path-traversal filter had an off-by-one that missed a trailing `..` with no separator, allowing a malicious peer to read/write one directory above the shared folder (FreeRDP GHSA-3xpj-m4hx-8vmx); a related class of bug (CVE-2025-48817) hit Windows' own RDP client file-transfer path validation. Since rdpilot's own drive backend is the code that will decide what paths are legal on the remote share, an incomplete or off-by-one path-canonicalization check on the new `Write`/`Create` handling is an arbitrary-file-write primitive on the remote target, not just a file-transfer bug.
 
-In a remote session where the UIA call crosses from the helper process to the application process (and potentially across session boundaries), this overhead is amplified. A full tree walk on a Chrome browser with 20 tabs can return tens of thousands of elements.
+**Why it happens:**
+Path-traversal filtering that only checks for the substring `../` or `..\` mid-path (rather than canonicalizing the full resulting path and verifying it stays within the shared root) is the natural first implementation, and is exactly the shape of bug that shipped in FreeRDP for years before being found.
 
-Additionally, `TreeWalker` traversal (element-by-element) is even slower than `FindAll` for large trees because each `GetFirstChildElement` / `GetNextSiblingElement` call is an individual COM round-trip.
+**How to avoid:**
+Canonicalize the full resolved path (join + normalize, resolving `.`/`..` structurally rather than substring-matching) and verify it is still a descendant of the configured share root before honoring any `Create`/`Write` IRP; reject on any ambiguity rather than trying to be permissive. Write unit tests that specifically mirror the disclosed bug class: a path ending in `..` with no trailing separator, a path with mixed `/`/`\` separators, and an absolute path masquerading as relative.
 
 **Warning signs:**
-- UIA queries take >5 seconds for complex applications
-- The helper process becomes unresponsive during a tree walk
-- Memory usage spikes during tree capture (hundreds of MB for large applications)
+A path-traversal test suite that only tests `../../etc/passwd`-shaped inputs and passes, without testing the trailing-no-separator or mixed-separator edge cases that caused the real disclosed bugs.
 
-**Prevention strategy:**
-- Never use `TreeScope_Descendants` as the default scope. Default to `TreeScope_Children` and expand only when necessary.
-- Walk the tree lazily from a known root (e.g., the window handle returned by `EnumWindows`), not from `GetRootElement`.
-- Cache the UIA snapshot with a TTL; do not re-walk on every agent action. Invalidate only on window change events.
-- Use `CacheRequest` to fetch multiple properties in a single round-trip rather than querying each property separately.
-- Implement a timeout on tree walks and fall back to screenshot-only mode when UIA is unavailable or too slow.
-
-**Phase:** Phase 2 (UIA integration). Must be designed into the helper's perception loop from the start.
+**Phase to address:**
+Bidirectional File Transfer phase — must include an explicit path-traversal test suite as a success criterion before the upload verb is considered done, referencing the specific disclosed bug shapes above rather than generic "sanitize the path" language.
 
 ---
 
-### Pitfall M3: Elements Without UIA Support (Vision Fallback Required)
+### Pitfall 9: Daemon death does not clean up the corresponding Windows-side RDP session
 
 **What goes wrong:**
-Not all Windows applications expose a useful UIA tree. Known classes of applications that produce sparse or useless trees:
+If the daemon process dies (crash, OOM-kill, host reboot) while holding live sessions, the local TCP connection to each RDP target dies with it — but per this codebase's own Phase 6 live-gate finding, Windows treats an RDP connection drop as a *disconnect*, not a *logoff*: the interactive session on the target persists in a disconnected state, and Windows reconnects to that same existing session (rather than creating a fresh one) the next time the same user authenticates. The daemon's in-memory registry, however, is gone. On restart, the daemon has zero knowledge that a durable Windows-side session (and possibly a still-running sensor process on it) already exists, and nothing informs the user that reconnecting under the same name/credentials will resume old state rather than start clean — or, worse, that repeated daemon crashes under *different* target credentials could accumulate multiple orphaned disconnected Windows sessions with no client-side way to see or reap them.
 
-- **Legacy Win32 with owner-draw controls:** custom-drawn list boxes, toolbars, and grids report as a single opaque element with no children.
-- **DirectX/OpenGL/game-engine UIs:** the entire application surface is a single `HWND` with no accessibility peers. No UIA structure exists at all.
-- **Older MFC applications:** may use `IAccessible` (MSAA) but not full UIA; the MSAA-to-UIA bridge produces a shallow, often incorrect tree.
-- **Custom web apps in a WebView2/Edge frame:** inner web elements are accessible only via the browser's own UIA provider, which may not be active in embedded contexts.
-- **Electron apps with custom chrome:** depend on the app enabling accessibility explicitly; many do not unless a screen reader is detected.
+**Why it happens:**
+The registry-in-memory design is the natural default for a daemon and works perfectly across clean `disconnect` calls; only an unclean daemon death exposes the client/server session-state divergence, which is easy to never test because it requires deliberately killing the daemon mid-session.
+
+**How to avoid:**
+Persist minimal registry state (session name, target host, timestamp — never the credential) to disk on every registry mutation, and on daemon startup, reconcile: report any persisted session as "possibly still live on the target, reconnect to confirm" rather than silently discarding it. Explicitly test the crash-and-restart path (kill -9 the daemon with a live session, restart, attempt to address the same session name) as a first-class scenario, not an afterthought — this is a codebase-specific risk given the same reconnect-to-disconnected-session behavior already surprised the Phase 6 sensor deployment logic once (stale sensor process required an explicit taskkill-before-relaunch fix).
 
 **Warning signs:**
-- UIA tree for a window shows only one or two elements regardless of visible UI complexity
-- `GetCurrentPropertyValue(UIA_IsEnabledPropertyId)` returns false on most elements
-- Element names are empty or generic ("Window", "Pane")
+A restarted daemon with an empty registry that, on a fresh `connect --name foo`, silently lands on an old disconnected Windows session with stale sensor/process state rather than a clean one — indistinguishable from a true fresh connect until something behaves unexpectedly (a "ghost" running process from the prior daemon lifetime).
 
-**Prevention strategy:**
-- Design the SDK's perception API to treat UIA as **opportunistic**, not required. The screenshot is always available; UIA enriches it when available.
-- For applications known to have poor UIA: fall back to OCR on the screenshot, or to MSAA (`IAccessible`) which has broader legacy coverage.
-- Document per-application UIA quality in the test harness to guide the agent on what to expect.
-
-**Phase:** Phase 2 (perception integration). The API design must anticipate mixed-fidelity perception from day one.
+**Phase to address:**
+Session Daemon phase for the persistence/reconciliation mechanism; should be explicitly retested whenever the MCP/CLI phases add their own crash-recovery expectations.
 
 ---
 
-### Pitfall M4: RDP Virtual Channel Bootstrap — Trust and Version Skew
+## Technical Debt Patterns
 
-**What goes wrong:**
-A DVC (Dynamic Virtual Channel) plugin requires a client-side component registered on the machine running the RDP client AND a server-side component running in the remote session. The handshake is:
+| Shortcut | Immediate Benefit | Long-term Cost | When Acceptable |
+|----------|--------------------|-----------------|------------------|
+| Reuse `Session::ping()`'s sensor-health check as the daemon's connection-liveness signal | No new keepalive code | Conflates "sensor process alive" with "RDP transport alive" — a hung/crashed sensor looks identical to a dead connection, so the daemon can't tell whether to retry the sensor deploy or fully reconnect | Never for the daemon's core health model; fine as one diagnostic signal among several |
+| Session registry as a plain in-memory `Mutex<HashMap>` with no persistence | Fast to build, correct for the common clean-shutdown path | Total state loss (and orphaned remote sessions, Pitfall 9) on any unclean daemon death | Acceptable only for a first internal spike; must gain at least minimal disk persistence before this is used for real personal-tooling sessions left running unattended |
+| CLI passes `--password` as a plain argument | Simplest to implement and demo | Leaks via `ps`/shell history on any shared machine | Never by default; acceptable only behind an explicit `--i-know-this-is-insecure` style flag for one-off scripting, with env var / prompt as the documented default path |
+| MCP server awaits the daemon IPC call inline in the tool-call handler (no per-call task isolation) | Simplest possible MCP server loop | One slow/hung call blocks the whole server (Pitfall 7) | Acceptable only until the first tool with unbounded duration (file transfer, `launch_process` wait) is added — must be fixed before Bidirectional File Transfer phase ships |
+| Single-shot (non-resumable) file transfer implementation | Much simpler than chunked resume logic | Any interruption on a large transfer means starting over from zero, with no partial-progress recovery | Acceptable for v1.1 personal-tooling scope, provided partial writes are staged-and-renamed (Pitfall 8/file-transfer gotchas) so failure is at least clean, not silently corrupt |
 
-1. Register the client plugin (COM object on the client machine)
-2. Establish RDP connection
-3. Launch the server-side component inside the remote session
+## Integration Gotchas
 
-If the client plugin and server component are version-skew'd (e.g., after an SDK update), the channel negotiation may silently fail — the RDP session connects normally but the virtual channel never opens. There is no visible error.
+| Integration | Common Mistake | Correct Approach |
+|-------------|------------------|-------------------|
+| Anthropic computer-use tool schema | Sending full native-resolution screenshots and trusting the API's own image resizing | Downscale to a fixed advertised resolution (XGA/WXGA) server-side and maintain an explicit, tested coordinate-scaling function (Pitfall 6) |
+| MCP transport (stdio/socket) | Defaulting to or accidentally exposing a network-bindable transport instead of local-only stdio/socket/pipe | Default strictly to local transport; require an explicit, documented opt-in (with its own auth story) for anything network-reachable |
+| RDPDR drive redirection (extending the existing backend) | Treating the existing Create/Close/Read/QueryDirectory implementation as "the hard part is done" and bolting Write on without re-auditing path validation | Re-audit path canonicalization specifically for the new write path against the disclosed FreeRDP/Windows CVE shapes (Pitfall 8) |
+| Windows session reconnect semantics | Assuming a fresh RDP connect always yields a fresh Windows-side session | Explicitly test and document the reconnect-to-disconnected-session behavior (already empirically observed in Phase 6) as it applies to daemon restarts and file-transfer resume |
 
-Additionally, the DVC plugin must be registered on every client machine that will run rdpilot. For a library intended to run headlessly (not mstsc.exe), this is moot — IronRDP and FreeRDP implement DVC natively in the client library without requiring COM registration. But if `mstsc.exe` is the transport, the plugin COM registration is a deployment step that must succeed before the channel is available.
+## Performance Traps
 
-**Warning signs:**
-- RDP session connects successfully but `OpenDynamicVirtualChannel` on the server side returns `ERROR_NOT_FOUND`
-- Channel works after fresh deploy, fails after SDK update without re-registering the plugin
+| Trap | Symptoms | Prevention | When It Breaks |
+|------|----------|------------|-----------------|
+| Reading an entire file into memory before starting an RDPDR write loop | Works fine in small-file tests, OOMs or stalls on anything large | Stream in bounded chunks matching MS-RDPEFS's per-IRP size limits, tracking offset explicitly | Any file beyond a few MB, or several concurrent transfers on a memory-constrained workstation |
+| One OS thread per `Session` with no upper bound | Fine with 1-2 sessions in testing | Cap concurrent sessions (config limit) and monitor thread count; document the limit rather than silently degrading | Beyond roughly a handful of concurrent sessions per daemon instance, thread scheduling and memory overhead become noticeable — explicitly out of scope per PROJECT.md ("multi-session orchestration at scale" not exercised), but the daemon should still fail loudly rather than silently degrade past some threshold |
+| Full-resolution PNG screenshot on every MCP computer-use tool call | Slow round trips, high token cost, sluggish live-LLM demo | Downscale per Pitfall 6, and consider JPEG for computer-use frames where lossy compression is acceptable (native/UIA-perception paths should stay lossless) | Any conversation with more than a handful of screenshot tool calls — costs compound quickly |
 
-**Prevention strategy:**
-- Prefer out-of-band transport (WinRM/named pipe) over a DVC for the sensor helper in v1. DVC is powerful but adds significant complexity to deployment and version management.
-- If DVC is used: implement a version handshake as the first message on the channel. If versions mismatch, close and report an error with the version delta — do not silently continue with broken data.
-- For IronRDP/FreeRDP as the client library: DVC is part of the library and does not require COM registration — this removes the client-side deployment concern.
+## Security Mistakes
 
-**Phase:** Phase 3 (sensor helper transport).
+| Mistake | Risk | Prevention |
+|---------|------|------------|
+| World-readable/writable IPC socket or named pipe | Any local user on a shared machine can drive a live RDP session with someone else's remote credentials, with zero RDP auth of their own | Restrict via directory/DACL permissions plus a peer-uid check on every accepted connection (Pitfall 5), never rely on the socket path being "secret" |
+| `Serialize`-derived DTOs reusing the internal `ConnectionConfig` shape | Password leaks over the IPC wire / into MCP tool results even though `Debug` output is correctly redacted | Distinct, credential-free status DTOs for every IPC/MCP response type (Pitfall 4) |
+| Trusting substring-based path traversal filters (`contains("..")`) on the RDPDR write path | Arbitrary file read/write on the remote target one level outside the intended share root — the exact disclosed FreeRDP/Windows CVE shape | Canonicalize and verify ancestry, not substring match (Pitfall 8) |
+| Logging full daemon requests (including credentials) for debugging | Credentials land in a daemon log file that may have looser permissions than the socket/config file itself | Redact at the logging boundary using the same discipline as the existing `ConnectionConfig` Debug redaction, and audit every new log call site added for the daemon/MCP/CLI surfaces |
+| Treating the MCP server's "it's just talking to Claude" framing as inherently safe | An MCP client is still an untrusted-input boundary for anything the model decides to type/click/upload/download on the daemon's behalf — a prompt-injected or misled model can drive destructive file operations exactly as a human CLI user could | Apply the same session-identity-required and path-traversal protections to the MCP surface as the CLI surface; do not special-case "trust" for the AI-driven path |
 
----
+## UX Pitfalls
 
-### Pitfall M5: FreeRDP 3.x Screenshot API Breakage
+| Pitfall | User Impact | Better Approach |
+|---------|-------------|-------------------|
+| Auto-generated session ids that are long opaque UUIDs with no human-legible name | Painful to reference in CLI usage and in MCP tool arguments the model has to carry around verbatim | Short, memorable auto-ids (e.g. adjective-noun or short hash) when the user doesn't supply a name, while still guaranteeing uniqueness (ties into Pitfall 3's atomic-insert requirement) |
+| Silent truncate-or-overwrite behavior on file-transfer destination conflicts | A download/upload appears to succeed but clobbers or silently coexists with existing data in a way the user didn't intend | Fail closed by default on destination-exists conflicts, with an explicit `--force`/overwrite flag |
+| No visibility into session age/idle time in `list` output | User (or agent) forgets a session is still open, consuming a remote login slot / cloud cost indefinitely | `list` should show connected-since / last-activity so cleanup is a deliberate, informed decision — matches this project's registry-not-mystery philosophy |
+| MCP tool error messages that just say "internal error" for every daemon-side failure | Agent can't tell "session name doesn't exist" from "connection lost, needs reconnect" from "click was out of bounds," so it can't decide how to recover | Map distinct daemon error variants to distinct, legible MCP tool-error text (see Pitfall 7's error-surfacing note) |
 
-**What goes wrong:**
-FreeRDP 2.x included a proxy module (`DecordGFX`) that enabled BMP capture of the remote session framebuffer. In FreeRDP 3.x this module was removed with no documented replacement and no migration guide. Developers implementing framebuffer capture against FreeRDP 3.x must manually hook the GDI update pipeline (`SurfaceBits` and `GDI` callbacks) and call `winpr_image_write_bmp` to serialize the buffer — an undocumented, brittle approach.
+## "Looks Done But Isn't" Checklist
 
-Additionally, FreeRDP has a known bug where taking a screenshot (via external screenshot software) can crash the RDP connection (FreeRDP issue #8735). The `SDL` renderer in FreeRDP 3.x has exhibited blank output on connect in some configurations (issue #9354).
+- [ ] **Session daemon disconnect:** Looks done when a single connect/disconnect cycle works — verify with a soak test of repeated cycles that thread count and memory return to baseline (Pitfall 1).
+- [ ] **No-implicit-default session targeting:** Looks done when every documented CLI example includes a session name — verify by testing every verb with the session argument *omitted* and confirming a hard rejection, not a fallback (Pitfall 2).
+- [ ] **IPC/MCP credential redaction:** Looks done when `println!("{:?}", config)` is redacted — verify by serializing every daemon response type to JSON and grepping for a planted test secret (Pitfall 4).
+- [ ] **IPC transport permissions:** Looks done when it works for the developer's own user — verify with a second local test user/process actually attempting to connect and confirming rejection (Pitfall 5).
+- [ ] **Computer-use tool coordinate mapping:** Looks done when a screenshot displays and a click "roughly" lands nearby — verify with a precision test clicking small UI elements near screen edges/corners, not just the center (Pitfall 6).
+- [ ] **File-transfer path safety:** Looks done when normal relative paths transfer correctly — verify against the specific disclosed traversal shapes (trailing `..` with no separator, mixed separators, absolute-path-as-relative) (Pitfall 8).
+- [ ] **File-transfer chunking:** Looks done when a small test file transfers correctly — verify with a file larger than one MS-RDPEFS IRP's max chunk size to confirm the read/write loop actually loops.
+- [ ] **Daemon crash recovery:** Looks done when clean shutdown/restart works — verify by `kill -9`-ing the daemon mid-session and confirming the restart behaves sanely (reports the possibly-still-live remote session rather than silently forgetting it) (Pitfall 9).
 
-IronRDP provides a first-class screenshot example (`crates/ironrdp/examples/screenshot.rs`) and is the better-documented path for headless bitmap capture.
+## Recovery Strategies
 
-**Warning signs:**
-- Linker errors or missing symbols when trying to use the `DecordGFX` module with FreeRDP 3.x
-- Framebuffer callbacks are called but produce zero-size or all-black bitmaps
-- RDP connection drops immediately after a screenshot attempt
+| Pitfall | Recovery Cost | Recovery Steps |
+|---------|----------------|------------------|
+| Session-per-thread leak (Pitfall 1) | MEDIUM | Add the missing shutdown-signal/join path; restart the daemon to clear existing leaked threads; add the soak test going forward |
+| Registry race / orphaned session (Pitfall 3) | MEDIUM | Convert registry mutation to a single-writer actor or atomic `entry()` pattern; any already-orphaned live connections must be found via a "sessions the registry doesn't know about" audit and manually torn down |
+| IPC credential leak via Serialize (Pitfall 4) | LOW-MEDIUM | Introduce the credential-free DTO, audit and scrub any already-written logs/history that may have captured the leaked value, rotate any credential that was exposed |
+| Unauthenticated local socket/pipe (Pitfall 5) | LOW | Tighten permissions/DACL and add the peer-check; if this shipped to any real multi-user machine, treat any credential used during that window as potentially exposed and rotate it |
+| Path-traversal on RDPDR write (Pitfall 8) | HIGH | This is a real remote-file-integrity risk if shipped — requires canonicalization fix, a full audit of what paths were actually reachable during the vulnerable window, and verification the remote target wasn't already touched outside the intended share root |
+| Daemon-crash orphaned Windows session (Pitfall 9) | LOW | Add persistence/reconciliation; in the meantime, manually inspect the target for stray disconnected sessions after any daemon crash and log off manually if found |
 
-**Prevention strategy:**
-- Use IronRDP rather than FreeRDP for headless screenshot automation. IronRDP's screenshot example is functional and maintained.
-- If FreeRDP must be used: use the GDI bitmap pointer directly from the `freerdp_get_image_format_pixel_format` / `gdi->primary_buffer` path, not the proxy screenshot module.
-- Test screenshot reliability under both the GFX pipeline (H.264/RFX) and the classic RemoteFX path — they produce different pixel formats.
+## Pitfall-to-Phase Mapping
 
-**Phase:** Phase 1 (RDP stack selection). This is a stack decision, not a bug to work around later.
-
----
-
-## Minor Pitfalls
-
----
-
-### Pitfall m1: Windows Workstation Single-Session Licensing Limit
-
-**What goes wrong:**
-Windows 10/11 (all editions) and Windows Server 2019/2022 with default licensing permit only two concurrent RDP sessions (both administrative). Windows workstations permit only one RDP session per user. Attempting a second connection with the same user account either: reconnects to the existing session (disconnecting any in-flight automation), or fails with "session access denied" depending on the `fSingleSessionPerUser` policy.
-
-This is a licensing constraint, not a bug. Bypassing it via `rdpwrap` or registry edits is a license violation.
-
-**Prevention strategy:**
-- Use a Windows Server target for any multi-session scenario.
-- For single-target development: use one dedicated service account, never share it.
-- Document this limit prominently; do not design the v1 API as if multi-session on a workstation is possible.
-
-**Phase:** Phase 1 (target prerequisites documentation).
-
----
-
-### Pitfall m2: GFX/H.264 Codec Pixel Format Surprises
-
-**What goes wrong:**
-Modern RDP uses the Graphics Pipeline Extension (MS-RDPEGFX) with H.264/AVC420 or AVC444 encoding. When the client library decodes the H.264 frame, the output is typically in YUV (NV12 or YUV420) format, not RGB. If the screenshot code assumes RGB/BGRA and reads a YUV buffer, the captured image will have scrambled colors or appear as a grey luma-only image.
-
-AVC444 mode encodes chroma at full resolution, which requires a different decode path than AVC420. Clients that only implement AVC420 decode will produce incorrectly colored screenshots when AVC444 is negotiated.
-
-**Warning signs:**
-- Screenshots are grey (luma only) or have severe color banding
-- Screenshot colors are correct with some servers, wrong with others
-- Colors correct on initial connect, wrong after the server switches codec (which can happen dynamically based on content)
-
-**Prevention strategy:**
-- After decoding an RDP frame, explicitly convert YUV → RGB using a SIMD-accelerated converter (libyuv or the platform's media foundation) before passing to the screenshot API.
-- Negotiate a specific codec version at connect time rather than accepting whatever the server offers. For automation, prioritize image fidelity over compression efficiency — consider negotiating RemoteFX (lossless-mode) if available.
-- Verify screenshot pixel format in the test harness by checking a known-color pixel value.
-
-**Phase:** Phase 1 (RDP client implementation).
-
----
-
-### Pitfall m3: Credentials in Process Memory and Channel Leakage
-
-**What goes wrong:**
-The RDP connection requires plaintext credentials (username + password) at the point of CredSSP negotiation. Whatever credentials the SDK receives must be passed to the RDP library, which holds them in memory for the duration of the handshake. In managed languages (C#, Python), the GC does not zero strings; the credential can persist in heap memory longer than expected.
-
-Additionally, if the RDP virtual channel carries the sensor helper's command stream unencrypted, any other process in the same session that can attach to the DVC can read the channel. On Windows, DVC channels are accessible to code running in the same session.
-
-**Warning signs:**
-- Memory dump of the SDK process contains credentials in plaintext
-- Other processes in the session can open the virtual channel by name
-
-**Prevention strategy:**
-- Use `SecureString` or pinned byte arrays that are explicitly zeroed after the CredSSP handshake completes.
-- Do not log credentials anywhere, including debug output and crash dumps.
-- Name the virtual channel with a randomized suffix to reduce predictability.
-- Treat the DVC as unauthenticated transport — add an application-layer authentication step on first connect (the helper authenticates to the client using a session-derived token, not a stored secret).
-- If the channel carries commands that mutate system state, encrypt and MAC the channel even though it runs over RDP's TLS layer — defense in depth.
-
-**Phase:** Phase 3 (sensor helper) and Phase 1 (connection management).
-
----
-
-### Pitfall m4: UIA Cross-Process and Cross-Session Access Restrictions
-
-**What goes wrong:**
-`IUIAutomation` in the local session is the well-tested path. When the sensor helper runs in the RDP session and calls UIA on applications in the same session, it generally works. However:
-
-- If the helper runs at a lower integrity level than the target application, UIA property access is blocked (UIPI applies to UIA just as it does to `SendMessage`).
-- UIA calls against applications in a **different** session (cross-session) are blocked at the Windows session boundary — UIA is session-local. This is relevant only if someone attempts to drive the remote session's UIA from the local machine directly (which is not possible); the sensor helper must live in the same session as the target.
-- If the application being automated launches elevated child processes (common in installers), UIA access to those children is denied unless the helper is also elevated.
-
-**Prevention strategy:**
-- The sensor helper must run **in the same session as the target application** — this is already implied by the architecture (helper runs in the RDP session), but it must be verified at bootstrap.
-- The helper process must run at the same or higher integrity level as the most-elevated process it needs to query. For v1 (read/inspect), this means running as the logged-in user (standard integrity) is sufficient for most applications.
-- Add a self-test step in the helper bootstrap that verifies it can successfully call `FindAll(TreeScope_Children)` on the desktop root before reporting "ready."
-
-**Phase:** Phase 3 (helper bootstrap), cross-referenced with Phase 2 (UIA integration).
-
----
-
-## Phase-Specific Warnings
-
-| Phase Topic | Likely Pitfall | Mitigation |
-|-------------|---------------|------------|
-| RDP stack selection (P1) | FreeRDP 3.x screenshot breakage (C) | Choose IronRDP; verify screenshot example works against target before committing |
-| Session lifecycle (P1) | Console vs. virtual session collision (C2) | Dedicated service account; detect session ID at connect |
-| Authentication (P1) | NLA/CredSSP cert trust failure (C3) | Pin cert thumbprint; test against both domain-joined and workgroup targets |
-| Screenshot capture (P1) | YUV pixel format mismatch (m2) | Force explicit color space conversion; test with a known-color pixel |
-| Session management (P1) | Idle timeout disconnection (M1) | Implement keep-alive from day one |
-| UIA integration (P2) | Minimized window kills UIA (C1) | `RemoteDesktop_SuppressWhenMinimized=2` must be set before any UIA test |
-| UIA integration (P2) | Full tree walk performance (M2) | Default to `Children` scope; cache with TTL |
-| UIA integration (P2) | Applications without UIA (M3) | API design: UIA is optional enrichment, screenshot is always the fallback |
-| Input injection (P2) | UIPI blocks SendInput (C4) | v1 read-only scope avoids this; document as a Phase 3+ concern |
-| Coordinate mapping (P2) | DPI scaling mismatch (C5) | Fix remote DPI to 96 (100%); emit both logical and physical coords |
-| Helper bootstrap (P3) | AV/EDR flags helper as RAT (C5) | Minimize helper surface; plan for code signing; document exclusion requirement |
-| Helper transport (P3) | DVC version skew (M4) | Version handshake on first message; prefer WinRM in v1 |
-| Helper security (P3) | Credential leakage via channel (m3) | Zero credentials post-handshake; randomize channel name |
-
----
+| Pitfall | Prevention Phase | Verification |
+|---------|--------------------|----------------|
+| 1. Session-per-thread leak | Session Daemon phase | Soak test: N connect/disconnect cycles, thread/memory count returns to baseline |
+| 2. Implicit default session creep | Session Identity phase (wire protocol / schema design) | Every verb tested with session field omitted → hard rejection |
+| 3. Registry check-then-insert race | Session Daemon phase (registry design) | Concurrency test: N simultaneous same-name connects → exactly 1 success |
+| 4. Debug redaction ≠ Serialize redaction | Layered Connection Config / IPC protocol design phase | Serialize every response DTO, grep for planted test secret |
+| 5. Unauthenticated local IPC socket/pipe | Session Daemon phase (IPC transport) | Different-uid client connection attempt is rejected |
+| 6. Computer-use coordinate mismatch | MCP Server Surface phase | Precision click test near screen edges/corners via computer-use tool schema |
+| 7. MCP tool call blocks event loop | MCP Server Surface phase (+ File Transfer phase for progress reporting) | Slow tool call in flight does not block a concurrent unrelated fast tool call |
+| 8. RDPDR write path traversal | Bidirectional File Transfer phase | Test suite covering disclosed CVE-shaped inputs (trailing `..`, mixed separators, absolute-as-relative) |
+| 9. Daemon death orphans Windows session | Session Daemon phase | `kill -9` mid-session, restart, confirm reconciliation behavior (not silent amnesia) |
 
 ## Sources
 
-- UiPath documentation on executing tasks in minimized RDP windows: https://docs.uipath.com/robot/standalone/2024.10/admin-guide/executing-automations-in-minimized-rdp-windows
-- SmartBear TestComplete: Disconnecting from Remote Desktop while running automated tests: https://support.smartbear.com/testcomplete/docs/testing-with/running/via-rdp/keeping-computer-unlocked.html
-- Microsoft Power Automate UIPI issues documentation (updated 2026-04-03): https://learn.microsoft.com/en-us/troubleshoot/power-platform/power-automate/desktop-flows/ui-automation/uipi-issues
-- UiPath Robot Windows Sessions documentation: https://docs.uipath.com/robot/docs/windows-sessions
-- pywinauto issue #1096 "no active desktop required for moving mouse cursor": https://github.com/pywinauto/pywinauto/issues/1096
-- FreeRDP issue #11765 "How to implement session capture (BMP screenshot) in FreeRDP3 proxy": https://github.com/FreeRDP/FreeRDP/issues/11765
-- FreeRDP issue #8735 "Screenshot crashes RDP connection": https://github.com/FreeRDP/FreeRDP/issues/8735
-- IronRDP screenshot example: https://github.com/Devolutions/IronRDP/blob/master/crates/ironrdp/examples/screenshot.rs
-- IronRDP Hacker News discussion (HN #43436894): https://news.ycombinator.com/item?id=43436894
-- Microsoft documentation: RemoteDesktop_SuppressWhenMinimized registry key (via GitHub gist): https://gist.github.com/GrumpyChunks/bb7b58c63883af8f137a1264078d30ca
-- EdgeVerve AssistEdge: Running UI automation with RDP session disconnected: https://www.edgeverve.com/assistedge/knowledge-base/RPA19.0/Troubleshooting/Running_UI_RDPdisconnected.htm
-- Microsoft documentation: DPI scaling in RDP (Windows OS Hub): https://woshub.com/dpi-scaling-font-size-rdp/
-- GoSecure blog: Capturing RDP NetNTLMv2 Hashes: https://gosecure.ai/blog/2022/01/17/capturing-rdp-netntlmv2-hashes-attack-details-and-a-technical-how-to-guide/
-- Microsoft documentation: `SetCursorPos` — input desktop requirement: https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setcursorpos
-- Microsoft documentation: Session 0 isolation: https://techcommunity.microsoft.com/blog/askperf/application-compatibility---session-0-isolation/372361
-- Microsoft documentation: RDP DVC plugin samples: https://learn.microsoft.com/en-us/samples/microsoft/rdp-dvc-plugin-samples/rdp-dvc-plugin-samples/
-- TSplus: NLA Errors in RDP — causes, fixes, best practices: https://tsplus.net/advanced-security/blog/nla-errors-in-rdp-causes-fixes-best-practices/
-- Microsoft documentation: UI Automation threading issues: https://learn.microsoft.com/en-us/dotnet/framework/ui-automation/ui-automation-threading-issues
+- Anthropic computer-use best practices and XGA/WXGA screenshot-resolution guidance — [claude.com/blog/best-practices-for-computer-and-browser-use-with-claude](https://claude.com/blog/best-practices-for-computer-and-browser-use-with-claude), [github.com/anthropics/claude-quickstarts computer-use-demo README](https://github.com/anthropics/claude-quickstarts/blob/main/computer-use-demo/README.md) — MEDIUM-HIGH confidence, cross-referenced across official Anthropic sources
+- MCP long-running tool call / event-loop blocking patterns — [ClickHouse mcp-clickhouse issue #128](https://github.com/ClickHouse/mcp-clickhouse/issues/128), [rapidevelopers.com MCP timeout guide](https://www.rapidevelopers.com/mcp-tutorial/how-to-fix-mcp-server-timeout-errors), [dev.to async handleId pattern](https://dev.to/aws/fix-mcp-timeouts-async-handleid-pattern-8ek) — MEDIUM confidence (community sources, consistent with MCP protocol's documented progress-notification support)
+- Unix domain socket / local daemon IPC security (permissions, peer-credential checks) — [Shenanigans Labs: LXD LPE via hijacked Unix socket credentials](https://shenaniganslabs.io/2019/05/21/LXD-LPE.html), [Broadcom: restricting local IPC over Unix domain sockets](https://techdocs.broadcom.com/us/en/symantec-security-software/identity-security/privileged-access-manager/4-2/pam-server-control/Administrate-PAM-SC/endpoint-administration-for-unix/restricting-local-interprocess-communication-over-unix-local-named-domain-sockets.html) — MEDIUM-HIGH confidence
+- RDPDR/CLIPRDR path-traversal and file-redirection vulnerabilities — [FreeRDP GHSA-3xpj-m4hx-8vmx (contains_dotdot off-by-one)](https://github.com/FreeRDP/FreeRDP/security/advisories/GHSA-3xpj-m4hx-8vmx), [ZeroPath: CVE-2025-48817 Windows RDP client path traversal](https://zeropath.com/blog/cve-2025-48817-windows-rdp-path-traversal), [Check Point: Reverse RDP Attack](https://research.checkpoint.com/2019/reverse-rdp-attack-code-execution-on-rdp-clients/) — HIGH confidence, disclosed CVEs/advisories from primary sources
+- rdpilot v1.0 own accumulated context (Session OS-thread-per-connection architecture, `Session::ping()` transient-error propagation bug fixed at Phase 4, `SetForegroundWindow`/`AttachThreadInput` finding and stale-process-on-reconnect finding at Phase 6, `ConnectionConfig` Debug redaction D-14, RDPDR backend's 4-of-11 implemented IRP variants at Phase 5) — HIGH confidence, drawn directly from `.planning/STATE.md` and `.planning/PROJECT.md`
+
+---
+*Pitfalls research for: rdpilot v1.1 (session daemon + CLI + MCP server + bidirectional file transfer over a persistent RDP-perception SDK)*
+*Researched: 2026-07-10*
