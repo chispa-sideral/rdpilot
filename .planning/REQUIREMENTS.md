@@ -1,0 +1,120 @@
+# Requirements: rdpilot — v1.1 (Consumer Surfaces & File Transfer)
+
+**Defined:** 2026-07-10
+**Core Value:** A local AI agent can connect to a remote Windows desktop over RDP and read/inspect a program that is only reachable via RDP — using both screenshots and structured accessibility data, without installing or running the agent itself on the remote machine.
+
+## v1.1 Requirements
+
+Requirements for the v1.1 milestone. Each maps to roadmap phases.
+
+### Session Daemon
+
+- [ ] **DAEMON-01**: A long-lived daemon holds N live RDP sessions with keepalive, decoupled from any CLI process lifetime
+- [ ] **DAEMON-02**: A local IPC transport (unix socket / Windows named pipe) carries requests between clients (CLI, MCP) and the daemon, restricted to the local user (permission/DACL-scoped)
+- [ ] **DAEMON-03**: The daemon auto-starts on first client connect and reaps idle sessions / self-shuts-down when the registry empties
+- [ ] **DAEMON-04**: On restart, the daemon detects and tears down orphaned Windows-side sessions (in-memory registry; no reattach)
+
+### Session Lifecycle & Identity
+
+- [ ] **SESSION-01**: User can open a session under a caller-supplied name, or receive an auto-generated id when unnamed
+- [ ] **SESSION-02**: Every perception/input/file command explicitly targets a session by name/id — no implicit default
+- [ ] **SESSION-03**: User can list active sessions (name/id, target, status)
+- [ ] **SESSION-04**: User can disconnect a named session; names/ids are unique (collisions rejected)
+
+### CLI Surface
+
+- [ ] **CLI-01**: A `rdpilot` CLI manages session lifecycle (connect [--name] / list / disconnect) over the daemon
+- [ ] **CLI-02**: CLI exposes the full perception + input + launch verb set (screenshot, world_state, UIA, window/process list, click/type/key/scroll/drag, launch, foreground), each targeting a named session
+- [ ] **CLI-03**: CLI exposes file put/get and reports errors clearly (session-not-found, daemon-unreachable, transfer failure)
+
+### MCP Server Surface
+
+- [ ] **MCP-01**: An `rmcp`-based MCP server exposes rdpilot over MCP to any MCP client (e.g. Claude)
+- [ ] **MCP-02**: MCP exposes a single Anthropic computer-use-compatible `computer` tool (screenshot + action-discriminated mouse/keyboard/scroll) mapping onto the SDK input/capture verbs
+- [ ] **MCP-03**: MCP exposes rdpilot-native tools (world_state, UIA, window/process list, launch, foreground, session connect/list/disconnect, file put/get) as MCP Tools
+- [ ] **MCP-04**: The computer-use surface bridges rdpilot's 96-DPI physical-pixel coordinates to the tool's expected scaled screenshot/coordinate space
+- [ ] **MCP-05**: MCP file put/get operate on local disk paths and return path/size/checksum metadata (never inline file bytes)
+- [ ] **MCP-06**: Slow RDP round-trips (file transfer, launch waits) do not block the MCP transport event loop
+
+### Bidirectional File Transfer
+
+- [ ] **FILE-01**: User can upload a file local→remote to a named session
+- [ ] **FILE-02**: User can download a file remote→local from a named session
+- [ ] **FILE-03**: Transfer validates remote paths via canonicalization to prevent path traversal / arbitrary write (blocking security requirement)
+- [ ] **FILE-04**: Large files transfer reliably (chunked); partial-transfer failure is detected and surfaced
+
+### Connection Config
+
+- [ ] **CONFIG-01**: Consumers supply target host + credentials via layered config — a clearly-named gitignored file, overridable by env vars and CLI flags / MCP init params
+- [ ] **CONFIG-02**: The config file follows common CLI-tool convention (platform config dir / clearly-named `.rdpilot.*`), discoverable and self-explanatory
+- [ ] **CONFIG-03**: Credentials never leak through IPC/MCP wire responses or logs — Serialize paths redact secrets (closing the v1.0 D-14 Debug-only redaction gap)
+
+### Proof
+
+- [ ] **PROOF-02**: A scripted harness proves the CLI surface end-to-end against a real remote-only Windows program (no live LLM)
+- [ ] **PROOF-03**: A scripted harness proves the MCP surface end-to-end (tool calls exercised programmatically, no live LLM)
+- [ ] **PROOF-04**: A capstone live-LLM demo drives a read/inspect + file-transfer task through the MCP surface against a real remote-only Windows program
+
+## Future Requirements
+
+Deferred to future release. Tracked but not in current roadmap.
+
+- PyO3 / NAPI-RS bindings exposing the SDK to Python and TypeScript consumers
+- Clipboard read/write over CLIPRDR (text sync from remote apps)
+- MCP progress notifications (notifications/progress) for long transfers
+- Durable session reattach across daemon restart (v1.1 uses in-memory registry + orphan cleanup)
+- Remote-assist / session shadowing (Backlog Phase 999.4 / SEED-001)
+
+## Out of Scope
+
+Explicitly excluded. Documented to prevent scope creep.
+
+| Feature | Reason |
+|---------|--------|
+| Running the AI agent on the remote session | Explicitly rejected; intelligence stays local |
+| Non-Windows RDP targets (Linux/xrdp, macOS) | Windows-only to lean on UIA/WinRM/WMI |
+| Multi-session orchestration / concurrency AT SCALE | The registry holds multiple named sessions, but load/scale orchestration is out of scope |
+| Published-package polish (public API stability guarantees, comprehensive docs, multi-registry distribution) | Remains personal tooling first |
+
+## Traceability
+
+Which phases cover which requirements. Updated during roadmap creation.
+
+| Requirement | Phase | Status |
+|-------------|-------|--------|
+| DAEMON-01 | TBD | Pending |
+| DAEMON-02 | TBD | Pending |
+| DAEMON-03 | TBD | Pending |
+| DAEMON-04 | TBD | Pending |
+| SESSION-01 | TBD | Pending |
+| SESSION-02 | TBD | Pending |
+| SESSION-03 | TBD | Pending |
+| SESSION-04 | TBD | Pending |
+| CLI-01 | TBD | Pending |
+| CLI-02 | TBD | Pending |
+| CLI-03 | TBD | Pending |
+| MCP-01 | TBD | Pending |
+| MCP-02 | TBD | Pending |
+| MCP-03 | TBD | Pending |
+| MCP-04 | TBD | Pending |
+| MCP-05 | TBD | Pending |
+| MCP-06 | TBD | Pending |
+| FILE-01 | TBD | Pending |
+| FILE-02 | TBD | Pending |
+| FILE-03 | TBD | Pending |
+| FILE-04 | TBD | Pending |
+| CONFIG-01 | TBD | Pending |
+| CONFIG-02 | TBD | Pending |
+| CONFIG-03 | TBD | Pending |
+| PROOF-02 | TBD | Pending |
+| PROOF-03 | TBD | Pending |
+| PROOF-04 | TBD | Pending |
+
+**Coverage:**
+- v1.1 requirements: 27 total
+- Mapped to phases: 0 (roadmap pending)
+- Unmapped: 27 ⚠️
+
+---
+*Requirements defined: 2026-07-10*
+*Last updated: 2026-07-10 after initial v1.1 definition*
