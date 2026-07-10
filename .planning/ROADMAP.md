@@ -38,73 +38,92 @@ Full phase goals, success criteria, and plan-by-plan detail: `.planning/mileston
 ## Phase Details
 
 ### Phase 10: SDK File-Transfer Extension
+
 **Goal**: The SDK can move files in both directions between local disk and the remote target through the already-proven RDPDR channel plus new sensor-mediated commands — safely, and without touching `Session`'s threading model.
 **Depends on**: Nothing new (extends the v1.0 SDK: `RdpilotDriveBackend`, the DVC sensor protocol)
 **Requirements**: FILE-01, FILE-02, FILE-03, FILE-04
 **Success Criteria** (what must be TRUE):
+
   1. A local file uploads to a named remote destination (`Session::upload_file`) and is verified present on the target (FILE-01).
   2. A remote file downloads to a named local destination (`Session::download_file`) with matching size/checksum (FILE-02).
   3. **[BLOCKING]** An adversarial path-traversal test suite — trailing `..` with no separator, mixed `/`/`\` separators, and absolute-path-as-relative inputs — is rejected by full canonicalized ancestry validation under the share root (never substring matching), with no `Write`/`Create` IRP escaping the share root (FILE-03; Pitfall 8 / FreeRDP GHSA-3xpj-m4hx-8vmx / CVE-2025-48817).
   4. A file larger than one MS-RDPEFS per-IRP chunk transfers correctly (the chunked read/write loop actually loops), and an interrupted transfer surfaces a clean, detectable failure (staged-and-renamed) rather than silent corruption (FILE-04).
-**Plans**: 5 plans across 4 waves
-- [ ] 10-01-PLAN.md — Rust foundation: error taxonomy + share-root config + canonicalizing path validator + backend generalization + FILE-03 Rust adversarial suite (Wave 1)
+
+**Plans**: 1/5 plans executed
+
+- [x] 10-01-PLAN.md — Rust foundation: error taxonomy + share-root config + canonicalizing path validator + backend generalization + FILE-03 Rust adversarial suite (Wave 1)
 - [ ] 10-02-PLAN.md — Staged-write IRPs (DeviceWrite + SetInformation) + atomic-rename-on-Close + FILE-04 multi-IRP/interrupted offline proxy (Wave 2)
 - [ ] 10-03-PLAN.md — Sensor FileTransfer wire variant + C# copy-with-inline-SHA256 handler + C# GetRelativePath validator + FILE-03 C# selftest (Wave 1)
 - [ ] 10-04-PLAN.md — Public Session::upload_file/download_file + TransferOutcome + SHA-256 verify / ChecksumMismatch (Wave 3)
 - [ ] 10-05-PLAN.md — Live Azure VM gate: FILE-01/02/04 end-to-end + FILE-03 live re-confirm + real chunk-size measurement (Wave 4)
 
 ### Phase 11: Shared Wire Protocol & Config
+
 **Goal**: One shared crate defines the daemon↔client wire protocol and another resolves layered configuration — with session-identity-as-required-field and credential-redaction enforced at the schema level *before* any consumer binary is built on top.
 **Depends on**: Phase 10 (wire protocol must cover the file-transfer request/response variants)
 **Requirements**: SESSION-02, CONFIG-01, CONFIG-02, CONFIG-03
 **Success Criteria** (what must be TRUE):
+
   1. **[BLOCKING]** Every session-scoped request carries a required, non-optional `session: SessionId` field; omitting it is a hard schema-validation rejection at the wire boundary (not a fallback), verified by a test that omits the field on every verb (SESSION-02; Pitfall 2).
   2. Target host + credentials resolve through a layered file → env → flag/MCP-init precedence, with the highest-precedence layer deterministically winning (CONFIG-01).
   3. The config file follows common CLI-tool convention (platform config dir / clearly-named `.rdpilot.*`), is gitignored, and is discoverable and self-explanatory (CONFIG-02).
   4. **[BLOCKING]** Serializing every wire response type and grepping the output for a planted secret sentinel finds nothing — credential-free status DTOs, no plaintext password on the wire or in logs (CONFIG-03; Pitfall 4, closing the v1.0 D-14 Debug-only redaction gap).
+
 **Plans**: TBD
 
 ### Phase 12: Session Daemon
+
 **Goal**: A long-lived local daemon holds N named RDP sessions behind a correct, leak-free, local-only registry and survives its own crashes without orphaning remote Windows sessions.
 **Depends on**: Phase 11 (registry and dispatch are written against the shared protocol types)
 **Requirements**: DAEMON-01, DAEMON-02, DAEMON-03, DAEMON-04, SESSION-01, SESSION-03, SESSION-04
 **Success Criteria** (what must be TRUE):
+
   1. A session opens under a caller-supplied name (or a short, human-legible auto-id when unnamed) and stays addressable on later commands; duplicate names are rejected, and a concurrency test firing N simultaneous same-name connects yields exactly one live session and N-1 clean rejections (SESSION-01, SESSION-04; Pitfall 3 atomic insert).
   2. `list` reports active sessions with name/id, target, status, and connected-since / last-activity (SESSION-03).
   3. **[BLOCKING]** A soak test of N connect/disconnect cycles returns thread count and RSS to baseline — no session-per-OS-thread leak (DAEMON-01; Pitfall 1).
   4. **[BLOCKING]** The IPC transport is restricted to the local user (Unix `0700` dir + peer-uid check / Windows explicit DACL via `create_with_security_attributes_raw`), verified by a different-uid/other-account client being rejected (DAEMON-02; Pitfall 5).
   5. **[BLOCKING]** The daemon auto-starts on first client connect and self-shuts-down when the registry empties; after a `kill -9` mid-session and restart it reports the possibly-still-live remote session and tears down / reconciles orphans rather than silently forgetting them (DAEMON-03, DAEMON-04; Pitfall 9, in-memory registry + minimal disk-persisted reconciliation state).
+
 **Plans**: TBD
 
 ### Phase 13: CLI Surface
+
 **Goal**: A thin `rdpilot` CLI drives the full session/perception/input/file verb set over the daemon, with every command explicitly targeting a named session.
 **Depends on**: Phase 12 (CLI is a thin `rdpilot-ipc` client of the daemon)
 **Requirements**: CLI-01, CLI-02, CLI-03
 **Success Criteria** (what must be TRUE):
+
   1. `rdpilot connect [--name] / list / disconnect` manages session lifecycle over the daemon, transparently auto-starting it on first use (CLI-01).
   2. The full perception + input + launch verb set (screenshot, world_state, uia, window/process list, click/type/key/scroll/drag, launch, foreground) runs against an explicit `--session` (CLI-02).
   3. `put`/`get` transfer files (no-clobber by default with an explicit `--force`), and failures — session-not-found, daemon-unreachable, transfer failure — surface as distinct, legible errors (CLI-03).
+
 **Plans**: TBD
 
 ### Phase 14: MCP Server Surface
+
 **Goal**: An `rmcp`-based MCP server exposes rdpilot to any MCP client through a computer-use-compatible mega-tool plus rdpilot-native tools — without coordinate drift or event-loop stalls.
 **Depends on**: Phase 13 (built on the daemon/IPC foundation the CLI already validated end-to-end)
 **Requirements**: MCP-01, MCP-02, MCP-03, MCP-04, MCP-05, MCP-06
 **Success Criteria** (what must be TRUE):
+
   1. An MCP client (e.g. Claude) can call a single Anthropic computer-use-compatible `computer` tool (screenshot + action-discriminated mouse/keyboard/scroll) that maps onto the SDK input/capture verbs (MCP-01, MCP-02).
   2. rdpilot-native tools (world_state, uia, window/process list, launch, foreground, session connect/list/disconnect, file put/get returning `{path, bytes_transferred, checksum}` metadata only — never inline file bytes) are exposed as MCP Tools (MCP-03, MCP-05).
   3. **[BLOCKING]** Coordinates round-trip correctly: one fixed advertised resolution + a single tested `scale_to_native(x, y)` bridges rdpilot's 96-DPI physical-pixel space to the computer-use scaled screenshot/coordinate space, verified by a precision click test near screen edges/corners (not just center) (MCP-04; Pitfall 6).
   4. **[BLOCKING]** A slow tool call (large file transfer, `launch_process` wait) does not block a concurrent unrelated fast tool call — per-call task isolation with bounded, explicit timeouts (MCP-06; Pitfall 7).
+
 **Plans**: TBD
 
 ### Phase 15: Proof Harnesses & Live-LLM Capstone
+
 **Goal**: Both consumer surfaces are proven end-to-end by scripted harnesses, and a live LLM drives a real read/inspect + file-transfer task through MCP — the milestone's dual finish line.
 **Depends on**: Phase 14 (validates the combination of every prior phase functioning end-to-end)
 **Requirements**: PROOF-02, PROOF-03, PROOF-04
 **Success Criteria** (what must be TRUE):
+
   1. A scripted harness proves the CLI surface end-to-end against a real remote-only Windows program, with no live LLM (PROOF-02).
   2. A scripted harness proves the MCP surface end-to-end — tool calls exercised programmatically — with no live LLM (PROOF-03).
   3. A capstone live-LLM demo drives a read/inspect + file-transfer task through the MCP surface against a real remote-only Windows program (PROOF-04).
+
 **Plans**: TBD
 
 ## Progress
@@ -120,7 +139,7 @@ Full phase goals, success criteria, and plan-by-plan detail: `.planning/mileston
 | 7. UIA Tree Module | v1.0 | 5/5 | Complete | 2026-07-09 |
 | 8. Public SDK API + WorldState | v1.0 | 3/3 | Complete | 2026-07-09 |
 | 9. Scripted Proof Harness | v1.0 | 4/4 | Complete | 2026-07-10 |
-| 10. SDK File-Transfer Extension | v1.1 | 0/? | Not started | - |
+| 10. SDK File-Transfer Extension | v1.1 | 1/5 | In Progress|  |
 | 11. Shared Wire Protocol & Config | v1.1 | 0/? | Not started | - |
 | 12. Session Daemon | v1.1 | 0/? | Not started | - |
 | 13. CLI Surface | v1.1 | 0/? | Not started | - |

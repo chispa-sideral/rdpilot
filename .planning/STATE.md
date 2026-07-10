@@ -1,15 +1,16 @@
 ---
 gsd_state_version: 1.0
 milestone: v1.1
-milestone_name: Consumer Surfaces & File Transfer
-status: planning
-last_updated: "2026-07-10T16:07:43.046Z"
-last_activity: 2026-07-10
+milestone_name: — Consumer Surfaces & File Transfer
+status: Plan 10-01 executed — Rust-side error taxonomy, share_root config, resolve_under_root validator, generalized RdpilotDriveBackend, FILE-03 Rust adversarial suite all pass offline
+stopped_at: "v1.1 roadmap created — Phases 10-15 derived from the 27 v1.1 requirements (research-recommended dependency order: SDK file-transfer → ipc/config → daemon → CLI → MCP → proof). All 27 requirements mapped (0 unmapped); REQUIREMENTS.md traceability updated; ROADMAP.md and STATE.md reflect the new phase list."
+last_updated: "2026-07-10T17:41:51.513Z"
+last_activity: 2026-07-10 — Plan 10-01 executed (3/3 tasks, 111/111 offline tests pass)
 progress:
   total_phases: 6
   completed_phases: 0
-  total_plans: 0
-  completed_plans: 0
+  total_plans: 5
+  completed_plans: 1
   percent: 0
 ---
 
@@ -24,10 +25,10 @@ See: .planning/PROJECT.md (updated 2026-07-10)
 
 ## Current Position
 
-Phase: 10 — SDK File-Transfer Extension (not started)
-Plan: —
-Status: Roadmap complete; ready for phase planning
-Last activity: 2026-07-10 — v1.1 roadmap created (6 phases, 27/27 requirements mapped)
+Phase: 10 — SDK File-Transfer Extension (in progress)
+Plan: 01 complete (of 5)
+Status: Plan 10-01 executed — Rust-side error taxonomy, share_root config, resolve_under_root validator, generalized RdpilotDriveBackend, FILE-03 Rust adversarial suite all pass offline
+Last activity: 2026-07-10 — Plan 10-01 executed (3/3 tasks, 111/111 offline tests pass)
 
 ## Milestone v1.1 Phases
 
@@ -91,6 +92,7 @@ Last activity: 2026-07-10 — v1.1 roadmap created (6 phases, 27/27 requirements
 | Phase 09-scripted-proof-harness P02 | ~25min | 2 tasks | 6 files |
 | Phase 09 P03 | 55min | 3 tasks | 3 files |
 | Phase 09-scripted-proof-harness P04 | ~2h | 1 tasks | 1 files (terminal live gate; sensor rebuild + 1 live bug fix + 1 live-tune) |
+| Phase 10 P01 | ~20min | 3 tasks | 5 files |
 
 ## Accumulated Context
 
@@ -165,6 +167,9 @@ Recent decisions affecting current work:
 - [Phase ?]: SC#2 assertion passes on any of menu item / toolbar button / listview row deeper elements present (not all three required)
 - [Phase ?]: D-9.2 navigation default: click deeper 'File' MenuItem if matched, else first matched deeper element
 - **Phase 9 terminal live gate (09-04, 2026-07-10, PASSED — v1.0 MILESTONE CLOSED):** All four PROOF-01 success criteria proven live against a real disposable Azure VM (reused from an earlier session, confirmed healthy rather than reprovisioned). Mandatory sensor AOT-rebuild on the VM from current 09-02 source (not the Phase 8 cache) via `az vm run-command invoke`, SHA256 `41a35f8cc60e0a1ab38c62b8736246518c84c0f7dc8220c25940f1ab9c313f6e`, confirmed byte-identical VM-built vs relayed and confirmed different from the Phase 8 cache hash `7a775b990cca3b40e72d4cd8ce910ebfc8e14262dd660089a4e5c62355ec34c2`. Two live-diagnosed fixes: (1) [Rule 1 bug] the SC#3 navigate step now calls `set_foreground_window` + settle before clicking a deeper element — a freshly `launch_process`'d window is not guaranteed OS foreground focus (identical root cause to Phase 6's own SC#3 diagnosis; every other live navigation test in the crate already did this, the 09-03 harness had missed it); (2) [Rule 3 live-tune] `SC2_MAX_DEPTH` tuned from 4 to 3 after measuring the deeper-walk latency at 555.2ms (over the Phase 7 SC#3 500ms budget) — re-measured at 130.2ms with zero loss of SC#2 element coverage. One documented first-RDP-login `deploy_and_launch` transient self-resolved on retry, no code change. Measured results: SC#1 screenshot 1920x1080; SC#2 30 deeper elements (menu items + toolbar buttons) matched at max_depth=3; SC#3 navigation + verified screenshot-diff change; SC#4 `examples/proof_harness` printed `PROOF: PASS` and exited 0. VM torn down and confirmed absent (`az group exists -n rdpilot-test` => false; `rdpilot-mgmt` persists). PROOF-01 retired in REQUIREMENTS.md; Phase 9 marked complete (4/4) in ROADMAP.md. See `09-04-SUMMARY.md`.
+- [Phase ?]: 10-01: resolve_under_root deviates from 10-RESEARCH's naive trim-and-join example with an explicit host-independent looks_rooted() check (leading '/' or drive-letter prefix) -- Path::join's absolute-path-replace behavior is cfg(windows)-conditional and would not reject a Windows drive-letter string on this Linux test host without it (mutation-verified)
+- [Phase ?]: 10-01: RdpilotDriveBackend::new(sensor_path, sensor_name, share_root: Option<PathBuf>) -- share_root canonicalized fresh per resolve_under_root call, not cached at construction; connect.rs pre-creates <share_root>/.rdpilot-staging/ before constructing the backend
+- [Phase ?]: 10-01: plan frontmatter listed requirements:[FILE-01,FILE-03] but executor did NOT mark them fully Complete in REQUIREMENTS.md -- only the Rust-side foundation (validator + adversarial suite) is done; FILE-01 needs Session::upload_file + sensor trigger (later plans), FILE-03's D-10.2 BLOCKING criterion requires BOTH Rust AND C# sensor-side validators. Marked both 'In Progress' with a clarifying note instead.
 
 ### Pending Todos
 
@@ -210,7 +215,7 @@ Pre-close artifact audit surfaced 3 open items. Reviewed and explicitly acknowle
 
 ## Session Continuity
 
-Last session: 2026-07-10T16:07:43.046Z
+Last session: 2026-07-10T17:41:01.370Z
 Stopped at: v1.1 roadmap created — Phases 10-15 derived from the 27 v1.1 requirements (research-recommended dependency order: SDK file-transfer → ipc/config → daemon → CLI → MCP → proof). All 27 requirements mapped (0 unmapped); REQUIREMENTS.md traceability updated; ROADMAP.md and STATE.md reflect the new phase list.
 Resume file: .planning/ROADMAP.md (Phase Details, Phase 10)
 
