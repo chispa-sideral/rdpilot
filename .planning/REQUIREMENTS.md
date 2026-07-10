@@ -38,10 +38,10 @@ Requirements for the v1.1 milestone. Each maps to roadmap phases.
 
 ### Bidirectional File Transfer
 
-- [x] **FILE-01**: User can upload a file local→remote to a named session (Rust-side share-root/validator foundation done in 10-01; sensor trigger + Session::upload_file pending later plans)
-- [x] **FILE-02**: User can download a file remote→local from a named session
-- [x] **FILE-03**: Transfer validates remote paths via canonicalization to prevent path traversal / arbitrary write (blocking security requirement) — Rust-side validator + adversarial suite done in 10-01 (D-10.2 requires BOTH sides; C# sensor-side validator pending a later plan)
-- [x] **FILE-04**: Large files transfer reliably (chunked); partial-transfer failure is detected and surfaced
+- [x] **FILE-01**: User can upload a file local→remote to a named session — LIVE-VERIFIED end-to-end (10-05): `Session::upload_file` round-trips against a real Azure VM
+- [x] **FILE-02**: User can download a file remote→local from a named session — LIVE-VERIFIED end-to-end (10-05): `Session::download_file`'s bytes_transferred/checksum independently confirmed against a real Azure VM
+- [x] **FILE-03**: Transfer validates remote paths via canonicalization to prevent path traversal / arbitrary write (blocking security requirement) — LIVE re-confirmed (10-05): the mixed-separator and Windows-drive-absolute adversarial cases both reject as `Error::PathTraversal` on the real Windows target, both directions
+- [x] **FILE-04**: Large files transfer reliably (chunked); partial-transfer failure is detected and surfaced — LIVE-VERIFIED (10-05): a 3 MiB file transfers correctly (102-137 read IRPs / 48 write IRPs observed, real per-IRP write chunk = 65,536 bytes), and an abruptly-interrupted download leaves no final-named file
 
 ### Connection Config
 
@@ -82,10 +82,10 @@ Which phases cover which requirements. Updated during roadmap creation.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| FILE-01 | Phase 10 | In Progress (Rust-side foundation done, 10-01) |
-| FILE-02 | Phase 10 | Complete |
-| FILE-03 | Phase 10 | In Progress (Rust-side validator + adversarial suite done, 10-01; C#-side pending) |
-| FILE-04 | Phase 10 | Complete |
+| FILE-01 | Phase 10 | Complete (live-verified 10-05) |
+| FILE-02 | Phase 10 | Complete (live-verified 10-05) |
+| FILE-03 | Phase 10 | Complete (live-verified 10-05, BLOCKING re-confirm passed) |
+| FILE-04 | Phase 10 | Complete (live-verified 10-05, BLOCKING re-confirm passed) |
 | SESSION-02 | Phase 11 | Pending |
 | CONFIG-01 | Phase 11 | Pending |
 | CONFIG-02 | Phase 11 | Pending |
