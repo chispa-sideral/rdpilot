@@ -30,9 +30,10 @@ pub struct WireError {
 /// five fixed codes (e.g. `Connect`, `Tls`, `Decode`, `Session`,
 /// `CoordinateOutOfBounds`, `Dvc`, `Bootstrap`, `SensorRejected`, `Config`).
 ///
-/// `#[non_exhaustive]`: Phase 11 ships exactly these six variants; a future
-/// phase may need a more granular code without this being a breaking wire
-/// change for existing consumers matching exhaustively today.
+/// `#[non_exhaustive]`: Phase 11 ships exactly six variants; Phase 12 adds a
+/// seventh (`DuplicateSession`); a future phase may need a more granular
+/// code without this being a breaking wire change for existing consumers
+/// matching exhaustively today.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 #[non_exhaustive]
@@ -58,6 +59,12 @@ pub enum WireErrorCode {
     /// Catch-all (Decision 3) for every `rdpilot::Error` variant outside the
     /// five fixed D-28 codes above. Wire string: `internal`.
     Internal,
+    /// A `Connect` request's caller-supplied (or auto-generated) session
+    /// name/id collided with an already-live or in-flight-connecting
+    /// session (daemon-only concept — no `rdpilot::Error` equivalent;
+    /// SESSION-04). Produced by the registry's atomic-insert collision path
+    /// (Plan 12-03). Wire string: `duplicate-session`.
+    DuplicateSession,
 }
 
 #[cfg(test)]
@@ -73,6 +80,7 @@ mod tests {
             (WireErrorCode::PathTraversal, "\"path-traversal\""),
             (WireErrorCode::ChecksumMismatch, "\"checksum-mismatch\""),
             (WireErrorCode::Internal, "\"internal\""),
+            (WireErrorCode::DuplicateSession, "\"duplicate-session\""),
         ];
         for (code, expected) in cases {
             let json = serde_json::to_string(&code)?;
@@ -90,6 +98,7 @@ mod tests {
             "\"path-traversal\"",
             "\"checksum-mismatch\"",
             "\"internal\"",
+            "\"duplicate-session\"",
         ] {
             let code: WireErrorCode = serde_json::from_str(json)?;
             let round_tripped = serde_json::to_string(&code)?;
