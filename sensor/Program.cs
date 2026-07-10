@@ -365,6 +365,10 @@ internal static class Program
             {
                 WriteEnvelope(handle, BuildUiaTreeReplyEnvelope(msg.ReqId, msg.Payload));
             }
+            else if (msg.Type == MsgType.FileTransfer)
+            {
+                WriteEnvelope(handle, BuildFileTransferReplyEnvelope(msg.ReqId, msg.Payload));
+            }
             // Any other message type this v1 protocol doesn't define is
             // silently ignored — never crashes the loop (T-05-01, mirrors
             // the Rust processor's own unknown-type handling).
@@ -530,6 +534,44 @@ internal static class Program
             ReqId = reqId,
             Type = MsgType.Uia,
             Payload = responsePayload,
+        };
+    }
+
+    /// Build the FileTransfer reply envelope (T-10-01 / D-6.4 / D-10.4):
+    /// deserializes the request payload and calls
+    /// <see cref="FileTransfer.Transfer"/>, which validates the destination
+    /// path (setting `error_kind = "path_traversal"` on rejection) and
+    /// copies bytes with an inline SHA-256 pass. A missing/malformed request
+    /// payload, or any exception escaping the handler, degrades to a
+    /// `success:false` reply carrying `error_kind = "io"` instead of
+    /// throwing out of the dispatch loop (D-6.4, T-10-01), mirroring
+    /// BuildLaunchProcessReplyEnvelope/BuildUiaTreeReplyEnvelope's
+    /// discipline exactly — this outer try/catch is defense-in-depth on top
+    /// of `FileTransfer.Transfer`'s own internal try/catch (deserialization
+    /// itself can throw before the handler is even reached).
+    private static Envelope BuildFileTransferReplyEnvelope(ulong reqId, JsonElement? payload)
+    {
+        FileTransferResponse response;
+        try
+        {
+            FileTransferRequest? request = payload?.Deserialize(EnvelopeJsonContext.Default.FileTransferRequest);
+            response = request is null
+                ? new FileTransferResponse { Success = false, Data = null, Error = "missing/malformed FileTransfer request payload", ErrorKind = null }
+                : FileTransfer.Transfer(request);
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[rdpilot-sensor] FileTransfer handler failed: {ex}");
+            response = new FileTransferResponse { Success = false, Data = null, Error = ex.Message, ErrorKind = "io" };
+        }
+
+        JsonElement fileTransferResponsePayload = JsonSerializer.SerializeToElement(response, EnvelopeJsonContext.Default.FileTransferResponse);
+        return new Envelope
+        {
+            Version = ProtocolVersion.Value,
+            ReqId = reqId,
+            Type = MsgType.FileTransfer,
+            Payload = fileTransferResponsePayload,
         };
     }
 
