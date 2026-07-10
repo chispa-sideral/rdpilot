@@ -87,7 +87,15 @@ Full phase goals, success criteria, and plan-by-plan detail: `.planning/mileston
   4. **[BLOCKING]** The IPC transport is restricted to the local user (Unix `0700` dir + peer-uid check / Windows explicit DACL via `create_with_security_attributes_raw`), verified by a different-uid/other-account client being rejected (DAEMON-02; Pitfall 5).
   5. **[BLOCKING]** The daemon auto-starts on first client connect and self-shuts-down when the registry empties; after a `kill -9` mid-session and restart it reports the possibly-still-live remote session and tears down / reconciles orphans rather than silently forgetting them (DAEMON-03, DAEMON-04; Pitfall 9, in-memory registry + minimal disk-persisted reconciliation state).
 
-**Plans**: TBD
+**Plans**: 7 plans (6 waves)
+
+- [ ] 12-01-PLAN.md — `rdpilot-ipc` lifecycle-verb extension: Connect/List/Disconnect + WireResponse::Connected + WireErrorCode::DuplicateSession + SessionLifecycle::Orphaned; SessionScoped -> Option (Wave 1)
+- [ ] 12-02-PLAN.md — `rdpilot-daemon` crate scaffold + workspace member + session/reconciliation seams + rdpilot::Error->WireError mapping (Wave 2)
+- [ ] 12-03-PLAN.md — Registry: atomic claim-then-connect + auto-id (D-29) + close-not-drop teardown; SC#1 concurrency test + SC#3 [BLOCKING] thread/RSS soak (Wave 3)
+- [ ] 12-04-PLAN.md — Unix IPC (0700 dir + peer-uid) + framing + dispatch (incl `list`, SESSION-03); SC#4 [BLOCKING] different-uid-rejected (Wave 4)
+- [ ] 12-05-PLAN.md — Crash-survivable reconciliation: JSON disk record + startup orphan scan/seed; SC#5 [BLOCKING] offline crash-restart-surface (DAEMON-04) (Wave 4)
+- [ ] 12-06-PLAN.md — Server assembly + idle reaper + empty-grace self-shutdown + connect-or-spawn auto-start; SC#5 [BLOCKING] auto-start/self-shutdown (DAEMON-03) (Wave 5)
+- [ ] 12-07-PLAN.md — Live gate: Windows explicit-DACL pipe + anti-squatting (DAEMON-02) + live remote-liveness reconciliation (DAEMON-04) + e2e session verify; `windows-permissions` legitimacy checkpoint (Wave 6)
 
 ### Phase 13: CLI Surface
 
