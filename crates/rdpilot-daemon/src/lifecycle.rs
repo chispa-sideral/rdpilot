@@ -242,7 +242,6 @@ pub async fn empty_watcher(registry: Arc<Registry>, cfg: LifecycleConfig, shutdo
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used, clippy::unwrap_used)] // Test-only fail-fast assertions -- mirrors this crate's other test modules' established convention (e.g. registry.rs/dispatch.rs/reconcile.rs), which this crate-wide #![deny] has never actually been enforced against with `cargo clippy --all-targets` until this plan's own verification pass.
 mod tests {
     use std::future::Future;
     use std::pin::Pin;

@@ -37,6 +37,21 @@
 #![deny(unsafe_code)]
 #![deny(clippy::unwrap_used)]
 #![deny(clippy::expect_used)]
+// `#[cfg(test)] mod tests` blocks are, structurally, still part of this
+// crate's own compilation unit, so the two `#![deny]`s above apply to them
+// too -- and `cargo test` (which does not invoke clippy lints at all) never
+// caught that until `cargo clippy --all-targets` was run against this crate
+// for the first time (Phase 12 verification, 2026-07-11). Inline test
+// modules legitimately use `.expect()`/`.unwrap()` for fail-fast assertion
+// fixtures (mirrors every `tests/*.rs` integration-test binary in this
+// crate, which sits outside the lib's own compilation unit and so was never
+// subject to this `#![deny]` in the first place). Relax the two lints for
+// `#[cfg(test)]` code only, crate-wide, superseding the now-redundant
+// per-module `#[allow(clippy::expect_used, clippy::unwrap_used)]` attributes
+// this had accreted ad hoc (`lifecycle.rs`, `server.rs`). Production-code
+// call sites (e.g. `registry.rs`'s poisoned-mutex `.expect()`s) remain
+// individually `#[allow]`d and fully covered by the crate-wide `#![deny]`.
+#![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used))]
 
 mod dispatch;
 mod error_map;

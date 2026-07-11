@@ -283,8 +283,7 @@ impl ManagedSession for FakeTestSession {
                 pid: 1234,
                 parent_pid: 4,
                 name: "notepad.exe".to_owned(),
-                path: r"C:\Windows
-otepad.exe".to_owned(),
+                path: r"C:\Windows\notepad.exe".to_owned(),
                 command_line: None,
                 owner: None,
             }])
@@ -418,7 +417,6 @@ impl SessionConnector for FakeTestConnector {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used, clippy::unwrap_used)] // Test-only fail-fast assertions -- mirrors this crate's other test modules' established convention (e.g. registry.rs/dispatch.rs/reconcile.rs), which this crate-wide #![deny] has never actually been enforced against with `cargo clippy --all-targets` until this plan's own verification pass.
 mod tests {
     use std::time::Duration;
 
