@@ -111,7 +111,7 @@ Full phase goals, success criteria, and plan-by-plan detail: `.planning/mileston
 **Plans**: 1/7 plans executed
 
 - [x] 13-01-PLAN.md — Relocate the auto-start transport (socket_path/framing/connect_or_spawn) from rdpilot-daemon into rdpilot-ipc so the CLI reaches the daemon without the RDP stack (Wave 1)
-- [ ] 13-02-PLAN.md — Extend rdpilot-ipc with perception/input wire DTOs + six Request / four WireResponse verbs, preserving SESSION-02 (Wave 2)
+- [x] 13-02-PLAN.md — Extend rdpilot-ipc with perception/input wire DTOs + six Request / four WireResponse verbs, preserving SESSION-02 (Wave 2)
 - [ ] 13-03-PLAN.md — Extend ManagedSession with operational &self methods + Arc<TokioMutex<Option<Box>>> registry storage + Registry::call (Wave 2)
 - [ ] 13-04-PLAN.md — Wire every operational dispatch arm to the live Session + fix the share_root Connect gap from config (Wave 3)
 - [ ] 13-05-PLAN.md — rdpilot-cli scaffold + connect/list/disconnect lifecycle verbs, thin-client + auto-start (CLI-01, Wave 4)
