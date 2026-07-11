@@ -90,13 +90,13 @@ Which phases cover which requirements. Updated during roadmap creation.
 | CONFIG-01 | Phase 11 | Complete |
 | CONFIG-02 | Phase 11 | Complete |
 | CONFIG-03 | Phase 11 | Complete |
-| DAEMON-01 | Phase 12 | Pending |
+| DAEMON-01 | Phase 12 | In Progress (12-01/02/03: registry-level leak-free session holding proven — SC#3 BLOCKING thread+RSS soak passes across N=50 real connect/disconnect cycles; the long-lived daemon *process* with keepalive, decoupled from any CLI process lifetime, is Wave 4/6, 12-04/12-06) |
 | DAEMON-02 | Phase 12 | Pending |
 | DAEMON-03 | Phase 12 | Pending |
 | DAEMON-04 | Phase 12 | Pending |
-| SESSION-01 | Phase 12 | Pending |
-| SESSION-03 | Phase 12 | Pending |
-| SESSION-04 | Phase 12 | Pending |
+| SESSION-01 | Phase 12 | In Progress (12-01/02/03: wire verb `Request::Connect` + registry `open()` with caller-name/auto-id (D-29) both implemented and tested — SC#1 concurrency proves auto-id collision-safety; wire-level dispatch routing a client's Connect to `Registry::open` is Wave 4, 12-04) |
+| SESSION-03 | Phase 12 | Pending (dispatch — Wave 4, 12-04) |
+| SESSION-04 | Phase 12 | In Progress (12-01/02/03: wire verb `Request::Disconnect` + registry `close()`/uniqueness enforcement both implemented and tested — SC#1 proves N=16 same-name contention yields exactly one winner; wire-level dispatch is Wave 4, 12-04) |
 | CLI-01 | Phase 13 | Pending |
 | CLI-02 | Phase 13 | Pending |
 | CLI-03 | Phase 13 | Pending |

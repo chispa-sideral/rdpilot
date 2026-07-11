@@ -4,14 +4,14 @@ milestone: v1.1
 milestone_name: — Consumer Surfaces & File Transfer
 status: verifying
 stopped_at: Phase 10 complete (5/5 plans). Plan 10-05's live gate found and fixed a Rule 1 bug in finalize_write's completeness rule (real Windows never sends FILE_END_OF_FILE_INFORMATION), measured the real per-IRP chunk size, and validated TRANSFER_TIMEOUT_MS. Ready to plan Phase 11 (Shared Wire Protocol & Config).
-last_updated: "2026-07-10T22:56:11.687Z"
+last_updated: "2026-07-11T00:00:32.124Z"
 last_activity: 2026-07-10 -- Phase 11 execution started
 progress:
   total_phases: 6
-  completed_phases: 1
-  total_plans: 7
-  completed_plans: 7
-  percent: 17
+  completed_phases: 2
+  total_plans: 14
+  completed_plans: 10
+  percent: 33
 ---
 
 # Project State
@@ -100,6 +100,9 @@ Last activity: 2026-07-10 -- Phase 11 execution started
 | Phase 10 P05 | ~2h | 2 tasks | 4 files |
 | Phase 11 P01 | ~35 min | 3 tasks | 7 files |
 | Phase 11 P02 | ~30 min | 3 tasks | 6 files |
+| Phase 12 P01 | ~25m | 3 tasks | 3 files |
+| Phase 12 P02 | ~50m | 3 tasks | 5 files |
+| Phase 12 P03 | ~90m | 3 tasks | 3 files |
 
 ## Accumulated Context
 
@@ -190,6 +193,9 @@ Recent decisions affecting current work:
 - [Phase ?]: sample_all_response_variants() tightened with a trailing non-wildcard exhaustive match — Checker's hardening note: a future WireResponse variant added without updating this function is a compile error, not a code-review gap
 - [Phase ?]: rdpilot-config: ResolvedConfig derives ONLY Debug/Clone/Deserialize, never Serialize — Structural credential-leak prevention one layer before the rdpilot-ipc wire boundary (extends D-31)
 - [Phase ?]: rdpilot-config: flag/MCP-init override layer implemented as a plain Option-based apply_overrides pass, not routed through config::Source — clap (Phase 13) / rmcp (Phase 14) already hand over typed values; re-stringifying through Source would lose type safety for no benefit
+- [Phase ?]: rdpilot-daemon: rdpilot::Session::connect's returned future is NOT Send (HRTB &dyn PduHint-across-await limitation reaches the connect path, not only the reactivation loop) -- SessionConnector/ManagedSession's BoxFuture drops the +Send bound; registry-touching async code must run on tokio::task::LocalSet + spawn_local, never bare tokio::spawn (12-02/12-03)
+- [Phase ?]: rdpilot-daemon registry: atomic claim-then-connect (research Pattern 1) + close-not-drop teardown (research Pattern 2) implemented and proven offline -- SC#1 N=16 concurrency race (exactly one winner) and SC#3 BLOCKING thread+RSS soak (N=50 cycles, exact thread-count return to baseline) both pass deterministically (12-03)
+- [Phase ?]: rdpilot-daemon soak-test discipline: per-test dedicated Tokio runtime with a short thread_keep_alive (10ms) avoids a false-positive leak signal from Tokio's own blocking-thread-pool 10s default lingering; the two soak tests in one file are serialized via a shared Mutex since /proc/self/status Threads: is a whole-process metric and Rust's default test harness runs tests in parallel within one process (12-03)
 
 ### Pending Todos
 
@@ -236,7 +242,7 @@ Pre-close artifact audit surfaced 3 open items. Reviewed and explicitly acknowle
 
 ## Session Continuity
 
-Last session: 2026-07-10T22:56:11.682Z
+Last session: 2026-07-11T00:00:32.118Z
 Stopped at: Phase 11 complete (2/2 plans). rdpilot-ipc (SESSION-02, CONFIG-03) and rdpilot-config (CONFIG-01, CONFIG-02) both built, verified, and workspace-integrated. Ready for Phase 12 (Session Daemon).
 Resume file: .planning/DECISIONS-INDEX.md
 
