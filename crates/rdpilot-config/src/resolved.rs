@@ -43,6 +43,18 @@ pub struct ResolvedConfig {
     /// When `true`, the server certificate is accepted without validation.
     #[serde(default)]
     pub accept_invalid_certs: bool,
+    /// Local filesystem path of the daemon-local file-transfer staging root
+    /// (`ConnectionConfig::share_root`, D-10.1/FILE-01/FILE-02).
+    ///
+    /// This is daemon-local operational config, never a wire-transmitted
+    /// value from `Request::Connect` (research Pitfall 6) -- a caller
+    /// configures it via `config.toml`/`RDPILOT_SHARE_ROOT`/CLI flag exactly
+    /// like every other `ResolvedConfig` field. `None` (the default) means
+    /// [`crate::share_root_or_default`] falls back to a documented
+    /// platform-data-dir default rather than leaving `put`/`get`
+    /// unconfigured.
+    #[serde(default)]
+    pub share_root: Option<String>,
 }
 
 /// Owned configuration error (D-09): no third-party type (`config::ConfigError`,
@@ -94,6 +106,7 @@ mod tests {
         assert_eq!(resolved.password, None);
         assert_eq!(resolved.domain, None);
         assert!(!resolved.accept_invalid_certs);
+        assert_eq!(resolved.share_root, None);
         Ok(())
     }
 }

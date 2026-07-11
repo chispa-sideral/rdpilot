@@ -37,3 +37,12 @@
 # intended only for a self-signed lab target you control (D-15). Defaults to
 # false.
 # accept_invalid_certs = false
+
+# Local filesystem path of the daemon-local file-transfer staging root that
+# backs rdpilot::ConnectionConfig::share_root (put/get, D-10.1/FILE-01/
+# FILE-02). This is daemon-local operational config -- it is never sent over
+# the wire by a CLI/MCP client's Connect request. Omitting it uses a
+# documented platform-data-dir default of <data_dir>/rdpilot/transfer-staging
+# (e.g. ~/.local/share/rdpilot/transfer-staging on Linux,
+# %APPDATA%\rdpilot\transfer-staging on Windows).
+# share_root = "/var/lib/rdpilot/transfer-staging"

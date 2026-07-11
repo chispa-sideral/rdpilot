@@ -10,7 +10,10 @@
 //! textual/map-shaped `Source` trait would re-stringify and re-parse data
 //! that is already correct, for no benefit.
 
+use std::path::PathBuf;
+
 use config::{Config, Environment, File, FileFormat};
+use directories::BaseDirs;
 
 use crate::resolved::{ConfigError, ResolvedConfig};
 
@@ -90,7 +93,48 @@ pub fn apply_overrides(mut base: ResolvedConfig, overrides: ResolvedConfig) -> R
     if overrides.accept_invalid_certs {
         base.accept_invalid_certs = true;
     }
+    if overrides.share_root.is_some() {
+        base.share_root = overrides.share_root;
+    }
     base
+}
+
+/// Fixed subpath appended to the platform data directory for the
+/// daemon-local file-transfer staging root default (research "Pitfall 6" /
+/// D-10.1) — used only when [`ResolvedConfig::share_root`] is unset.
+const DEFAULT_SHARE_ROOT_SUBPATH: [&str; 2] = ["rdpilot", "transfer-staging"];
+
+/// Resolve the daemon-local file-transfer staging root
+/// (`rdpilot::ConnectionConfig::share_root`) from `cfg.share_root` when set,
+/// else a documented `directories`-based platform-data-dir default
+/// (`<data_dir>/rdpilot/transfer-staging`). Never fails/panics: when even
+/// `directories::BaseDirs::new()` cannot resolve a home directory on this
+/// platform, falls back to `std::env::temp_dir()/rdpilot/transfer-staging`
+/// so a caller always gets a usable, non-empty path (never `None`/panic —
+/// API-01 discipline mirrored from `rdpilot`).
+#[must_use]
+pub fn share_root_or_default(cfg: &ResolvedConfig) -> PathBuf {
+    if let Some(configured) = &cfg.share_root {
+        return PathBuf::from(configured);
+    }
+    default_share_root()
+}
+
+/// The `directories`-based platform-data-dir default staging root, with a
+/// `std::env::temp_dir()`-based fallback when no platform data directory can
+/// be resolved at all (mirrors `paths::config_file_path`'s
+/// `BaseDirs`-optionality handling, but never returns `None` here — a
+/// missing `share_root` must still resolve to *something* usable so
+/// `put`/`get` are never unconditionally broken by an unresolvable home
+/// directory).
+fn default_share_root() -> PathBuf {
+    let mut root = BaseDirs::new()
+        .map(|b| b.data_dir().to_path_buf())
+        .unwrap_or_else(std::env::temp_dir);
+    for segment in DEFAULT_SHARE_ROOT_SUBPATH {
+        root.push(segment);
+    }
+    root
 }
 
 /// An all-`None`/`false` [`ResolvedConfig`] — the identity value for
@@ -106,6 +150,7 @@ fn empty_overrides() -> ResolvedConfig {
         password: None,
         domain: None,
         accept_invalid_certs: false,
+        share_root: None,
     }
 }
 
@@ -168,5 +213,54 @@ mod tests {
 
         let result = apply_overrides(base, empty_overrides());
         assert_eq!(result.host.as_deref(), Some("base-host"));
+    }
+
+    /// `apply_overrides` carries `share_root` with the same
+    /// override-wins/absent-never-clobbers semantics as every other field.
+    #[test]
+    fn apply_overrides_share_root_follows_the_same_precedence_rules() {
+        let mut base = empty_overrides();
+        base.share_root = Some("/base/share".to_owned());
+
+        // An override with no share_root set must not clobber the base value.
+        let unchanged = apply_overrides(base.clone(), empty_overrides());
+        assert_eq!(unchanged.share_root.as_deref(), Some("/base/share"));
+
+        // An explicit override wins.
+        let mut with_override = empty_overrides();
+        with_override.share_root = Some("/override/share".to_owned());
+        let overridden = apply_overrides(base, with_override);
+        assert_eq!(overridden.share_root.as_deref(), Some("/override/share"));
+    }
+
+    /// `share_root_or_default` returns the configured value, verbatim, when
+    /// `ResolvedConfig::share_root` is set.
+    #[test]
+    fn share_root_or_default_returns_the_configured_value_when_set() {
+        let mut cfg = empty_overrides();
+        cfg.share_root = Some("/configured/share-root".to_owned());
+        assert_eq!(share_root_or_default(&cfg), PathBuf::from("/configured/share-root"));
+    }
+
+    /// `share_root_or_default` falls back to a non-empty, `rdpilot`-scoped
+    /// platform-data-dir default when `share_root` is unset — never an empty
+    /// path, never a panic.
+    #[test]
+    fn share_root_or_default_returns_a_nonempty_default_path_when_unset() {
+        let cfg = empty_overrides();
+        let default_path = share_root_or_default(&cfg);
+        assert!(!default_path.as_os_str().is_empty(), "default share_root path must not be empty");
+        let components: Vec<String> = default_path
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            components.contains(&"rdpilot".to_owned()),
+            "default share_root must be scoped under an `rdpilot` segment, got {default_path:?}"
+        );
+        assert!(
+            components.contains(&"transfer-staging".to_owned()),
+            "default share_root must end in `transfer-staging`, got {default_path:?}"
+        );
     }
 }

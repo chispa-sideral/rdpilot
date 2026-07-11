@@ -30,7 +30,7 @@ mod resolve;
 mod resolved;
 
 pub use paths::config_file_path;
-pub use resolve::{apply_overrides, resolve};
+pub use resolve::{apply_overrides, resolve, share_root_or_default};
 pub use resolved::{ConfigError, ResolvedConfig};
 
 /// A fully-commented, self-explanatory `config.toml` template documenting
