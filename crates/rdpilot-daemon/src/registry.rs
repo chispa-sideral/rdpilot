@@ -324,6 +324,24 @@ impl Registry {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    /// Every `Live` entry's id paired with the elapsed time since its
+    /// `last_activity` (DAEMON-03's idle reaper, Plan 12-06, uses this to
+    /// decide which sessions are stale). `Connecting`/`Orphaned` entries
+    /// have no `last_activity` to age and are never candidates for idle
+    /// reap -- only a `Live` entry is included.
+    #[must_use]
+    pub fn live_idle_durations(&self) -> Vec<(SessionId, std::time::Duration)> {
+        #[allow(clippy::expect_used)] // A poisoned registry mutex is unrecoverable.
+        let guard = self.sessions.lock().expect("registry mutex poisoned");
+        guard
+            .iter()
+            .filter_map(|(id, entry)| match entry {
+                SessionEntry::Live { last_activity, .. } => Some((id.clone(), last_activity.elapsed())),
+                SessionEntry::Connecting { .. } | SessionEntry::Orphaned { .. } => None,
+            })
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -541,6 +559,27 @@ mod tests {
         fn _assert_shape(s: &SessionStatus) {
             let _ = (&s.id, &s.name, &s.host, &s.status, &s.connected_since, &s.last_activity);
         }
+    }
+
+    #[tokio::test]
+    async fn live_idle_durations_reports_only_live_entries_and_grows_with_elapsed_time() {
+        let registry = succeeding_registry();
+        registry
+            .open(Some("web".to_owned()), "10.0.0.5".to_owned(), test_cfg())
+            .await
+            .expect("open should succeed");
+        // Seed an Orphaned entry too -- it must never be reported here (only
+        // Live entries have a last_activity to age).
+        let orphan_id = SessionId::from_str("orphan").expect("non-empty literal");
+        registry.seed_orphan(orphan_id, "10.0.0.9".to_owned(), "2026-01-01T00:00:00Z".to_owned());
+
+        let first = registry.live_idle_durations();
+        assert_eq!(first.len(), 1, "only the Live entry should be reported, not the Orphaned one");
+        assert_eq!(first[0].0.as_str(), "web");
+
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let second = registry.live_idle_durations();
+        assert!(second[0].1 >= first[0].1, "elapsed idle duration must not go backwards");
     }
 
     #[test]
