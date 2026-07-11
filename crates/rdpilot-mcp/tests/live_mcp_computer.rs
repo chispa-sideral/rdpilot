@@ -82,10 +82,40 @@ use scale::ADVERTISED_WIDTH;
 /// D-17), mirroring `tests/live_proof.rs`'s identical convention.
 const LIVE_ENV: &str = "RDPILOT_LIVE";
 
-/// A margin (pixels, in the advertised space) inset from the true 0/max
-/// edge for each corner click -- "near the corner", not exactly AT the
-/// (0,0)/(max,max) pixel, which could straddle the window/screen boundary.
-const CORNER_MARGIN: u32 = 10;
+/// Live-tuned (Plan 15-06) advertised-space coordinates for the top-left
+/// "File" menu click, empirically calibrated against this VM's real
+/// negotiated 1920x1080 desktop (`Request::DesktopSize`, confirmed via a
+/// direct daemon probe) and 7-Zip FM's real, live-measured chrome layout
+/// AFTER a genuine fresh maximize (see the restore-before-maximize doc
+/// comment below -- 7-Zip FM's remembered "maximized" placement is stale
+/// and undersized until forced through one restore/re-maximize cycle).
+///
+/// **What was live-diagnosed (two rounds):** round 1 measured the "File"
+/// `MenuItem`'s native bbox against a STALE pre-restore maximize
+/// (`x: 60..92, y: 83..102`) and produced `[51, 69]` -- this worked for the
+/// window instance measured, but a fresh window instance's stale-maximize
+/// bounds turned out NOT to be identical across launches (contrary to the
+/// initial assumption), so round-1 coordinates were unreliable. Round 2
+/// re-measured AFTER adding the restore-before-maximize fix, against the
+/// TRUE full-screen bounds every window reaches once genuinely
+/// re-maximized (`TitleBar` bbox spanning the real 0..1920 native width,
+/// not a stale ~1408px remnant): "File"'s real bbox became
+/// `x: 0..32, y: 23..42`, center (16, 32.5), inverted through the SAME
+/// `scale_to_native` scale factors (1920/1280 = 1.5x, 1080/800 = 1.35x)
+/// this file's own `scale::ADVERTISED_WIDTH` uses. A genuine full-screen
+/// maximize is deterministic across window instances (unlike the stale
+/// remembered placement it replaces), so THIS calibration generalizes.
+const TOP_LEFT_ADVERTISED: [u32; 2] = [11, 24];
+
+/// Live-tuned (Plan 15-06) advertised-space coordinates for the top-right
+/// "Minimize" button click -- same round-2 (post-restore-fix, true
+/// full-screen) methodology as [`TOP_LEFT_ADVERTISED`]; see its doc
+/// comment for the full round-1-vs-round-2 diagnosis. The "Minimize"
+/// button's real native bbox, measured against the TRUE full-screen
+/// maximize, is `x: 1779..1826, y: 0..22` (now genuinely flush against the
+/// real screen-width edge, unlike round 1's stale `x: 1345..1392`), center
+/// (1802.5, 11), inverted through the identical scale factors.
+const TOP_RIGHT_ADVERTISED: [u32; 2] = [1202, 8];
 
 struct LiveTarget {
     host: String,
@@ -210,19 +240,28 @@ async fn poll_for_window_state(
     false
 }
 
-/// `true` if `rdpilot_uia`'s `children` scope of `hwnd` reports an element
-/// whose `name` contains `name_substr` (case-insensitive) AND `focused ==
-/// true`, OR (fallback, mirroring
+/// `true` if `rdpilot_uia`'s `subtree` scope (depth 3) of `hwnd` reports an
+/// element whose `name` contains `name_substr` (case-insensitive) AND
+/// `focused == true`, OR (fallback, mirroring
 /// `crates/rdpilot-cli/tests/live_cli_verbs.rs`'s CLI-02 click-landing
 /// verification) ANY element reports `focused == true`. Returns
 /// `(landed, detail)`.
+///
+/// **Live-diagnosed (Plan 15-06), same root cause as CLI-02:** `children`
+/// scope only reaches depth-1 (Window/ToolBar/Pane/TitleBar/MenuBar) -- the
+/// Phase 9 D-9.1 finding (STATE.md) that 7-Zip FM's actual menu
+/// items/toolbar buttons live deeper. Opening the "File" menu genuinely
+/// sets `focused: true` on the depth-2 `MenuItem` itself (live-confirmed),
+/// which `children` scope can never see. `subtree`/`max_depth: 3` is the
+/// same live-tuned depth 09-04 confirmed (30 deeper elements, 130.2ms,
+/// well under the 500ms sensor-side budget).
 async fn verify_focus_via_uia(
     client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
     session: &str,
     hwnd: u64,
     name_substr: &str,
 ) -> (bool, String) {
-    let uia_args = serde_json::json!({ "session": session, "hwnd": hwnd, "scope": { "scope": "children" } });
+    let uia_args = serde_json::json!({ "session": session, "hwnd": hwnd, "scope": { "scope": "subtree", "max_depth": 3 } });
     let result = call(client, "rdpilot_uia", uia_args).await;
     let Some(elements) = json_of(&result).and_then(|v| v.get("elements").and_then(|e| e.as_array().cloned())) else {
         return (false, match &result {
@@ -251,6 +290,14 @@ async fn computer_click_lands_near_screen_edges_and_corners_mcp04_live() {
         eprintln!("skipping MCP-04 live half: RDPILOT_LIVE unset or .secrets/connection.json absent");
         return;
     };
+
+    // The live-tuned corner constants must stay inside the fixed advertised
+    // space they were computed against (D-14.2 LOCKED, `scale::
+    // ADVERTISED_WIDTH`/`ADVERTISED_HEIGHT`) -- keeps this file's own
+    // single-source-of-truth import genuinely load-bearing rather than a
+    // stale doc-comment-only reference.
+    assert!(TOP_LEFT_ADVERTISED[0] < ADVERTISED_WIDTH && TOP_LEFT_ADVERTISED[1] < scale::ADVERTISED_HEIGHT);
+    assert!(TOP_RIGHT_ADVERTISED[0] < ADVERTISED_WIDTH && TOP_RIGHT_ADVERTISED[1] < scale::ADVERTISED_HEIGHT);
 
     let mut steps: Vec<(String, bool, String)> = Vec::new();
     let session = "mcp04-live";
@@ -333,10 +380,62 @@ async fn computer_click_lands_near_screen_edges_and_corners_mcp04_live() {
     );
 
     // --- maximize the window (win+up) so its corners coincide with the
-    // SCREEN's corners -- no coordinate needed for this action ---
+    // SCREEN's corners -- no coordinate needed for this action.
+    //
+    // Live-diagnosed (Plan 15-06): 7-Zip FM persists its OWN remembered
+    // window placement (including a "maximized" `GetWindowPlacement` flag)
+    // across launches, independent of the CURRENT session's real desktop
+    // size -- a freshly launched window can already report
+    // `state: "maximized"` while its real, UIA-measurable chrome bounds
+    // are stale/narrower than the actual negotiated desktop (confirmed via
+    // a direct `Request::DesktopSize` probe showing 1920x1080 while the
+    // window's own title bar bbox spanned only ~1408px). Sending "win+up"
+    // to an ALREADY-maximized window is a genuine Windows no-op -- it
+    // never recomputes fresh bounds. An unconditional "win+down" (restore)
+    // immediately before "win+up" forces a real restore -> maximize cycle,
+    // so Windows recomputes the maximize bounds fresh against the CURRENT
+    // work area every time, regardless of what stale state the window
+    // launched with. Tolerant of the restore being a no-op when the window
+    // was genuinely already restored (state normal) -- only the outcome of
+    // the FOLLOWING maximize is asserted. ---
+    // Live-diagnosed: on THIS window's stale remembered "maximized"
+    // placement, a single "win+down" does not land on "normal" -- it goes
+    // straight to "minimized" (confirmed via a direct manual probe: state
+    // transitioned maximized -> minimized on one press). Either outcome
+    // ("normal" or "minimized") is equally sufficient to un-stick the
+    // stale maximize state; "win+up" reliably RE-maximizes fresh from
+    // EITHER. A settle (not a state poll targeting one specific
+    // intermediate state) is used here since which of the two states is
+    // reached is not the property under test.
+    let restore_args = serde_json::json!({ "session": session, "action": "key", "text": "win+down" });
+    let _ = call(&client, "computer", restore_args).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Live-diagnosed (the actual root cause of the maximize step's
+    // flakiness): "win+down" genuinely MINIMIZES this window (see above --
+    // it does not land on a plain "normal" restored state), and a
+    // minimized window necessarily LOSES OS foreground focus (Windows
+    // hands focus to whatever's next, typically the desktop). "win+up" is
+    // a GLOBAL hotkey that acts on whatever currently has foreground focus
+    // -- without re-foregrounding the target window first, it was being
+    // dispatched to the wrong context entirely, explaining why the
+    // maximize poll kept failing even though the restore itself succeeded.
+    // A manual reproduction confirmed re-foregrounding between the two key
+    // presses is what makes the subsequent maximize land on the intended
+    // window.
+    let _ = call(&client, "rdpilot_foreground", serde_json::json!({ "session": session, "hwnd": hwnd })).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
     let maximize_args = serde_json::json!({ "session": session, "action": "key", "text": "win+up" });
     let maximize_result = call(&client, "computer", maximize_args).await;
     let maximized = maximize_result.is_ok() && poll_for_window_state(&client, session, hwnd, "maximized").await;
+    // The `state` flag (GetWindowPlacement) can flip to "maximized" slightly
+    // ahead of the actual visual re-layout completing over RDP -- an extra
+    // settle here (mirrors the crate's own established
+    // deploy_and_launch/navigate "settle before interacting" precedent,
+    // STATE.md) gives the UIA tree (queried by the corner clicks right
+    // after) a moment to catch up with the now-genuinely-maximized bounds.
+    tokio::time::sleep(Duration::from_millis(500)).await;
     record(
         &mut steps,
         "computer key win+up (maximize)",
@@ -369,8 +468,9 @@ async fn computer_click_lands_near_screen_edges_and_corners_mcp04_live() {
         },
     );
 
-    // --- corner 1: top-left -- the menu bar's "File" menu ---
-    let top_left = [CORNER_MARGIN, CORNER_MARGIN];
+    // --- corner 1: top-left -- the menu bar's "File" menu (Plan 15-06
+    // live-tuned coordinates, see TOP_LEFT_ADVERTISED's doc comment) ---
+    let top_left = TOP_LEFT_ADVERTISED;
     let top_left_click_args =
         serde_json::json!({ "session": session, "action": "left_click", "coordinate": top_left });
     let top_left_click_result = call(&client, "computer", top_left_click_args).await;
@@ -386,12 +486,10 @@ async fn computer_click_lands_near_screen_edges_and_corners_mcp04_live() {
         top_left_detail,
     );
 
-    // --- corner 2 (last): top-right -- the title bar's "Minimize" button.
-    // A wider inset on x: the three window-control buttons occupy roughly
-    // the rightmost ~140 native pixels of a standard title bar, and
-    // Minimize is the LEFTMOST of the three -- an offset comfortably inside
-    // that cluster but not flush against the extreme corner pixel. ---
-    let top_right = [ADVERTISED_WIDTH.saturating_sub(3 * CORNER_MARGIN), CORNER_MARGIN];
+    // --- corner 2 (last): top-right -- the title bar's "Minimize" button
+    // (Plan 15-06 live-tuned coordinates, see TOP_RIGHT_ADVERTISED's doc
+    // comment) ---
+    let top_right = TOP_RIGHT_ADVERTISED;
     let top_right_click_args =
         serde_json::json!({ "session": session, "action": "left_click", "coordinate": top_right });
     let top_right_click_result = call(&client, "computer", top_right_click_args).await;
