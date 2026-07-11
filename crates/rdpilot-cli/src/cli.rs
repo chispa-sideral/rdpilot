@@ -48,6 +48,9 @@ pub enum Command {
     #[command(subcommand)]
     Perceive(PerceiveCmd),
 
+    /// Input + launch verbs, grouped-only (`rdpilot input click|scroll|drag|type|key|launch|foreground ...`, CLI-02).
+    #[command(subcommand)]
+    Input(InputCmd),
 }
 
 /// The grouped `session` subcommand family — shares `ConnectArgs`/`SessionArg`
@@ -204,4 +207,153 @@ pub enum WindowCmd {
 pub enum ProcessCmd {
     /// List the remote process tree.
     List(SessionArg),
+}
+
+// --- Input + launch (CLI-02) ---------------------------------------------
+
+/// The grouped-only `input` subcommand family (research D-13.1/Pattern 1).
+#[derive(Debug, Subcommand)]
+pub enum InputCmd {
+    /// Move to `(x, y)` then press-and-release (or double-click, with
+    /// `--double`) a mouse button.
+    Click(ClickArgs),
+    /// Move to `(x, y)` then scroll vertically.
+    Scroll(ScrollArgs),
+    /// Press a button at the origin, move to the destination, then release.
+    Drag(DragArgs),
+    /// Type literal text, one Unicode code point at a time.
+    #[command(name = "type")]
+    Type(TypeArgs),
+    /// Press a combination of named keys, in order, then release in reverse
+    /// order.
+    Key(KeyArgs),
+    /// Launch a process on the remote machine.
+    Launch(LaunchArgs),
+    /// Bring a remote window to the foreground.
+    Foreground(ForegroundArgs),
+}
+
+/// A mouse button — the CLI spelling of `rdpilot_ipc::WireButton`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[value(rename_all = "kebab-case")]
+pub enum ButtonArg {
+    /// The left (primary) mouse button.
+    Left,
+    /// The right (secondary/context-menu) mouse button.
+    Right,
+    /// The middle (wheel) mouse button.
+    Middle,
+}
+
+/// `input click --session <id> --x <n> --y <n> [--button <button>] [--double]`.
+#[derive(Debug, Args)]
+pub struct ClickArgs {
+    /// The session to target.
+    #[arg(long)]
+    pub session: String,
+    /// Target x, in physical virtual-desktop pixels.
+    #[arg(long)]
+    pub x: u16,
+    /// Target y, in physical virtual-desktop pixels.
+    #[arg(long)]
+    pub y: u16,
+    /// The button to click (default: left).
+    #[arg(long, value_enum, default_value = "left")]
+    pub button: ButtonArg,
+    /// Double-click instead of a single click.
+    #[arg(long)]
+    pub double: bool,
+}
+
+/// `input scroll --session <id> --x <n> --y <n> --dy <n>`.
+#[derive(Debug, Args)]
+pub struct ScrollArgs {
+    /// The session to target.
+    #[arg(long)]
+    pub session: String,
+    /// Target x, in physical virtual-desktop pixels.
+    #[arg(long)]
+    pub x: u16,
+    /// Target y, in physical virtual-desktop pixels.
+    #[arg(long)]
+    pub y: u16,
+    /// Signed count of `WHEEL_DELTA` (120-unit) notches, positive = away
+    /// from the user.
+    #[arg(long, allow_hyphen_values = true)]
+    pub dy: i16,
+}
+
+/// `input drag --session <id> --from-x <n> --from-y <n> --to-x <n> --to-y <n> [--button <button>]`.
+#[derive(Debug, Args)]
+pub struct DragArgs {
+    /// The session to target.
+    #[arg(long)]
+    pub session: String,
+    /// Origin x, in physical virtual-desktop pixels.
+    #[arg(long = "from-x")]
+    pub from_x: u16,
+    /// Origin y, in physical virtual-desktop pixels.
+    #[arg(long = "from-y")]
+    pub from_y: u16,
+    /// Destination x, in physical virtual-desktop pixels.
+    #[arg(long = "to-x")]
+    pub to_x: u16,
+    /// Destination y, in physical virtual-desktop pixels.
+    #[arg(long = "to-y")]
+    pub to_y: u16,
+    /// The button to drag with (default: left).
+    #[arg(long, value_enum, default_value = "left")]
+    pub button: ButtonArg,
+}
+
+/// `input type --session <id> --text <string>`.
+#[derive(Debug, Args)]
+pub struct TypeArgs {
+    /// The session to target.
+    #[arg(long)]
+    pub session: String,
+    /// The literal text to type.
+    #[arg(long)]
+    pub text: String,
+}
+
+/// `input key --session <id> --combo <comma-separated key names>`.
+#[derive(Debug, Args)]
+pub struct KeyArgs {
+    /// The session to target.
+    #[arg(long)]
+    pub session: String,
+    /// Comma-separated key names (e.g. `ctrl,a`), pressed in order and
+    /// released in reverse order. Unrecognized names produce a legible
+    /// error, never a panic.
+    #[arg(long)]
+    pub combo: String,
+}
+
+/// `input launch --session <id> --exe <path> [--args <string>] [--cwd <path>]`.
+#[derive(Debug, Args)]
+pub struct LaunchArgs {
+    /// The session to target.
+    #[arg(long)]
+    pub session: String,
+    /// The executable path.
+    #[arg(long)]
+    pub exe: String,
+    /// Optional command-line arguments.
+    #[arg(long)]
+    pub args: Option<String>,
+    /// Optional working directory.
+    #[arg(long)]
+    pub cwd: Option<String>,
+}
+
+/// `input foreground --session <id> --hwnd <n>`.
+#[derive(Debug, Args)]
+pub struct ForegroundArgs {
+    /// The session to target.
+    #[arg(long)]
+    pub session: String,
+    /// The target window handle.
+    #[arg(long)]
+    pub hwnd: u64,
 }

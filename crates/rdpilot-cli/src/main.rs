@@ -18,7 +18,7 @@ mod verbs;
 
 use clap::Parser;
 
-use cli::{Cli, Command, PerceiveCmd, ProcessCmd, SessionCmd, WindowCmd};
+use cli::{Cli, Command, InputCmd, PerceiveCmd, ProcessCmd, SessionCmd, WindowCmd};
 use exit_codes::{CliError, exit_code_for};
 
 #[tokio::main(flavor = "current_thread")]
@@ -49,5 +49,13 @@ async fn dispatch(command: Command, json: bool) -> Result<(), CliError> {
         Command::Perceive(PerceiveCmd::Uia(args)) => verbs::perceive::uia(args, json).await,
         Command::Perceive(PerceiveCmd::Window(WindowCmd::List(args))) => verbs::perceive::window_list(args, json).await,
         Command::Perceive(PerceiveCmd::Process(ProcessCmd::List(args))) => verbs::perceive::process_list(args, json).await,
+
+        Command::Input(InputCmd::Click(args)) => verbs::input::click(args, json).await,
+        Command::Input(InputCmd::Scroll(args)) => verbs::input::scroll(args, json).await,
+        Command::Input(InputCmd::Drag(args)) => verbs::input::drag(args, json).await,
+        Command::Input(InputCmd::Type(args)) => verbs::input::type_text(args, json).await,
+        Command::Input(InputCmd::Key(args)) => verbs::input::key(args, json).await,
+        Command::Input(InputCmd::Launch(args)) => verbs::input::launch(args, json).await,
+        Command::Input(InputCmd::Foreground(args)) => verbs::input::foreground(args, json).await,
     }
 }
