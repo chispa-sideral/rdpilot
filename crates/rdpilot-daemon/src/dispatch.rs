@@ -1,5 +1,6 @@
 //! Dispatch: `rdpilot-ipc::Request` -> registry operations -> `WireResponse`
-//! (Plan 12-04).
+//! (Plan 12-04; every operational verb wired to a live `rdpilot::Session`
+//! method via `Registry::call` in Plan 13-04).
 //!
 //! [`dispatch`]'s `match` over `Request` is EXHAUSTIVE — no wildcard arm —
 //! so a future wire verb added to `rdpilot-ipc::Request` without a
@@ -10,32 +11,43 @@
 //! `println!`/`tracing`/`eprintln!` call anywhere in this file prints a
 //! `req` value.
 
-// `dispatch` is exercised by this file's own inline tests but is not yet
-// CALLED from any non-test crate code — `ipc::mod::serve_connection`
-// (Plan 12-04, same wave) calls it, but `serve_connection` itself is only
-// wired into the accept loop by `server.rs` (Plan 12-06). Silence the
-// resulting `dead_code` lint at the module level, mirroring `registry.rs`'s
-// identical interface-first rationale.
+// `dispatch` is called from `ipc::serve_connection`'s accept loop
+// (production) and exercised directly by this file's own inline tests.
+// Several small wire<->SDK conversion helpers below are exercised only
+// through `dispatch`'s operational arms (never called directly by a test),
+// so the module-level allow stays rather than per-item annotation churn.
 #![allow(dead_code)]
 
+use std::path::PathBuf;
+use std::time::Duration;
+
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use rdpilot::ConnectionConfig;
-use rdpilot_ipc::{Request, SessionId, WireError, WireErrorCode, WireResponse};
+use rdpilot_ipc::{
+    Request, TransferOutcome as WireTransferOutcome, WireButton, WireKey, WireKeyAction, WireMouseAction,
+    WireProcessInfo, WireRect, WireResponse, WireUiaElement, WireUiaMode, WireUiaScope, WireWindowInfo,
+    WireWindowState, WireWorldStateOptions,
+};
 
 use crate::registry::Registry;
+use crate::seams::DaemonError;
 
 /// Route one decoded `Request` to `registry` and produce the corresponding
 /// `WireResponse`.
 ///
 /// - `Connect` builds a `rdpilot::ConnectionConfig` from the request's
-///   fields and calls `registry.open` (atomic claim-then-connect).
+///   fields, sources the daemon-local `share_root` file-transfer staging
+///   path from `rdpilot-config` (Plan 13-04, research Pitfall 6 — the
+///   pre-existing Phase 12 gap where `Connect` never set `share_root`), and
+///   calls `registry.open` (atomic claim-then-connect).
 /// - `List` returns the registry's credential-free snapshot (SESSION-03).
 /// - `Disconnect` calls `registry.close`.
-/// - Every other (operational) verb is not wired to a live session yet in
-///   this phase (research Open Question 3 — a full operational-verb
-///   implementation is out of Plan 12-04's success criteria): an unknown
-///   session resolves to `SessionNotFound`; a known session resolves to an
-///   explicit `Internal` "not implemented in Phase 12" error, never a
-///   silently-dropped request.
+/// - Every operational verb (`Ping`/`Screenshot`/`WindowList`/
+///   `ProcessList`/`Uia`/`WorldState`/`Mouse`/`Key`/`LaunchProcess`/
+///   `SetForeground`/`Put`/`Get`) routes through `registry.call` to the live
+///   session via the `ManagedSession` seam (Plan 13-03), converting wire
+///   DTOs (Plan 13-02) to/from the corresponding SDK types (Plan 13-04).
 pub async fn dispatch(registry: &Registry, req: Request) -> WireResponse {
     match req {
         Request::Connect {
@@ -54,6 +66,17 @@ pub async fn dispatch(registry: &Registry, req: Request) -> WireResponse {
             if let Some(domain) = domain {
                 cfg = cfg.domain(domain);
             }
+            // Source the daemon-local file-transfer staging root
+            // (research Pitfall 6): NOT a wire field — `share_root` is
+            // daemon-local operational config, never dictated per-Connect
+            // by a client. host/username/password/domain/
+            // accept_invalid_certs above already arrived resolved on the
+            // wire; only this one value is resolved here.
+            let share_root = match resolve_share_root() {
+                Ok(path) => path,
+                Err(e) => return WireResponse::Error(e.into()),
+            };
+            cfg = cfg.share_root(share_root);
             match registry.open(name, host, cfg).await {
                 Ok(session) => WireResponse::Connected { session },
                 Err(e) => WireResponse::Error(e.into()),
@@ -64,42 +87,335 @@ pub async fn dispatch(registry: &Registry, req: Request) -> WireResponse {
             Ok(()) => WireResponse::Ack,
             Err(e) => WireResponse::Error(e.into()),
         },
-        // Deferred operational verbs (Phase 13/14 wire these against a
-        // live `Session`): kept in an exhaustive match arm (not a
-        // wildcard) so each is individually acknowledged here, per D-31 —
-        // none of these branches inspects or logs `password`/credential
-        // fields (none of these variants carry one).
-        Request::Ping { session }
-        | Request::Screenshot { session }
-        | Request::LaunchProcess { session, .. }
-        | Request::SetForeground { session, .. }
-        | Request::Put { session, .. }
-        | Request::Get { session, .. }
-        | Request::WindowList { session }
-        | Request::ProcessList { session }
-        | Request::Uia { session, .. }
-        | Request::WorldState { session, .. }
-        | Request::Mouse { session, .. }
-        | Request::Key { session, .. } => not_implemented_for(registry, &session),
+        Request::Ping { session } => match registry.call(&session, |s| s.ping()).await {
+            Ok(_) => WireResponse::Ack,
+            Err(e) => WireResponse::Error(e.into()),
+        },
+        Request::Screenshot { session } => match registry.call(&session, |s| s.screenshot()).await {
+            Ok(shot) => match screenshot_to_base64(&shot) {
+                Ok(png_base64) => WireResponse::Screenshot { png_base64 },
+                Err(e) => WireResponse::Error(e.into()),
+            },
+            Err(e) => WireResponse::Error(e.into()),
+        },
+        Request::LaunchProcess { session, exe, args, cwd } => {
+            match registry.call(&session, move |s| s.launch_process(exe, args, cwd)).await {
+                Ok(pid) => WireResponse::Pid { pid },
+                Err(e) => WireResponse::Error(e.into()),
+            }
+        }
+        Request::SetForeground { session, hwnd } => {
+            match registry.call(&session, move |s| s.set_foreground_window(hwnd)).await {
+                Ok(()) => WireResponse::Ack,
+                Err(e) => WireResponse::Error(e.into()),
+            }
+        }
+        Request::Put { session, local_path, remote_name } => {
+            match registry
+                .call(&session, move |s| s.upload_file(PathBuf::from(local_path), remote_name))
+                .await
+            {
+                Ok(outcome) => WireResponse::Transfer(wire_transfer_outcome(outcome)),
+                Err(e) => WireResponse::Error(e.into()),
+            }
+        }
+        Request::Get { session, remote_name, local_path } => {
+            match registry
+                .call(&session, move |s| s.download_file(remote_name, PathBuf::from(local_path)))
+                .await
+            {
+                Ok(outcome) => WireResponse::Transfer(wire_transfer_outcome(outcome)),
+                Err(e) => WireResponse::Error(e.into()),
+            }
+        }
+        Request::WindowList { session } => match registry.call(&session, |s| s.get_window_list()).await {
+            Ok(windows) => WireResponse::WindowList { windows: windows.into_iter().map(wire_window_info).collect() },
+            Err(e) => WireResponse::Error(e.into()),
+        },
+        Request::ProcessList { session } => match registry.call(&session, |s| s.get_process_tree()).await {
+            Ok(processes) => {
+                WireResponse::ProcessList { processes: processes.into_iter().map(wire_process_info).collect() }
+            }
+            Err(e) => WireResponse::Error(e.into()),
+        },
+        Request::Uia { session, hwnd, scope } => {
+            let scope = sdk_uia_scope(scope);
+            match registry.call(&session, move |s| s.get_uia_tree(hwnd, scope)).await {
+                Ok(elements) => WireResponse::Uia { elements: elements.into_iter().map(wire_uia_element).collect() },
+                Err(e) => WireResponse::Error(e.into()),
+            }
+        }
+        Request::WorldState { session, options } => {
+            let opts = sdk_world_state_options(options);
+            match registry.call(&session, move |s| s.world_state(opts)).await {
+                Ok(state) => match wire_world_state(state) {
+                    Ok(response) => response,
+                    Err(e) => WireResponse::Error(e.into()),
+                },
+                Err(e) => WireResponse::Error(e.into()),
+            }
+        }
+        Request::Mouse { session, action } => {
+            let action = sdk_mouse_action(action);
+            match registry.call(&session, move |s| s.send_mouse(action)).await {
+                Ok(()) => WireResponse::Ack,
+                Err(e) => WireResponse::Error(e.into()),
+            }
+        }
+        Request::Key { session, action } => {
+            let action = sdk_key_action(action);
+            match registry.call(&session, move |s| s.send_key(action)).await {
+                Ok(()) => WireResponse::Ack,
+                Err(e) => WireResponse::Error(e.into()),
+            }
+        }
     }
 }
 
-/// Resolve `session` against `registry` for an as-yet-unwired operational
-/// verb: `SessionNotFound` if no such session exists, otherwise an
-/// explicit `Internal` not-implemented error (never a silent no-op).
-fn not_implemented_for(registry: &Registry, session: &SessionId) -> WireResponse {
-    let exists = registry.list().iter().any(|s| s.id == session.as_str());
-    if exists {
-        WireResponse::Error(WireError {
-            code: WireErrorCode::Internal,
-            message: "operational verb not implemented in Phase 12".to_owned(),
-        })
-    } else {
-        WireResponse::Error(WireError {
-            code: WireErrorCode::SessionNotFound,
-            message: format!("no such session \"{}\"", session.as_str()),
-        })
+/// Resolve the daemon-local file-transfer staging root (research Pitfall 6)
+/// via `rdpilot-config`'s file -> env layering (no flag/MCP-init override
+/// layer exists at the daemon: `share_root` is never a wire field, so the
+/// override layer passed to `rdpilot_config::resolve` is always the
+/// all-`None` identity value).
+fn resolve_share_root() -> Result<PathBuf, DaemonError> {
+    let identity_overrides = rdpilot_config::ResolvedConfig {
+        host: None,
+        port: None,
+        username: None,
+        password: None,
+        domain: None,
+        accept_invalid_certs: false,
+        share_root: None,
+    };
+    let resolved = rdpilot_config::resolve(identity_overrides).map_err(|e| DaemonError::Config(e.to_string()))?;
+    Ok(rdpilot_config::share_root_or_default(&resolved))
+}
+
+/// Encode a captured [`rdpilot::Screenshot`] as base64 PNG bytes (the
+/// `WireResponse::Screenshot`/`WireResponse::WorldState.screenshot`
+/// convention).
+fn screenshot_to_base64(shot: &rdpilot::Screenshot) -> Result<String, DaemonError> {
+    let png = shot.to_png().map_err(DaemonError::Sdk)?;
+    Ok(BASE64_STANDARD.encode(png))
+}
+
+/// Convert a completed [`rdpilot::WorldState`] into its
+/// `WireResponse::WorldState` wire mirror: `SystemTime`/`Duration` (no
+/// serde impl) are converted here, never in `rdpilot-ipc` (its own doc
+/// comment), reusing `registry.rs`'s existing ISO-8601 civil-calendar
+/// conversion rather than duplicating it.
+fn wire_world_state(state: rdpilot::WorldState) -> Result<WireResponse, DaemonError> {
+    let timestamp = crate::registry::iso8601_from_system_time(state.timestamp);
+    let capture_span_ms = duration_as_millis_u64(state.capture_span);
+    let screenshot = state.screenshot.as_ref().map(screenshot_to_base64).transpose()?;
+    let window_list = state.window_list.map(|windows| windows.into_iter().map(wire_window_info).collect());
+    let uia = state.uia.map(|groups| {
+        groups
+            .into_iter()
+            .map(|(hwnd, elements)| (hwnd, elements.into_iter().map(wire_uia_element).collect()))
+            .collect()
+    });
+    Ok(WireResponse::WorldState { timestamp, capture_span_ms, screenshot, window_list, uia })
+}
+
+/// `Duration::as_millis()` returns `u128`; the wire shape is `u64`
+/// (`capture_span_ms`) — saturate rather than silently wrap on the
+/// astronomically large durations that would only ever arise from a
+/// malformed/adversarial clock, never a real capture span (API-01: no
+/// unwrap/expect/panic in library code).
+fn duration_as_millis_u64(d: Duration) -> u64 {
+    u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Wire mirror of `rdpilot::Rect` (identical field shape — a straight
+/// field-for-field copy, no unit conversion).
+fn wire_rect(r: rdpilot::Rect) -> WireRect {
+    WireRect { x: r.x, y: r.y, w: r.w, h: r.h }
+}
+
+/// Wire mirror of `rdpilot::WindowState`.
+fn wire_window_state(s: rdpilot::WindowState) -> WireWindowState {
+    match s {
+        rdpilot::WindowState::Normal => WireWindowState::Normal,
+        rdpilot::WindowState::Minimized => WireWindowState::Minimized,
+        rdpilot::WindowState::Maximized => WireWindowState::Maximized,
     }
+}
+
+/// Wire mirror of `rdpilot::WindowInfo`.
+fn wire_window_info(w: rdpilot::WindowInfo) -> WireWindowInfo {
+    WireWindowInfo {
+        hwnd: w.hwnd,
+        title: w.title,
+        rect: wire_rect(w.rect),
+        z_order: w.z_order,
+        state: wire_window_state(w.state),
+        class_name: w.class_name,
+        pid: w.pid,
+    }
+}
+
+/// Wire mirror of `rdpilot::ProcessInfo` (identical field shape).
+fn wire_process_info(p: rdpilot::ProcessInfo) -> WireProcessInfo {
+    WireProcessInfo {
+        pid: p.pid,
+        parent_pid: p.parent_pid,
+        name: p.name,
+        path: p.path,
+        command_line: p.command_line,
+        owner: p.owner,
+    }
+}
+
+/// Wire mirror of `rdpilot::UiaElement`.
+fn wire_uia_element(e: rdpilot::UiaElement) -> WireUiaElement {
+    WireUiaElement {
+        id: e.id,
+        role: e.role,
+        name: e.name,
+        bbox: wire_rect(e.bbox),
+        enabled: e.enabled,
+        visible: e.visible,
+        focusable: e.focusable,
+        focused: e.focused,
+        depth: e.depth,
+        parent_id: e.parent_id,
+    }
+}
+
+/// Wire `WireUiaScope` -> SDK `rdpilot::UiaScope`.
+fn sdk_uia_scope(s: WireUiaScope) -> rdpilot::UiaScope {
+    match s {
+        WireUiaScope::Children => rdpilot::UiaScope::Children,
+        WireUiaScope::Subtree { max_depth } => rdpilot::UiaScope::Subtree { max_depth },
+    }
+}
+
+/// Wire `WireUiaMode` -> SDK `rdpilot::UiaMode`.
+fn sdk_uia_mode(m: WireUiaMode) -> rdpilot::UiaMode {
+    match m {
+        WireUiaMode::None => rdpilot::UiaMode::None,
+        WireUiaMode::Foreground => rdpilot::UiaMode::Foreground,
+        WireUiaMode::Hwnd(hwnds) => rdpilot::UiaMode::Hwnd(hwnds),
+        WireUiaMode::AllTopLevel => rdpilot::UiaMode::AllTopLevel,
+    }
+}
+
+/// Wire `WireWorldStateOptions` -> SDK `rdpilot::WorldStateOptions`.
+fn sdk_world_state_options(o: WireWorldStateOptions) -> rdpilot::WorldStateOptions {
+    rdpilot::WorldStateOptions { screenshot: o.screenshot, window_list: o.window_list, uia: sdk_uia_mode(o.uia) }
+}
+
+/// Wire `WireButton` -> SDK `rdpilot::Button`.
+fn sdk_button(b: WireButton) -> rdpilot::Button {
+    match b {
+        WireButton::Left => rdpilot::Button::Left,
+        WireButton::Right => rdpilot::Button::Right,
+        WireButton::Middle => rdpilot::Button::Middle,
+    }
+}
+
+/// Wire `WireMouseAction` -> SDK `rdpilot::MouseAction`.
+fn sdk_mouse_action(a: WireMouseAction) -> rdpilot::MouseAction {
+    match a {
+        WireMouseAction::Move { x, y } => rdpilot::MouseAction::Move { x, y },
+        WireMouseAction::Click { x, y, button } => rdpilot::MouseAction::Click { x, y, button: sdk_button(button) },
+        WireMouseAction::DoubleClick { x, y, button } => {
+            rdpilot::MouseAction::DoubleClick { x, y, button: sdk_button(button) }
+        }
+        WireMouseAction::Scroll { x, y, dy } => rdpilot::MouseAction::Scroll { x, y, dy },
+        WireMouseAction::Drag { from_x, from_y, to_x, to_y, button } => {
+            rdpilot::MouseAction::Drag { from_x, from_y, to_x, to_y, button: sdk_button(button) }
+        }
+    }
+}
+
+/// Wire `WireKey` -> SDK `rdpilot::Key` (full 1:1 67-variant match — see
+/// `rdpilot-ipc::input`'s own doc comment for the exact variant-count
+/// provenance).
+fn sdk_key(k: WireKey) -> rdpilot::Key {
+    match k {
+        WireKey::Ctrl => rdpilot::Key::Ctrl,
+        WireKey::Alt => rdpilot::Key::Alt,
+        WireKey::Shift => rdpilot::Key::Shift,
+        WireKey::A => rdpilot::Key::A,
+        WireKey::B => rdpilot::Key::B,
+        WireKey::C => rdpilot::Key::C,
+        WireKey::D => rdpilot::Key::D,
+        WireKey::E => rdpilot::Key::E,
+        WireKey::F => rdpilot::Key::F,
+        WireKey::G => rdpilot::Key::G,
+        WireKey::H => rdpilot::Key::H,
+        WireKey::I => rdpilot::Key::I,
+        WireKey::J => rdpilot::Key::J,
+        WireKey::K => rdpilot::Key::K,
+        WireKey::L => rdpilot::Key::L,
+        WireKey::M => rdpilot::Key::M,
+        WireKey::N => rdpilot::Key::N,
+        WireKey::O => rdpilot::Key::O,
+        WireKey::P => rdpilot::Key::P,
+        WireKey::Q => rdpilot::Key::Q,
+        WireKey::R => rdpilot::Key::R,
+        WireKey::S => rdpilot::Key::S,
+        WireKey::T => rdpilot::Key::T,
+        WireKey::U => rdpilot::Key::U,
+        WireKey::V => rdpilot::Key::V,
+        WireKey::W => rdpilot::Key::W,
+        WireKey::X => rdpilot::Key::X,
+        WireKey::Y => rdpilot::Key::Y,
+        WireKey::Z => rdpilot::Key::Z,
+        WireKey::Digit0 => rdpilot::Key::Digit0,
+        WireKey::Digit1 => rdpilot::Key::Digit1,
+        WireKey::Digit2 => rdpilot::Key::Digit2,
+        WireKey::Digit3 => rdpilot::Key::Digit3,
+        WireKey::Digit4 => rdpilot::Key::Digit4,
+        WireKey::Digit5 => rdpilot::Key::Digit5,
+        WireKey::Digit6 => rdpilot::Key::Digit6,
+        WireKey::Digit7 => rdpilot::Key::Digit7,
+        WireKey::Digit8 => rdpilot::Key::Digit8,
+        WireKey::Digit9 => rdpilot::Key::Digit9,
+        WireKey::F1 => rdpilot::Key::F1,
+        WireKey::F2 => rdpilot::Key::F2,
+        WireKey::F3 => rdpilot::Key::F3,
+        WireKey::F4 => rdpilot::Key::F4,
+        WireKey::F5 => rdpilot::Key::F5,
+        WireKey::F6 => rdpilot::Key::F6,
+        WireKey::F7 => rdpilot::Key::F7,
+        WireKey::F8 => rdpilot::Key::F8,
+        WireKey::F9 => rdpilot::Key::F9,
+        WireKey::F10 => rdpilot::Key::F10,
+        WireKey::F11 => rdpilot::Key::F11,
+        WireKey::F12 => rdpilot::Key::F12,
+        WireKey::Enter => rdpilot::Key::Enter,
+        WireKey::Esc => rdpilot::Key::Esc,
+        WireKey::Tab => rdpilot::Key::Tab,
+        WireKey::Space => rdpilot::Key::Space,
+        WireKey::Backspace => rdpilot::Key::Backspace,
+        WireKey::Delete => rdpilot::Key::Delete,
+        WireKey::Up => rdpilot::Key::Up,
+        WireKey::Down => rdpilot::Key::Down,
+        WireKey::Left => rdpilot::Key::Left,
+        WireKey::Right => rdpilot::Key::Right,
+        WireKey::Home => rdpilot::Key::Home,
+        WireKey::End => rdpilot::Key::End,
+        WireKey::PageUp => rdpilot::Key::PageUp,
+        WireKey::PageDown => rdpilot::Key::PageDown,
+        WireKey::Insert => rdpilot::Key::Insert,
+        WireKey::Win => rdpilot::Key::Win,
+    }
+}
+
+/// Wire `WireKeyAction` -> SDK `rdpilot::KeyAction`.
+fn sdk_key_action(a: WireKeyAction) -> rdpilot::KeyAction {
+    match a {
+        WireKeyAction::Type(s) => rdpilot::KeyAction::Type(s),
+        WireKeyAction::Combo(keys) => rdpilot::KeyAction::Combo(keys.into_iter().map(sdk_key).collect()),
+    }
+}
+
+/// SDK `rdpilot::TransferOutcome` -> wire mirror `rdpilot_ipc::TransferOutcome`.
+fn wire_transfer_outcome(o: rdpilot::TransferOutcome) -> WireTransferOutcome {
+    WireTransferOutcome { bytes_transferred: o.bytes_transferred, checksum: o.checksum }
 }
 
 #[cfg(test)]
@@ -109,7 +425,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    use rdpilot_ipc::SessionLifecycle;
+    use rdpilot_ipc::{SessionId, SessionLifecycle, WireError, WireErrorCode};
 
     use super::*;
     use crate::seams::{BoxFuture, DaemonError, ManagedSession, NoopReconciliationSink, SessionConnector};
@@ -296,20 +612,383 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn an_operational_verb_for_a_known_session_returns_an_internal_not_implemented_error() {
-        let registry = test_registry();
-        let connected = dispatch(&registry, connect_request(Some("web"), "10.0.0.5")).await;
+    /// Connects a fresh `FakeSession`-backed session and returns its
+    /// `SessionId`, for the per-verb dispatch tests below.
+    async fn connected_session(registry: &Registry) -> SessionId {
+        let connected = dispatch(registry, connect_request(Some("web"), "10.0.0.5")).await;
         let WireResponse::Connected { session } = connected else {
-            panic!("expected Connected");
+            panic!("expected Connected, got {connected:?}");
         };
+        session
+    }
 
+    // --- Task 3: every operational verb routes through registry.call to a
+    // live (fake, in these offline tests) session and returns its expected
+    // WireResponse variant -- proving the "not implemented" arms are truly
+    // gone, not just that the match still compiles.
+
+    #[tokio::test]
+    async fn ping_returns_ack() {
+        let registry = test_registry();
+        let session = connected_session(&registry).await;
+        let response = dispatch(&registry, Request::Ping { session }).await;
+        assert!(matches!(response, WireResponse::Ack), "expected Ack, got {response:?}");
+    }
+
+    #[tokio::test]
+    async fn screenshot_returns_a_response_whose_png_base64_decodes_to_valid_png_bytes() {
+        let registry = test_registry();
+        let session = connected_session(&registry).await;
+        let response = dispatch(&registry, Request::Screenshot { session }).await;
+        let WireResponse::Screenshot { png_base64 } = response else {
+            panic!("expected Screenshot, got {response:?}");
+        };
+        let bytes = BASE64_STANDARD.decode(png_base64).expect("valid base64");
+        assert_eq!(&bytes[0..4], &[0x89, b'P', b'N', b'G'], "decoded bytes must be a PNG");
+    }
+
+    /// A `ManagedSession` fake reporting exactly one populated
+    /// window/process/UIA element from each perception method -- proves the
+    /// `wire_window_info`/`wire_process_info`/`wire_uia_element` field-by-
+    /// field conversions actually run (an empty-vec fake could pass even
+    /// with a broken mapper).
+    struct RichPerceptionSession;
+
+    impl ManagedSession for RichPerceptionSession {
+        fn close(self: Box<Self>) -> TestFuture<Result<(), DaemonError>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn describe(&self) -> SessionLifecycle {
+            SessionLifecycle::Live
+        }
+        fn screenshot(&self) -> BoxFuture<'_, Result<rdpilot::Screenshot, DaemonError>> {
+            Box::pin(async { Ok(rdpilot::Screenshot { width: 1, height: 1, rgba: vec![0, 0, 0, 0] }) })
+        }
+        fn world_state(&self, _opts: rdpilot::WorldStateOptions) -> BoxFuture<'_, Result<rdpilot::WorldState, DaemonError>> {
+            Box::pin(async {
+                Ok(rdpilot::WorldState {
+                    timestamp: std::time::SystemTime::now(),
+                    capture_span: std::time::Duration::from_millis(0),
+                    screenshot: None,
+                    window_list: None,
+                    uia: None,
+                })
+            })
+        }
+        fn get_window_list(&self) -> BoxFuture<'_, Result<Vec<rdpilot::WindowInfo>, DaemonError>> {
+            Box::pin(async {
+                Ok(vec![rdpilot::WindowInfo {
+                    hwnd: 65536,
+                    title: "Notepad".to_owned(),
+                    rect: rdpilot::Rect { x: 0, y: 0, w: 100, h: 100 },
+                    z_order: 0,
+                    state: rdpilot::WindowState::Normal,
+                    class_name: "Notepad".to_owned(),
+                    pid: 4242,
+                }])
+            })
+        }
+        fn get_process_tree(&self) -> BoxFuture<'_, Result<Vec<rdpilot::ProcessInfo>, DaemonError>> {
+            Box::pin(async {
+                Ok(vec![rdpilot::ProcessInfo {
+                    pid: 4242,
+                    parent_pid: 4,
+                    name: "notepad.exe".to_owned(),
+                    path: "C:\\Windows\\notepad.exe".to_owned(),
+                    command_line: None,
+                    owner: None,
+                }])
+            })
+        }
+        fn get_uia_tree(&self, _hwnd: u64, _scope: rdpilot::UiaScope) -> BoxFuture<'_, Result<Vec<rdpilot::UiaElement>, DaemonError>> {
+            Box::pin(async {
+                Ok(vec![rdpilot::UiaElement {
+                    id: "1.2.3".to_owned(),
+                    role: "Button".to_owned(),
+                    name: "OK".to_owned(),
+                    bbox: rdpilot::Rect { x: 0, y: 0, w: 10, h: 10 },
+                    enabled: true,
+                    visible: true,
+                    focusable: true,
+                    focused: false,
+                    depth: 1,
+                    parent_id: "1.2".to_owned(),
+                }])
+            })
+        }
+        fn send_mouse(&self, _action: rdpilot::MouseAction) -> BoxFuture<'_, Result<(), DaemonError>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn send_key(&self, _action: rdpilot::KeyAction) -> BoxFuture<'_, Result<(), DaemonError>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn set_foreground_window(&self, _hwnd: u64) -> BoxFuture<'_, Result<(), DaemonError>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn launch_process(
+            &self,
+            _exe: String,
+            _args: Option<String>,
+            _cwd: Option<String>,
+        ) -> BoxFuture<'_, Result<u32, DaemonError>> {
+            Box::pin(async { Ok(0) })
+        }
+        fn upload_file(
+            &self,
+            _local: std::path::PathBuf,
+            _remote_name: String,
+        ) -> BoxFuture<'_, Result<rdpilot::TransferOutcome, DaemonError>> {
+            Box::pin(async { Ok(rdpilot::TransferOutcome { bytes_transferred: 0, checksum: String::new() }) })
+        }
+        fn download_file(
+            &self,
+            _remote_name: String,
+            _local: std::path::PathBuf,
+        ) -> BoxFuture<'_, Result<rdpilot::TransferOutcome, DaemonError>> {
+            Box::pin(async { Ok(rdpilot::TransferOutcome { bytes_transferred: 0, checksum: String::new() }) })
+        }
+        fn ping(&self) -> BoxFuture<'_, Result<std::time::Duration, DaemonError>> {
+            Box::pin(async { Ok(std::time::Duration::from_millis(0)) })
+        }
+    }
+
+    struct RichPerceptionConnector;
+
+    impl SessionConnector for RichPerceptionConnector {
+        fn connect(&self, _cfg: ConnectionConfig) -> TestFuture<Result<Box<dyn ManagedSession>, DaemonError>> {
+            Box::pin(async { Ok(Box::new(RichPerceptionSession) as Box<dyn ManagedSession>) })
+        }
+    }
+
+    fn rich_perception_registry() -> Registry {
+        Registry::new(Arc::new(RichPerceptionConnector), Arc::new(NoopReconciliationSink))
+    }
+
+    #[tokio::test]
+    async fn window_list_returns_the_fakes_one_element_vec_with_fields_mapped() {
+        let registry = rich_perception_registry();
+        let session = connected_session(&registry).await;
+        let response = dispatch(&registry, Request::WindowList { session }).await;
+        let WireResponse::WindowList { windows } = response else {
+            panic!("expected WindowList, got {response:?}");
+        };
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].hwnd, 65536);
+        assert_eq!(windows[0].title, "Notepad");
+        assert_eq!(windows[0].rect, WireRect { x: 0, y: 0, w: 100, h: 100 });
+        assert_eq!(windows[0].pid, 4242);
+    }
+
+    #[tokio::test]
+    async fn process_list_returns_the_fakes_one_element_vec_with_fields_mapped() {
+        let registry = rich_perception_registry();
+        let session = connected_session(&registry).await;
+        let response = dispatch(&registry, Request::ProcessList { session }).await;
+        let WireResponse::ProcessList { processes } = response else {
+            panic!("expected ProcessList, got {response:?}");
+        };
+        assert_eq!(processes.len(), 1);
+        assert_eq!(processes[0].pid, 4242);
+        assert_eq!(processes[0].name, "notepad.exe");
+    }
+
+    #[tokio::test]
+    async fn uia_returns_the_fakes_one_element_vec_with_fields_mapped() {
+        let registry = rich_perception_registry();
+        let session = connected_session(&registry).await;
+        let response = dispatch(&registry, Request::Uia { session, hwnd: 1, scope: WireUiaScope::Children }).await;
+        let WireResponse::Uia { elements } = response else {
+            panic!("expected Uia, got {response:?}");
+        };
+        assert_eq!(elements.len(), 1);
+        assert_eq!(elements[0].id, "1.2.3");
+        assert_eq!(elements[0].role, "Button");
+    }
+
+    #[tokio::test]
+    async fn world_state_converts_timestamp_and_capture_span_and_returns_the_fakes_data() {
+        let registry = test_registry();
+        let session = connected_session(&registry).await;
+        let options = WireWorldStateOptions { screenshot: false, window_list: false, uia: WireUiaMode::None };
+        let response = dispatch(&registry, Request::WorldState { session, options }).await;
+        let WireResponse::WorldState { timestamp, capture_span_ms, screenshot, window_list, uia } = response else {
+            panic!("expected WorldState, got {response:?}");
+        };
+        assert!(!timestamp.is_empty(), "timestamp must be a non-empty ISO-8601 string");
+        assert_eq!(capture_span_ms, 0, "the fake's capture_span is zero");
+        assert!(screenshot.is_none(), "the fake's world_state screenshot is None");
+        assert!(window_list.is_none(), "the fake's world_state window_list is None");
+        assert!(uia.is_none(), "the fake's world_state uia is None");
+    }
+
+    #[tokio::test]
+    async fn world_state_screenshot_when_the_fake_reports_one_decodes_to_valid_png_bytes() {
+        // A second fake connector whose FakeSession reports a screenshot in
+        // world_state (the shared FakeSession above always returns `None`
+        // for it) -- proves the WorldState arm's screenshot conversion path
+        // specifically, not just the always-None default.
+        struct WithScreenshotSession;
+        impl ManagedSession for WithScreenshotSession {
+            fn close(self: Box<Self>) -> TestFuture<Result<(), DaemonError>> {
+                Box::pin(async { Ok(()) })
+            }
+            fn describe(&self) -> SessionLifecycle {
+                SessionLifecycle::Live
+            }
+            fn screenshot(&self) -> BoxFuture<'_, Result<rdpilot::Screenshot, DaemonError>> {
+                Box::pin(async { Ok(rdpilot::Screenshot { width: 1, height: 1, rgba: vec![0, 0, 0, 0] }) })
+            }
+            fn world_state(&self, _opts: rdpilot::WorldStateOptions) -> BoxFuture<'_, Result<rdpilot::WorldState, DaemonError>> {
+                Box::pin(async {
+                    Ok(rdpilot::WorldState {
+                        timestamp: std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_704_067_200),
+                        capture_span: std::time::Duration::from_millis(42),
+                        screenshot: Some(rdpilot::Screenshot { width: 1, height: 1, rgba: vec![0, 0, 0, 0] }),
+                        window_list: None,
+                        uia: None,
+                    })
+                })
+            }
+            fn get_window_list(&self) -> BoxFuture<'_, Result<Vec<rdpilot::WindowInfo>, DaemonError>> {
+                Box::pin(async { Ok(vec![]) })
+            }
+            fn get_process_tree(&self) -> BoxFuture<'_, Result<Vec<rdpilot::ProcessInfo>, DaemonError>> {
+                Box::pin(async { Ok(vec![]) })
+            }
+            fn get_uia_tree(&self, _hwnd: u64, _scope: rdpilot::UiaScope) -> BoxFuture<'_, Result<Vec<rdpilot::UiaElement>, DaemonError>> {
+                Box::pin(async { Ok(vec![]) })
+            }
+            fn send_mouse(&self, _action: rdpilot::MouseAction) -> BoxFuture<'_, Result<(), DaemonError>> {
+                Box::pin(async { Ok(()) })
+            }
+            fn send_key(&self, _action: rdpilot::KeyAction) -> BoxFuture<'_, Result<(), DaemonError>> {
+                Box::pin(async { Ok(()) })
+            }
+            fn set_foreground_window(&self, _hwnd: u64) -> BoxFuture<'_, Result<(), DaemonError>> {
+                Box::pin(async { Ok(()) })
+            }
+            fn launch_process(
+                &self,
+                _exe: String,
+                _args: Option<String>,
+                _cwd: Option<String>,
+            ) -> BoxFuture<'_, Result<u32, DaemonError>> {
+                Box::pin(async { Ok(0) })
+            }
+            fn upload_file(
+                &self,
+                _local: std::path::PathBuf,
+                _remote_name: String,
+            ) -> BoxFuture<'_, Result<rdpilot::TransferOutcome, DaemonError>> {
+                Box::pin(async { Ok(rdpilot::TransferOutcome { bytes_transferred: 0, checksum: String::new() }) })
+            }
+            fn download_file(
+                &self,
+                _remote_name: String,
+                _local: std::path::PathBuf,
+            ) -> BoxFuture<'_, Result<rdpilot::TransferOutcome, DaemonError>> {
+                Box::pin(async { Ok(rdpilot::TransferOutcome { bytes_transferred: 0, checksum: String::new() }) })
+            }
+            fn ping(&self) -> BoxFuture<'_, Result<std::time::Duration, DaemonError>> {
+                Box::pin(async { Ok(std::time::Duration::from_millis(0)) })
+            }
+        }
+        struct WithScreenshotConnector;
+        impl SessionConnector for WithScreenshotConnector {
+            fn connect(&self, _cfg: ConnectionConfig) -> TestFuture<Result<Box<dyn ManagedSession>, DaemonError>> {
+                Box::pin(async { Ok(Box::new(WithScreenshotSession) as Box<dyn ManagedSession>) })
+            }
+        }
+
+        let registry = Registry::new(Arc::new(WithScreenshotConnector), Arc::new(NoopReconciliationSink));
+        let session = connected_session(&registry).await;
+        let options = WireWorldStateOptions { screenshot: true, window_list: false, uia: WireUiaMode::None };
+        let response = dispatch(&registry, Request::WorldState { session, options }).await;
+        let WireResponse::WorldState { timestamp, capture_span_ms, screenshot, .. } = response else {
+            panic!("expected WorldState, got {response:?}");
+        };
+        assert_eq!(timestamp, "2024-01-01T00:00:00Z");
+        assert_eq!(capture_span_ms, 42);
+        let png_base64 = screenshot.expect("screenshot must be Some when the fake reports one");
+        let bytes = BASE64_STANDARD.decode(png_base64).expect("valid base64");
+        assert_eq!(&bytes[0..4], &[0x89, b'P', b'N', b'G']);
+    }
+
+    #[tokio::test]
+    async fn mouse_returns_ack() {
+        let registry = test_registry();
+        let session = connected_session(&registry).await;
+        let action = WireMouseAction::Move { x: 1, y: 2 };
+        let response = dispatch(&registry, Request::Mouse { session, action }).await;
+        assert!(matches!(response, WireResponse::Ack), "expected Ack, got {response:?}");
+    }
+
+    #[tokio::test]
+    async fn key_returns_ack() {
+        let registry = test_registry();
+        let session = connected_session(&registry).await;
+        let action = WireKeyAction::Type("hi".to_owned());
+        let response = dispatch(&registry, Request::Key { session, action }).await;
+        assert!(matches!(response, WireResponse::Ack), "expected Ack, got {response:?}");
+    }
+
+    #[tokio::test]
+    async fn launch_process_returns_the_fakes_pid() {
+        let registry = test_registry();
+        let session = connected_session(&registry).await;
+        let response = dispatch(
+            &registry,
+            Request::LaunchProcess { session, exe: "notepad.exe".to_owned(), args: None, cwd: None },
+        )
+        .await;
+        assert!(matches!(response, WireResponse::Pid { pid: 0 }), "expected Pid{{pid:0}}, got {response:?}");
+    }
+
+    #[tokio::test]
+    async fn set_foreground_returns_ack() {
+        let registry = test_registry();
+        let session = connected_session(&registry).await;
+        let response = dispatch(&registry, Request::SetForeground { session, hwnd: 1 }).await;
+        assert!(matches!(response, WireResponse::Ack), "expected Ack, got {response:?}");
+    }
+
+    #[tokio::test]
+    async fn put_returns_a_transfer_response() {
+        let registry = test_registry();
+        let session = connected_session(&registry).await;
+        let response = dispatch(
+            &registry,
+            Request::Put { session, local_path: "/tmp/a".to_owned(), remote_name: "a".to_owned() },
+        )
+        .await;
+        assert!(matches!(response, WireResponse::Transfer(_)), "expected Transfer, got {response:?}");
+    }
+
+    #[tokio::test]
+    async fn get_returns_a_transfer_response() {
+        let registry = test_registry();
+        let session = connected_session(&registry).await;
+        let response = dispatch(
+            &registry,
+            Request::Get { session, remote_name: "a".to_owned(), local_path: "/tmp/a".to_owned() },
+        )
+        .await;
+        assert!(matches!(response, WireResponse::Transfer(_)), "expected Transfer, got {response:?}");
+    }
+
+    /// Every operational verb still returns `SessionNotFound` for an unknown
+    /// session -- `Registry::call`'s own guarantee, exercised end-to-end
+    /// through `dispatch` for a representative verb beyond `Ping` (already
+    /// covered above) to prove the property holds after the not-implemented
+    /// arms were replaced with live ones.
+    #[tokio::test]
+    async fn an_operational_verb_for_an_unknown_session_still_returns_session_not_found_after_wiring() {
+        let registry = test_registry();
+        let session: SessionId = "ghost".parse().expect("non-empty literal");
         let response = dispatch(&registry, Request::Screenshot { session }).await;
         match response {
-            WireResponse::Error(WireError { code: WireErrorCode::Internal, message }) => {
-                assert!(message.contains("not implemented"), "message: {message}");
-            }
-            other => panic!("expected Error(Internal), got {other:?}"),
+            WireResponse::Error(WireError { code: WireErrorCode::SessionNotFound, .. }) => {}
+            other => panic!("expected Error(SessionNotFound), got {other:?}"),
         }
     }
 }

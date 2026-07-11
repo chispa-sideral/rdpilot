@@ -472,6 +472,14 @@ pub enum DaemonError {
     /// Plan 12-05).
     #[error("io error: {0}")]
     Io(String),
+    /// `rdpilot-config` layered resolution failed while the `Connect` arm
+    /// (Plan 13-04) resolved the daemon-local `share_root` staging path.
+    /// Source-erased into an owned `String` (`rdpilot_config::ConfigError`'s
+    /// own `Display`), mirroring `DaemonError::Io`'s external-detail style —
+    /// never a credential (share_root/config resolution never touches a
+    /// password field).
+    #[error("config resolution failed: {0}")]
+    Config(String),
 }
 
 #[cfg(test)]
@@ -514,6 +522,7 @@ mod tests {
             DaemonError::Sdk(rdpilot::Error::Connect("host unreachable".to_owned())),
             DaemonError::Connect("host unreachable".to_owned()),
             DaemonError::Io("disk full".to_owned()),
+            DaemonError::Config("bad toml".to_owned()),
         ];
         for err in cases {
             let rendered = format!("{err}");

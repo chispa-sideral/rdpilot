@@ -24,6 +24,12 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 directories = "6.0.0"
 thiserror = "2"
+# Dispatch-side screenshot PNG -> base64 encoding (Plan 13-04). Legitimacy
+# gate (developer-approved, 13-04-PLAN.md Task 2): slopcheck [OK], crates.io
+# identity confirmed (github.com/marshallpierce/rust-base64), pinned to the
+# live current version at plan-execution time. Plan 13-06's CLI addition
+# reuses this exact pin.
+base64 = "0.22.1"
 
 [target.'cfg(unix)'.dependencies]
 # Fallback for effective-uid retrieval if tokio's peer_cred() needs a

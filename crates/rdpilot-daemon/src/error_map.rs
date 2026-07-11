@@ -57,6 +57,7 @@ impl From<DaemonError> for WireError {
             DaemonError::Sdk(e) => wire_code_for_sdk_error(e),
             DaemonError::Connect(_) => WireErrorCode::Internal,
             DaemonError::Io(_) => WireErrorCode::Internal,
+            DaemonError::Config(_) => WireErrorCode::Internal,
             // No trailing wildcard: `DaemonError` is defined in THIS
             // crate, so — unlike `wire_code_for_sdk_error`'s match on the
             // externally-`#[non_exhaustive]` `rdpilot::Error` above — the
@@ -162,6 +163,13 @@ mod tests {
     }
 
     #[test]
+    fn daemon_error_config_maps_to_internal_code() {
+        let err = DaemonError::Config("bad toml".to_owned());
+        let wire: WireError = err.into();
+        assert_eq!(wire.code, WireErrorCode::Internal);
+    }
+
+    #[test]
     fn daemon_error_sdk_delegates_to_the_sdk_mapping() {
         let err = DaemonError::Sdk(rdpilot::Error::PathTraversal("x".to_owned()));
         let wire: WireError = err.into();
@@ -182,6 +190,7 @@ mod tests {
             DaemonError::Sdk(rdpilot::Error::Connect("host unreachable".to_owned())),
             DaemonError::Connect("host unreachable".to_owned()),
             DaemonError::Io("disk full".to_owned()),
+            DaemonError::Config("bad toml".to_owned()),
         ];
         for err in cases {
             let wire: WireError = err.into();

@@ -90,10 +90,20 @@ fn generate_auto_id() -> String {
 /// dependency — a small, pure, offline-testable civil-calendar conversion
 /// (Howard Hinnant's `civil_from_days` algorithm) from Unix seconds.
 fn iso8601_now() -> String {
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    iso8601_from_system_time(SystemTime::now())
+}
+
+/// Render an arbitrary [`SystemTime`] as an ISO-8601 / RFC 3339 UTC
+/// timestamp — the same conversion [`iso8601_now`] applies to "now",
+/// factored out so callers with their own captured `SystemTime` (e.g.
+/// `dispatch.rs`'s `WorldState` arm, Plan 13-04, converting
+/// `rdpilot::WorldState::timestamp`) reuse this exact civil-calendar math
+/// rather than duplicating it (research: "reuse the same ISO-8601 helper
+/// registry.rs uses"). A `SystemTime` before the Unix epoch (clock skew /
+/// test fixture) degrades to the epoch itself rather than panicking
+/// (API-01 discipline mirrored from `rdpilot`).
+pub(crate) fn iso8601_from_system_time(t: SystemTime) -> String {
+    let secs = t.duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     iso8601_from_unix_seconds(i64::try_from(secs).unwrap_or(i64::MAX))
 }
 
@@ -702,6 +712,12 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         let second = registry.live_idle_durations();
         assert!(second[0].1 >= first[0].1, "elapsed idle duration must not go backwards");
+    }
+
+    #[test]
+    fn iso8601_from_system_time_matches_iso8601_from_unix_seconds() {
+        let t = UNIX_EPOCH + std::time::Duration::from_secs(1_704_067_200);
+        assert_eq!(iso8601_from_system_time(t), iso8601_from_unix_seconds(1_704_067_200));
     }
 
     #[test]
