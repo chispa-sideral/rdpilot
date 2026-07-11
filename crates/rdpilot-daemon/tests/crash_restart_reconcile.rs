@@ -115,6 +115,9 @@ impl ManagedSession for FakeSession {
     fn desktop_size(&self) -> (u32, u32) {
         (1920, 1080)
     }
+    fn deploy_and_launch(&self) -> OpFuture<'_, Result<std::time::Duration, DaemonError>> {
+        Box::pin(async move { Ok(std::time::Duration::from_millis(0)) })
+    }
 }
 
 /// A fake `SessionConnector` that always succeeds immediately, producing a

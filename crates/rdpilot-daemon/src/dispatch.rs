@@ -87,15 +87,37 @@ pub async fn dispatch(registry: &Registry, req: Request) -> WireResponse {
             // either). None (unconfigured) is preserved as a legitimate
             // session-management-only mode; only a Some resolved value
             // is wired onto cfg.
-            match resolve_sensor_binary_path() {
-                Ok(Some(sensor_binary_path)) => cfg = cfg.sensor_binary_path(sensor_binary_path),
-                Ok(None) => {}
+            let sensor_configured = match resolve_sensor_binary_path() {
+                Ok(Some(sensor_binary_path)) => {
+                    cfg = cfg.sensor_binary_path(sensor_binary_path);
+                    true
+                }
+                Ok(None) => false,
                 Err(e) => return WireResponse::Error(e.into()),
+            };
+            let session = match registry.open(name, host, cfg).await {
+                Ok(session) => session,
+                Err(e) => return WireResponse::Error(e.into()),
+            };
+            // Live-diagnosed (Plan 15-06): every `rdpilot`-crate live test
+            // calls `deploy_and_launch` explicitly right after connect,
+            // before any sensor-mediated request -- this daemon path never
+            // did, so the remote sensor was never started and every
+            // subsequent perception/input/launch/put/get call timed out
+            // waiting on a DVC channel with nothing listening. Only
+            // attempted when a sensor path was actually configured above
+            // (a sensor-less session has nothing to deploy). A failure here
+            // closes the just-opened session and surfaces as a Connect
+            // failure -- a caller that configured a sensor path expects
+            // sensor-backed verbs to work; a silent partial success would
+            // be more confusing than a clear upfront error.
+            if sensor_configured {
+                if let Err(e) = registry.call(&session, |s| s.deploy_and_launch()).await {
+                    let _ = registry.close(&session).await;
+                    return WireResponse::Error(e.into());
+                }
             }
-            match registry.open(name, host, cfg).await {
-                Ok(session) => WireResponse::Connected { session },
-                Err(e) => WireResponse::Error(e.into()),
-            }
+            WireResponse::Connected { session }
         }
         Request::List {} => WireResponse::SessionList { sessions: registry.list() },
         Request::Disconnect { session } => match registry.close(&session).await {
@@ -552,6 +574,9 @@ mod tests {
         fn desktop_size(&self) -> (u32, u32) {
             (1920, 1080)
         }
+        fn deploy_and_launch(&self) -> BoxFuture<'_, Result<std::time::Duration, DaemonError>> {
+            Box::pin(async move { Ok(std::time::Duration::from_millis(0)) })
+        }
     }
 
     /// A fake `SessionConnector` that always succeeds.
@@ -799,6 +824,9 @@ mod tests {
         fn desktop_size(&self) -> (u32, u32) {
             (1920, 1080)
         }
+        fn deploy_and_launch(&self) -> BoxFuture<'_, Result<std::time::Duration, DaemonError>> {
+            Box::pin(async move { Ok(std::time::Duration::from_millis(0)) })
+        }
     }
 
     struct RichPerceptionConnector;
@@ -943,6 +971,9 @@ mod tests {
             }
             fn desktop_size(&self) -> (u32, u32) {
                 (1920, 1080)
+            }
+            fn deploy_and_launch(&self) -> BoxFuture<'_, Result<std::time::Duration, DaemonError>> {
+                Box::pin(async move { Ok(std::time::Duration::from_millis(0)) })
             }
         }
         struct WithScreenshotConnector;

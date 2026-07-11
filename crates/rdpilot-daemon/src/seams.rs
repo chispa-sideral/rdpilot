@@ -190,6 +190,28 @@ pub trait ManagedSession: Send + 'static {
     /// `desktop_size` is a cheap stored-field read on `rdpilot::Session`, no
     /// `.await`/`BoxFuture` needed.
     fn desktop_size(&self) -> (u32, u32);
+
+    /// Deploy and start the remote sensor process (mirrors
+    /// [`rdpilot::Session::deploy_and_launch`]).
+    ///
+    /// **Live-diagnosed (Plan 15-06):** every `rdpilot`-crate live test
+    /// calls this explicitly before any sensor-mediated request
+    /// (window/process/UIA/launch/put/get) -- it was never called ANYWHERE
+    /// in the daemon before this plan, so every real `Connect` left the
+    /// remote sensor never started; every subsequent sensor-backed verb
+    /// then failed with a DVC channel timeout. `dispatch.rs`'s `Connect`
+    /// handler now calls this once, right after a successful connect, only
+    /// when a sensor binary path was configured (see
+    /// `resolve_sensor_binary_path`) -- an unconfigured (sensor-less)
+    /// session skips this call entirely, preserving the legitimate
+    /// session-management-only mode.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DaemonError::Sdk`] on any underlying SDK failure (e.g. the
+    /// RDPDR copy-and-launch sequence never got a sensor pong within its
+    /// own bounded retry budget).
+    fn deploy_and_launch(&self) -> BoxFuture<'_, Result<std::time::Duration, DaemonError>>;
 }
 
 impl ManagedSession for Session {
@@ -271,6 +293,10 @@ impl ManagedSession for Session {
 
     fn desktop_size(&self) -> (u32, u32) {
         self.desktop_size()
+    }
+
+    fn deploy_and_launch(&self) -> BoxFuture<'_, Result<std::time::Duration, DaemonError>> {
+        Box::pin(async move { self.deploy_and_launch().await.map_err(DaemonError::Sdk) })
     }
 }
 

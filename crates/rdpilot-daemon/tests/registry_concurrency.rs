@@ -108,6 +108,9 @@ impl ManagedSession for FakeSession {
     fn desktop_size(&self) -> (u32, u32) {
         (1920, 1080)
     }
+    fn deploy_and_launch(&self) -> OpFuture<'_, Result<std::time::Duration, DaemonError>> {
+        Box::pin(async move { Ok(std::time::Duration::from_millis(0)) })
+    }
 }
 
 /// Sleeps briefly before succeeding, widening the atomic-insert race
