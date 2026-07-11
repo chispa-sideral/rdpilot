@@ -4,14 +4,14 @@ milestone: v1.1
 milestone_name: — Consumer Surfaces & File Transfer
 status: completed
 stopped_at: "Phase 14 Plan 03 complete (3/5 plans). MCP-02/MCP-04 delivered: the Anthropic computer_20250124-compatible `computer` mega-tool is registered on RdpilotMcpHandler, dispatching every action onto rdpilot-ipc's Mouse/Key/Screenshot/DesktopSize verbs. scale_to_native (MCP-04 BLOCKING) bridges the fixed 1280x800 advertised space to native 96-DPI pixels via round-half-away-from-zero + clamp-before-cast, proven at corners/near-corners/center/exclusive-edge in tests/scale_to_native.rs (14 tests, including the corrected exact-tie vector (1279,799,1920,1080)->(1919,1079)). The three genuine SDK gaps (left_mouse_down/left_mouse_up, cursor_position, horizontal scroll) are explicit tool-error rejections, tested by name. cargo tree -p rdpilot-mcp confirmed still free of ironrdp/rustls/rdpilot/rdpilot-daemon/interprocess. Ready to execute 14-04 (remaining rdpilot_* native tools) and 14-05."
-last_updated: "2026-07-11T10:21:30.278Z"
+last_updated: "2026-07-11T10:41:31.293Z"
 last_activity: 2026-07-11 -- Phase 14 Plan 03 (computer mega-tool + scale_to_native coordinate bridge, MCP-02/MCP-04) executed
 progress:
   total_phases: 6
-  completed_phases: 3
+  completed_phases: 4
   total_plans: 26
-  completed_plans: 24
-  percent: 50
+  completed_plans: 25
+  percent: 67
 ---
 
 # Project State
@@ -26,7 +26,7 @@ See: .planning/PROJECT.md (updated 2026-07-10)
 ## Current Position
 
 Phase: 14 (MCP Server Surface) — EXECUTING
-Plan: 4 of 5
+Plan: 5 of 5
 Status: MCP-02/MCP-04 delivered (14-03 complete, 3/5 plans): the `computer` mega-tool (Anthropic computer_20250124-compatible schema) is registered and dispatches every action onto rdpilot-ipc's Mouse/Key/Screenshot/DesktopSize wire verbs; scale_to_native (MCP-04 BLOCKING) is pure, unit-tested at corners/near-corners/center/exclusive-edge-clamp; the 3 genuine SDK gaps (left_mouse_down/left_mouse_up, cursor_position, horizontal scroll) are explicit tool-error rejections, tested by name. Phase 13 (CLI Surface) is complete (7/7 plans, CLI-01/02/03). 14-04 (remaining rdpilot_* native tools) and 14-05 remain.
 Last activity: 2026-07-11 -- Phase 14 Plan 03 (computer mega-tool + scale_to_native coordinate bridge, MCP-02/MCP-04) executed
 
@@ -117,6 +117,7 @@ Last activity: 2026-07-11 -- Phase 14 Plan 03 (computer mega-tool + scale_to_nat
 | Phase 14 P03 | ~45min | 3 tasks | 7 files (rdpilot-mcp: computer/{mod,scale,dispatch}.rs, tests/scale_to_native.rs, handler.rs, main.rs, error.rs) |
 | Phase 14 P03 | 45min | 3 tasks | 7 files |
 | Phase 14 P04 | 45min | 3 tasks | 6 files |
+| Phase 14 P05 | 12min | 2 tasks | 2 files |
 
 ## Accumulated Context
 
@@ -232,6 +233,8 @@ Recent decisions affecting current work:
 - [Phase ?]: 14-03: the 3 genuine computer_20250124 SDK gaps (left_mouse_down/left_mouse_up, cursor_position, horizontal scroll) are EXPLICIT tool-error rejections, tested by name -- never a silent no-op (T-14-10).
 - [Phase ?]: rdpilot_connect/rdpilot_list carry no session param -- mirrors Request::Connect/List's own session-less wire shape (SESSION-01/03), overriding the plan summary's blanket 'every tool requires session' wording
 - [Phase ?]: tool_handler router-summation expr must be parenthesized: router = (A() + B()) -- unparenthesized, postfix .call()/.list_all()/.get() binds only to the right operand
+- [Phase ?]: 14-05: env-unset regression guard proven as direct FakeTestSession unit tests (slow_ms=0 vs N), not a second daemon-subprocess test, to avoid global-env-var flakiness across parallel test threads
+- [Phase ?]: 14-05: MCP-06 isolation test pre-starts the real daemon itself via CARGO_BIN_EXE_rdpilot-mcp's sibling path rather than relying on connect::open_stream's current_exe()-based resolution, which would incorrectly target the TEST binary's own deps/ directory when driven in-process
 
 ### Pending Todos
 
@@ -278,7 +281,7 @@ Pre-close artifact audit surfaced 3 open items. Reviewed and explicitly acknowle
 
 ## Session Continuity
 
-Last session: 2026-07-11T10:21:30.272Z
+Last session: 2026-07-11T10:41:31.286Z
 Stopped at: Phase 13 Plan 06 complete (6/7 plans). CLI-02 (perception+input+launch verb set against --session) delivered and offline-proven via tests/cli_verbs.rs against the real daemon binary's canned FakeTestSession. Ready to execute 13-07 (CLI-03: put/get no-clobber + path absolutization + error taxonomy). Phase 12's 12-07 live gate (Windows explicit-DACL pipe, live orphan-liveness confirmation, e2e session verify) remains separately pending and is not blocked by Phase 13's progress.
 Resume file: .planning/DECISIONS-INDEX.md
 

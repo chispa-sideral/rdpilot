@@ -34,7 +34,7 @@ Requirements for the v1.1 milestone. Each maps to roadmap phases.
 - [x] **MCP-03**: MCP exposes rdpilot-native tools (world_state, UIA, window/process list, launch, foreground, session connect/list/disconnect, file put/get) as MCP Tools
 - [x] **MCP-04**: The computer-use surface bridges rdpilot's 96-DPI physical-pixel coordinates to the tool's expected scaled screenshot/coordinate space
 - [x] **MCP-05**: MCP file put/get operate on local disk paths and return path/size/checksum metadata (never inline file bytes)
-- [ ] **MCP-06**: Slow RDP round-trips (file transfer, launch waits) do not block the MCP transport event loop
+- [x] **MCP-06**: Slow RDP round-trips (file transfer, launch waits) do not block the MCP transport event loop
 
 ### Bidirectional File Transfer
 
@@ -105,7 +105,7 @@ Which phases cover which requirements. Updated during roadmap creation.
 | MCP-03 | Phase 14 | Complete |
 | MCP-04 | Phase 14 | Complete |
 | MCP-05 | Phase 14 | Complete |
-| MCP-06 | Phase 14 | Pending |
+| MCP-06 | Phase 14 | Complete |
 | PROOF-02 | Phase 15 | Pending |
 | PROOF-03 | Phase 15 | Pending |
 | PROOF-04 | Phase 15 | Pending |
