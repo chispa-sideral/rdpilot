@@ -45,7 +45,7 @@ mod transfer;
 pub mod transport;
 
 pub use error::{WireError, WireErrorCode};
-pub use input::{WireButton, WireKey, WireKeyAction, WireMouseAction};
+pub use input::{WireButton, WireKey, WireKeyAction, WireMouseAction, parse_wire_key};
 pub use perception::{
     WireProcessInfo, WireRect, WireUiaElement, WireUiaMode, WireUiaScope, WireWindowInfo, WireWindowState,
     WireWorldStateOptions,

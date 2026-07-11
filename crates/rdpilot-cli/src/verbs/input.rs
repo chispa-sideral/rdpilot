@@ -126,83 +126,17 @@ fn wire_button(b: ButtonArg) -> WireButton {
 /// Parse one `--combo` key name (case-insensitive, matching
 /// `rdpilot_ipc::WireKey`'s variant spellings) into a [`WireKey`].
 ///
+/// Delegates to `rdpilot_ipc::parse_wire_key` — the ONE canonical key-name
+/// table shared with the (future) MCP surface (research "Don't Hand-Roll");
+/// this CLI no longer holds its own copy.
+///
 /// # Errors
 ///
 /// [`CliError::Internal`] with a legible message naming the offending token
 /// if `name` does not match any known key (T-13-17: no silent drop, no
 /// panic).
 fn parse_key_name(name: &str) -> Result<WireKey, CliError> {
-    let trimmed = name.trim();
-    Ok(match trimmed.to_lowercase().as_str() {
-        "ctrl" => WireKey::Ctrl,
-        "alt" => WireKey::Alt,
-        "shift" => WireKey::Shift,
-        "a" => WireKey::A,
-        "b" => WireKey::B,
-        "c" => WireKey::C,
-        "d" => WireKey::D,
-        "e" => WireKey::E,
-        "f" => WireKey::F,
-        "g" => WireKey::G,
-        "h" => WireKey::H,
-        "i" => WireKey::I,
-        "j" => WireKey::J,
-        "k" => WireKey::K,
-        "l" => WireKey::L,
-        "m" => WireKey::M,
-        "n" => WireKey::N,
-        "o" => WireKey::O,
-        "p" => WireKey::P,
-        "q" => WireKey::Q,
-        "r" => WireKey::R,
-        "s" => WireKey::S,
-        "t" => WireKey::T,
-        "u" => WireKey::U,
-        "v" => WireKey::V,
-        "w" => WireKey::W,
-        "x" => WireKey::X,
-        "y" => WireKey::Y,
-        "z" => WireKey::Z,
-        "digit0" | "0" => WireKey::Digit0,
-        "digit1" | "1" => WireKey::Digit1,
-        "digit2" | "2" => WireKey::Digit2,
-        "digit3" | "3" => WireKey::Digit3,
-        "digit4" | "4" => WireKey::Digit4,
-        "digit5" | "5" => WireKey::Digit5,
-        "digit6" | "6" => WireKey::Digit6,
-        "digit7" | "7" => WireKey::Digit7,
-        "digit8" | "8" => WireKey::Digit8,
-        "digit9" | "9" => WireKey::Digit9,
-        "f1" => WireKey::F1,
-        "f2" => WireKey::F2,
-        "f3" => WireKey::F3,
-        "f4" => WireKey::F4,
-        "f5" => WireKey::F5,
-        "f6" => WireKey::F6,
-        "f7" => WireKey::F7,
-        "f8" => WireKey::F8,
-        "f9" => WireKey::F9,
-        "f10" => WireKey::F10,
-        "f11" => WireKey::F11,
-        "f12" => WireKey::F12,
-        "enter" => WireKey::Enter,
-        "esc" | "escape" => WireKey::Esc,
-        "tab" => WireKey::Tab,
-        "space" => WireKey::Space,
-        "backspace" => WireKey::Backspace,
-        "delete" | "del" => WireKey::Delete,
-        "up" => WireKey::Up,
-        "down" => WireKey::Down,
-        "left" => WireKey::Left,
-        "right" => WireKey::Right,
-        "home" => WireKey::Home,
-        "end" => WireKey::End,
-        "pageup" | "page-up" => WireKey::PageUp,
-        "pagedown" | "page-down" => WireKey::PageDown,
-        "insert" | "ins" => WireKey::Insert,
-        "win" | "windows" | "super" => WireKey::Win,
-        other => return Err(CliError::Internal(format!("unknown key name '{other}' in --combo (original token: '{trimmed}')"))),
-    })
+    rdpilot_ipc::parse_wire_key(name).map_err(CliError::Internal)
 }
 
 /// Interpret a round-tripped [`WireResponse`] that every input/launch verb
