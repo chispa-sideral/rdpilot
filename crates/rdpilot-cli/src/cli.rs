@@ -51,6 +51,15 @@ pub enum Command {
     /// Input + launch verbs, grouped-only (`rdpilot input click|scroll|drag|type|key|launch|foreground ...`, CLI-02).
     #[command(subcommand)]
     Input(InputCmd),
+
+    /// Upload a local file to the remote transfer root (flat: `rdpilot put ...`, CLI-03).
+    Put(PutArgs),
+    /// Download a file from the remote transfer root (flat: `rdpilot get ...`, CLI-03).
+    Get(GetArgs),
+
+    /// File-transfer verbs, grouped (`rdpilot file put|get ...`, CLI-03).
+    #[command(subcommand)]
+    File(FileCmd),
 }
 
 /// The grouped `session` subcommand family — shares `ConnectArgs`/`SessionArg`
@@ -356,4 +365,74 @@ pub struct ForegroundArgs {
     /// The target window handle.
     #[arg(long)]
     pub hwnd: u64,
+}
+
+// --- File transfer (CLI-03) ----------------------------------------------
+
+/// The grouped `file` subcommand family — shares `PutArgs`/`GetArgs` with
+/// the flat `Put`/`Get` leaves above so flat and grouped invocations parse
+/// identically (research Pattern 1, D-13.1).
+#[derive(Debug, Subcommand)]
+pub enum FileCmd {
+    /// Upload a local file to the remote transfer root.
+    Put(PutArgs),
+    /// Download a file from the remote transfer root.
+    Get(GetArgs),
+}
+
+/// `put --session <id> --local <path> --remote-name <name> [--force]`
+/// (CLI-03). No file bytes cross the wire — the daemon and CLI share a
+/// filesystem, so only the absolutized local path + the remote destination
+/// name travel over IPC.
+#[derive(Debug, Args)]
+pub struct PutArgs {
+    /// The session to target.
+    #[arg(long)]
+    pub session: String,
+    /// The local file to upload. Resolved to an absolute path (joined onto
+    /// the CLI process's own current directory, NOT the daemon's) before
+    /// being sent — the daemon's cwd differs from the invoking shell's.
+    #[arg(long)]
+    pub local: std::path::PathBuf,
+    /// The destination name under the remote transfer root.
+    #[arg(long = "remote-name")]
+    pub remote_name: String,
+    /// Accepted for forward-compatibility only: `put`'s REMOTE destination
+    /// is not currently existence-checked (no cheap way to probe the remote
+    /// filesystem without a new sensor round trip, out of scope this
+    /// phase — see backlog Phase 999.5, symmetric remote no-clobber). This
+    /// flag changes nothing about `put`'s wire behavior yet; it exists so a
+    /// caller's `put ... --force` script does not need to change once
+    /// remote no-clobber ships. Contrast with `get --force`, which IS fully
+    /// enforced client-side today.
+    #[arg(
+        long,
+        help = "Accepted for forward-compat only — remote overwrite is NOT prevented this phase (see backlog: symmetric remote no-clobber, Phase 999.5)"
+    )]
+    pub force: bool,
+}
+
+/// `get --session <id> --remote-name <name> --local <path> [--force]`
+/// (CLI-03). The local destination is fully no-clobber-enforced: if it
+/// already exists and `--force` is absent, the CLI refuses before ever
+/// sending the request (`CliError::NoClobber`, exit code 8).
+#[derive(Debug, Args)]
+pub struct GetArgs {
+    /// The session to target.
+    #[arg(long)]
+    pub session: String,
+    /// The source name under the remote transfer root.
+    #[arg(long = "remote-name")]
+    pub remote_name: String,
+    /// The local destination path. Resolved to an absolute path (joined
+    /// onto the CLI process's own current directory, NOT the daemon's)
+    /// before being sent, and checked for a pre-existing file at that
+    /// absolute path (no-clobber).
+    #[arg(long)]
+    pub local: std::path::PathBuf,
+    /// Overwrite an existing local destination. Without this flag, a
+    /// pre-existing `--local` path is refused (exit code 8) before any
+    /// request is sent to the daemon.
+    #[arg(long, help = "Overwrite an existing local destination (without it, a pre-existing --local path is refused)")]
+    pub force: bool,
 }
