@@ -118,9 +118,20 @@ async fn read_frame<T: serde::de::DeserializeOwned>(stream: &mut UnixStream) -> 
 /// A unique temp root per test invocation -- isolates `XDG_RUNTIME_DIR`
 /// (the daemon's socket directory) and the reconciliation-state sink path,
 /// mirroring `tests/autostart_lifecycle.rs::unique_temp_root`.
+///
+/// **Live-diagnosed (Plan 15-06):** the socket path is
+/// `<root>/xdg-runtime/rdpilot/daemon.sock`, which must fit inside the
+/// kernel's `sockaddr_un.sun_path` (108 bytes on Linux, "SUN_LEN"). The
+/// original full-precision-nanosecond + long-label form overflowed that
+/// limit for this file's longer test labels (e.g.
+/// `connect-list-disconnect`), causing a genuine
+/// `io error: path must be shorter than SUN_LEN` bind failure. Truncated to
+/// the low 6 digits of the nanosecond timestamp (still unique across the
+/// two tests in this same process run) and shortened the fixed prefix.
 fn unique_temp_root(label: &str) -> PathBuf {
     let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).expect("clock should be after the Unix epoch").as_nanos();
-    std::env::temp_dir().join(format!("rdpilot-daemon-live-e2e-{label}-{}-{nanos}", std::process::id()))
+    let short_nanos = nanos % 1_000_000;
+    std::env::temp_dir().join(format!("rdpilot-e2e-{label}-{}-{short_nanos}", std::process::id()))
 }
 
 /// Connect to the daemon socket with a bounded retry backoff -- spawning a
