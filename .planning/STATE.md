@@ -4,13 +4,13 @@ milestone: v1.1
 milestone_name: — Consumer Surfaces & File Transfer
 status: completed
 stopped_at: "Phase 14 Plan 03 complete (3/5 plans). MCP-02/MCP-04 delivered: the Anthropic computer_20250124-compatible `computer` mega-tool is registered on RdpilotMcpHandler, dispatching every action onto rdpilot-ipc's Mouse/Key/Screenshot/DesktopSize verbs. scale_to_native (MCP-04 BLOCKING) bridges the fixed 1280x800 advertised space to native 96-DPI pixels via round-half-away-from-zero + clamp-before-cast, proven at corners/near-corners/center/exclusive-edge in tests/scale_to_native.rs (14 tests, including the corrected exact-tie vector (1279,799,1920,1080)->(1919,1079)). The three genuine SDK gaps (left_mouse_down/left_mouse_up, cursor_position, horizontal scroll) are explicit tool-error rejections, tested by name. cargo tree -p rdpilot-mcp confirmed still free of ironrdp/rustls/rdpilot/rdpilot-daemon/interprocess. Ready to execute 14-04 (remaining rdpilot_* native tools) and 14-05."
-last_updated: "2026-07-11T10:02:03.789Z"
+last_updated: "2026-07-11T10:21:30.278Z"
 last_activity: 2026-07-11 -- Phase 14 Plan 03 (computer mega-tool + scale_to_native coordinate bridge, MCP-02/MCP-04) executed
 progress:
   total_phases: 6
   completed_phases: 3
   total_plans: 26
-  completed_plans: 23
+  completed_plans: 24
   percent: 50
 ---
 
@@ -26,7 +26,7 @@ See: .planning/PROJECT.md (updated 2026-07-10)
 ## Current Position
 
 Phase: 14 (MCP Server Surface) — EXECUTING
-Plan: 3 of 5
+Plan: 4 of 5
 Status: MCP-02/MCP-04 delivered (14-03 complete, 3/5 plans): the `computer` mega-tool (Anthropic computer_20250124-compatible schema) is registered and dispatches every action onto rdpilot-ipc's Mouse/Key/Screenshot/DesktopSize wire verbs; scale_to_native (MCP-04 BLOCKING) is pure, unit-tested at corners/near-corners/center/exclusive-edge-clamp; the 3 genuine SDK gaps (left_mouse_down/left_mouse_up, cursor_position, horizontal scroll) are explicit tool-error rejections, tested by name. Phase 13 (CLI Surface) is complete (7/7 plans, CLI-01/02/03). 14-04 (remaining rdpilot_* native tools) and 14-05 remain.
 Last activity: 2026-07-11 -- Phase 14 Plan 03 (computer mega-tool + scale_to_native coordinate bridge, MCP-02/MCP-04) executed
 
@@ -116,6 +116,7 @@ Last activity: 2026-07-11 -- Phase 14 Plan 03 (computer mega-tool + scale_to_nat
 | Phase 14 P01 | ~25m | 3 tasks | 13 files (rdpilot-ipc: request.rs/response.rs/input.rs/lib.rs; rdpilot-cli: verbs/input.rs; rdpilot-daemon: seams.rs/dispatch.rs/lifecycle.rs/registry.rs/server.rs + 3 tests/*.rs fakes for the new ManagedSession::desktop_size trait method) |
 | Phase 14 P03 | ~45min | 3 tasks | 7 files (rdpilot-mcp: computer/{mod,scale,dispatch}.rs, tests/scale_to_native.rs, handler.rs, main.rs, error.rs) |
 | Phase 14 P03 | 45min | 3 tasks | 7 files |
+| Phase 14 P04 | 45min | 3 tasks | 6 files |
 
 ## Accumulated Context
 
@@ -229,6 +230,8 @@ Recent decisions affecting current work:
 - **Phase 14 Plan 02 (2026-07-11, concurrent with 14-01, root `Cargo.toml` + `crates/rdpilot-mcp/*` file scope only — never touches `rdpilot-ipc`/`rdpilot-daemon`/`rdpilot-cli`, which 14-01 owns):** Scaffolded the `rdpilot-mcp` crate (new workspace member) as the fourth thin `rdpilot-ipc`/`rdpilot-config`-only client of the daemon (D-17): `rmcp = "2.2.0"` (`server`/`macros`/`transport-io` features) + `schemars = "1"`, both pre-verified `[OK]`/`[VERIFIED]` in `14-RESEARCH.md`'s Package Legitimacy Audit — no legitimacy checkpoint needed. `main.rs` bootstraps an rmcp stdio server (`ServiceExt::serve(stdio())` + `.waiting()`), initializes `tracing_subscriber` to stderr as the FIRST statement, and denies `clippy::print_stdout` crate-wide (T-14-04: stdout is the JSON-RPC wire). `handler.rs` defines `RdpilotMcpHandler` with an empty `#[tool_router(server_handler)]` impl (zero `#[tool]` methods yet — confirmed via source read of the published `rmcp-macros` 2.2.0 crate that a zero-route `ToolRouter::new()` and the macro-generated `ServerHandler`/`get_info` compile and report the `tools` capability correctly; Plans 14-03/14-04 add the tool methods). `connect.rs` relocates the CLI's `open_stream`/`round_trip` fresh-`UnixStream`-per-call pattern verbatim in shape, adding `round_trip_bounded(req, bound)` — an internal `timeout_wrap` helper wraps the round trip in `tokio::time::timeout`, unit-tested directly against a genuinely pending future (`Duration::ZERO` -> `McpError::Timeout`) so the MCP-06 Layer-3 mapping is proven without a live daemon socket. `timeouts.rs` adds the four per-verb-class `Duration` constants (`FAST` 15s, `CONNECT` 120s, `LIFECYCLE` 10s, `TRANSFER` 300s) per the research worst-case-latency table. `error.rs` adds `McpError` (`Wire`/`Timeout`/`DaemonUnreachable`/`Transport`, mirroring `CliError`'s client-local-class precedent) plus `impl From<McpError> for rmcp::ErrorData` rendering both the `WireError` code discriminant (via `data.code`) and the message text (D-28), unit-tested. **[Rule 2 — quality]:** the scaffold's `pub` transport/timeout API has no caller yet (zero tools registered) — every otherwise-unused item got an explicit `#[allow(dead_code)]` with a comment pointing at Plans 14-03/14-04 as the consumer, mirroring `rdpilot-cli::exit_codes::CliError::NoClobber`'s identical "declared now, consumed later" precedent, so `cargo build -p rdpilot-mcp` is warning-free rather than accumulating unexplained `#[allow]`s later. `cargo build -p rdpilot-mcp` and `cargo test -p rdpilot-mcp` (7/7) green; `cargo clippy -p rdpilot-mcp --all-targets` clean; `cargo tree -p rdpilot-mcp` gate (`grep -E 'ironrdp|rustls|rdpilot-daemon|^rdpilot v| rdpilot v'`) matches nothing — thin-client invariant holds; `interprocess` confirmed absent from `crates/rdpilot-mcp/Cargo.toml`. Full `cargo build --workspace` also green post-commit (no race with 14-01's concurrent edits — 14-01 had already completed and committed by the time this plan's workspace build ran). Built/tested on the `x86_64-unknown-linux-gnu` substitute target via `RUSTUP_TOOLCHAIN=stable-x86_64-unknown-linux-gnu` (repo-pinned `x86_64-pc-windows-gnu` toolchain not installed on this host). See `14-02-SUMMARY.md`.
 - [Phase ?]: 14-03: scale_to_native (MCP-04 BLOCKING) rounds via plain f64::round() (half away from zero) then clamps to [0, native_dim-1] as the LAST step before the u16 cast -- the bridge itself, not Session::check_bounds, is the safety net (Pitfall 2).
 - [Phase ?]: 14-03: the 3 genuine computer_20250124 SDK gaps (left_mouse_down/left_mouse_up, cursor_position, horizontal scroll) are EXPLICIT tool-error rejections, tested by name -- never a silent no-op (T-14-10).
+- [Phase ?]: rdpilot_connect/rdpilot_list carry no session param -- mirrors Request::Connect/List's own session-less wire shape (SESSION-01/03), overriding the plan summary's blanket 'every tool requires session' wording
+- [Phase ?]: tool_handler router-summation expr must be parenthesized: router = (A() + B()) -- unparenthesized, postfix .call()/.list_all()/.get() binds only to the right operand
 
 ### Pending Todos
 
@@ -275,7 +278,7 @@ Pre-close artifact audit surfaced 3 open items. Reviewed and explicitly acknowle
 
 ## Session Continuity
 
-Last session: 2026-07-11T10:02:03.783Z
+Last session: 2026-07-11T10:21:30.272Z
 Stopped at: Phase 13 Plan 06 complete (6/7 plans). CLI-02 (perception+input+launch verb set against --session) delivered and offline-proven via tests/cli_verbs.rs against the real daemon binary's canned FakeTestSession. Ready to execute 13-07 (CLI-03: put/get no-clobber + path absolutization + error taxonomy). Phase 12's 12-07 live gate (Windows explicit-DACL pipe, live orphan-liveness confirmation, e2e session verify) remains separately pending and is not blocked by Phase 13's progress.
 Resume file: .planning/DECISIONS-INDEX.md
 
