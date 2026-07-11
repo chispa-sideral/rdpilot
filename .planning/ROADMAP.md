@@ -153,10 +153,10 @@ Full phase goals, success criteria, and plan-by-plan detail: `.planning/mileston
   2. A scripted harness proves the MCP surface end-to-end — tool calls exercised programmatically — with no live LLM (PROOF-03).
   3. A capstone live-LLM demo drives a read/inspect + file-transfer task through the MCP surface against a real remote-only Windows program (PROOF-04).
 
-**Plans**: 1/8 plans executed
+**Plans**: 2/8 plans executed
 
 - [x] 15-01-PLAN.md — OFFLINE-AUTHOR: 12-07 windows-sys owner-only DACL + split live test files (Windows DACL / Linux e2e) (Wave 1) (completed 2026-07-11)
-- [ ] 15-02-PLAN.md — OFFLINE-AUTHOR: PROOF-02 CLI harness + CLI-02/03 live re-exercise (gated tests) (Wave 1)
+- [x] 15-02-PLAN.md — OFFLINE-AUTHOR: PROOF-02 CLI harness + CLI-02/03 live re-exercise (gated tests) (Wave 1) (completed 2026-07-11)
 - [ ] 15-03-PLAN.md — OFFLINE-AUTHOR: rmcp client dev-deps + PROOF-03 MCP harness + MCP-04 live half (Wave 1)
 - [ ] 15-04-PLAN.md — OFFLINE-AUTHOR: PROOF-04 capstone via `claude -p` (transcript + side-effect verification) (Wave 2)
 - [ ] 15-05-PLAN.md — LIVE-RUN: provision VM + on-VM sensor build + Windows-DACL gate on the VM (DAEMON-02) (Wave 3)
@@ -182,7 +182,7 @@ Full phase goals, success criteria, and plan-by-plan detail: `.planning/mileston
 | 12. Session Daemon | v1.1 | 6/7 | In Progress|  |
 | 13. CLI Surface | v1.1 | 7/7 | Complete   | 2026-07-11 |
 | 14. MCP Server Surface | v1.1 | 5/5 | Complete   | 2026-07-11 |
-| 15. Proof Harnesses & Live-LLM Capstone | v1.1 | 1/8 | In Progress|  |
+| 15. Proof Harnesses & Live-LLM Capstone | v1.1 | 2/8 | In Progress|  |
 
 ## Backlog
 
