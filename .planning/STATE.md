@@ -4,14 +4,14 @@ milestone: v1.1
 milestone_name: — Consumer Surfaces & File Transfer
 status: completed
 stopped_at: "Phase 13 Plan 06 complete (6/7 plans). CLI-02 delivered: rdpilot perceive {screenshot,world-state,uia,window list,process list} and rdpilot input {click,scroll,drag,type,key,launch,foreground} are wired into the clap tree as grouped-only subcommand families, each requiring --session (D-29). screenshot/world-state base64-decode png_base64 and write raw PNG bytes to --output only (D-13.1, verified bytes never hit stdout). base64 = 0.22.1 added to rdpilot-cli, reusing Plan 13-04's legitimacy-gated pin on rdpilot-daemon verbatim (no second checkpoint). tests/cli_verbs.rs offline-proves every verb against the real rdpilot-daemon binary's canned FakeTestSession; real-Windows semantics deferred to the Phase 15 batched live gate. cargo tree -p rdpilot-cli confirmed still free of ironrdp/rustls/rdpilot-daemon after adding base64. Ready to execute 13-07 (CLI-03: put/get no-clobber + path absolutization + error taxonomy)."
-last_updated: "2026-07-11T08:46:06.089Z"
+last_updated: "2026-07-11T08:57:46.535Z"
 last_activity: 2026-07-11 -- Phase 13 Plan 06 (CLI perception+input+launch verb set, CLI-02) executed
 progress:
   total_phases: 6
-  completed_phases: 2
+  completed_phases: 3
   total_plans: 21
-  completed_plans: 19
-  percent: 33
+  completed_plans: 20
+  percent: 50
 ---
 
 # Project State
@@ -112,6 +112,7 @@ Last activity: 2026-07-11 -- Phase 13 Plan 06 (CLI perception+input+launch verb 
 | Phase 13 P04 | 70 | 3 tasks | 10 files |
 | Phase 13 P05 | 55min | 2 tasks | 13 files |
 | Phase 13 P06 | 7min | 3 tasks | 9 files |
+| Phase 13 P07 | 55m | 2 tasks | 6 files |
 
 ## Accumulated Context
 
@@ -219,6 +220,8 @@ Recent decisions affecting current work:
 - [Phase ?]: 13-06: base64 pinned at 0.22.1 on rdpilot-cli, verbatim reuse of Plan 13-04's legitimacy-gated pin on rdpilot-daemon -- no second checkpoint
 - [Phase ?]: 13-06: Perceive/Input are grouped-only clap subcommand families (research D-13.1) -- no flat top-level spelling unlike Session's flat+grouped duality
 - [Phase ?]: 13-06: click uses one leaf with a --double flag rather than a separate double-click leaf
+- [Phase ?]: Asymmetric no-clobber shipped exactly as scoped: get fully CLI-side enforced (exists() check + --force), put's remote no-clobber deferred to backlog Phase 999.5 — documented in put --help, never silently under-delivered
+- [Phase ?]: daemon-unreachable proven offline by copying the compiled rdpilot binary into an isolated dir with no sibling rdpilot-daemon binary (real spawn-failure path), rather than mocking connect_or_spawn
 
 ### Pending Todos
 
@@ -265,7 +268,7 @@ Pre-close artifact audit surfaced 3 open items. Reviewed and explicitly acknowle
 
 ## Session Continuity
 
-Last session: 2026-07-11T08:46:06.083Z
+Last session: 2026-07-11T08:57:46.529Z
 Stopped at: Phase 13 Plan 06 complete (6/7 plans). CLI-02 (perception+input+launch verb set against --session) delivered and offline-proven via tests/cli_verbs.rs against the real daemon binary's canned FakeTestSession. Ready to execute 13-07 (CLI-03: put/get no-clobber + path absolutization + error taxonomy). Phase 12's 12-07 live gate (Windows explicit-DACL pipe, live orphan-liveness confirmation, e2e session verify) remains separately pending and is not blocked by Phase 13's progress.
 Resume file: .planning/DECISIONS-INDEX.md
 

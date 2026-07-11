@@ -31,7 +31,7 @@ Full phase goals, success criteria, and plan-by-plan detail: `.planning/mileston
 - [x] **Phase 10: SDK File-Transfer Extension** — Generalize the RDPDR drive backend to bidirectional, allow-listed, canonicalization-guarded file transfer with sensor upload/download commands. (completed 2026-07-10)
 - [x] **Phase 11: Shared Wire Protocol & Config** — `rdpilot-ipc` (required-session-id schema, credential-free DTOs) + `rdpilot-config` (layered file/env/flag resolution). (completed 2026-07-10)
 - [ ] **Phase 12: Session Daemon** — Long-lived daemon with a leak-free named-session registry, local-only DACL/peer-scoped IPC, auto-start/idle-shutdown, and crash-restart orphan reconciliation.
-- [ ] **Phase 13: CLI Surface** — Thin `rdpilot` CLI over the daemon: lifecycle + perception/input/launch/file verbs, each explicitly targeting a named session.
+- [x] **Phase 13: CLI Surface** — Thin `rdpilot` CLI over the daemon: lifecycle + perception/input/launch/file verbs, each explicitly targeting a named session. (completed 2026-07-11)
 - [ ] **Phase 14: MCP Server Surface** — `rmcp` server exposing a computer-use `computer` mega-tool + rdpilot-native tools, with a tested coordinate-scaling bridge and non-blocking per-call isolation.
 - [ ] **Phase 15: Proof Harnesses & Live-LLM Capstone** — Scripted per-surface proof (CLI, MCP, no live LLM) plus the capstone live-LLM read/inspect + file-transfer demo through MCP.
 
@@ -108,7 +108,7 @@ Full phase goals, success criteria, and plan-by-plan detail: `.planning/mileston
   2. The full perception + input + launch verb set (screenshot, world_state, uia, window/process list, click/type/key/scroll/drag, launch, foreground) runs against an explicit `--session` (CLI-02).
   3. `put`/`get` transfer files (no-clobber by default with an explicit `--force`), and failures — session-not-found, daemon-unreachable, transfer failure — surface as distinct, legible errors (CLI-03).
 
-**Plans**: 6/7 plans executed
+**Plans**: 7/7 plans complete — Complete offline (CLI-01/02/03 all proven against the real compiled `rdpilot-daemon` binary with its canned fake connector; no live Windows target required for this phase's own verification)
 
 - [x] 13-01-PLAN.md — Relocate the auto-start transport (socket_path/framing/connect_or_spawn) from rdpilot-daemon into rdpilot-ipc so the CLI reaches the daemon without the RDP stack (Wave 1)
 - [x] 13-02-PLAN.md — Extend rdpilot-ipc with perception/input wire DTOs + six Request / four WireResponse verbs, preserving SESSION-02 (Wave 2)
@@ -116,7 +116,9 @@ Full phase goals, success criteria, and plan-by-plan detail: `.planning/mileston
 - [x] 13-04-PLAN.md — Wire every operational dispatch arm to the live Session + fix the share_root Connect gap from config (Wave 3)
 - [x] 13-05-PLAN.md — rdpilot-cli scaffold + connect/list/disconnect lifecycle verbs, thin-client + auto-start (CLI-01, Wave 4)
 - [x] 13-06-PLAN.md — CLI perception/input/launch verb set against --session, screenshot --output, base64 legitimacy gate (CLI-02, Wave 5)
-- [ ] 13-07-PLAN.md — CLI put/get no-clobber (asymmetric) + path absolutization + distinct error taxonomy/exit codes (CLI-03, Wave 6)
+- [x] 13-07-PLAN.md — CLI put/get no-clobber (asymmetric) + path absolutization + distinct error taxonomy/exit codes (CLI-03, Wave 6)
+
+**Deferred to the Phase 15 batched live gate** (never re-litigated per-plan, re-exercised once through the CLI surface at the gate): real screenshot pixel content, real click/UIA-tree shape against a live Windows target (CLI-02); a real multi-MB `put`/`get` transfer's bytes-transferred/checksum correctness through the CLI (CLI-03 — FILE-01/02/04 were already live-verified in Phase 10; this re-exercises the same semantics through a new client surface, it does not re-prove them). `put`'s remote no-clobber asymmetry is NOT part of the Phase 15 gate — it is tracked separately as backlog Phase 999.5.
 
 ### Phase 14: MCP Server Surface
 
@@ -161,7 +163,7 @@ Full phase goals, success criteria, and plan-by-plan detail: `.planning/mileston
 | 10. SDK File-Transfer Extension | v1.1 | 5/5 | Complete   | 2026-07-10 |
 | 11. Shared Wire Protocol & Config | v1.1 | 2/2 | Complete   | 2026-07-10 |
 | 12. Session Daemon | v1.1 | 6/7 | In Progress|  |
-| 13. CLI Surface | v1.1 | 6/7 | In Progress|  |
+| 13. CLI Surface | v1.1 | 7/7 | Complete   | 2026-07-11 |
 | 14. MCP Server Surface | v1.1 | 0/? | Not started | - |
 | 15. Proof Harnesses & Live-LLM Capstone | v1.1 | 0/? | Not started | - |
 
