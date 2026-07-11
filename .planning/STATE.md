@@ -2,15 +2,15 @@
 gsd_state_version: 1.0
 milestone: v1.1
 milestone_name: — Consumer Surfaces & File Transfer
-status: completed
-stopped_at: "Phase 15 Plan 01 complete (1/8 plans). Closed Phase 12's pending 12-07 scope as a side effect: ipc/windows.rs's explicit owner-only named-pipe DACL (windows-sys 0.61.2 raw Win32 calls: OpenProcessToken -> GetTokenInformation(TokenUser) -> InitializeSecurityDescriptor -> InitializeAcl -> AddAccessAllowedAce -> SetSecurityDescriptorDacl) + first_pipe_instance(true) anti-squatting is authored (Linux build green, cfg(windows)-gated); 12-07's single live_daemon.rs split into live_daemon_windows_dacl.rs (Windows-host-only, 0 tests on Linux) and live_daemon_e2e.rs (Linux-hostable, drives the real compiled binary). windows-sys needed no legitimacy checkpoint (Microsoft-official, already lockfile-resolved). Non-regression green (lib 70/70, ipc_security, crash_restart_reconcile, registry_concurrency, thread_leak_soak, autostart_lifecycle). Real Windows compile+run deferred to 15-05; orphan-liveness/e2e live run deferred to 15-06. Ready to execute 15-02 (PROOF-02 CLI harness + CLI-02/03 live re-exercise)."
-last_updated: "2026-07-11T20:53:32.217Z"
-last_activity: 2026-07-11 -- Phase 15 Plan 01 (Windows owner-only pipe DACL via windows-sys + split 12-07 live test files, closing Phase 12's pending scope) executed
+status: verifying
+stopped_at: "Phase 15 Plan 08 (15-08): Task 1 (claude-auth probe) and Task 2 (PROOF-04 live-LLM capstone via claude -p) complete -- PROOF-04 LIVE-VERIFIED PASS (transcript + independent side-effect both green) against the live Azure VM's 7-Zip File Manager, after one live-diagnosed fix (RDPILOT_SENSOR_BINARY_PATH missing from the rendered --mcp-config, identical root cause to 15-06/15-07's finding). Task 3 (teardown authorization, checkpoint:human-verify gate=blocking-human) is the plan's sole remaining step and was deliberately NOT executed this session per binding direction 4 -- the VM (rdpilot-vm, rdpilot-test RG) remains UP. All of PROOF-02/PROOF-03/PROOF-04 are now live-verified; the v1.1 milestone's finish line is complete pending only the teardown checkpoint. Awaiting developer authorization ('approved: teardown') to run infra/manage-env.ps1 down and confirm az group exists => false."
+last_updated: "2026-07-11T21:09:56.767Z"
+last_activity: 2026-07-11 -- Phase 15 Plan 08 (PROOF-04 live-LLM capstone via claude -p, live-diagnosed RDPILOT_SENSOR_BINARY_PATH fix, genuinely PASS) executed through Task 2; Task 3 teardown checkpoint pending developer authorization
 progress:
   total_phases: 6
   completed_phases: 4
   total_plans: 34
-  completed_plans: 32
+  completed_plans: 33
   percent: 67
 ---
 
@@ -25,10 +25,10 @@ See: .planning/PROJECT.md (updated 2026-07-10)
 
 ## Current Position
 
-Phase: 15 (Proof Harnesses & Live-LLM Capstone) — EXECUTING
-Plan: 7 of 8
-Status: 15-01 complete (1/8 plans): closed Phase 12's pending 12-07 scope as a side effect. `ipc/windows.rs`'s explicit owner-only named-pipe DACL is authored via raw `windows-sys` 0.61.2 Win32 calls (no legitimacy checkpoint needed, per binding direction 3) + `first_pipe_instance(true)` anti-squatting; 12-07's single deferred `live_daemon.rs` is split into `live_daemon_windows_dacl.rs` (Windows-host-only, cfg-gated to 0 tests on Linux) and `live_daemon_e2e.rs` (Linux-hostable, drives the real compiled daemon binary against a live target). Linux offline build/tests green, non-regression suite green. Phase 14 (MCP Server Surface) is complete (5/5 plans, MCP-01..06). Real Windows compile+run deferred to 15-05; orphan-liveness/e2e live run deferred to 15-06. 15-02..15-08 remain.
-Last activity: 2026-07-11 -- Phase 15 Plan 01 (Windows owner-only pipe DACL via windows-sys + split 12-07 live test files, closing Phase 12's pending scope) executed
+Phase: 15 (Proof Harnesses & Live-LLM Capstone) — EXECUTING (awaiting teardown checkpoint)
+Plan: 8 of 8 (Tasks 1-2 complete; Task 3 teardown checkpoint PENDING developer authorization)
+Status: 15-08 Tasks 1-2 complete: claude-auth probe confirmed the local Claude Code CLI (v2.1.207) is authenticated and reachable; PROOF-04's live-LLM capstone (`claude -p --permission-mode bypassPermissions --strict-mcp-config`) drove `rdpilot_connect` -> `rdpilot_launch` (7-Zip::FM) -> `rdpilot_window_list`/`rdpilot_foreground` -> `rdpilot_uia` (menu bar: File, Edit, View, Favorites, Tools, Help) -> `rdpilot_put`/`rdpilot_get` entirely through the real `rdpilot-mcp` binary against the live Azure VM, `PROOF: PASS` on both required signals (transcript + independent second-client byte-for-byte side-effect). One live-diagnosed fix required: `RDPILOT_SENSOR_BINARY_PATH` was missing from the rendered `--mcp-config`'s env block (identical root cause to 15-06/15-07's finding for CLI-02/03 and PROOF-02/03) -- fixed, committed (`d405805`), re-verified genuinely green. All of PROOF-02/03/04 are now live-verified; the v1.1 milestone's dual/triple finish line is complete pending only Task 3's teardown authorization. VM `rdpilot-vm` (RG `rdpilot-test`) confirmed STILL UP; teardown deliberately NOT run.
+Last activity: 2026-07-11 -- Phase 15 Plan 08 (PROOF-04 live-LLM capstone via claude -p, live-diagnosed RDPILOT_SENSOR_BINARY_PATH fix, genuinely PASS) executed through Task 2; Task 3 teardown checkpoint pending developer authorization
 
 ## Milestone v1.1 Phases
 
@@ -261,6 +261,7 @@ Recent decisions affecting current work:
 - [Phase ?]: Phase 15-06: UIA verification after a click must use --scope subtree --max-depth 3, never children (Phase 9 D-9.1 recurrence) -- fixed in both CLI-02 and MCP-04 live gates independently
 - [Phase ?]: Phase 15-06: 7-Zip FM persists a stale remembered maximized placement across launches independent of the session's real desktop size -- a maximize hotkey to an already-maximized window is a no-op; fix is an unconditional restore/minimize immediately before maximize, PLUS an explicit re-foreground between the two key presses (minimizing loses OS foreground focus)
 - [Phase ?]: PROOF-02/PROOF-03 harnesses now self-sufficiently set RDPILOT_SENSOR_BINARY_PATH rather than depending on an externally-exported shell variable, matching the live_cli_verbs.rs pattern from 15-06
+- [Phase ?]: PROOF-04 live-LLM capstone LIVE-VERIFIED PASS (15-08): claude -p drove read/inspect + file-transfer through the real MCP surface against the live Azure VM; live-diagnosed RDPILOT_SENSOR_BINARY_PATH fix (identical to 15-06/15-07's finding) was required and committed (d405805). VM teardown deliberately deferred pending developer authorization (Task 3 blocking-human checkpoint).
 
 ### Pending Todos
 
@@ -307,7 +308,7 @@ Pre-close artifact audit surfaced 3 open items. Reviewed and explicitly acknowle
 
 ## Session Continuity
 
-Last session: 2026-07-11T20:53:32.210Z
+Last session: 2026-07-11T21:09:56.760Z
 Stopped at: Phase 13 Plan 06 complete (6/7 plans). CLI-02 (perception+input+launch verb set against --session) delivered and offline-proven via tests/cli_verbs.rs against the real daemon binary's canned FakeTestSession. Ready to execute 13-07 (CLI-03: put/get no-clobber + path absolutization + error taxonomy). Phase 12's 12-07 live gate (Windows explicit-DACL pipe, live orphan-liveness confirmation, e2e session verify) remains separately pending and is not blocked by Phase 13's progress.
 Resume file: .planning/DECISIONS-INDEX.md
 

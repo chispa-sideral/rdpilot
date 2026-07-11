@@ -33,7 +33,7 @@ Full phase goals, success criteria, and plan-by-plan detail: `.planning/mileston
 - [ ] **Phase 12: Session Daemon** — Long-lived daemon with a leak-free named-session registry, local-only DACL/peer-scoped IPC, auto-start/idle-shutdown, and crash-restart orphan reconciliation.
 - [x] **Phase 13: CLI Surface** — Thin `rdpilot` CLI over the daemon: lifecycle + perception/input/launch/file verbs, each explicitly targeting a named session. (completed 2026-07-11)
 - [x] **Phase 14: MCP Server Surface** — `rmcp` server exposing a computer-use `computer` mega-tool + rdpilot-native tools, with a tested coordinate-scaling bridge and non-blocking per-call isolation. (completed 2026-07-11)
-- [ ] **Phase 15: Proof Harnesses & Live-LLM Capstone** — Scripted per-surface proof (CLI, MCP, no live LLM) plus the capstone live-LLM read/inspect + file-transfer demo through MCP. (Wave 3 LIVE-RUN complete 2026-07-11: single VM provisioned and held UP for 15-06/07/08; DAEMON-02 Windows half live-verified.)
+- [ ] **Phase 15: Proof Harnesses & Live-LLM Capstone** — Scripted per-surface proof (CLI, MCP, no live LLM) plus the capstone live-LLM read/inspect + file-transfer demo through MCP. (2026-07-11: Waves 3-6 LIVE-RUN — single VM provisioned and held UP through 15-05/06/07/08; DAEMON-02 Windows half, PROOF-02, PROOF-03, and PROOF-04 (capstone) all live-verified PASS. Phase not yet closed — Task 3's teardown-authorization checkpoint is still PENDING; VM remains UP.)
 
 ## Phase Details
 
@@ -162,7 +162,7 @@ Full phase goals, success criteria, and plan-by-plan detail: `.planning/mileston
 - [x] 15-05-PLAN.md — LIVE-RUN: provision VM + on-VM sensor build + Windows-DACL gate on the VM (DAEMON-02) (Wave 3) (completed 2026-07-11: VM `rdpilot-vm` UP and held for 15-06/07/08; sensor SHA-256 byte-verified; DAEMON-02 Windows half live-verified — owner-only DACL, anti-squatting, genuine cross-account rejection all PASS)
 - [x] 15-06-PLAN.md — LIVE-RUN: orphan-liveness/e2e + CLI-02/03 live + MCP-04 live half, from the Linux host (Wave 4)
 - [x] 15-07-PLAN.md — LIVE-RUN: PROOF-02 + PROOF-03 scripted proofs (no live LLM) (Wave 5)
-- [ ] 15-08-PLAN.md — LIVE-RUN: PROOF-04 capstone (`claude -p`) + teardown authorization checkpoint (Wave 6)
+- [ ] 15-08-PLAN.md — LIVE-RUN: PROOF-04 capstone (`claude -p`) + teardown authorization checkpoint (Wave 6). **Capstone PASS** (2026-07-11): `claude -p` drove read/inspect + file-transfer through the real MCP surface against the live Azure VM, verified by transcript + independent side-effect (one live-diagnosed fix: `RDPILOT_SENSOR_BINARY_PATH` missing from the rendered `--mcp-config`, mirroring 15-06/15-07's finding). **Teardown checkpoint still PENDING developer authorization** — VM remains UP.
 
 ## Progress
 
