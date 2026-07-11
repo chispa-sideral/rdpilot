@@ -112,7 +112,7 @@ mod tests {
     use rdpilot_ipc::SessionLifecycle;
 
     use super::*;
-    use crate::seams::{DaemonError, ManagedSession, NoopReconciliationSink, SessionConnector};
+    use crate::seams::{BoxFuture, DaemonError, ManagedSession, NoopReconciliationSink, SessionConnector};
 
     type TestFuture<T> = Pin<Box<dyn Future<Output = T>>>;
 
@@ -131,6 +131,64 @@ mod tests {
         }
         fn describe(&self) -> SessionLifecycle {
             SessionLifecycle::Live
+        }
+
+        fn screenshot(&self) -> BoxFuture<'_, Result<rdpilot::Screenshot, DaemonError>> {
+            Box::pin(async { Ok(rdpilot::Screenshot { width: 1, height: 1, rgba: vec![0, 0, 0, 0] }) })
+        }
+        fn world_state(&self, _opts: rdpilot::WorldStateOptions) -> BoxFuture<'_, Result<rdpilot::WorldState, DaemonError>> {
+            Box::pin(async {
+                Ok(rdpilot::WorldState {
+                    timestamp: std::time::SystemTime::now(),
+                    capture_span: std::time::Duration::from_millis(0),
+                    screenshot: None,
+                    window_list: None,
+                    uia: None,
+                })
+            })
+        }
+        fn get_window_list(&self) -> BoxFuture<'_, Result<Vec<rdpilot::WindowInfo>, DaemonError>> {
+            Box::pin(async { Ok(vec![]) })
+        }
+        fn get_process_tree(&self) -> BoxFuture<'_, Result<Vec<rdpilot::ProcessInfo>, DaemonError>> {
+            Box::pin(async { Ok(vec![]) })
+        }
+        fn get_uia_tree(&self, _hwnd: u64, _scope: rdpilot::UiaScope) -> BoxFuture<'_, Result<Vec<rdpilot::UiaElement>, DaemonError>> {
+            Box::pin(async { Ok(vec![]) })
+        }
+        fn send_mouse(&self, _action: rdpilot::MouseAction) -> BoxFuture<'_, Result<(), DaemonError>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn send_key(&self, _action: rdpilot::KeyAction) -> BoxFuture<'_, Result<(), DaemonError>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn set_foreground_window(&self, _hwnd: u64) -> BoxFuture<'_, Result<(), DaemonError>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn launch_process(
+            &self,
+            _exe: String,
+            _args: Option<String>,
+            _cwd: Option<String>,
+        ) -> BoxFuture<'_, Result<u32, DaemonError>> {
+            Box::pin(async { Ok(0) })
+        }
+        fn upload_file(
+            &self,
+            _local: std::path::PathBuf,
+            _remote_name: String,
+        ) -> BoxFuture<'_, Result<rdpilot::TransferOutcome, DaemonError>> {
+            Box::pin(async { Ok(rdpilot::TransferOutcome { bytes_transferred: 0, checksum: String::new() }) })
+        }
+        fn download_file(
+            &self,
+            _remote_name: String,
+            _local: std::path::PathBuf,
+        ) -> BoxFuture<'_, Result<rdpilot::TransferOutcome, DaemonError>> {
+            Box::pin(async { Ok(rdpilot::TransferOutcome { bytes_transferred: 0, checksum: String::new() }) })
+        }
+        fn ping(&self) -> BoxFuture<'_, Result<std::time::Duration, DaemonError>> {
+            Box::pin(async { Ok(std::time::Duration::from_millis(0)) })
         }
     }
 

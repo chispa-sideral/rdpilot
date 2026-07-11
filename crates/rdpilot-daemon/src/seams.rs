@@ -25,6 +25,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Instant;
 
 use rdpilot::{ConnectionConfig, Session};
@@ -330,8 +331,27 @@ pub enum SessionEntry {
     },
     /// A live, connected session.
     Live {
-        /// The owned, type-erased managed session.
-        session: Box<dyn ManagedSession>,
+        /// The owned, type-erased managed session, behind a `tokio::sync::Mutex`
+        /// so [`crate::registry::Registry::call`] can dispatch a `&self`
+        /// operational method WITHOUT holding the registry's synchronous
+        /// outer lock across the call's `.await` (research Pitfall 3): the
+        /// `Arc` is cloned under the outer lock, the outer lock is dropped,
+        /// THEN the inner `tokio::sync::Mutex` is `.await`-locked.
+        ///
+        /// The `Option` lets [`crate::registry::Registry::close`] `.take()`
+        /// the SIZED `Box` out from behind the `Arc` to reclaim ownership
+        /// for its consuming `close()` call — moving the unsized
+        /// `dyn ManagedSession` trait object itself out of an `Arc` does not
+        /// compile (research Pitfall 2); the `Box` (a sized pointer) is what
+        /// actually moves.
+        session: Arc<tokio::sync::Mutex<Option<Box<dyn ManagedSession>>>>,
+        /// A cheap, lock-free snapshot of the session's lifecycle status,
+        /// captured at insert time and never updated by this phase (mirrors
+        /// `describe()`'s current baseline-`Live` behavior exactly). Storing
+        /// this separately lets [`SessionEntry::to_status`] avoid taking the
+        /// inner `tokio::sync::Mutex` at all — `list` must never block on a
+        /// busy session.
+        status: SessionLifecycle,
         /// When the connect completed (monotonic; idle-reap arithmetic,
         /// Plan 12-06).
         connected_since: Instant,
@@ -392,7 +412,7 @@ impl SessionEntry {
                 last_activity: None,
             },
             SessionEntry::Live {
-                session,
+                status,
                 name,
                 host,
                 connected_since_wall,
@@ -402,7 +422,7 @@ impl SessionEntry {
                 id: id.as_str().to_owned(),
                 name: name.clone(),
                 host: host.clone(),
-                status: session.describe(),
+                status: *status,
                 connected_since: Some(connected_since_wall.clone()),
                 last_activity: Some(last_activity_wall.clone()),
             },

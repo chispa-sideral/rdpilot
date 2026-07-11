@@ -36,6 +36,11 @@ use rdpilot_daemon::{
 use rdpilot_ipc::SessionLifecycle;
 
 type TestFuture<T> = Pin<Box<dyn Future<Output = T>>>;
+/// Like `TestFuture`, but lifetime-parameterized -- required for the
+/// `&self`-based operational `ManagedSession` methods (Phase 13), whose
+/// trait-declared `BoxFuture<'_, T>` ties the returned future's lifetime
+/// to the `&self` borrow (not `'static`, unlike `close`/`connect`).
+type OpFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
 
 /// A fake, immediately-resolving `ManagedSession` — this test is about the
 /// disk record + surfacing, not about a real OS thread (the thread-owning
@@ -48,6 +53,64 @@ impl ManagedSession for FakeSession {
     }
     fn describe(&self) -> SessionLifecycle {
         SessionLifecycle::Live
+    }
+
+    fn screenshot(&self) -> OpFuture<'_, Result<rdpilot::Screenshot, DaemonError>> {
+        Box::pin(async { Ok(rdpilot::Screenshot { width: 1, height: 1, rgba: vec![0, 0, 0, 0] }) })
+    }
+    fn world_state(&self, _opts: rdpilot::WorldStateOptions) -> OpFuture<'_, Result<rdpilot::WorldState, DaemonError>> {
+        Box::pin(async {
+            Ok(rdpilot::WorldState {
+                timestamp: std::time::SystemTime::now(),
+                capture_span: std::time::Duration::from_millis(0),
+                screenshot: None,
+                window_list: None,
+                uia: None,
+            })
+        })
+    }
+    fn get_window_list(&self) -> OpFuture<'_, Result<Vec<rdpilot::WindowInfo>, DaemonError>> {
+        Box::pin(async { Ok(vec![]) })
+    }
+    fn get_process_tree(&self) -> OpFuture<'_, Result<Vec<rdpilot::ProcessInfo>, DaemonError>> {
+        Box::pin(async { Ok(vec![]) })
+    }
+    fn get_uia_tree(&self, _hwnd: u64, _scope: rdpilot::UiaScope) -> OpFuture<'_, Result<Vec<rdpilot::UiaElement>, DaemonError>> {
+        Box::pin(async { Ok(vec![]) })
+    }
+    fn send_mouse(&self, _action: rdpilot::MouseAction) -> OpFuture<'_, Result<(), DaemonError>> {
+        Box::pin(async { Ok(()) })
+    }
+    fn send_key(&self, _action: rdpilot::KeyAction) -> OpFuture<'_, Result<(), DaemonError>> {
+        Box::pin(async { Ok(()) })
+    }
+    fn set_foreground_window(&self, _hwnd: u64) -> OpFuture<'_, Result<(), DaemonError>> {
+        Box::pin(async { Ok(()) })
+    }
+    fn launch_process(
+        &self,
+        _exe: String,
+        _args: Option<String>,
+        _cwd: Option<String>,
+    ) -> OpFuture<'_, Result<u32, DaemonError>> {
+        Box::pin(async { Ok(0) })
+    }
+    fn upload_file(
+        &self,
+        _local: std::path::PathBuf,
+        _remote_name: String,
+    ) -> OpFuture<'_, Result<rdpilot::TransferOutcome, DaemonError>> {
+        Box::pin(async { Ok(rdpilot::TransferOutcome { bytes_transferred: 0, checksum: String::new() }) })
+    }
+    fn download_file(
+        &self,
+        _remote_name: String,
+        _local: std::path::PathBuf,
+    ) -> OpFuture<'_, Result<rdpilot::TransferOutcome, DaemonError>> {
+        Box::pin(async { Ok(rdpilot::TransferOutcome { bytes_transferred: 0, checksum: String::new() }) })
+    }
+    fn ping(&self) -> OpFuture<'_, Result<std::time::Duration, DaemonError>> {
+        Box::pin(async { Ok(std::time::Duration::from_millis(0)) })
     }
 }
 

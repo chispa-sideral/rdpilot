@@ -38,9 +38,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use rdpilot::ConnectionConfig;
-use rdpilot_ipc::{SessionId, SessionStatus};
+use rdpilot_ipc::{SessionId, SessionLifecycle, SessionStatus};
 
-use crate::seams::{DaemonError, ReconciliationSink, SessionConnector, SessionEntry};
+use crate::seams::{BoxFuture, DaemonError, ManagedSession, ReconciliationSink, SessionConnector, SessionEntry};
 
 /// Word lists for [`generate_auto_id`] (D-29: short, human-legible
 /// adjective-noun auto-generated ids, e.g. `brave-otter`). Deliberately
@@ -224,7 +224,8 @@ impl Registry {
                     guard.insert(
                         id.clone(),
                         SessionEntry::Live {
-                            session,
+                            session: Arc::new(tokio::sync::Mutex::new(Some(session))),
+                            status: SessionLifecycle::Live,
                             connected_since: Instant::now(),
                             connected_since_wall: now_wall.clone(),
                             name,
@@ -266,9 +267,28 @@ impl Registry {
 
         match entry {
             Some(SessionEntry::Live { session, .. }) => {
-                session.close().await?; // joins the OS thread — NEVER a bare drop
-                self.sink.record_closed(id);
-                Ok(())
+                // Take the SIZED `Box` out of the `Option` (never the
+                // unsized `dyn ManagedSession` itself, which does not
+                // compile out of an `Arc` -- research Pitfall 2) and close
+                // it -- NEVER a bare drop (DAEMON-01). `try_lock` cannot be
+                // used here: `close` is this session's terminal operation
+                // and MUST wait for any concurrent `Registry::call` in
+                // flight to finish before reclaiming ownership, not race
+                // past it.
+                let boxed = { session.lock().await.take() };
+                match boxed {
+                    Some(boxed) => {
+                        boxed.close().await?; // joins the OS thread — NEVER a bare drop
+                        self.sink.record_closed(id);
+                        Ok(())
+                    }
+                    None => {
+                        // Already taken/closed concurrently -- treat as a
+                        // clean success, not a double-close error.
+                        self.sink.record_closed(id);
+                        Ok(())
+                    }
+                }
             }
             Some(SessionEntry::Connecting { claimed_at }) => {
                 // A connect is in flight for this id — do not interrupt it.
@@ -286,6 +306,50 @@ impl Registry {
                 Ok(())
             }
             None => Err(DaemonError::SessionNotFound(id.as_str().to_owned())),
+        }
+    }
+
+    /// Dispatch an operation onto the live session `id` WITHOUT holding the
+    /// registry's synchronous outer [`Mutex`] across the operation's
+    /// `.await` (research Pitfall 3): the `Arc` wrapping the session is
+    /// cloned under the outer lock, the outer lock is DROPPED, THEN the
+    /// inner `tokio::sync::Mutex` is `.await`-locked to reach the boxed
+    /// session and run `op`.
+    ///
+    /// Calls to the SAME session serialize (the inner `tokio::sync::Mutex`
+    /// is per-session); calls to DIFFERENT sessions never block each other
+    /// (each `Live` entry owns its own `Arc`) — pre-satisfying Phase 14's
+    /// MCP-06 non-blocking-isolation property.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DaemonError::SessionNotFound`] if `id` has no entry (or was
+    /// closed mid-flight between the clone and the inner lock),
+    /// [`DaemonError::StillConnecting`] if `id`'s connect is still in
+    /// flight, or whatever `op` itself returns.
+    pub async fn call<T>(
+        &self,
+        id: &SessionId,
+        op: impl for<'a> FnOnce(&'a dyn ManagedSession) -> BoxFuture<'a, Result<T, DaemonError>>,
+    ) -> Result<T, DaemonError> {
+        let entry = {
+            #[allow(clippy::expect_used)] // A poisoned registry mutex is unrecoverable.
+            let guard = self.sessions.lock().expect("registry mutex poisoned");
+            match guard.get(id) {
+                Some(SessionEntry::Live { session, .. }) => Arc::clone(session),
+                Some(SessionEntry::Connecting { .. }) => {
+                    return Err(DaemonError::StillConnecting(id.as_str().to_owned()));
+                }
+                Some(SessionEntry::Orphaned { .. }) | None => {
+                    return Err(DaemonError::SessionNotFound(id.as_str().to_owned()));
+                }
+            }
+        }; // outer lock dropped here — never held across the .await below
+
+        let guard = entry.lock().await; // tokio::sync::Mutex — safe across .await
+        match guard.as_deref() {
+            Some(session) => op(session).await,
+            None => Err(DaemonError::SessionNotFound(id.as_str().to_owned())), // closed mid-flight
         }
     }
 
@@ -371,6 +435,64 @@ mod tests {
         }
         fn describe(&self) -> SessionLifecycle {
             SessionLifecycle::Live
+        }
+
+        fn screenshot(&self) -> BoxFuture<'_, Result<rdpilot::Screenshot, DaemonError>> {
+            Box::pin(async { Ok(rdpilot::Screenshot { width: 1, height: 1, rgba: vec![0, 0, 0, 0] }) })
+        }
+        fn world_state(&self, _opts: rdpilot::WorldStateOptions) -> BoxFuture<'_, Result<rdpilot::WorldState, DaemonError>> {
+            Box::pin(async {
+                Ok(rdpilot::WorldState {
+                    timestamp: std::time::SystemTime::now(),
+                    capture_span: std::time::Duration::from_millis(0),
+                    screenshot: None,
+                    window_list: None,
+                    uia: None,
+                })
+            })
+        }
+        fn get_window_list(&self) -> BoxFuture<'_, Result<Vec<rdpilot::WindowInfo>, DaemonError>> {
+            Box::pin(async { Ok(vec![]) })
+        }
+        fn get_process_tree(&self) -> BoxFuture<'_, Result<Vec<rdpilot::ProcessInfo>, DaemonError>> {
+            Box::pin(async { Ok(vec![]) })
+        }
+        fn get_uia_tree(&self, _hwnd: u64, _scope: rdpilot::UiaScope) -> BoxFuture<'_, Result<Vec<rdpilot::UiaElement>, DaemonError>> {
+            Box::pin(async { Ok(vec![]) })
+        }
+        fn send_mouse(&self, _action: rdpilot::MouseAction) -> BoxFuture<'_, Result<(), DaemonError>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn send_key(&self, _action: rdpilot::KeyAction) -> BoxFuture<'_, Result<(), DaemonError>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn set_foreground_window(&self, _hwnd: u64) -> BoxFuture<'_, Result<(), DaemonError>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn launch_process(
+            &self,
+            _exe: String,
+            _args: Option<String>,
+            _cwd: Option<String>,
+        ) -> BoxFuture<'_, Result<u32, DaemonError>> {
+            Box::pin(async { Ok(0) })
+        }
+        fn upload_file(
+            &self,
+            _local: std::path::PathBuf,
+            _remote_name: String,
+        ) -> BoxFuture<'_, Result<rdpilot::TransferOutcome, DaemonError>> {
+            Box::pin(async { Ok(rdpilot::TransferOutcome { bytes_transferred: 0, checksum: String::new() }) })
+        }
+        fn download_file(
+            &self,
+            _remote_name: String,
+            _local: std::path::PathBuf,
+        ) -> BoxFuture<'_, Result<rdpilot::TransferOutcome, DaemonError>> {
+            Box::pin(async { Ok(rdpilot::TransferOutcome { bytes_transferred: 0, checksum: String::new() }) })
+        }
+        fn ping(&self) -> BoxFuture<'_, Result<std::time::Duration, DaemonError>> {
+            Box::pin(async { Ok(std::time::Duration::from_millis(0)) })
         }
     }
 
