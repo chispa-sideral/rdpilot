@@ -23,6 +23,14 @@
 //! (a missed orphan surface — a visibility gap) rather than crashing the
 //! daemon over its own crash-recovery bookkeeping.
 
+// This crate's ONLY production caller of this module's public surface is
+// Plan 12-06's `server.rs` `run()` (the startup scan + seed), which has
+// not landed yet — mirrors `registry.rs`'s own module-level `dead_code`
+// allowance for the exact same interface-first reason (this plan's own
+// inline tests below exercise every item; production wiring is Plan
+// 12-06's job).
+#![allow(dead_code)]
+
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -103,12 +111,26 @@ impl JsonReconciliationSink {
 }
 
 impl ReconciliationSink for JsonReconciliationSink {
-    fn record_open(&self, _id: &SessionId, _host: &str, _connected_since: &str) {
-        // TODO(RED): not yet implemented — filled in by the GREEN step.
+    fn record_open(&self, id: &SessionId, host: &str, connected_since: &str) {
+        let mut records = self.load();
+        match records.iter_mut().find(|r| r.id == id.as_str()) {
+            Some(existing) => {
+                existing.host = host.to_owned();
+                existing.connected_since = connected_since.to_owned();
+            }
+            None => records.push(ReconciliationRecord {
+                id: id.as_str().to_owned(),
+                host: host.to_owned(),
+                connected_since: connected_since.to_owned(),
+            }),
+        }
+        self.save(&records);
     }
 
-    fn record_closed(&self, _id: &SessionId) {
-        // TODO(RED): not yet implemented — filled in by the GREEN step.
+    fn record_closed(&self, id: &SessionId) {
+        let mut records = self.load();
+        records.retain(|r| r.id != id.as_str());
+        self.save(&records);
     }
 }
 
@@ -124,9 +146,22 @@ pub fn scan_orphans(path: &Path) -> Vec<ReconciliationRecord> {
     load_records(path)
 }
 
-fn load_records(_path: &Path) -> Vec<ReconciliationRecord> {
-    // TODO(RED): not yet implemented — filled in by the GREEN step.
-    Vec::new()
+fn load_records(path: &Path) -> Vec<ReconciliationRecord> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Vec::new(),
+        Err(err) => {
+            eprintln!("rdpilot-daemon: could not read reconciliation file {path:?}: {err}");
+            return Vec::new();
+        }
+    };
+    match serde_json::from_slice::<Vec<ReconciliationRecord>>(&bytes) {
+        Ok(records) => records,
+        Err(err) => {
+            eprintln!("rdpilot-daemon: reconciliation file {path:?} is corrupt ({err}); treating as empty");
+            Vec::new()
+        }
+    }
 }
 
 /// Monotonic per-process counter mixed into [`tmp_sibling_path`] so two
