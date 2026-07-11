@@ -108,7 +108,15 @@ Full phase goals, success criteria, and plan-by-plan detail: `.planning/mileston
   2. The full perception + input + launch verb set (screenshot, world_state, uia, window/process list, click/type/key/scroll/drag, launch, foreground) runs against an explicit `--session` (CLI-02).
   3. `put`/`get` transfer files (no-clobber by default with an explicit `--force`), and failures — session-not-found, daemon-unreachable, transfer failure — surface as distinct, legible errors (CLI-03).
 
-**Plans**: TBD
+**Plans**: 7 plans
+
+- [ ] 13-01-PLAN.md — Relocate the auto-start transport (socket_path/framing/connect_or_spawn) from rdpilot-daemon into rdpilot-ipc so the CLI reaches the daemon without the RDP stack (Wave 1)
+- [ ] 13-02-PLAN.md — Extend rdpilot-ipc with perception/input wire DTOs + six Request / four WireResponse verbs, preserving SESSION-02 (Wave 2)
+- [ ] 13-03-PLAN.md — Extend ManagedSession with operational &self methods + Arc<TokioMutex<Option<Box>>> registry storage + Registry::call (Wave 2)
+- [ ] 13-04-PLAN.md — Wire every operational dispatch arm to the live Session + fix the share_root Connect gap from config (Wave 3)
+- [ ] 13-05-PLAN.md — rdpilot-cli scaffold + connect/list/disconnect lifecycle verbs, thin-client + auto-start (CLI-01, Wave 4)
+- [ ] 13-06-PLAN.md — CLI perception/input/launch verb set against --session, screenshot --output, base64 legitimacy gate (CLI-02, Wave 5)
+- [ ] 13-07-PLAN.md — CLI put/get no-clobber (asymmetric) + path absolutization + distinct error taxonomy/exit codes (CLI-03, Wave 6)
 
 ### Phase 14: MCP Server Surface
 
@@ -198,6 +206,19 @@ Plans:
 
 **Goal:** We should support session shadowing (with and without control) so that an agent can offer assistance to a user in need.
 **Requirements:** TBD
+**Plans:** 0 plans
+
+Plans:
+
+- [ ] TBD (promote with /gsd-review-backlog when ready)
+
+### Phase 999.5: Symmetric remote no-clobber for `put` (BACKLOG)
+
+**Goal:** Make `rdpilot put`'s no-clobber symmetric with `get`. Phase 13 (CLI-03) enforces no-clobber fully for `get` (local destination `exists()` check + `--force`), but `put`'s destination is REMOTE and its overwrite-refusal is a documented known gap — the CLI/daemon cannot cheaply check remote existence without a new sensor round trip, and the Phase 10 C# `FileTransfer` Upload handler has no overwrite-refusal. Extend the C# sensor's Upload handler with a `no_clobber` flag + `File.Exists` check-then-refuse (honoring `--force`), thread the flag through the wire `Request::Put` and dispatch, and add a live gate proving a remote overwrite is refused without `--force` and allowed with it.
+
+**Motivation:** During Phase 13 planning the developer accepted the asymmetry deliberately (sensor is out of Phase 13 scope); this backlog item tracks the follow-up so the asymmetry is closed, not silently permanent.
+
+**Requirements:** TBD (extends CLI-03 / FILE-01)
 **Plans:** 0 plans
 
 Plans:
