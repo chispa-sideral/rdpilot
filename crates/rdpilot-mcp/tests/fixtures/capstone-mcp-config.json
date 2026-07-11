@@ -1,0 +1,41 @@
+{
+  "_comment": [
+    "TEMPLATE ONLY -- this committed file is NEVER passed directly to `claude -p`",
+    "and carries NO real secrets. `crates/rdpilot-mcp/tests/live_capstone.rs`",
+    "(PROOF-04) reads this template at RUN TIME and renders a CONCRETE copy to a",
+    "gitignored std::env::temp_dir() path, substituting the tokens below, before",
+    "passing THAT rendered temp file to `claude -p --mcp-config <temp path>`:",
+    "",
+    "  __RDPILOT_MCP_BIN__   -> env!(\"CARGO_BIN_EXE_rdpilot-mcp\") (the compiled",
+    "                           rdpilot-mcp server binary this test built)",
+    "  __RDPILOT_HOST__      -> .secrets/connection.json `host`",
+    "  __RDPILOT_PORT__      -> .secrets/connection.json `rdpPort` (stringified;",
+    "                           defaults to \"3389\" when absent)",
+    "  __RDPILOT_USERNAME__  -> .secrets/connection.json `user`",
+    "  __RDPILOT_PASSWORD__  -> .secrets/connection.json `password`",
+    "",
+    "The rendered copy's `env` block carries the REAL connection secrets for the",
+    "spawned `rdpilot-mcp` server subprocess ONLY -- it is written to a gitignored",
+    "temp path, never printed/logged, and removed after the run (T-15-08). The",
+    "capstone LLM itself never sees a host/username/password value: they reach",
+    "the server purely as ITS OWN process environment and are resolved through",
+    "the existing file->env->MCP-init layered config pipeline (D-27,",
+    "`rdpilot_config::resolve`, consumed by `rdpilot_connect`'s handler) -- so",
+    "the capstone's task prompt never needs to mention credentials at all, and",
+    "the transcript this test parses can never contain the password by",
+    "construction."
+  ],
+  "mcpServers": {
+    "rdpilot": {
+      "command": "__RDPILOT_MCP_BIN__",
+      "args": [],
+      "env": {
+        "RDPILOT_HOST": "__RDPILOT_HOST__",
+        "RDPILOT_PORT": "__RDPILOT_PORT__",
+        "RDPILOT_USERNAME": "__RDPILOT_USERNAME__",
+        "RDPILOT_PASSWORD": "__RDPILOT_PASSWORD__",
+        "RDPILOT_ACCEPT_INVALID_CERTS": "true"
+      }
+    }
+  }
+}
