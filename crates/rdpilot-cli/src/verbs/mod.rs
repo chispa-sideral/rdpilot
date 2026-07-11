@@ -1,5 +1,5 @@
-//! Verb handlers, one module per grouped family. Only `session` (CLI-01)
-//! exists in this plan — `perceive`/`input`/`file` are added by Plans
-//! 13-06/13-07.
+//! Verb handlers, one module per grouped family: `session` (CLI-01),
+//! `perceive` (CLI-02) -- `input` (CLI-02) and `file` (Plan 13-07) follow.
 
+pub mod perceive;
 pub mod session;

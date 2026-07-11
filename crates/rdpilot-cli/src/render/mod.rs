@@ -7,7 +7,7 @@
 
 pub mod table;
 
-pub use table::render_table;
+pub use table::{render_process_table, render_table, render_uia_table, render_window_table};
 
 use crate::exit_codes::CliError;
 

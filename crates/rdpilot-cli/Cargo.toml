@@ -18,4 +18,10 @@ rdpilot-ipc = { path = "../rdpilot-ipc" }
 rdpilot-config = { path = "../rdpilot-config" }
 tokio = { version = "1", features = ["rt", "net", "io-util", "macros", "time"] }
 serde_json = "1"
+# Screenshot PNG base64-decode on the CLI side (Plan 13-06). Legitimacy gate
+# already satisfied by Plan 13-04 Task 2 (slopcheck [OK], crates.io identity
+# confirmed: github.com/marshallpierce/rust-base64) -- this reuses that exact
+# approved pin verbatim, no second checkpoint (crates/rdpilot-daemon/Cargo.toml
+# is the source of truth for the pin).
+base64 = "0.22.1"
 

@@ -2981,6 +2981,7 @@ dependencies = [
 name = "rdpilot-cli"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "clap",
  "rdpilot-config",
  "rdpilot-ipc",

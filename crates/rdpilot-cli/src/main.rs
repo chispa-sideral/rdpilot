@@ -18,7 +18,7 @@ mod verbs;
 
 use clap::Parser;
 
-use cli::{Cli, Command, SessionCmd};
+use cli::{Cli, Command, PerceiveCmd, ProcessCmd, SessionCmd, WindowCmd};
 use exit_codes::{CliError, exit_code_for};
 
 #[tokio::main(flavor = "current_thread")]
@@ -33,8 +33,9 @@ async fn main() -> std::process::ExitCode {
     }
 }
 
-/// Route the parsed [`Command`] (flat or grouped-`session`) to its verb
-/// handler — both spellings call the exact same handler function.
+/// Route the parsed [`Command`] (flat or grouped-`session`/`perceive`/
+/// `input`) to its verb handler — flat and grouped spellings of the same
+/// verb call the exact same handler function.
 async fn dispatch(command: Command, json: bool) -> Result<(), CliError> {
     match command {
         Command::Connect(args) | Command::Session(SessionCmd::Connect(args)) => verbs::session::connect(args, json).await,
@@ -42,5 +43,11 @@ async fn dispatch(command: Command, json: bool) -> Result<(), CliError> {
         Command::Disconnect(args) | Command::Session(SessionCmd::Disconnect(args)) => {
             verbs::session::disconnect(args, json).await
         }
+
+        Command::Perceive(PerceiveCmd::Screenshot(args)) => verbs::perceive::screenshot(args, json).await,
+        Command::Perceive(PerceiveCmd::WorldState(args)) => verbs::perceive::world_state(args, json).await,
+        Command::Perceive(PerceiveCmd::Uia(args)) => verbs::perceive::uia(args, json).await,
+        Command::Perceive(PerceiveCmd::Window(WindowCmd::List(args))) => verbs::perceive::window_list(args, json).await,
+        Command::Perceive(PerceiveCmd::Process(ProcessCmd::List(args))) => verbs::perceive::process_list(args, json).await,
     }
 }
