@@ -176,6 +176,25 @@ fn connection_file() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("..").join(".secrets").join("connection.json")
 }
 
+/// Locate the byte-verified sensor executable relayed by Plan 15-05
+/// (`.secrets/sensor-build/rdpilot-sensor.exe`), same two-levels-up
+/// resolution as [`connection_file`]. **Live-diagnosed here (Plan 15-08,
+/// mirroring the identical Plan 15-06/15-07 finding for
+/// `live_cli_verbs.rs`/both `live_proof.rs` harnesses):** without pointing
+/// the spawned `rdpilot-mcp` subprocess's `RDPILOT_SENSOR_BINARY_PATH` at
+/// this path, the real `Connect` path never deploys a sensor at all, so
+/// every sensor-backed tool call this capstone drives (`rdpilot_launch`,
+/// `rdpilot_window_list`, `rdpilot_uia`, `rdpilot_put`/`rdpilot_get`) times
+/// out identically to what those three prior plans already found and fixed.
+fn sensor_binary_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join(".secrets")
+        .join("sensor-build")
+        .join("rdpilot-sensor.exe")
+}
+
 /// Load the live target, or `None` if the suite is not armed (D-18 gate:
 /// `RDPILOT_LIVE` unset, or the secrets file absent) -- a legitimate,
 /// quiet skip. A present-but-malformed file panics with a descriptive
@@ -256,6 +275,7 @@ fn render_mcp_config(mcp_bin: &Path, target: &LiveTarget, dest: &Path) {
     env["RDPILOT_PORT"] = serde_json::Value::String(target.port.to_string());
     env["RDPILOT_USERNAME"] = serde_json::Value::String(target.user.clone());
     env["RDPILOT_PASSWORD"] = serde_json::Value::String(target.password.clone());
+    env["RDPILOT_SENSOR_BINARY_PATH"] = serde_json::Value::String(sensor_binary_path().to_string_lossy().into_owned());
 
     let rendered = serde_json::json!({ "mcpServers": servers });
     let mut file = std::fs::File::create(dest).expect("create the rendered --mcp-config temp file");

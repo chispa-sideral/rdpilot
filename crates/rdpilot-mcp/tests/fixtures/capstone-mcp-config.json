@@ -13,6 +13,11 @@
     "                           defaults to \"3389\" when absent)",
     "  __RDPILOT_USERNAME__  -> .secrets/connection.json `user`",
     "  __RDPILOT_PASSWORD__  -> .secrets/connection.json `password`",
+    "  __RDPILOT_SENSOR_BINARY_PATH__ -> .secrets/sensor-build/rdpilot-sensor.exe",
+    "                           (live-diagnosed Plan 15-08 -- without this, the",
+    "                           real Connect path never deploys a sensor, so",
+    "                           every sensor-backed tool call times out, mirroring",
+    "                           the identical Plan 15-06/15-07 finding)",
     "",
     "The rendered copy's `env` block carries the REAL connection secrets for the",
     "spawned `rdpilot-mcp` server subprocess ONLY -- it is written to a gitignored",
@@ -34,6 +39,7 @@
         "RDPILOT_PORT": "__RDPILOT_PORT__",
         "RDPILOT_USERNAME": "__RDPILOT_USERNAME__",
         "RDPILOT_PASSWORD": "__RDPILOT_PASSWORD__",
+        "RDPILOT_SENSOR_BINARY_PATH": "__RDPILOT_SENSOR_BINARY_PATH__",
         "RDPILOT_ACCEPT_INVALID_CERTS": "true"
       }
     }
