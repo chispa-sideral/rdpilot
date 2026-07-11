@@ -3,7 +3,7 @@
 ## Milestones
 
 - ✅ **v1.0 MVP** — Phases 1-9 (shipped 2026-07-10)
-- 🚧 **v1.1 Consumer Surfaces & File Transfer** — Phases 10-15 (planning)
+- ✅ **v1.1 Consumer Surfaces & File Transfer** — Phases 10-15 (shipped 2026-07-11)
 
 ## Phases
 
@@ -30,7 +30,7 @@ Full phase goals, success criteria, and plan-by-plan detail: `.planning/mileston
 
 - [x] **Phase 10: SDK File-Transfer Extension** — Generalize the RDPDR drive backend to bidirectional, allow-listed, canonicalization-guarded file transfer with sensor upload/download commands. (completed 2026-07-10)
 - [x] **Phase 11: Shared Wire Protocol & Config** — `rdpilot-ipc` (required-session-id schema, credential-free DTOs) + `rdpilot-config` (layered file/env/flag resolution). (completed 2026-07-10)
-- [ ] **Phase 12: Session Daemon** — Long-lived daemon with a leak-free named-session registry, local-only DACL/peer-scoped IPC, auto-start/idle-shutdown, and crash-restart orphan reconciliation.
+- [x] **Phase 12: Session Daemon** — Long-lived daemon with a leak-free named-session registry, local-only DACL/peer-scoped IPC, auto-start/idle-shutdown, and crash-restart orphan reconciliation. (completed 2026-07-11: 6/7 plans executed offline (12-01..12-06, all offline success criteria verified — see `12-VERIFICATION.md`); Plan 12-07's live-gate scope (Windows explicit-DACL pipe, live orphan-liveness confirmation, e2e session verify) was superseded by design and re-authored/live-verified via Phase 15's 15-01 (offline author) / 15-05 (Windows DACL live-run) / 15-06 (orphan-liveness + e2e live-run) — not an incomplete phase, functionally complete)
 - [x] **Phase 13: CLI Surface** — Thin `rdpilot` CLI over the daemon: lifecycle + perception/input/launch/file verbs, each explicitly targeting a named session. (completed 2026-07-11)
 - [x] **Phase 14: MCP Server Surface** — `rmcp` server exposing a computer-use `computer` mega-tool + rdpilot-native tools, with a tested coordinate-scaling bridge and non-blocking per-call isolation. (completed 2026-07-11)
 - [x] **Phase 15: Proof Harnesses & Live-LLM Capstone** — Scripted per-surface proof (CLI, MCP, no live LLM) plus the capstone live-LLM read/inspect + file-transfer demo through MCP. (completed 2026-07-11: Waves 3-6 LIVE-RUN — single VM provisioned and held UP through 15-05/06/07/08; DAEMON-02 Windows half, PROOF-02, PROOF-03, and PROOF-04 (capstone) all live-verified PASS. Developer-authorized teardown (`manage-env.ps1 down`) confirmed the test RG destroyed (`az group exists -n rdpilot-test` => `false`), management RG `rdpilot-mgmt` persists. v1.1 milestone's proof/live-gate track is now fully closed.)
@@ -87,7 +87,7 @@ Full phase goals, success criteria, and plan-by-plan detail: `.planning/mileston
   4. **[BLOCKING]** The IPC transport is restricted to the local user (Unix `0700` dir + peer-uid check / Windows explicit DACL via `create_with_security_attributes_raw`), verified by a different-uid/other-account client being rejected (DAEMON-02; Pitfall 5).
   5. **[BLOCKING]** The daemon auto-starts on first client connect and self-shuts-down when the registry empties; after a `kill -9` mid-session and restart it reports the possibly-still-live remote session and tears down / reconciles orphans rather than silently forgetting them (DAEMON-03, DAEMON-04; Pitfall 9, in-memory registry + minimal disk-persisted reconciliation state).
 
-**Plans**: 6/7 plans executed
+**Plans**: 6/7 plans executed — functionally complete (12-07 superseded by design, see below; its scope is live-verified via 15-01/15-05/15-06)
 
 - [x] 12-01-PLAN.md — `rdpilot-ipc` lifecycle-verb extension: Connect/List/Disconnect + WireResponse::Connected + WireErrorCode::DuplicateSession + SessionLifecycle::Orphaned; SessionScoped -> Option (Wave 1)
 - [x] 12-02-PLAN.md — `rdpilot-daemon` crate scaffold + workspace member + session/reconciliation seams + rdpilot::Error->WireError mapping (Wave 2)
@@ -179,7 +179,7 @@ Full phase goals, success criteria, and plan-by-plan detail: `.planning/mileston
 | 9. Scripted Proof Harness | v1.0 | 4/4 | Complete | 2026-07-10 |
 | 10. SDK File-Transfer Extension | v1.1 | 5/5 | Complete   | 2026-07-10 |
 | 11. Shared Wire Protocol & Config | v1.1 | 2/2 | Complete   | 2026-07-10 |
-| 12. Session Daemon | v1.1 | 6/7 | In Progress|  |
+| 12. Session Daemon | v1.1 | 6/7 (12-07 superseded, live-verified via 15-01/05/06) | Complete | 2026-07-11 |
 | 13. CLI Surface | v1.1 | 7/7 | Complete   | 2026-07-11 |
 | 14. MCP Server Surface | v1.1 | 5/5 | Complete   | 2026-07-11 |
 | 15. Proof Harnesses & Live-LLM Capstone | v1.1 | 8/8 | Complete   | 2026-07-11 |

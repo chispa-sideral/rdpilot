@@ -1,5 +1,43 @@
 # Milestones
 
+## v1.1 Consumer Surfaces & File Transfer (Shipped: 2026-07-11)
+
+**Delivered:** rdpilot's v1.0 SDK is now reachable through three consumer-facing surfaces — a long-lived session daemon, a thin CLI, and an MCP server — plus bidirectional file transfer between local disk and the remote target. A local AI agent (or a human via the CLI) can now hold multiple named RDP sessions concurrently, drive the full perception/input/launch verb set against any of them by explicit name, and move files in both directions, all without the SDK's Rust/IronRDP stack ever leaving the daemon process. Proven live end-to-end against a real Azure VM target, including a genuine live-LLM capstone (`claude -p` driving `rdpilot-mcp` with no scripted mocking).
+
+**Phases completed:** 6 phases (10-15), 33 of 34 authored plans executed (Plan 12-07 intentionally superseded by design — its full scope was re-authored and live-verified via Phase 15's 15-01/15-05/15-06 instead of being re-executed standalone; see ROADMAP.md Phase 12 entry)
+**Timeline:** 2026-07-10 → 2026-07-11 (2 days)
+**Git range:** `e410437`..`a006301` (151 commits, 291 files changed, +38,622/-2,175 LOC)
+**Known deferred items at close:** 4 (see below)
+
+**Summary accomplishments:**
+
+1. **SDK file transfer** (Phase 10) — `Session::upload_file`/`download_file` over the already-proven RDPDR channel, canonicalization-guarded against path traversal (mixed-separator and Windows-drive-absolute adversarial cases both rejected, live-confirmed against CVE-2025-48817-class attacks), chunked large-file transfer with clean interrupted-transfer detection.
+2. **Shared wire protocol + config** (Phase 11) — `rdpilot-ipc` (required-session-id schema, credential-free DTOs) and `rdpilot-config` (layered file → env → flag/MCP-init resolution), the dependency-free foundation every consumer surface builds on.
+3. **Session daemon** (Phase 12) — a long-lived, leak-free named-session registry (N=50 connect/disconnect thread/RSS soak passes deterministically), local-only IPC (Unix `0700` dir + peer-uid check; Windows explicit-DACL named pipe), auto-start-on-first-connect / idle-reap / self-shutdown-on-empty, and crash-restart orphan reconciliation (a killed daemon never silently forgets a possibly-still-live remote session).
+4. **CLI surface** (Phase 13) — a thin `rdpilot` binary (`connect`/`list`/`disconnect`/perception/input/launch/`put`/`get`) that auto-starts the daemon transparently and never links `ironrdp`/`rustls`/the SDK itself (thin-client invariant, D-17).
+5. **MCP server surface** (Phase 14) — an `rmcp`-based server exposing both an Anthropic computer-use-compatible `computer` mega-tool (with a precision-tested 96-DPI-to-advertised-space coordinate bridge) and 11 rdpilot-native tools, with per-call task isolation so a slow file transfer never blocks a concurrent fast tool call.
+6. **Proof harnesses + live-LLM capstone** (Phase 15) — scripted end-to-end proofs of the CLI and MCP surfaces (no live LLM), plus the milestone's dual finish line: a real local `claude -p` session driving `rdpilot-mcp` through a genuine read/inspect + file-transfer task against a live Azure VM, verified by both transcript evidence and independent byte-for-byte side-effect confirmation — never model self-report.
+
+**Live-verification highlights (all against a real, disposable Azure Windows VM, torn down and confirmed absent at close):**
+
+- Windows-DACL cross-account rejection: a genuinely different Windows account (`rdpilot2`, provisioned for this test) receives a real `ERROR_ACCESS_DENIED` opening the daemon's named pipe — the local-only IPC guarantee holds cross-account, not just same-account (15-05).
+- DAEMON-04 orphan-liveness: `kill -9` mid-session against the live VM target, then daemon restart, correctly surfaces the session as `Orphaned` (never silently forgotten or auto-killed); explicit disconnect reconciles it (15-06).
+- CLI and MCP surfaces live-verified with real pixels and real clicks: before/after screenshot byte-diff, real UIA-tree-verified click landing, and a real 8 MiB `put`/`get` round trip with matching checksums, all through the CLI (15-06) and MCP (15-06) surfaces against real 7-Zip File Manager.
+- PROOF-02/PROOF-03/PROOF-04 all live-verified (15-07/15-08): scripted CLI and MCP proofs pass against the live target with no live LLM; the PROOF-04 capstone has `claude -p` itself drive `rdpilot_connect → rdpilot_launch → rdpilot_window_list/foreground → rdpilot_uia → rdpilot_put/get`, `PROOF: PASS` on both the transcript tool-call evidence and an independent second-client byte-for-byte side-effect check.
+
+**Key finding — two milestone-critical production bugs the live gate caught (15-06):** the daemon's `Connect` handler had never been wired to actually deploy and launch the sensor — offline tests never exercised this because they ran entirely against a canned fake connector. (1) `ResolvedConfig` had no `sensor_binary_path` field at all, so the daemon had no way to source a sensor binary path even in principle; (2) even after adding that, nothing in the `Connect` handler ever called `Session::deploy_and_launch` — the sensor was configured but never actually started. Both fixes were prerequisites for every sensor-backed live verb (CLI-02, CLI-03, MCP-04, PROOF-02/03/04) and were only discoverable by running against a real target — exactly the class of gap a purely-offline, fake-connector test suite structurally cannot catch.
+
+**Deferred items at close (acknowledged, tracked in ROADMAP.md Backlog, not blocking):**
+
+| Item | Status |
+|------|--------|
+| `put`'s remote no-clobber asymmetry — `get` fully enforces no-clobber client-side (`exists()` + `--force`), `put`'s destination is remote and the sensor's Upload handler has no overwrite-refusal | Deliberately deferred, tracked as Backlog Phase 999.5 (symmetric remote no-clobber for `put`), documented in `put --help` — not silently under-delivered |
+| Web viewer for daemon sessions (human visibility into agent/session activity + takeover) | Backlog Phase 999.6, not started |
+| Session recording with timestamps/annotations | Backlog Phase 999.7, not started |
+| Consolidated post-close cleanup debt (DAEMON-01 checkbox drift, a test-only typo, rdpilot-daemon clippy test-module debt) | Resolved same-day in the v1.1 close cleanup pass (2026-07-11) — see commits `04025f8`/`a006301` |
+
+---
+
 ## v1.0 MVP (Shipped: 2026-07-10)
 
 **Delivered:** A local AI agent can connect to a remote Windows desktop over RDP and read/inspect a program that is only reachable via RDP — using both screenshots and structured accessibility data (window list, process tree, UI Automation tree) — proven live end-to-end against a real remote-only Windows program (7-Zip File Manager), with no live LLM required to call it done.

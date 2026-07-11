@@ -2,16 +2,17 @@
 gsd_state_version: 1.0
 milestone: v1.1
 milestone_name: — Consumer Surfaces & File Transfer
-status: verifying
-stopped_at: "Phase 15 Plan 08 (15-08) COMPLETE (8/8 plans, Phase 15 closed): Task 1 (claude-auth probe) confirmed the local Claude Code CLI authenticated/reachable; Task 2 -- PROOF-04's live-LLM capstone (claude -p --permission-mode bypassPermissions --strict-mcp-config) drove connect/launch/window-list/foreground/uia/put/get entirely through the real rdpilot-mcp binary against the live Azure VM's 7-Zip File Manager, PROOF-04 LIVE-VERIFIED PASS (transcript + independent side-effect both green), after one live-diagnosed fix (RDPILOT_SENSOR_BINARY_PATH missing from the rendered --mcp-config, identical root cause to 15-06/15-07's finding, commit d405805); Task 3 -- developer authorized teardown ('approved: teardown'), pwsh infra/manage-env.ps1 -Action down ran clean (exit 0, 'Resource group rdpilot-test is fully deleted'), independently confirmed via az group exists -n rdpilot-test => false, rdpilot-mgmt persists (Succeeded), no stray local daemon/sensor/claude processes or IPC socket remained. All of PROOF-02/PROOF-03/PROOF-04 are live-verified; the v1.1 milestone's Consumer Surfaces & File Transfer scope (Phases 10-15) is now fully live-verified end to end."
-last_updated: "2026-07-11T21:26:47.799Z"
-last_activity: 2026-07-11 -- Phase 15 Plan 08 (PROOF-04 live-LLM capstone via claude -p PASS + developer-authorized VM teardown confirmed) executed to completion; Phase 15 (8/8 plans) now Complete
+status: shipped
+stopped_at: "v1.1 MILESTONE COMPLETE (2026-07-11): all six phases (10-15) done, all 27 v1.1 requirements Complete, PROOF-02/03/04 all live-verified against a real Azure VM target, VM torn down and confirmed absent. Post-close cleanup pass (same day): DAEMON-01 checkbox drift corrected (soak evidence confirmed, tests/thread_leak_soak.rs N=50 re-passes), a test-only FakeTestSession string-literal typo fixed, rdpilot-daemon's 28 pre-existing clippy::expect_used/unwrap_used test-module violations resolved via one crate-wide #![cfg_attr(test, ...)], and this STATE.md's narrative fields reconciled to the true end state. Offline workspace suite reconfirmed green post-cleanup (467 passed / 0 failed / 40 ignored) and cargo clippy --all-targets -p rdpilot-daemon is clean. ROADMAP.md/MILESTONES.md updated to mark v1.1 Complete/SHIPPED."
+last_updated: "2026-07-11T23:00:00.000Z"
+last_activity: 2026-07-11 -- v1.1 milestone CLOSED (Phases 10-15 all Complete, PROOF-02/03/04 live-verified, VM torn down); same-day consolidated cleanup pass reconciled tracked debt (DAEMON-01 checkbox, FakeTestSession typo, daemon clippy debt) and closed the milestone in ROADMAP.md/MILESTONES.md
 progress:
   total_phases: 6
-  completed_phases: 5
+  completed_phases: 6
   total_plans: 34
   completed_plans: 33
-  percent: 83
+  percent: 100
+  note: "34 plans authored across Phases 10-15; 33 executed. The 1 gap is Plan 12-07, intentionally superseded by design (not an incomplete phase) — its full scope (Windows explicit-DACL pipe + live orphan-liveness + e2e session verify) was re-authored and re-scoped into Phase 15's 15-01 (offline author) / 15-05 (Windows DACL live-run) / 15-06 (orphan-liveness + e2e live-run), all of which completed and live-verified. Phase 12 itself is functionally 7/7-equivalent-complete; see ROADMAP.md Phase 12 entry."
 ---
 
 # Project State
@@ -21,14 +22,15 @@ progress:
 See: .planning/PROJECT.md (updated 2026-07-10)
 
 **Core value:** A local AI agent can connect to a remote Windows desktop over RDP and read/inspect a program that is only reachable via RDP — using both screenshots and structured accessibility data, without installing or running the agent itself on the remote machine.
-**Current focus:** Phase 15 — Proof Harnesses & Live-LLM Capstone
+**Current focus:** v1.1 milestone SHIPPED. No active phase — awaiting next milestone scoping (see Operator Next Steps / ROADMAP.md Backlog).
 
 ## Current Position
 
-Phase: 15 (Proof Harnesses & Live-LLM Capstone) — COMPLETE (8/8 plans)
+Phase: 15 (Proof Harnesses & Live-LLM Capstone) — COMPLETE (8/8 plans) — the last phase of the v1.1 milestone
 Plan: 8 of 8 — all tasks complete (Task 3 teardown developer-authorized and confirmed)
-Status: 15-08 fully complete: claude-auth probe confirmed the local Claude Code CLI (v2.1.207) is authenticated and reachable; PROOF-04's live-LLM capstone (`claude -p --permission-mode bypassPermissions --strict-mcp-config`) drove `rdpilot_connect` -> `rdpilot_launch` (7-Zip::FM) -> `rdpilot_window_list`/`rdpilot_foreground` -> `rdpilot_uia` (menu bar: File, Edit, View, Favorites, Tools, Help) -> `rdpilot_put`/`rdpilot_get` entirely through the real `rdpilot-mcp` binary against the live Azure VM, `PROOF: PASS` on both required signals (transcript + independent second-client byte-for-byte side-effect). One live-diagnosed fix required: `RDPILOT_SENSOR_BINARY_PATH` was missing from the rendered `--mcp-config`'s env block (identical root cause to 15-06/15-07's finding for CLI-02/03 and PROOF-02/03) -- fixed, committed (`d405805`), re-verified genuinely green. Task 3: developer authorized teardown ("approved: teardown"); `pwsh infra/manage-env.ps1 -Action down` ran clean (exit 0), independently confirmed `az group exists -n rdpilot-test` => `false` and `rdpilot-mgmt` persists (`Succeeded`); no stray local processes/sockets left. All of PROOF-02/03/04 are live-verified; the v1.1 milestone's Consumer Surfaces & File Transfer scope (Phases 10-15) is now fully live-verified end to end. Phase 15 CLOSED.
-Last activity: 2026-07-11 -- Phase 15 Plan 08 (PROOF-04 live-LLM capstone via claude -p PASS + developer-authorized VM teardown confirmed) executed to completion; Phase 15 (8/8 plans) now Complete
+Status: v1.1 MILESTONE COMPLETE. All six phases (10-15) are Complete; all 27 v1.1 requirements are `[x]` Complete in REQUIREMENTS.md. 15-08 (the terminal plan) fully complete: claude-auth probe confirmed the local Claude Code CLI (v2.1.207) is authenticated and reachable; PROOF-04's live-LLM capstone (`claude -p --permission-mode bypassPermissions --strict-mcp-config`) drove `rdpilot_connect` -> `rdpilot_launch` (7-Zip::FM) -> `rdpilot_window_list`/`rdpilot_foreground` -> `rdpilot_uia` (menu bar: File, Edit, View, Favorites, Tools, Help) -> `rdpilot_put`/`rdpilot_get` entirely through the real `rdpilot-mcp` binary against the live Azure VM, `PROOF: PASS` on both required signals (transcript + independent second-client byte-for-byte side-effect). One live-diagnosed fix required: `RDPILOT_SENSOR_BINARY_PATH` was missing from the rendered `--mcp-config`'s env block (identical root cause to 15-06/15-07's finding for CLI-02/03 and PROOF-02/03) -- fixed, committed (`d405805`), re-verified genuinely green. Task 3: developer authorized teardown ("approved: teardown"); `pwsh infra/manage-env.ps1 -Action down` ran clean (exit 0), independently confirmed `az group exists -n rdpilot-test` => `false` and `rdpilot-mgmt` persists (`Succeeded`); no stray local processes/sockets left. All of PROOF-02/03/04 are live-verified; the v1.1 milestone's Consumer Surfaces & File Transfer scope (Phases 10-15) is now fully live-verified end to end. Phase 15 CLOSED.
+Post-close: a same-day consolidated cleanup pass (2026-07-11) cleared tracked debt (DAEMON-01 checkbox drift, a test-only FakeTestSession typo, rdpilot-daemon clippy debt), reconfirmed the full offline workspace suite green (467 passed / 0 failed / 40 ignored), and closed the milestone formally in ROADMAP.md/MILESTONES.md.
+Last activity: 2026-07-11 -- v1.1 milestone CLOSED and SHIPPED; same-day consolidated cleanup + milestone-close docs pass completed
 
 ## Milestone v1.1 Phases
 
@@ -45,9 +47,11 @@ Last activity: 2026-07-11 -- Phase 15 Plan 08 (PROOF-04 live-LLM capstone via cl
 
 **Velocity:**
 
-- Total plans completed: 10
-- Average duration: ~17 min
-- Total execution time: ~2.6 hours
+- Total plans completed (v1.1, Phases 10-15): 33 of 34 authored (12-07 intentionally superseded by design, see ROADMAP.md Phase 12 entry)
+- v1.1 (Phases 10-15) recorded execution time: ~30.5 hours across 31 of the 33 executed plans with a logged duration (14-02 and 15-08 predate consistent duration logging and have no recorded figure) — average ~59 min/plan
+- Phases 11-15 alone (excluding Phase 10, which shipped 2026-07-10): ~26.3 hours across 26 of 28 executed plans with a logged duration
+- Longest single plans: 15-05 (~7h, live VM provisioning + on-VM sensor build + Windows-DACL live gate), 15-06 (~2.5h, orphan-liveness/e2e + CLI-02/03 + MCP-04 live half), 10-05 (~2h, terminal Phase 10 live gate)
+- *(Note: the totals above supersede the stale "Total plans completed: 10 / ~17 min avg / ~2.6h total" figure previously recorded here, which reflected only an early subset of the v1.0 phases and was never updated as the project progressed. Full per-plan detail for every phase remains in the By Phase table below.)*
 
 **By Phase:**
 
@@ -309,11 +313,11 @@ Pre-close artifact audit surfaced 3 open items. Reviewed and explicitly acknowle
 
 ## Session Continuity
 
-Last session: 2026-07-11T21:26:41.600Z
-Stopped at: Phase 13 Plan 06 complete (6/7 plans). CLI-02 (perception+input+launch verb set against --session) delivered and offline-proven via tests/cli_verbs.rs against the real daemon binary's canned FakeTestSession. Ready to execute 13-07 (CLI-03: put/get no-clobber + path absolutization + error taxonomy). Phase 12's 12-07 live gate (Windows explicit-DACL pipe, live orphan-liveness confirmation, e2e session verify) remains separately pending and is not blocked by Phase 13's progress.
-Resume file: .planning/DECISIONS-INDEX.md
+Last session: 2026-07-11T23:00:00.000Z
+Stopped at: v1.1 MILESTONE COMPLETE and SHIPPED. Phases 10-15 all Complete (33/34 plans executed; the 1 gap, Plan 12-07, is intentionally superseded by design — its scope was re-authored and live-verified via Phase 15's 15-01/15-05/15-06 instead). All 27 v1.1 requirements are `[x]` Complete in REQUIREMENTS.md. PROOF-02/PROOF-03/PROOF-04 are all live-verified against a real Azure VM target; the VM is torn down and confirmed absent. A same-day consolidated cleanup pass closed out tracked debt (DAEMON-01 checkbox drift, a test-only FakeTestSession string-literal typo, rdpilot-daemon's clippy::expect_used/unwrap_used test-module debt) and reconfirmed the full offline workspace suite green (467 passed / 0 failed / 40 ignored, cargo clippy --all-targets -p rdpilot-daemon clean). ROADMAP.md and MILESTONES.md now mark v1.1 Complete/SHIPPED 2026-07-11, mirroring the v1.0 close pattern. No active phase; the project is between milestones.
+Resume file: .planning/MILESTONES.md
 
 ## Operator Next Steps
 
-- Execute Plan 13-02 (extend rdpilot-ipc with perception/input wire DTOs) to continue Phase 13
-- Execute Plan 12-07 (the Phase 12 live gate) to close out Phase 12 and DAEMON-02/DAEMON-04's remaining live components — independent of Phase 13's progress
+- v1.1 (Consumer Surfaces & File Transfer) is SHIPPED — no phase currently in progress.
+- Scope and kick off the next milestone (v1.2 or later), or promote a Backlog item (999.1-999.7 in ROADMAP.md) into a planned phase via `/gsd-review-backlog` — notable candidates: 999.5 (symmetric remote no-clobber for `put`), 999.6 (web viewer for daemon sessions), 999.7 (session recording).
