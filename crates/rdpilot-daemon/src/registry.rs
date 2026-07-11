@@ -212,6 +212,12 @@ impl Registry {
 
         match self.connector.connect(cfg).await {
             Ok(session) => {
+                // A single wall-clock capture shared by the entry's
+                // `connected_since_wall`/`last_activity_wall` and the
+                // reconciliation sink's `record_open` call below — avoids
+                // two independent `SystemTime::now()` reads racing apart
+                // by a few milliseconds for what is conceptually one event.
+                let now_wall = iso8601_now();
                 {
                     #[allow(clippy::expect_used)] // A poisoned registry mutex is unrecoverable.
                     let mut guard = self.sessions.lock().expect("registry mutex poisoned");
@@ -220,13 +226,15 @@ impl Registry {
                         SessionEntry::Live {
                             session,
                             connected_since: Instant::now(),
+                            connected_since_wall: now_wall.clone(),
                             name,
                             host: host.clone(),
                             last_activity: Instant::now(),
+                            last_activity_wall: now_wall.clone(),
                         },
                     );
                 } // guard dropped here — never held across the .await below
-                self.sink.record_open(&id, &host, &iso8601_now());
+                self.sink.record_open(&id, &host, &now_wall);
                 Ok(id)
             }
             Err(e) => {
@@ -495,6 +503,28 @@ mod tests {
 
         registry.close(&id).await.expect("reclaiming an orphan should succeed");
         assert_eq!(registry.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn list_reports_connected_since_and_last_activity_for_a_live_session() {
+        // SESSION-03 field-completeness: a live session's `list` entry
+        // carries a real (non-`None`) `connected_since`/`last_activity`
+        // wall-clock timestamp, not the placeholder `None` a `Connecting`
+        // entry legitimately reports.
+        let registry = succeeding_registry();
+        registry
+            .open(Some("web".to_owned()), "10.0.0.5".to_owned(), test_cfg())
+            .await
+            .expect("open should succeed");
+
+        let statuses = registry.list();
+        assert_eq!(statuses.len(), 1);
+        let status = &statuses[0];
+        assert_eq!(status.name.as_deref(), Some("web"));
+        assert_eq!(status.host, "10.0.0.5");
+        assert_eq!(status.status, SessionLifecycle::Live);
+        assert!(status.connected_since.is_some(), "connected_since must be populated for a live session");
+        assert!(status.last_activity.is_some(), "last_activity must be populated for a live session");
     }
 
     #[test]

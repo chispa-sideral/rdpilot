@@ -158,8 +158,14 @@ pub enum SessionEntry {
     Live {
         /// The owned, type-erased managed session.
         session: Box<dyn ManagedSession>,
-        /// When the connect completed (monotonic; idle-reap arithmetic).
+        /// When the connect completed (monotonic; idle-reap arithmetic,
+        /// Plan 12-06).
         connected_since: Instant,
+        /// ISO-8601 wall-clock rendering of `connected_since`, captured
+        /// once at insert time — the `list` (SESSION-03) display value; a
+        /// monotonic `Instant` cannot be rendered as a wall-clock string on
+        /// its own.
+        connected_since_wall: String,
         /// The caller-supplied name, if any (an auto-generated id has no
         /// separate name — `None`).
         name: Option<String>,
@@ -168,6 +174,14 @@ pub enum SessionEntry {
         /// Monotonic timestamp of the last observed activity (idle-reap,
         /// Plan 12-06).
         last_activity: Instant,
+        /// ISO-8601 wall-clock rendering of `last_activity`. No
+        /// operational verb is wired to update activity yet in this phase
+        /// (dispatch resolves them to a not-implemented error, Plan
+        /// 12-04's deliberately narrow scope) — this equals
+        /// `connected_since_wall` until Phase 13 wires per-request
+        /// activity tracking, which is accurate: for a freshly connected
+        /// session, the last observed activity IS the connect itself.
+        last_activity_wall: String,
     },
     /// A possibly-still-live remote Windows session surfaced after a
     /// crash-restart (DAEMON-04) — never silently torn down; requires an
@@ -185,15 +199,13 @@ pub enum SessionEntry {
 
 impl SessionEntry {
     /// Render this entry (plus its registry key) into the credential-free
-    /// wire DTO `list` returns (D-30/D-31).
+    /// wire DTO `list` returns (D-30/D-31, SESSION-03).
     ///
-    /// `Live`'s `connected_since`/`last_activity` are intentionally `None`
-    /// here: they are tracked internally as monotonic [`Instant`]s (for
-    /// idle-reap arithmetic, Plan 12-06), which cannot be rendered as an
-    /// ISO-8601 wall-clock string without a separate capture — the
-    /// registry (Plan 12-03/12-04) is responsible for tracking and
-    /// supplying that wall-clock string alongside the `Instant` once `list`
-    /// is wired end-to-end.
+    /// `Live`'s `connected_since`/`last_activity` are populated from the
+    /// wall-clock captures taken at insert time (Plan 12-04 finishes the
+    /// wiring this doc comment previously flagged as outstanding) —
+    /// `Connecting` has no wall-clock capture yet (the claim predates any
+    /// successful connect), so it legitimately reports `None` for both.
     #[must_use]
     pub fn to_status(&self, id: &SessionId) -> SessionStatus {
         match self {
@@ -205,13 +217,20 @@ impl SessionEntry {
                 connected_since: None,
                 last_activity: None,
             },
-            SessionEntry::Live { session, name, host, .. } => SessionStatus {
+            SessionEntry::Live {
+                session,
+                name,
+                host,
+                connected_since_wall,
+                last_activity_wall,
+                ..
+            } => SessionStatus {
                 id: id.as_str().to_owned(),
                 name: name.clone(),
                 host: host.clone(),
                 status: session.describe(),
-                connected_since: None,
-                last_activity: None,
+                connected_since: Some(connected_since_wall.clone()),
+                last_activity: Some(last_activity_wall.clone()),
             },
             SessionEntry::Orphaned { host, connected_since } => SessionStatus {
                 id: id.as_str().to_owned(),
