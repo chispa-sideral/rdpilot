@@ -2,15 +2,15 @@
 gsd_state_version: 1.0
 milestone: v1.1
 milestone_name: — Consumer Surfaces & File Transfer
-status: executing
-stopped_at: "Phase 13 Plan 01 complete (1/7 plans). Auto-start transport (socket_path/connect_or_spawn/framing) relocated from rdpilot-daemon into rdpilot-ipc::transport, verified rdpilot/IronRDP-free via cargo tree. Phase 12 unchanged at 6/7 (12-07 live gate still pending, not part of this plan). Ready to execute 13-02 (perception/input wire DTOs)."
-last_updated: "2026-07-11T07:14:08.831Z"
-last_activity: 2026-07-11 -- Phase 13 Plan 01 (relocate auto-start transport into rdpilot-ipc) executed
+status: completed
+stopped_at: "Phase 13 Plan 04 complete (4/7 plans). dispatch.rs's every operational verb (Ping/Screenshot/WindowList/ProcessList/Uia/WorldState/Mouse/Key/LaunchProcess/SetForeground/Put/Get) now routes through Registry::call to the live rdpilot::Session (13-03's ManagedSession seam), converting wire DTOs (13-02) to/from SDK types; the not_implemented_for stub is gone. The pre-existing Phase-12 share_root Connect-arm gap (research Pitfall 6) is fixed via a new rdpilot-config::share_root_or_default resolver. base64 = 0.22.1 added to rdpilot-daemon (developer-approved legitimacy checkpoint, mechanically verified against crates.io). Note: STATE.md's plan counter had drifted at '1/7' since a Wave-2 parallel-execution race (13-02/13-03) clobbered each other's session updates without landing; this session (single-owner, Wave 3) reconciles the counter to reflect all 4 completed plans (13-01/02/03/04), confirmed against the 4 SUMMARY.md files actually on disk. Ready to execute 13-05."
+last_updated: "2026-07-11T08:14:00.139Z"
+last_activity: 2026-07-11 -- Phase 13 Plan 04 (daemon dispatch wiring + share_root fix) executed; reconciled plan counter after the Wave-2 session-update race
 progress:
   total_phases: 6
   completed_phases: 2
   total_plans: 21
-  completed_plans: 14
+  completed_plans: 17
   percent: 33
 ---
 
@@ -26,9 +26,9 @@ See: .planning/PROJECT.md (updated 2026-07-10)
 ## Current Position
 
 Phase: 13 (CLI Surface) — EXECUTING
-Plan: 1 of 7
-Status: Transport relocation (CLI-01 prerequisite) complete; Phase 12's 12-07 live gate remains separately pending (not part of Phase 13)
-Last activity: 2026-07-11 -- Phase 13 Plan 01 (relocate auto-start transport into rdpilot-ipc) executed
+Plan: 5 of 7
+Status: Daemon dispatch fully wired to live sessions (13-01/02/03/04 complete); share_root Connect-arm gap fixed; Phase 12's 12-07 live gate remains separately pending (not part of Phase 13)
+Last activity: 2026-07-11 -- Phase 13 Plan 04 (daemon dispatch wiring + share_root fix) executed
 
 ## Milestone v1.1 Phases
 
@@ -109,6 +109,7 @@ Last activity: 2026-07-11 -- Phase 13 Plan 01 (relocate auto-start transport int
 | Phase 13 P01 | ~15min | 2 tasks | 6 files |
 | Phase 13 P02 | ~20min | 2 tasks | 5 files |
 | Phase 13 P03 | ~40min | 2 tasks | 10 files (rdpilot-daemon only: seams.rs, registry.rs, dispatch.rs, server.rs, lifecycle.rs + 3 tests/*.rs; incl. concurrency-induced dispatch.rs fix) |
+| Phase 13 P04 | 70 | 3 tasks | 10 files |
 
 ## Accumulated Context
 
@@ -208,6 +209,8 @@ Recent decisions affecting current work:
 - **Phase 13 Plan 01 (2026-07-11):** Relocated socket_path/socket_dir, length-prefixed JSON framing (read_frame/write_frame/MAX_FRAME_LEN), and connect_or_spawn/BACKOFF_MS out of rdpilot-daemon and into a new `rdpilot_ipc::transport` module (`#[cfg(unix)]`) — the CLI-01 prerequisite so Plan 13-05's thin CLI can auto-start/reach the daemon without depending on rdpilot/IronRDP. Introduced a crate-local `TransportError` since rdpilot-ipc cannot reference rdpilot-daemon's `DaemonError`. `directories`/`tokio` added to rdpilot-ipc strictly under `[target.'cfg(unix)'.dependencies]`. `rdpilot_daemon::connect_or_spawn`/`socket_path` remain stable transparent re-exports; `bind`/`accept_and_authorize`/`authorize_uid`/`effective_uid` (listener-side security, T-13-03) stay daemon-only, untouched. `cargo tree -p rdpilot-ipc` confirmed no ironrdp/rustls in the graph; `cargo test --workspace` green; `tests/autostart_lifecycle.rs` (real-binary auto-start, `--include-ignored`) and `tests/ipc_security.rs` both pass unchanged. Built/tested on the `x86_64-unknown-linux-gnu` substitute target (pinned `x86_64-pc-windows-gnu` toolchain not installed on this host). This plan is independent of Phase 12's still-pending 12-07 live gate. See `13-01-SUMMARY.md`.
 - **Phase 13 Plan 02 (2026-07-11):** Extended `rdpilot-ipc` with the full CLI-02 perception/input wire vocabulary: new `perception.rs` (WireRect, WireWindowState, WireWindowInfo, WireProcessInfo, WireUiaScope, WireUiaElement, WireUiaMode, WireWorldStateOptions) and `input.rs` (WireButton, WireMouseAction, WireKey, WireKeyAction) modules — owned mirrors, never importing `rdpilot`, per the `transfer.rs` convention. `Request` gained six new session-scoped verbs (WindowList/ProcessList/Uia/WorldState/Mouse/Key), each carrying a required non-`Option` `session: SessionId` and added to `SessionScoped`'s exhaustive no-wildcard match (SESSION-02 preserved); the missing-session-rejection and present-session-accepts tests were extended to cover all six. `WireResponse` gained four new variants (WindowList/ProcessList/Uia/WorldState), added to `sample_all_response_variants`'s exhaustive-match forcing function. **[Rule 1 - plan bug] found and fixed:** the plan/research claimed `WireKey` should have 68 variants, but `rdpilot::Key`'s actual source (`crates/rdpilot/src/input.rs`) has 67 (verified by direct count and by summing the plan's own stated category breakdown) — `WireKey` was written with the correct 67-variant 1:1 mirror and the test asserts `count == 67`, not 68 (documented in `13-02-SUMMARY.md`). `cargo test -p rdpilot-ipc` (38/38, x86_64-unknown-linux-gnu substitute target) and `cargo tree -p rdpilot-ipc` (still ironrdp/rustls/rdpilot-free) both green. See `13-02-SUMMARY.md`.
 - **Phase 13 Plan 03 (2026-07-11, concurrent with 13-02, `rdpilot-daemon`-only file scope):** Extended `ManagedSession` (`crates/rdpilot-daemon/src/seams.rs`) with the twelve `&self` operational methods (screenshot/world_state/get_window_list/get_process_tree/get_uia_tree/send_mouse/send_key/set_foreground_window/launch_process/upload_file/download_file/ping), each returning the crate's manual `BoxFuture<'_, Result<T, DaemonError>>` shape with no `+ Send` bound; `impl ManagedSession for rdpilot::Session` delegates each one-line to the matching SDK method. Changed `SessionEntry::Live.session` storage from `Box<dyn ManagedSession>` to `Arc<tokio::sync::Mutex<Option<Box<dyn ManagedSession>>>>` (the naive `Arc<dyn ManagedSession>` + `Arc::into_inner` design does not compile — `dyn ManagedSession` is unsized) plus a lock-free `status: SessionLifecycle` snapshot so `list`/`to_status` never touches the inner mutex. Added `Registry::call<T>`: clones the `Arc` under the synchronous outer `Mutex`, drops the guard, THEN `.await`-locks the inner `tokio::sync::Mutex` — the outer lock is never held across an `.await` (deadlock-free on the daemon's single-`LocalSet`-OS-thread model). `Registry::close`'s `Live` arm now `.take()`s the sized `Box` out of the `Option` (never the unsized trait object) before awaiting `close()` — close-not-drop (DAEMON-01) preserved bit-for-bit; DAEMON-01's `--include-ignored` 50-cycle thread/RSS soak and the SC#1 registry-concurrency test both re-verified green under the new storage. **[Rule 3 — blocking, concurrency-induced] found and fixed:** the concurrently-running Plan 13-02 added six new `rdpilot_ipc::Request` variants (WindowList/ProcessList/Uia/WorldState/Mouse/Key) to the same exhaustive `dispatch.rs` match this plan's own file list already included — extended the deferred-verb arm to route them through the existing `not_implemented_for` stub (no functional wiring; that is 13-04's job). **[Rule 3 — blocking, build-gate] found and fixed:** `server.rs`'s `FakeTestSession` (not `#[cfg(test)]` — used by the runtime `RDPILOT_DAEMON_TEST_CONNECTOR` env var path) needed the twelve new methods to satisfy Task 1's own `cargo build` gate; implemented immediately with plausible canned values (2x1 screenshot, one `WindowInfo`/`ProcessInfo`/`UiaElement`, fixed PID/checksum) rather than trivial stubs, since Task 2 would have needed to touch it again otherwise — the offline CLI-02 rendering proof (Plan 13-06) now has real non-empty data to render against. Every other `ManagedSession` test fake in the crate (registry.rs/dispatch.rs/lifecycle.rs inline fakes, `tests/registry_concurrency.rs`, `tests/thread_leak_soak.rs`, `tests/crash_restart_reconcile.rs`) updated with trivial canned stubs. `cargo test -p rdpilot-daemon` green (51 lib tests + all integration tests, `--include-ignored` for the soak/concurrency suites); `tests/ipc_security.rs`'s `cross_account_peer_is_rejected_end_to_end` skipped (pre-existing, requires `RDPILOT_SECOND_UID`, unrelated). Built/tested on the `x86_64-unknown-linux-gnu` substitute target per this plan's offline instructions. No `rdpilot-ipc` files touched (concurrency boundary with 13-02 respected). See `13-03-SUMMARY.md`.
+- [Phase ?]: base64 pinned at 0.22.1 (crates.io max_stable_version, verified 2026-07-11 against github.com/marshallpierce/rust-base64) — the single shared pin for both the 13-04 daemon addition and the 13-06 CLI addition, per the developer-approved legitimacy checkpoint
+- [Phase ?]: share_root_or_default() falls back to <platform-data-dir>/rdpilot/transfer-staging via directories::BaseDirs (temp_dir fallback if no home dir resolves) when ResolvedConfig::share_root is unset, closing research Pitfall 6's Connect-arm gap
 
 ### Pending Todos
 
@@ -254,7 +257,7 @@ Pre-close artifact audit surfaced 3 open items. Reviewed and explicitly acknowle
 
 ## Session Continuity
 
-Last session: 2026-07-11T07:14:08.831Z
+Last session: 2026-07-11T08:14:00.133Z
 Stopped at: Phase 13 Plan 01 complete (1/7 plans). Auto-start transport (socket_path/connect_or_spawn/framing) relocated from rdpilot-daemon into rdpilot-ipc::transport, verified rdpilot/IronRDP-free. Ready to execute 13-02 (perception/input wire DTOs). Phase 12's 12-07 live gate (Windows explicit-DACL pipe, live orphan-liveness confirmation, e2e session verify) remains separately pending and is not blocked by Phase 13's progress.
 Resume file: .planning/DECISIONS-INDEX.md
 
