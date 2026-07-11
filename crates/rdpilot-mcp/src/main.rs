@@ -16,9 +16,11 @@
 #![deny(clippy::print_stdout)]
 
 mod computer;
+mod config_params;
 mod connect;
 mod error;
 mod handler;
+mod native_tools;
 mod timeouts;
 
 use rmcp::{ServiceExt, transport::stdio};

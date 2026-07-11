@@ -1,18 +1,26 @@
 //! [`RdpilotMcpHandler`] — the rmcp `ServerHandler` implementation.
 //!
 //! Plan 14-02 registered ZERO tools (an empty `ToolRouter::new()`). Plan
-//! 14-03 adds the first: the Anthropic-`computer_20250124`-compatible
+//! 14-03 added the first: the Anthropic-`computer_20250124`-compatible
 //! `computer` mega-tool (MCP-02/MCP-04) as a `#[tool]` method on this same
 //! `impl` block — its actual dispatch logic lives in
 //! `crate::computer::dispatch::dispatch_computer` (a separate `impl
 //! RdpilotMcpHandler` block in `computer/dispatch.rs`), so this method is a
 //! thin adapter: extract `Parameters<ComputerArgs>`, dispatch, map
-//! `McpError` to `rmcp::ErrorData` (D-28). Plan 14-04 adds the remaining
-//! `rdpilot_*` native tools.
+//! `McpError` to `rmcp::ErrorData` (D-28).
+//!
+//! Plan 14-04 adds the remaining eleven `rdpilot_*` native tools
+//! (`crate::native_tools`, MCP-03) via a SECOND `#[tool_router]` block on
+//! this same type, in that module. The two routers are combined into ONE
+//! advertised `tools/list` surface via `ToolRouter`'s `Add` impl in this
+//! file's explicit `#[tool_handler(router = ...)]` block below — `#[tool_router(server_handler)]`
+//! (Plan 14-02/14-03's shorthand) only sums a single block's own router, so
+//! combining two files' worth of tools requires writing that summation out
+//! by hand instead.
 
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::CallToolResult;
-use rmcp::{tool, tool_router};
+use rmcp::{ServerHandler, tool, tool_handler, tool_router};
 
 use crate::computer::ComputerArgs;
 
@@ -23,12 +31,12 @@ use crate::computer::ComputerArgs;
 #[derive(Debug, Default, Clone, Copy)]
 pub struct RdpilotMcpHandler;
 
-/// `server_handler` emits `#[tool_handler] impl ServerHandler for
-/// RdpilotMcpHandler` for us (the tools-only-server shorthand from rmcp's
-/// own `handler::server::router::tool` module docs), wiring `call_tool`,
-/// `list_tools`, `get_tool`, and a default `get_info` from this impl's
-/// `tool_router()`.
-#[tool_router(server_handler)]
+/// The `computer` tool's own router-generating block. `router =
+/// computer_tool_router` (rather than the macro's default `tool_router`
+/// name) so this file's function and `crate::native_tools`'s
+/// `native_tool_router()` can coexist as two DIFFERENT inherent associated
+/// functions on the same `RdpilotMcpHandler` type — both are summed below.
+#[tool_router(router = computer_tool_router, vis = "pub(crate)")]
 impl RdpilotMcpHandler {
     /// Construct a handler instance. `main.rs`'s `#[tokio::main]` entry
     /// constructs exactly one of these per process and hands it to
@@ -68,18 +76,26 @@ impl RdpilotMcpHandler {
     }
 }
 
+/// Combine the `computer` tool's router (this file) with the eleven
+/// `rdpilot_*` native tools' router (`crate::native_tools::native_tool_router`)
+/// into ONE advertised `tools/list` surface (MCP-01/MCP-03) —
+/// `ToolRouter<Self>` implements `Add`, so summing the two static
+/// router-builder functions merges their disjoint route maps. Ownership of
+/// which tool lives in which source file stays exactly as each module's own
+/// doc comment describes; only the final wiring lives here.
+#[tool_handler(router = (Self::computer_tool_router() + Self::native_tool_router()))]
+impl ServerHandler for RdpilotMcpHandler {}
+
 #[cfg(test)]
 mod tests {
-    use rmcp::ServerHandler;
-
     use super::*;
 
-    /// The empty tool router still produces a valid `ServerInfo` with the
+    /// The combined router still produces a valid `ServerInfo` with the
     /// `tools` capability enabled (`#[tool_handler]`'s auto-generated
     /// `get_info`) — proves the macro-generated `ServerHandler` impl
-    /// compiles and is callable even with zero registered tools.
+    /// compiles and is callable now that it sums two routers.
     #[test]
-    fn handler_reports_tools_capability_even_with_zero_registered_tools() {
+    fn handler_reports_tools_capability() {
         let handler = RdpilotMcpHandler::new();
         let info = handler.get_info();
         assert!(info.capabilities.tools.is_some(), "tools capability should be enabled by #[tool_handler]");
