@@ -84,6 +84,28 @@ pub fn exit_code_for(err: &CliError) -> ExitCode {
     ExitCode::from(code_for(err))
 }
 
+/// The kebab-case wire-style error code string for `err` (D-28), used by
+/// the `--json` error-rendering path in `main.rs`
+/// (`{"error":{"code":"<kebab>","message":"..."}}`). For [`CliError::Wire`]
+/// this is exactly the wire's own `#[serde(rename_all = "kebab-case")]`
+/// string (`WireErrorCode` serializes to e.g. `"session-not-found"`); every
+/// client-local class gets its own fixed kebab spelling so the two families
+/// share one legible vocabulary.
+#[must_use]
+pub fn code_str_for(err: &CliError) -> String {
+    match err {
+        CliError::Wire(wire) => serde_json::to_string(&wire.code)
+            .ok()
+            .map(|s| s.trim_matches('"').to_owned())
+            .unwrap_or_else(|| "internal".to_owned()),
+        CliError::DaemonUnreachable(_) => "daemon-unreachable".to_owned(),
+        CliError::NoClobber(_) => "no-clobber".to_owned(),
+        CliError::MissingConfig(_) => "missing-config".to_owned(),
+        CliError::Internal(_) => "internal".to_owned(),
+        CliError::Transport(_) => "transport".to_owned(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -115,5 +137,24 @@ mod tests {
     fn cli_error_display_never_panics_and_includes_context() {
         let rendered = format!("{}", CliError::MissingConfig("host is required".to_owned()));
         assert!(rendered.contains("host is required"));
+    }
+
+    #[test]
+    fn code_str_for_wire_errors_matches_the_wire_kebab_case_string() {
+        assert_eq!(code_str_for(&wire(WireErrorCode::SessionNotFound)), "session-not-found");
+        assert_eq!(code_str_for(&wire(WireErrorCode::TransferFailed)), "transfer-failed");
+        assert_eq!(code_str_for(&wire(WireErrorCode::PathTraversal)), "path-traversal");
+        assert_eq!(code_str_for(&wire(WireErrorCode::ChecksumMismatch)), "checksum-mismatch");
+        assert_eq!(code_str_for(&wire(WireErrorCode::DuplicateSession)), "duplicate-session");
+        assert_eq!(code_str_for(&wire(WireErrorCode::Internal)), "internal");
+    }
+
+    #[test]
+    fn code_str_for_client_local_classes_is_distinct_and_stable() {
+        assert_eq!(code_str_for(&CliError::DaemonUnreachable("x".to_owned())), "daemon-unreachable");
+        assert_eq!(code_str_for(&CliError::NoClobber("x".to_owned())), "no-clobber");
+        assert_eq!(code_str_for(&CliError::MissingConfig("x".to_owned())), "missing-config");
+        assert_eq!(code_str_for(&CliError::Internal("x".to_owned())), "internal");
+        assert_eq!(code_str_for(&CliError::Transport("x".to_owned())), "transport");
     }
 }

@@ -19,15 +19,27 @@ mod verbs;
 use clap::Parser;
 
 use cli::{Cli, Command, FileCmd, InputCmd, PerceiveCmd, ProcessCmd, SessionCmd, WindowCmd};
-use exit_codes::{CliError, exit_code_for};
+use exit_codes::{CliError, code_str_for, exit_code_for};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
-    match dispatch(cli.command, cli.json).await {
+    let json = cli.json;
+    match dispatch(cli.command, json).await {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(err) => {
-            eprintln!("error: {err}");
+            // D-28: legible under both human and machine output. `--json`
+            // emits the same shape a successful verb would (stdout), so a
+            // scripted caller never has to branch its parser on exit
+            // status alone to find the error payload.
+            if json {
+                let payload = serde_json::json!({
+                    "error": { "code": code_str_for(&err), "message": err.to_string() }
+                });
+                println!("{payload}");
+            } else {
+                eprintln!("error: {err}");
+            }
             exit_code_for(&err)
         }
     }
