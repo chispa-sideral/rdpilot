@@ -4,13 +4,13 @@ milestone: v1.1
 milestone_name: — Consumer Surfaces & File Transfer
 status: completed
 stopped_at: "Phase 15 Plan 01 complete (1/8 plans). Closed Phase 12's pending 12-07 scope as a side effect: ipc/windows.rs's explicit owner-only named-pipe DACL (windows-sys 0.61.2 raw Win32 calls: OpenProcessToken -> GetTokenInformation(TokenUser) -> InitializeSecurityDescriptor -> InitializeAcl -> AddAccessAllowedAce -> SetSecurityDescriptorDacl) + first_pipe_instance(true) anti-squatting is authored (Linux build green, cfg(windows)-gated); 12-07's single live_daemon.rs split into live_daemon_windows_dacl.rs (Windows-host-only, 0 tests on Linux) and live_daemon_e2e.rs (Linux-hostable, drives the real compiled binary). windows-sys needed no legitimacy checkpoint (Microsoft-official, already lockfile-resolved). Non-regression green (lib 70/70, ipc_security, crash_restart_reconcile, registry_concurrency, thread_leak_soak, autostart_lifecycle). Real Windows compile+run deferred to 15-05; orphan-liveness/e2e live run deferred to 15-06. Ready to execute 15-02 (PROOF-02 CLI harness + CLI-02/03 live re-exercise)."
-last_updated: "2026-07-11T12:28:30.405Z"
+last_updated: "2026-07-11T19:48:04.435Z"
 last_activity: 2026-07-11 -- Phase 15 Plan 01 (Windows owner-only pipe DACL via windows-sys + split 12-07 live test files, closing Phase 12's pending scope) executed
 progress:
   total_phases: 6
   completed_phases: 4
   total_plans: 34
-  completed_plans: 28
+  completed_plans: 29
   percent: 67
 ---
 
@@ -26,7 +26,7 @@ See: .planning/PROJECT.md (updated 2026-07-10)
 ## Current Position
 
 Phase: 15 (Proof Harnesses & Live-LLM Capstone) — EXECUTING
-Plan: 4 of 8
+Plan: 5 of 8
 Status: 15-01 complete (1/8 plans): closed Phase 12's pending 12-07 scope as a side effect. `ipc/windows.rs`'s explicit owner-only named-pipe DACL is authored via raw `windows-sys` 0.61.2 Win32 calls (no legitimacy checkpoint needed, per binding direction 3) + `first_pipe_instance(true)` anti-squatting; 12-07's single deferred `live_daemon.rs` is split into `live_daemon_windows_dacl.rs` (Windows-host-only, cfg-gated to 0 tests on Linux) and `live_daemon_e2e.rs` (Linux-hostable, drives the real compiled daemon binary against a live target). Linux offline build/tests green, non-regression suite green. Phase 14 (MCP Server Surface) is complete (5/5 plans, MCP-01..06). Real Windows compile+run deferred to 15-05; orphan-liveness/e2e live run deferred to 15-06. 15-02..15-08 remain.
 Last activity: 2026-07-11 -- Phase 15 Plan 01 (Windows owner-only pipe DACL via windows-sys + split 12-07 live test files, closing Phase 12's pending scope) executed
 
@@ -122,6 +122,7 @@ Last activity: 2026-07-11 -- Phase 15 Plan 01 (Windows owner-only pipe DACL via 
 | Phase 15 P02 | 55 min | 2 tasks | 2 files |
 | Phase 15 P03 | 65min | 3 tasks | 3 files |
 | Phase 15 P04 | ~45 min | 2 tasks | 2 files |
+| Phase 15 P05 | ~7h | 3 tasks | 9 files |
 
 ## Accumulated Context
 
@@ -247,6 +248,13 @@ Recent decisions affecting current work:
 - [Phase ?]: MCP-04 live half targets two hardcoded advertised-space landmarks (menu-bar File item, title-bar Minimize button) on the maximized 7-Zip FM window, never a coordinate computed from a pre-click UIA query
 - [Phase ?]: PROOF-04 capstone drives claude -p (local, already-authenticated CLI) via --mcp-config, never the raw Anthropic API/reqwest/SDK -- superseding 15-RESEARCH.md's reqwest sketch (binding direction 1).
 - [Phase ?]: PROOF-04 independent side-effect verification uses a byte-for-byte comparison of the downloaded file against the known local seed content via a second rmcp client subprocess, avoiding a new sha2 dev-dependency entirely.
+- [Phase ?]: Phase 15-05: DAEMON-02 Windows half is LIVE-COMPLETE. windows-sys 0.61.2 module-path fixes needed on real compile: OpenProcessToken moved to Win32::System::Threading, SECURITY_DESCRIPTOR_REVISION moved to Win32::System::SystemServices (new Cargo.toml feature), HANDLE is now *mut c_void not an integer type.
+- [Phase ?]: Phase 15-05: rdpilot-ipc's transport module (read_frame/write_frame/TransportError) was wrongly #[cfg(unix)]-gated at the whole-module level -- fixed to be cross-platform (only socket_dir/socket_path/connect_or_spawn stay Unix-only), since rdpilot-daemon's Windows IPC path needs the same framing functions. tokio moved from cfg(unix) to unconditional dependency in rdpilot-ipc's Cargo.toml.
+- [Phase ?]: Phase 15-05: three rdpilot-daemon test files (autostart_lifecycle.rs, ipc_security.rs, live_daemon_e2e.rs) used Unix-only APIs with no cfg gate -- never real-compiled on Windows before this plan. All three now carry #![cfg(unix)], mirroring live_daemon_windows_dacl.rs's existing #![cfg(windows)] pattern.
+- [Phase ?]: Phase 15-05: the cross-account DACL test's original runas-based probe cannot work from this project's az vm run-command execution context (NT AUTHORITY\SYSTEM, non-interactive Session 0 -- runas requires an interactive window station and fails immediately, exit 1, without ever attempting the probe -- a false-positive PASS via the daemon-side timeout). Replaced with a one-shot Scheduled Task (schtasks /create+/run as the second account), which Task Scheduler can run non-interactively. Reusable pattern for any future live gate needing a genuinely-different-Windows-account probe from this same execution topology.
+- [Phase ?]: Phase 15-05: Azure VM 'rdpilot-vm' (Standard_B2s_v2, westeurope, RG rdpilot-test) provisioned and held UP for Plans 15-06/15-07/15-08 (torn down only in 15-08). Sensor SHA-256 a92a6bd6b29e515f0f734607b13e097329b9acb26b79e21d7b139a8c903725c3 (3,239,936 bytes) byte-verified VM-built vs relayed, saved to .secrets/sensor-build/rdpilot-sensor.exe. Second Windows account 'rdpilot2' provisioned (added to Backup Operators for SeBatchLogonRight, needed by the Scheduled-Task cross-account probe mechanism) -- credentials only in the live VM's own state, not committed.
+- [Phase ?]: Phase 15-05 infra lore: az vm run-command invoke has an internal execution timeout of roughly 80-90 minutes after which it force-kills the remote script WITHOUT the invoking az CLI process necessarily reporting a clean result (both ends can appear to hang/die independently -- the LOCAL az CLI call can die from the harness's own long-running-command handling while the REMOTE VM-side script keeps running past that, still holding the 'Run command extension execution is in progress' Conflict lock). For any build/test expected to exceed ~5 minutes, launch it DETACHED on the VM (Start-Process -WindowStyle Hidden running a wrapper .ps1 that redirects all output to a log file and writes a sentinel done-file on completion), then poll cheaply for the sentinel via short separate az vm run-command invoke calls -- never hold one invoke open across a long build.
+- [Phase ?]: Phase 15-05 infra lore: on this VM image, files SYSTEM writes to C:\Windows\Temp inherit a DACL scoped to BUILTIN\Administrators / NT AUTHORITY\SYSTEM only (Configure-Target.ps1's in-guest hardening) -- NOT world-readable/writable as on a stock Windows image. Any future live gate needing a non-admin account to read/write a file SYSTEM created must explicit icacls /grant that account on the specific file(s), not assume C:\Windows\Temp is shared scratch space.
 
 ### Pending Todos
 
@@ -293,7 +301,7 @@ Pre-close artifact audit surfaced 3 open items. Reviewed and explicitly acknowle
 
 ## Session Continuity
 
-Last session: 2026-07-11T12:28:30.398Z
+Last session: 2026-07-11T19:48:04.423Z
 Stopped at: Phase 13 Plan 06 complete (6/7 plans). CLI-02 (perception+input+launch verb set against --session) delivered and offline-proven via tests/cli_verbs.rs against the real daemon binary's canned FakeTestSession. Ready to execute 13-07 (CLI-03: put/get no-clobber + path absolutization + error taxonomy). Phase 12's 12-07 live gate (Windows explicit-DACL pipe, live orphan-liveness confirmation, e2e session verify) remains separately pending and is not blocked by Phase 13's progress.
 Resume file: .planning/DECISIONS-INDEX.md
 
