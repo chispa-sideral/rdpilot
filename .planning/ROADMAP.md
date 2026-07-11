@@ -93,7 +93,7 @@ Full phase goals, success criteria, and plan-by-plan detail: `.planning/mileston
 - [x] 12-02-PLAN.md — `rdpilot-daemon` crate scaffold + workspace member + session/reconciliation seams + rdpilot::Error->WireError mapping (Wave 2)
 - [x] 12-03-PLAN.md — Registry: atomic claim-then-connect + auto-id (D-29) + close-not-drop teardown; SC#1 concurrency test + SC#3 [BLOCKING] thread/RSS soak (Wave 3)
 - [ ] 12-04-PLAN.md — Unix IPC (0700 dir + peer-uid) + framing + dispatch (incl `list`, SESSION-03); SC#4 [BLOCKING] different-uid-rejected (Wave 4)
-- [ ] 12-05-PLAN.md — Crash-survivable reconciliation: JSON disk record + startup orphan scan/seed; SC#5 [BLOCKING] offline crash-restart-surface (DAEMON-04) (Wave 4)
+- [x] 12-05-PLAN.md — Crash-survivable reconciliation: JSON disk record + startup orphan scan/seed; SC#5 [BLOCKING] offline crash-restart-surface (DAEMON-04) (Wave 4)
 - [ ] 12-06-PLAN.md — Server assembly + idle reaper + empty-grace self-shutdown + connect-or-spawn auto-start; SC#5 [BLOCKING] auto-start/self-shutdown (DAEMON-03) (Wave 5)
 - [ ] 12-07-PLAN.md — Live gate: Windows explicit-DACL pipe + anti-squatting (DAEMON-02) + live remote-liveness reconciliation (DAEMON-04) + e2e session verify; `windows-permissions` legitimacy checkpoint (Wave 6)
 
