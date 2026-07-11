@@ -253,3 +253,13 @@ Plans:
 Plans:
 
 - [ ] TBD (promote with /gsd-review-backlog when ready)
+
+### Phase 999.7: Session recording with timestamps/annotations (BACKLOG)
+
+**Goal:** Support recording sessions (relates to the daemon/session lifecycle from Phase 12), capturing timestamps and annotations, with a config option to enable/disable (default-configurable).
+**Requirements:** TBD
+**Plans:** 0 plans
+
+Plans:
+
+- [ ] TBD (promote with /gsd-review-backlog when ready)
