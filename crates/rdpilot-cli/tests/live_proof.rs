@@ -101,6 +101,19 @@ fn connection_file() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("..").join(".secrets").join("connection.json")
 }
 
+/// Locate the byte-verified sensor executable relayed by Plan 15-05
+/// (`.secrets/sensor-build/rdpilot-sensor.exe`), same two-levels-up
+/// resolution as [`connection_file`]. `run_cli` points the auto-started
+/// daemon's `RDPILOT_SENSOR_BINARY_PATH` at this path -- **live-diagnosed
+/// (Plan 15-06, mirrored here Plan 15-07):** without it, the daemon's real
+/// `Connect` never deploys a sensor at all (see `dispatch.rs`'s
+/// `resolve_sensor_binary_path` fix from 15-06), so every sensor-backed step
+/// this file exercises (screenshot, launch, window list, put/get) would
+/// otherwise fail.
+fn sensor_binary_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("..").join(".secrets").join("sensor-build").join("rdpilot-sensor.exe")
+}
+
 /// Load the live target, or `None` if the suite is not armed (D-18 gate:
 /// `RDPILOT_LIVE` unset, or the secrets file absent). A present-but-
 /// malformed file panics with a descriptive message that never includes the
@@ -186,6 +199,11 @@ fn run_cli(args: &[&str], xdg_runtime_dir: &Path, sink_path: &Path, capture_dir:
         .args(args)
         .env("XDG_RUNTIME_DIR", xdg_runtime_dir)
         .env("RDPILOT_DAEMON_SINK_PATH", sink_path)
+        // Live-diagnosed (Plan 15-06, mirrored here): the daemon's real
+        // Connect handler only deploys a sensor when this is set -- required
+        // for screenshot/launch/window-list/put/get to work against a real
+        // target.
+        .env("RDPILOT_SENSOR_BINARY_PATH", sensor_binary_path())
         // Long enough for a real RDP handshake/session-establishment
         // round trip plus a full CLI-driven proof sequence to complete
         // without the idle reaper or empty-registry grace period firing.
