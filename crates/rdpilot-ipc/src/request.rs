@@ -189,6 +189,14 @@ pub enum Request {
         /// The keyboard action to perform.
         action: WireKeyAction,
     },
+    /// Fetch a session's native desktop dimensions (mirrors
+    /// `Session::desktop_size`; research recommendation, MCP-04's
+    /// coordinate bridge sources native dims over the wire rather than by
+    /// sniffing screenshot PNG headers).
+    DesktopSize {
+        /// The session to operate on.
+        session: SessionId,
+    },
 }
 
 /// Compile-time forcing function (SESSION-02): a future `Request` variant
@@ -216,7 +224,8 @@ impl SessionScoped for Request {
             | Request::Uia { session, .. }
             | Request::WorldState { session, .. }
             | Request::Mouse { session, .. }
-            | Request::Key { session, .. } => Some(session),
+            | Request::Key { session, .. }
+            | Request::DesktopSize { session } => Some(session),
         }
     }
 }
@@ -240,6 +249,7 @@ mod tests {
             r#"{"op":"WorldState","options":{"screenshot":true,"window_list":true,"uia":"None"}}"#,
             r#"{"op":"Mouse","action":{"Move":{"x":1,"y":2}}}"#,
             r#"{"op":"Key","action":{"Type":"hi"}}"#,
+            r#"{"op":"DesktopSize"}"#,
         ];
         for json in cases {
             let result: Result<Request, _> = serde_json::from_str(json);
@@ -262,6 +272,7 @@ mod tests {
             r#"{"op":"WorldState","session":"s","options":{"screenshot":true,"window_list":true,"uia":"None"}}"#,
             r#"{"op":"Mouse","session":"s","action":{"Move":{"x":1,"y":2}}}"#,
             r#"{"op":"Key","session":"s","action":{"Type":"hi"}}"#,
+            r#"{"op":"DesktopSize","session":"s"}"#,
         ];
         for json in cases {
             let result: Request = serde_json::from_str(json)?;
@@ -288,6 +299,7 @@ mod tests {
             )?,
             serde_json::from_str(r#"{"op":"Mouse","session":"a","action":{"Move":{"x":1,"y":2}}}"#)?,
             serde_json::from_str(r#"{"op":"Key","session":"a","action":{"Type":"hi"}}"#)?,
+            serde_json::from_str(r#"{"op":"DesktopSize","session":"a"}"#)?,
         ];
         for req in &requests {
             assert_eq!(req.session().map(SessionId::as_str), Some("a"));

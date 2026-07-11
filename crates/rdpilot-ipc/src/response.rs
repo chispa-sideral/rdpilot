@@ -120,6 +120,16 @@ pub enum WireResponse {
         /// UIA trees grouped by originating window handle, if requested.
         uia: Option<Vec<(u64, Vec<WireUiaElement>)>>,
     },
+    /// A session's native desktop dimensions (`DesktopSize`; mirrors
+    /// `Session::desktop_size`). `u16` because RDP desktop dimensions never
+    /// exceed 65535 and the SDK/config width/height fields are already
+    /// `u16`.
+    DesktopSize {
+        /// Native desktop width, in pixels.
+        width: u16,
+        /// Native desktop height, in pixels.
+        height: u16,
+    },
     /// A typed wire error (D-28).
     Error(WireError),
 }
@@ -208,6 +218,7 @@ mod tests {
                 window_list: None,
                 uia: None,
             },
+            WireResponse::DesktopSize { width: 1920, height: 1080 },
             WireResponse::Error(WireError {
                 code: WireErrorCode::SessionNotFound,
                 message: "not found".to_owned(),
@@ -226,6 +237,7 @@ mod tests {
                 | WireResponse::ProcessList { .. }
                 | WireResponse::Uia { .. }
                 | WireResponse::WorldState { .. }
+                | WireResponse::DesktopSize { .. }
                 | WireResponse::Error(_) => {}
             }
         }
