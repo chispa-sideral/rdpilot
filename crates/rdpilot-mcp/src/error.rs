@@ -38,6 +38,17 @@ pub enum McpError {
     /// protocol itself.
     #[error("transport error: {0}")]
     Transport(String),
+
+    /// A caller-supplied tool argument is malformed, out of range, or
+    /// names an action this server explicitly does not support (T-14-10):
+    /// an unsupported `computer` action (`left_mouse_down`/`left_mouse_up`,
+    /// `cursor_position`, horizontal `scroll_direction`), an unknown key
+    /// token (`parse_wire_key`'s rejection), a `wait`/`hold_key` `duration`
+    /// exceeding the 100s cap (Pitfall 5), or an empty/invalid `session`
+    /// string. Client-local — never crosses the wire; always an EXPLICIT
+    /// tool error, never a silent no-op.
+    #[error("invalid argument: {0}")]
+    InvalidArgument(String),
 }
 
 impl McpError {
@@ -51,6 +62,12 @@ impl McpError {
     /// use as a `.map_err` target.
     pub fn transport(err: impl std::fmt::Display) -> Self {
         McpError::Transport(err.to_string())
+    }
+
+    /// Construct a [`McpError::InvalidArgument`] from any displayable
+    /// error, for use as a `.map_err` target.
+    pub fn invalid_argument(err: impl std::fmt::Display) -> Self {
+        McpError::InvalidArgument(err.to_string())
     }
 }
 
@@ -73,6 +90,7 @@ fn code_str_for(err: &McpError) -> String {
         McpError::Timeout(_) => "timeout".to_owned(),
         McpError::DaemonUnreachable(_) => "daemon-unreachable".to_owned(),
         McpError::Transport(_) => "transport".to_owned(),
+        McpError::InvalidArgument(_) => "invalid-argument".to_owned(),
     }
 }
 
@@ -122,5 +140,16 @@ mod tests {
     fn client_local_classes_render_legibly() {
         assert!(McpError::daemon_unreachable("no socket").to_string().contains("no socket"));
         assert!(McpError::transport("broken pipe").to_string().contains("broken pipe"));
+        assert!(McpError::invalid_argument("bad duration").to_string().contains("bad duration"));
+    }
+
+    #[test]
+    fn invalid_argument_renders_with_the_invalid_argument_code() {
+        let err = McpError::invalid_argument("cursor_position is unsupported");
+        let rmcp_err: rmcp::ErrorData = err.into();
+        match rmcp_err.data {
+            Some(data) => assert_eq!(data["code"], "invalid-argument"),
+            None => panic!("data must carry the code discriminant (D-28)"),
+        }
     }
 }

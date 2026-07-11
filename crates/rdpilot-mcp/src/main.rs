@@ -15,6 +15,7 @@
 // initialized first below) is this crate's only sanctioned output channel.
 #![deny(clippy::print_stdout)]
 
+mod computer;
 mod connect;
 mod error;
 mod handler;
