@@ -36,6 +36,26 @@ base64 = "0.22.1"
 # companion (Plan 12-04, DAEMON-02's Unix path).
 libc = "0.2.186"
 
+[target.'cfg(windows)'.dependencies]
+# Explicit owner-only named-pipe DACL construction (Plan 15-01, closing
+# 12-07's Windows half of DAEMON-02) via raw Win32 calls: OpenProcessToken
+# -> GetTokenInformation(TokenUser) -> InitializeSecurityDescriptor ->
+# InitializeAcl -> AddAccessAllowedAce -> SetSecurityDescriptorDacl (see
+# `ipc/windows.rs`). Microsoft-official, already lockfile-resolved as a
+# transitive dependency (0.61.2, pulled in by `tokio`/`mio`/`socket2`
+# among others) -- per binding direction 3 this needs NO package-
+# legitimacy checkpoint (unlike the `[ASSUMED]` `windows-permissions`
+# 12-07-PLAN.md Task 1 would otherwise have required). Pinned to the SAME
+# 0.61.2 line already resolved in Cargo.lock -- deliberately not a second
+# major version.
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Threading",
+    "Win32_System_Memory",
+] }
+
 [dev-dependencies]
 # DAEMON-01 soak-test RSS baseline/return-to-baseline assertion (Plan 12-03).
 sysinfo = "0.39.6"

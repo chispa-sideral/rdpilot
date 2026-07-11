@@ -15,10 +15,12 @@
 //! - [`registry`] — the atomic claim-then-connect session registry
 //!   (Plan 12-03).
 //! - `ipc` — the Unix/Windows LISTENER-side security primitives
-//!   (bind/accept_and_authorize/authorize_uid, Plan 12-04). Socket-path
-//!   resolution and length-prefixed framing were relocated into
-//!   `rdpilot_ipc::transport` (Plan 13-01) so a thin CLI/MCP client can
-//!   share them without depending on this crate.
+//!   (bind/accept_and_authorize/authorize_uid on Unix; bind/
+//!   accept_and_authorize/socket_path on Windows via an explicit
+//!   owner-only pipe DACL, Plan 15-01, closing 12-07's Windows half of
+//!   DAEMON-02). Socket-path resolution and length-prefixed framing were
+//!   relocated into `rdpilot_ipc::transport` (Plan 13-01) so a thin
+//!   CLI/MCP client can share them without depending on this crate.
 //! - [`dispatch`] — `rdpilot-ipc::Request` -> registry ops -> `WireResponse`
 //!   (Plan 12-04).
 //! - [`reconcile`] — disk-persisted crash-restart reconciliation state
@@ -56,6 +58,16 @@ pub use server::{RunConfig, run};
 // dependency and can only see items reachable from the crate root.
 #[cfg(unix)]
 pub use ipc::{accept_and_authorize, authorize_uid, bind, socket_path};
+
+// Re-exported so `tests/live_daemon_windows_dacl.rs` (Plan 15-01, closing
+// 12-07's Windows half of DAEMON-02) can reach the Windows IPC primitives
+// across the crate boundary — mirrors the `#[cfg(unix)]` re-export above
+// exactly. `authorize_uid` has no Windows analogue (the module doc on
+// `ipc/windows.rs` explains why: the DACL itself is the access control,
+// enforced by the OS at connect time, not by a post-accept application
+// check) so it is deliberately absent from this list.
+#[cfg(windows)]
+pub use ipc::{accept_and_authorize, bind, socket_path};
 
 // Re-exported so `tests/autostart_lifecycle.rs` (the SC#5 [BLOCKING]
 // DAEMON-03 integration test, Plan 12-06) can drive the client-side

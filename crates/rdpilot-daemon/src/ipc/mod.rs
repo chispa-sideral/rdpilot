@@ -3,9 +3,12 @@
 //!
 //! The Unix path (`unix.rs`) is fully implemented and offline-testable on
 //! this Linux host: `0700` runtime-dir socket + per-connection
-//! `peer_cred()` uid check. The Windows path (`windows.rs`) remains a
-//! `#[cfg(windows)]` stub — explicit-DACL named-pipe security requires the
-//! pinned Windows machine and is deferred to the live-gate Plan 12-07.
+//! `peer_cred()` uid check. The Windows path (`windows.rs`, Plan 15-01,
+//! closing 12-07's Windows half of DAEMON-02) is authored — explicit
+//! owner-only DACL + `first_pipe_instance(true)` — but its
+//! `#[cfg(windows)]` gate means this Linux host never compiles it; the
+//! real Windows compile+run is confirmed on the pinned Azure VM in
+//! Plan 15-05.
 //!
 //! Socket-path resolution and length-prefixed JSON framing are shared with
 //! any thin client via `rdpilot_ipc::transport` (Plan 13-01) — this module
