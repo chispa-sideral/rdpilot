@@ -348,8 +348,16 @@ fn cli_02_screenshot_and_click_landing_against_a_real_target() {
     let mut click_detail = String::new();
     if let Some(hwnd) = hwnd {
         let hwnd_str = hwnd.to_string();
+        // Live-diagnosed (Plan 15-06, recurrence of the Phase 9 D-9.1
+        // finding documented in STATE.md): `--scope children` only reaches
+        // depth-1 (Window/ToolBar/Pane/TitleBar/MenuBar) -- none of 7-Zip
+        // FM's actual menu items/toolbar buttons/listview rows are visible
+        // at that depth. `--scope subtree --max-depth 3` is the SAME
+        // live-tuned depth 09-04 confirmed surfaces them (30 deeper
+        // elements, 130.2ms, comfortably under the 500ms sensor-side
+        // budget).
         let uia_before_run = run_cli(
-            &["--json", "perceive", "uia", "--session", session, "--hwnd", &hwnd_str, "--scope", "children"],
+            &["--json", "perceive", "uia", "--session", session, "--hwnd", &hwnd_str, "--scope", "subtree", "--max-depth", "3"],
             &xdg_runtime_dir,
             &sink_path,
             &capture_dir,
@@ -357,9 +365,25 @@ fn cli_02_screenshot_and_click_landing_against_a_real_target() {
         );
         if uia_before_run.status.success() {
             if let Ok(elements) = serde_json::from_str::<serde_json::Value>(uia_before_run.stdout.trim()) {
+                // Live-diagnosed (Plan 15-06): the root `Window` element
+                // itself (depth 0) is always `focusable: true` and always
+                // FIRST in the (BFS) array -- a naive "first focusable"
+                // search picks it every time, so the resulting click landed
+                // on the window's raw center (the listview body), which
+                // never visibly moves UIA focus at the shallow scope this
+                // test originally queried. Prefer an actual interactive
+                // leaf (MenuItem/Button, matching 09-04's confirmed 7-Zip
+                // FM element roles) at depth > 0; fall back to any
+                // depth > 0 focusable element, then the previous
+                // any-focusable/first-element behavior as a last resort.
                 let target_elem = elements.as_array().and_then(|arr| {
                     arr.iter()
-                        .find(|e| e["focusable"].as_bool() == Some(true))
+                        .find(|e| {
+                            e["depth"].as_u64().unwrap_or(0) > 0
+                                && matches!(e["role"].as_str(), Some("MenuItem") | Some("Button"))
+                        })
+                        .or_else(|| arr.iter().find(|e| e["depth"].as_u64().unwrap_or(0) > 0 && e["focusable"].as_bool() == Some(true)))
+                        .or_else(|| arr.iter().find(|e| e["focusable"].as_bool() == Some(true)))
                         .or_else(|| arr.first())
                 });
                 if let Some(elem) = target_elem {
@@ -374,6 +398,27 @@ fn cli_02_screenshot_and_click_landing_against_a_real_target() {
                     let center_x = (x + w / 2).min(u64::from(u16::MAX)).to_string();
                     let center_y = (y + h / 2).min(u64::from(u16::MAX)).to_string();
 
+                    // Live-diagnosed (Plan 15-06, recurrence of the Phase
+                    // 6/9 finding documented in STATE.md): a freshly
+                    // `launch_process`'d window is not guaranteed OS
+                    // foreground focus -- a click can land geometrically
+                    // correctly yet never actually move UIA focus if the
+                    // window itself isn't foregrounded first. Every other
+                    // live navigation test in the crate already does this
+                    // (`set_foreground_window` + settle); this harness had
+                    // missed it, exactly like 09-04's original diagnosis.
+                    let foreground_run = run_cli(
+                        &["input", "foreground", "--session", session, "--hwnd", &hwnd_str],
+                        &xdg_runtime_dir,
+                        &sink_path,
+                        &capture_dir,
+                        next_call(),
+                    );
+                    if !foreground_run.status.success() {
+                        eprintln!("  [WARN] input foreground failed before the click; stderr={}", foreground_run.stderr);
+                    }
+                    std::thread::sleep(Duration::from_millis(300));
+
                     let click_run = run_cli(
                         &["input", "click", "--session", session, "--x", &center_x, "--y", &center_y],
                         &xdg_runtime_dir,
@@ -384,7 +429,7 @@ fn cli_02_screenshot_and_click_landing_against_a_real_target() {
 
                     if click_run.status.success() {
                         let uia_after_run = run_cli(
-                            &["--json", "perceive", "uia", "--session", session, "--hwnd", &hwnd_str, "--scope", "children"],
+                            &["--json", "perceive", "uia", "--session", session, "--hwnd", &hwnd_str, "--scope", "subtree", "--max-depth", "3"],
                             &xdg_runtime_dir,
                             &sink_path,
                             &capture_dir,
