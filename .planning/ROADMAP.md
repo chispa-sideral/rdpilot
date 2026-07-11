@@ -95,7 +95,7 @@ Full phase goals, success criteria, and plan-by-plan detail: `.planning/mileston
 - [x] 12-04-PLAN.md — Unix IPC (0700 dir + peer-uid) + framing + dispatch (incl `list`, SESSION-03); SC#4 [BLOCKING] different-uid-rejected (Wave 4)
 - [x] 12-05-PLAN.md — Crash-survivable reconciliation: JSON disk record + startup orphan scan/seed; SC#5 [BLOCKING] offline crash-restart-surface (DAEMON-04) (Wave 4)
 - [x] 12-06-PLAN.md — Server assembly + idle reaper + empty-grace self-shutdown + connect-or-spawn auto-start; SC#5 [BLOCKING] auto-start/self-shutdown (DAEMON-03) (Wave 5)
-- [ ] 12-07-PLAN.md — Live gate: Windows explicit-DACL pipe + anti-squatting (DAEMON-02) + live remote-liveness reconciliation (DAEMON-04) + e2e session verify; `windows-permissions` legitimacy checkpoint (Wave 6)
+- [ ] 12-07-PLAN.md — Live gate: Windows explicit-DACL pipe + anti-squatting (DAEMON-02) + live remote-liveness reconciliation (DAEMON-04) + e2e session verify; `windows-permissions` legitimacy checkpoint (Wave 6). **Superseded by Phase 15's file split (15-RESEARCH.md):** the DACL code + both split live-gate test files are now AUTHORED via `windows-sys` (no legitimacy checkpoint needed) in 15-01-PLAN.md; the actual live compile+run closes this plan's remaining scope in 15-05 (Windows DACL) / 15-06 (orphan-liveness + e2e).
 
 ### Phase 13: CLI Surface
 
@@ -153,9 +153,9 @@ Full phase goals, success criteria, and plan-by-plan detail: `.planning/mileston
   2. A scripted harness proves the MCP surface end-to-end — tool calls exercised programmatically — with no live LLM (PROOF-03).
   3. A capstone live-LLM demo drives a read/inspect + file-transfer task through the MCP surface against a real remote-only Windows program (PROOF-04).
 
-**Plans**: 8 plans (4 offline-authoring waves 1-2, 4 live-run waves 3-6, single Azure-VM session). Also batches the deferred live gates from Phases 12/13/14 (DAEMON-02 Windows DACL, DAEMON-04/SESSION-01/03/04, CLI-02/03 live, MCP-04 live half) — closing Phase 12's pending 12-07.
+**Plans**: 1/8 plans executed
 
-- [ ] 15-01-PLAN.md — OFFLINE-AUTHOR: 12-07 windows-sys owner-only DACL + split live test files (Windows DACL / Linux e2e) (Wave 1)
+- [x] 15-01-PLAN.md — OFFLINE-AUTHOR: 12-07 windows-sys owner-only DACL + split live test files (Windows DACL / Linux e2e) (Wave 1) (completed 2026-07-11)
 - [ ] 15-02-PLAN.md — OFFLINE-AUTHOR: PROOF-02 CLI harness + CLI-02/03 live re-exercise (gated tests) (Wave 1)
 - [ ] 15-03-PLAN.md — OFFLINE-AUTHOR: rmcp client dev-deps + PROOF-03 MCP harness + MCP-04 live half (Wave 1)
 - [ ] 15-04-PLAN.md — OFFLINE-AUTHOR: PROOF-04 capstone via `claude -p` (transcript + side-effect verification) (Wave 2)
@@ -182,7 +182,7 @@ Full phase goals, success criteria, and plan-by-plan detail: `.planning/mileston
 | 12. Session Daemon | v1.1 | 6/7 | In Progress|  |
 | 13. CLI Surface | v1.1 | 7/7 | Complete   | 2026-07-11 |
 | 14. MCP Server Surface | v1.1 | 5/5 | Complete   | 2026-07-11 |
-| 15. Proof Harnesses & Live-LLM Capstone | v1.1 | 0/8 | Planned | - |
+| 15. Proof Harnesses & Live-LLM Capstone | v1.1 | 1/8 | In Progress|  |
 
 ## Backlog
 
