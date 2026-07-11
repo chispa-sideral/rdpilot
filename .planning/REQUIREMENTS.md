@@ -51,8 +51,8 @@ Requirements for the v1.1 milestone. Each maps to roadmap phases.
 
 ### Proof
 
-- [ ] **PROOF-02**: A scripted harness proves the CLI surface end-to-end against a real remote-only Windows program (no live LLM)
-- [ ] **PROOF-03**: A scripted harness proves the MCP surface end-to-end (tool calls exercised programmatically, no live LLM)
+- [x] **PROOF-02**: A scripted harness proves the CLI surface end-to-end against a real remote-only Windows program (no live LLM)
+- [x] **PROOF-03**: A scripted harness proves the MCP surface end-to-end (tool calls exercised programmatically, no live LLM)
 - [ ] **PROOF-04**: A capstone live-LLM demo drives a read/inspect + file-transfer task through the MCP surface against a real remote-only Windows program
 
 ## Future Requirements

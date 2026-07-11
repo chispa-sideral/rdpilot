@@ -4,13 +4,13 @@ milestone: v1.1
 milestone_name: — Consumer Surfaces & File Transfer
 status: completed
 stopped_at: "Phase 15 Plan 01 complete (1/8 plans). Closed Phase 12's pending 12-07 scope as a side effect: ipc/windows.rs's explicit owner-only named-pipe DACL (windows-sys 0.61.2 raw Win32 calls: OpenProcessToken -> GetTokenInformation(TokenUser) -> InitializeSecurityDescriptor -> InitializeAcl -> AddAccessAllowedAce -> SetSecurityDescriptorDacl) + first_pipe_instance(true) anti-squatting is authored (Linux build green, cfg(windows)-gated); 12-07's single live_daemon.rs split into live_daemon_windows_dacl.rs (Windows-host-only, 0 tests on Linux) and live_daemon_e2e.rs (Linux-hostable, drives the real compiled binary). windows-sys needed no legitimacy checkpoint (Microsoft-official, already lockfile-resolved). Non-regression green (lib 70/70, ipc_security, crash_restart_reconcile, registry_concurrency, thread_leak_soak, autostart_lifecycle). Real Windows compile+run deferred to 15-05; orphan-liveness/e2e live run deferred to 15-06. Ready to execute 15-02 (PROOF-02 CLI harness + CLI-02/03 live re-exercise)."
-last_updated: "2026-07-11T20:40:07.243Z"
+last_updated: "2026-07-11T20:53:32.217Z"
 last_activity: 2026-07-11 -- Phase 15 Plan 01 (Windows owner-only pipe DACL via windows-sys + split 12-07 live test files, closing Phase 12's pending scope) executed
 progress:
   total_phases: 6
   completed_phases: 4
   total_plans: 34
-  completed_plans: 31
+  completed_plans: 32
   percent: 67
 ---
 
@@ -26,7 +26,7 @@ See: .planning/PROJECT.md (updated 2026-07-10)
 ## Current Position
 
 Phase: 15 (Proof Harnesses & Live-LLM Capstone) — EXECUTING
-Plan: 6 of 8
+Plan: 7 of 8
 Status: 15-01 complete (1/8 plans): closed Phase 12's pending 12-07 scope as a side effect. `ipc/windows.rs`'s explicit owner-only named-pipe DACL is authored via raw `windows-sys` 0.61.2 Win32 calls (no legitimacy checkpoint needed, per binding direction 3) + `first_pipe_instance(true)` anti-squatting; 12-07's single deferred `live_daemon.rs` is split into `live_daemon_windows_dacl.rs` (Windows-host-only, cfg-gated to 0 tests on Linux) and `live_daemon_e2e.rs` (Linux-hostable, drives the real compiled daemon binary against a live target). Linux offline build/tests green, non-regression suite green. Phase 14 (MCP Server Surface) is complete (5/5 plans, MCP-01..06). Real Windows compile+run deferred to 15-05; orphan-liveness/e2e live run deferred to 15-06. 15-02..15-08 remain.
 Last activity: 2026-07-11 -- Phase 15 Plan 01 (Windows owner-only pipe DACL via windows-sys + split 12-07 live test files, closing Phase 12's pending scope) executed
 
@@ -124,6 +124,7 @@ Last activity: 2026-07-11 -- Phase 15 Plan 01 (Windows owner-only pipe DACL via 
 | Phase 15 P04 | ~45 min | 2 tasks | 2 files |
 | Phase 15 P05 | ~7h | 3 tasks | 9 files |
 | Phase 15 P06 | 2.5h | 3 tasks | 16 files |
+| Phase 15 P07 | 45m | 2 tasks | 2 files |
 
 ## Accumulated Context
 
@@ -259,6 +260,7 @@ Recent decisions affecting current work:
 - [Phase ?]: Phase 15-06: daemon Connect never sourced a sensor binary path or called deploy_and_launch -- fixed both (ResolvedConfig::sensor_binary_path mirrors share_root; ManagedSession::deploy_and_launch added and wired into Connect), load-bearing for every future sensor-backed live gate
 - [Phase ?]: Phase 15-06: UIA verification after a click must use --scope subtree --max-depth 3, never children (Phase 9 D-9.1 recurrence) -- fixed in both CLI-02 and MCP-04 live gates independently
 - [Phase ?]: Phase 15-06: 7-Zip FM persists a stale remembered maximized placement across launches independent of the session's real desktop size -- a maximize hotkey to an already-maximized window is a no-op; fix is an unconditional restore/minimize immediately before maximize, PLUS an explicit re-foreground between the two key presses (minimizing loses OS foreground focus)
+- [Phase ?]: PROOF-02/PROOF-03 harnesses now self-sufficiently set RDPILOT_SENSOR_BINARY_PATH rather than depending on an externally-exported shell variable, matching the live_cli_verbs.rs pattern from 15-06
 
 ### Pending Todos
 
@@ -305,7 +307,7 @@ Pre-close artifact audit surfaced 3 open items. Reviewed and explicitly acknowle
 
 ## Session Continuity
 
-Last session: 2026-07-11T20:40:07.236Z
+Last session: 2026-07-11T20:53:32.210Z
 Stopped at: Phase 13 Plan 06 complete (6/7 plans). CLI-02 (perception+input+launch verb set against --session) delivered and offline-proven via tests/cli_verbs.rs against the real daemon binary's canned FakeTestSession. Ready to execute 13-07 (CLI-03: put/get no-clobber + path absolutization + error taxonomy). Phase 12's 12-07 live gate (Windows explicit-DACL pipe, live orphan-liveness confirmation, e2e session verify) remains separately pending and is not blocked by Phase 13's progress.
 Resume file: .planning/DECISIONS-INDEX.md
 
