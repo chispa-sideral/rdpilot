@@ -35,6 +35,8 @@
 #![deny(clippy::expect_used)]
 
 mod error;
+mod input;
+mod perception;
 mod request;
 mod response;
 mod session_id;
@@ -43,6 +45,11 @@ mod transfer;
 pub mod transport;
 
 pub use error::{WireError, WireErrorCode};
+pub use input::{WireButton, WireKey, WireKeyAction, WireMouseAction};
+pub use perception::{
+    WireProcessInfo, WireRect, WireUiaElement, WireUiaMode, WireUiaScope, WireWindowInfo, WireWindowState,
+    WireWorldStateOptions,
+};
 pub use request::{Request, SessionScoped};
 pub use response::{SessionLifecycle, SessionStatus, WireResponse};
 pub use session_id::SessionId;
