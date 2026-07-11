@@ -14,17 +14,20 @@
 //!   `DaemonError -> WireError` mapping (Plan 12-02).
 //! - [`registry`] — the atomic claim-then-connect session registry
 //!   (Plan 12-03).
-//! - `ipc` — the Unix/Windows local-user-scoped transport + framing
-//!   (Plan 12-04).
+//! - `ipc` — the Unix/Windows LISTENER-side security primitives
+//!   (bind/accept_and_authorize/authorize_uid, Plan 12-04). Socket-path
+//!   resolution and length-prefixed framing were relocated into
+//!   `rdpilot_ipc::transport` (Plan 13-01) so a thin CLI/MCP client can
+//!   share them without depending on this crate.
 //! - [`dispatch`] — `rdpilot-ipc::Request` -> registry ops -> `WireResponse`
 //!   (Plan 12-04).
 //! - [`reconcile`] — disk-persisted crash-restart reconciliation state
 //!   (Plan 12-05).
 //! - [`lifecycle`] — idle reaper + empty-registry grace-period self-shutdown
 //!   (Plan 12-06).
-//! - [`autostart`] — client-side connect-or-spawn helper (Plan 12-06).
 //! - [`server`] — top-level assembly; [`run`] is this crate's public entry
-//!   point (Plan 12-06).
+//!   point (Plan 12-06). The client-side connect-or-spawn auto-start helper
+//!   now lives in `rdpilot_ipc::transport::connect_or_spawn` (Plan 13-01).
 
 // Per-crate opt-in (matches `rdpilot`/`rdpilot-ipc`'s `lib.rs` convention).
 // Targeted `#[allow]`s are used at unavoidable FFI/mutex-poison `expect`
@@ -33,7 +36,6 @@
 #![deny(clippy::unwrap_used)]
 #![deny(clippy::expect_used)]
 
-mod autostart;
 mod dispatch;
 mod error_map;
 mod ipc;
@@ -58,6 +60,9 @@ pub use ipc::{accept_and_authorize, authorize_uid, bind, socket_path};
 // Re-exported so `tests/autostart_lifecycle.rs` (the SC#5 [BLOCKING]
 // DAEMON-03 integration test, Plan 12-06) can drive the client-side
 // auto-start helper against the real compiled binary across the crate
-// boundary — Unix-only for now (`autostart.rs`'s own `#![cfg(unix)]`).
+// boundary. The implementation itself was relocated into
+// `rdpilot_ipc::transport::connect_or_spawn` (Plan 13-01) — this is a
+// transparent re-export, unix-only for now (matching its own
+// `#![cfg(unix)]`).
 #[cfg(unix)]
-pub use autostart::connect_or_spawn;
+pub use rdpilot_ipc::connect_or_spawn;

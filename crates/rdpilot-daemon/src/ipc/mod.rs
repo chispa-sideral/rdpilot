@@ -1,11 +1,16 @@
-//! Local-user-scoped IPC transport — cfg-gated Unix/Windows listener +
-//! shared framing (Plan 12-04; DAEMON-02).
+//! Local-user-scoped IPC transport — cfg-gated Unix/Windows listener
+//! (Plan 12-04; DAEMON-02).
 //!
 //! The Unix path (`unix.rs`) is fully implemented and offline-testable on
 //! this Linux host: `0700` runtime-dir socket + per-connection
 //! `peer_cred()` uid check. The Windows path (`windows.rs`) remains a
 //! `#[cfg(windows)]` stub — explicit-DACL named-pipe security requires the
 //! pinned Windows machine and is deferred to the live-gate Plan 12-07.
+//!
+//! Socket-path resolution and length-prefixed JSON framing are shared with
+//! any thin client via `rdpilot_ipc::transport` (Plan 13-01) — this module
+//! only owns the LISTENER-side security primitives that stay daemon-only
+//! (bind/accept_and_authorize/authorize_uid, T-13-03).
 
 // `serve_connection` is only wired into the accept loop by `server.rs`
 // (Plan 12-06); exercised directly by this wave's own tests until then
@@ -17,10 +22,10 @@ mod unix;
 #[cfg(windows)]
 mod windows;
 
-mod framing;
-
 #[cfg(unix)]
-pub use unix::{accept_and_authorize, authorize_uid, bind, socket_path};
+pub use unix::{accept_and_authorize, authorize_uid, bind};
+#[cfg(unix)]
+pub use rdpilot_ipc::transport::socket_path;
 
 #[cfg(windows)]
 pub use windows::{accept_and_authorize, bind, socket_path};
@@ -29,7 +34,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::dispatch::dispatch;
 use crate::registry::Registry;
-use framing::{read_frame, write_frame};
+use rdpilot_ipc::transport::{read_frame, write_frame};
 
 /// Serve one accepted connection: loop `read_frame::<Request>` ->
 /// `dispatch` -> `write_frame::<WireResponse>` until the peer closes the

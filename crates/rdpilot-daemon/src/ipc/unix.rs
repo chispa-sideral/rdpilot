@@ -2,13 +2,15 @@
 //! `tokio::net::UnixStream::peer_cred()` uid check (Plan 12-04; DAEMON-02,
 //! research Pitfall 5).
 //!
-//! - [`socket_dir`] creates `<runtime_dir>/rdpilot` with mode `0700`
-//!   applied ATOMICALLY at creation (`DirBuilder::mode`), never a post-hoc
-//!   `chmod` — closes the TOCTOU window research Pitfall 5/V4 warns about.
-//! - [`bind`] creates the listener at `<dir>/daemon.sock`, cleaning up a
-//!   stale socket file left by a killed predecessor (connect-then-unlink-
-//!   then-rebind) — it never blindly reuses a path it finds on disk
-//!   (T-12-10).
+//! Socket-path resolution (`socket_dir`/`socket_path`) was relocated into
+//! `rdpilot_ipc::transport` (Plan 13-01) so a thin CLI/MCP client resolves
+//! the SAME path without depending on this crate (T-13-02) — this module
+//! now only owns the LISTENER-side security primitives (T-13-03):
+//!
+//! - [`bind`] creates the listener at `rdpilot_ipc::transport::socket_path()`,
+//!   cleaning up a stale socket file left by a killed predecessor
+//!   (connect-then-unlink-then-rebind) — it never blindly reuses a path it
+//!   finds on disk (T-12-10).
 //! - [`accept_and_authorize`] accepts a connection and rejects it unless
 //!   the peer's uid matches the daemon's own effective uid (T-12-09).
 //! - [`authorize_uid`] is the pure decision function factored out of
@@ -16,45 +18,9 @@
 //!   real socket (Task 3, SC#4 [BLOCKING]).
 
 use std::io;
-use std::os::unix::fs::DirBuilderExt;
-use std::path::PathBuf;
 
-use directories::BaseDirs;
+use rdpilot_ipc::transport::socket_path;
 use tokio::net::{UnixListener, UnixStream};
-
-/// Resolve (and create, if absent) the `0700`-mode runtime directory the
-/// daemon socket lives under: `<XDG_RUNTIME_DIR>/rdpilot`, falling back to
-/// `<cache_dir>/rdpilot` when no runtime dir is available on this
-/// platform.
-///
-/// Mode is applied ATOMICALLY at creation via
-/// [`std::os::unix::fs::DirBuilderExt::mode`] — never a post-creation
-/// `chmod`, which would leave a brief TOCTOU window where the directory is
-/// world-traversable (research Pitfall 5 / V4).
-///
-/// # Errors
-///
-/// Returns an error if no home/runtime directory can be resolved on this
-/// platform, or if directory creation fails.
-pub fn socket_dir() -> io::Result<PathBuf> {
-    let base = BaseDirs::new()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "could not resolve a home/runtime directory on this platform"))?;
-    let dir = base.runtime_dir().unwrap_or_else(|| base.cache_dir()).join("rdpilot");
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700) // atomic at creation — no TOCTOU window (research Pitfall 5 / V4)
-        .create(&dir)?;
-    Ok(dir)
-}
-
-/// The daemon socket's full path: `<socket_dir>/daemon.sock`.
-///
-/// # Errors
-///
-/// Propagates [`socket_dir`]'s errors.
-pub fn socket_path() -> io::Result<PathBuf> {
-    Ok(socket_dir()?.join("daemon.sock"))
-}
 
 /// Bind the daemon's Unix listener at [`socket_path`].
 ///
@@ -145,16 +111,7 @@ pub async fn accept_and_authorize(listener: &UnixListener) -> io::Result<UnixStr
 
 #[cfg(test)]
 mod tests {
-    use std::os::unix::fs::MetadataExt;
-
     use super::*;
-
-    #[test]
-    fn socket_dir_is_created_with_mode_0700() {
-        let dir = socket_dir().expect("socket_dir should succeed on this host");
-        let meta = std::fs::metadata(&dir).expect("stat should succeed on a freshly created dir");
-        assert_eq!(meta.mode() & 0o777, 0o700, "expected mode 0700, got {:o}", meta.mode() & 0o777);
-    }
 
     #[test]
     fn authorize_uid_accepts_a_matching_uid_and_rejects_a_mismatch() {
