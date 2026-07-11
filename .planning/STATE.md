@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.1
 milestone_name: — Consumer Surfaces & File Transfer
 status: executing
-stopped_at: "Phase 12 Plan 06 complete (6/7 plans). DAEMON-03 fully proven OFFLINE (auto-start on first connect + idle reap + empty-registry grace-period self-shutdown) against the REAL compiled rdpilot-daemon binary via tests/autostart_lifecycle.rs's SC#5 [BLOCKING] test. Ready to plan/execute 12-07 (the live gate: Windows DACL pipe + live orphan-liveness confirmation + e2e session verify)."
-last_updated: "2026-07-11T00:37:12.412Z"
-last_activity: 2026-07-11 -- Phase 12 Plan 06 (server assembly + auto-start/idle-shutdown) executed
+stopped_at: "Phase 13 Plan 01 complete (1/7 plans). Auto-start transport (socket_path/connect_or_spawn/framing) relocated from rdpilot-daemon into rdpilot-ipc::transport, verified rdpilot/IronRDP-free via cargo tree. Phase 12 unchanged at 6/7 (12-07 live gate still pending, not part of this plan). Ready to execute 13-02 (perception/input wire DTOs)."
+last_updated: "2026-07-11T07:14:08.831Z"
+last_activity: 2026-07-11 -- Phase 13 Plan 01 (relocate auto-start transport into rdpilot-ipc) executed
 progress:
   total_phases: 6
   completed_phases: 2
-  total_plans: 14
-  completed_plans: 13
+  total_plans: 21
+  completed_plans: 14
   percent: 33
 ---
 
@@ -21,14 +21,14 @@ progress:
 See: .planning/PROJECT.md (updated 2026-07-10)
 
 **Core value:** A local AI agent can connect to a remote Windows desktop over RDP and read/inspect a program that is only reachable via RDP — using both screenshots and structured accessibility data, without installing or running the agent itself on the remote machine.
-**Current focus:** Phase 12 — Session Daemon
+**Current focus:** Phase 13 — CLI Surface
 
 ## Current Position
 
-Phase: 12 (Session Daemon) — EXECUTING
-Plan: 6 of 7
-Status: DAEMON-03 complete (offline); 12-07 (live gate) remaining
-Last activity: 2026-07-11 -- Phase 12 Plan 06 (server assembly + auto-start/idle-shutdown) executed
+Phase: 13 (CLI Surface) — EXECUTING
+Plan: 1 of 7
+Status: Transport relocation (CLI-01 prerequisite) complete; Phase 12's 12-07 live gate remains separately pending (not part of Phase 13)
+Last activity: 2026-07-11 -- Phase 13 Plan 01 (relocate auto-start transport into rdpilot-ipc) executed
 
 ## Milestone v1.1 Phases
 
@@ -106,6 +106,7 @@ Last activity: 2026-07-11 -- Phase 12 Plan 06 (server assembly + auto-start/idle
 | Phase 12 P05 | ~20m | 2 tasks | 2 files |
 | Phase 12 P04 | ~40m | 3 tasks | 8 files |
 | Phase 12 P06 | ~50min | 3 tasks | 6 files |
+| Phase 13 P01 | ~15min | 2 tasks | 6 files |
 
 ## Accumulated Context
 
@@ -202,6 +203,7 @@ Recent decisions affecting current work:
 - [Phase ?]: rdpilot-daemon reconcile: JSON ReconciliationSink (atomic temp-write+rename) + scan_orphans/seed_into startup bridge implemented and proven offline -- kill -9 (drop-without-close) surrogate + restart surfaces the prior session as Orphaned in list(), never silently forgotten, reconciled only via explicit close (DAEMON-04 SC#5 BLOCKING offline portion, 12-05)
 - [Phase ?]: rdpilot-daemon 12-04: Unix IPC transport complete -- 0700 runtime-dir socket (atomic DirBuilder::mode) + peer_cred() uid check (authorize_uid pure decision fn, unit-tested + BLOCKING SC#4 offline proof in tests/ipc_security.rs); 4-byte-BE length-prefixed serde_json framing with a 16MiB max-frame-length cap; dispatch.rs routes Connect/List/Disconnect to the registry (exhaustive match, no wildcard) and returns SessionNotFound/Internal-not-implemented for the six deferred operational verbs. Extended registry.rs/seams.rs (not in the plan's files_modified list, but disjoint from the concurrent 12-05 plan) to finish SESSION-03's list wiring: SessionEntry::Live now carries connected_since_wall/last_activity_wall ISO-8601 strings alongside the existing monotonic Instants, closing the None-hardcoded TODO both files' own doc comments had flagged as Plan 12-04's job.
 - [Phase ?]: rdpilot-daemon 12-06: server::run() drives everything via tokio::task::LocalSet/spawn_local (never bare tokio::spawn, per Session::connect's non-Send future); ShutdownSignal uses tokio::sync::watch::Sender::send_replace (not send, which no-ops with zero subscribers) so fire() is reliable regardless of subscriber timing; DAEMON-03 (auto-start + idle-reap + empty-registry self-shutdown) proven fully offline against the REAL compiled binary via tests/autostart_lifecycle.rs's SC#5 [BLOCKING] test
+- **Phase 13 Plan 01 (2026-07-11):** Relocated socket_path/socket_dir, length-prefixed JSON framing (read_frame/write_frame/MAX_FRAME_LEN), and connect_or_spawn/BACKOFF_MS out of rdpilot-daemon and into a new `rdpilot_ipc::transport` module (`#[cfg(unix)]`) — the CLI-01 prerequisite so Plan 13-05's thin CLI can auto-start/reach the daemon without depending on rdpilot/IronRDP. Introduced a crate-local `TransportError` since rdpilot-ipc cannot reference rdpilot-daemon's `DaemonError`. `directories`/`tokio` added to rdpilot-ipc strictly under `[target.'cfg(unix)'.dependencies]`. `rdpilot_daemon::connect_or_spawn`/`socket_path` remain stable transparent re-exports; `bind`/`accept_and_authorize`/`authorize_uid`/`effective_uid` (listener-side security, T-13-03) stay daemon-only, untouched. `cargo tree -p rdpilot-ipc` confirmed no ironrdp/rustls in the graph; `cargo test --workspace` green; `tests/autostart_lifecycle.rs` (real-binary auto-start, `--include-ignored`) and `tests/ipc_security.rs` both pass unchanged. Built/tested on the `x86_64-unknown-linux-gnu` substitute target (pinned `x86_64-pc-windows-gnu` toolchain not installed on this host). This plan is independent of Phase 12's still-pending 12-07 live gate. See `13-01-SUMMARY.md`.
 
 ### Pending Todos
 
@@ -248,10 +250,11 @@ Pre-close artifact audit surfaced 3 open items. Reviewed and explicitly acknowle
 
 ## Session Continuity
 
-Last session: 2026-07-11T00:37:12.406Z
-Stopped at: Phase 12 Plan 06 complete (6/7 plans). DAEMON-03 (auto-start on first connect, idle reap, empty-registry grace-period self-shutdown) fully proven OFFLINE against the REAL compiled rdpilot-daemon binary. Ready to execute 12-07 (the live gate: Windows explicit-DACL pipe, live orphan-liveness confirmation, e2e session verify, windows-permissions legitimacy checkpoint).
+Last session: 2026-07-11T07:14:08.831Z
+Stopped at: Phase 13 Plan 01 complete (1/7 plans). Auto-start transport (socket_path/connect_or_spawn/framing) relocated from rdpilot-daemon into rdpilot-ipc::transport, verified rdpilot/IronRDP-free. Ready to execute 13-02 (perception/input wire DTOs). Phase 12's 12-07 live gate (Windows explicit-DACL pipe, live orphan-liveness confirmation, e2e session verify) remains separately pending and is not blocked by Phase 13's progress.
 Resume file: .planning/DECISIONS-INDEX.md
 
 ## Operator Next Steps
 
-- Execute Plan 12-07 (the Phase 12 live gate) to close out Phase 12 and DAEMON-02/DAEMON-04's remaining live components
+- Execute Plan 13-02 (extend rdpilot-ipc with perception/input wire DTOs) to continue Phase 13
+- Execute Plan 12-07 (the Phase 12 live gate) to close out Phase 12 and DAEMON-02/DAEMON-04's remaining live components — independent of Phase 13's progress
