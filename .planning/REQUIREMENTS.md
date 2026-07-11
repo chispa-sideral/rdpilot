@@ -30,9 +30,9 @@ Requirements for the v1.1 milestone. Each maps to roadmap phases.
 ### MCP Server Surface
 
 - [ ] **MCP-01**: An `rmcp`-based MCP server exposes rdpilot over MCP to any MCP client (e.g. Claude)
-- [ ] **MCP-02**: MCP exposes a single Anthropic computer-use-compatible `computer` tool (screenshot + action-discriminated mouse/keyboard/scroll) mapping onto the SDK input/capture verbs
+- [x] **MCP-02**: MCP exposes a single Anthropic computer-use-compatible `computer` tool (screenshot + action-discriminated mouse/keyboard/scroll) mapping onto the SDK input/capture verbs
 - [ ] **MCP-03**: MCP exposes rdpilot-native tools (world_state, UIA, window/process list, launch, foreground, session connect/list/disconnect, file put/get) as MCP Tools
-- [ ] **MCP-04**: The computer-use surface bridges rdpilot's 96-DPI physical-pixel coordinates to the tool's expected scaled screenshot/coordinate space
+- [x] **MCP-04**: The computer-use surface bridges rdpilot's 96-DPI physical-pixel coordinates to the tool's expected scaled screenshot/coordinate space
 - [ ] **MCP-05**: MCP file put/get operate on local disk paths and return path/size/checksum metadata (never inline file bytes)
 - [ ] **MCP-06**: Slow RDP round-trips (file transfer, launch waits) do not block the MCP transport event loop
 
@@ -101,9 +101,9 @@ Which phases cover which requirements. Updated during roadmap creation.
 | CLI-02 | Phase 13 | In Progress (13-03: daemon-side seam complete. 13-04: `dispatch.rs`'s exhaustive match now wires every operational verb (screenshot/world_state/window+process list/uia/mouse/key/foreground/launch) through `Registry::call` to the live `rdpilot::Session`, with wire<->SDK conversion and offline dispatch tests proving each verb against a canned fake session — the `not_implemented_for` stub is gone. Remaining: the actual `rdpilot` CLI binary that issues these requests over IPC is 13-06) |
 | CLI-03 | Phase 13 | Complete (13-03: daemon-side seam complete. 13-04: `dispatch.rs`'s `Put`/`Get` arms call `upload_file`/`download_file` via `Registry::call`, and the pre-existing Phase-12 `share_root` gap is fixed. 13-07: `rdpilot put`/`get` (flat) + `rdpilot file put\|get` (grouped) absolutize `--local` client-side (`current_dir()` join, not the 1.79-only stdlib helper — workspace pins 1.78); `get`'s no-clobber is fully CLI-side enforced (exit 8, `--force` override), `put`'s remote no-clobber is a documented known gap (backlog Phase 999.5); `exit_codes.rs` finalized to 8 distinct non-zero exit codes plus `--json` `{"error":{"code":"<kebab>","message":"..."}}` rendering; offline-proven in `tests/cli_errors.rs` (session-not-found exit 2, daemon-unreachable exit 3, no-clobber exit 8/`--force` exit 0) against the real `rdpilot-daemon` binary. Real transfer-bytes correctness deferred to the Phase 15 batched live gate) |
 | MCP-01 | Phase 14 | Pending |
-| MCP-02 | Phase 14 | Pending |
+| MCP-02 | Phase 14 | Complete |
 | MCP-03 | Phase 14 | Pending |
-| MCP-04 | Phase 14 | Pending |
+| MCP-04 | Phase 14 | Complete |
 | MCP-05 | Phase 14 | Pending |
 | MCP-06 | Phase 14 | Pending |
 | PROOF-02 | Phase 15 | Pending |
