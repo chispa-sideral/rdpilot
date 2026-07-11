@@ -7,7 +7,7 @@
 
 #[tokio::main]
 async fn main() {
-    if let Err(e) = rdpilot_daemon::run().await {
+    if let Err(e) = rdpilot_daemon::run(rdpilot_daemon::RunConfig::from_env()).await {
         eprintln!("rdpilot-daemon: {e}");
         std::process::exit(1);
     }

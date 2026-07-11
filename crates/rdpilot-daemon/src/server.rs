@@ -1,18 +1,293 @@
-//! Top-level daemon assembly — binds the IPC listener, constructs the
-//! registry, and drives the lifecycle tasks (Plan 12-06).
+//! Top-level daemon assembly -- binds the IPC listener, constructs the
+//! registry, seeds startup reconciliation orphans, spawns the lifecycle
+//! tasks, and serves accepted+authorized connections (Plan 12-06).
 //!
-//! Stub for now (Plan 12-02): [`run`] is a minimal placeholder so
-//! `main.rs`/the crate compile end-to-end. Real config load + registry +
-//! listener + lifecycle-task assembly is filled in by Plan 12-06.
+//! ## Non-Send execution model
+//!
+//! `rdpilot::Session::connect`'s returned future is NOT `Send` (`seams.rs`'s
+//! `BoxFuture` doc comment), which makes `Registry::open`/`Registry::close`
+//! (and therefore `ipc::serve_connection`, `lifecycle::idle_reaper`) NOT
+//! `Send` either. [`run`] therefore drives EVERYTHING -- the accept loop,
+//! every per-connection task, and both lifecycle watchers -- inside a
+//! `tokio::task::LocalSet` via `tokio::task::spawn_local`, NEVER a bare
+//! `tokio::spawn` (which requires `F: Send` and would fail to compile
+//! against this crate's own registry/session types, exactly as
+//! `seams.rs`'s doc comment warns). `LocalSet::run_until` works
+//! irrespective of the ambient runtime's flavor (`main.rs`'s
+//! `#[tokio::main]` multi-thread runtime is untouched) -- it just pins
+//! every `spawn_local` task to the single OS thread that polls
+//! `run_until`'s own future.
 
-use crate::seams::DaemonError;
+use std::path::PathBuf;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::future::Future;
+
+use rdpilot::ConnectionConfig;
+use rdpilot_ipc::SessionLifecycle;
+
+use crate::lifecycle::{self, LifecycleConfig, ShutdownSignal};
+use crate::reconcile::{self, JsonReconciliationSink};
+use crate::registry::Registry;
+use crate::seams::{DaemonError, ManagedSession, RealConnector, ReconciliationSink, SessionConnector};
+
+/// When set (to any value), [`run`] selects [`FakeTestConnector`] instead
+/// of [`RealConnector`] -- lets the offline `autostart_lifecycle`
+/// integration test (Task 3) drive the REAL compiled binary's full
+/// Connect/List/Disconnect + auto-start/self-shutdown lifecycle without a
+/// real RDP target.
+const TEST_CONNECTOR_ENV: &str = "RDPILOT_DAEMON_TEST_CONNECTOR";
+
+/// The env var overriding [`RunConfig`]'s reconciliation-state sink path
+/// (test injection point -- production always resolves the platform
+/// cache-dir default via [`JsonReconciliationSink::new`]).
+const SINK_PATH_ENV: &str = "RDPILOT_DAEMON_SINK_PATH";
+
+/// Startup configuration for [`run`].
+///
+/// The well-known IPC socket path itself is NOT overridable here: `ipc::unix::bind`
+/// (Plan 12-04) always resolves it via `directories::BaseDirs::runtime_dir()`,
+/// which reads the standard `XDG_RUNTIME_DIR` OS env var -- the
+/// `autostart_lifecycle` integration test (Task 3) achieves temp-path
+/// isolation the same way any other process on this host would: by setting
+/// `XDG_RUNTIME_DIR` to a fresh temp directory before spawning the daemon,
+/// rather than by adding a parallel, never-otherwise-exercised parameterized
+/// bind path to `ipc::unix` (out of this plan's file scope, and would leave
+/// the production `bind()` call path partially untested by its own new
+/// sibling).
+#[derive(Debug, Clone, Default)]
+pub struct RunConfig {
+    /// Overrides the reconciliation-state sink's on-disk path (test
+    /// injection point). `None` resolves the platform cache-dir default
+    /// via [`JsonReconciliationSink::new`].
+    pub sink_path_override: Option<PathBuf>,
+    /// The idle-reap / empty-registry-grace / poll-interval durations
+    /// (D-31).
+    pub lifecycle: LifecycleConfig,
+}
+
+impl RunConfig {
+    /// Build a [`RunConfig`] from the production defaults, overridden by
+    /// [`SINK_PATH_ENV`] and [`LifecycleConfig::from_env`]'s own
+    /// `RDPILOT_DAEMON_*_MS` env vars when present. Used by `main.rs`'s
+    /// real entry point AND by the `autostart_lifecycle` integration test
+    /// (which sets these env vars on itself before spawning the real
+    /// binary -- env vars are the only config channel that crosses the
+    /// process boundary `connect_or_spawn` creates).
+    #[must_use]
+    pub fn from_env() -> Self {
+        RunConfig {
+            sink_path_override: std::env::var(SINK_PATH_ENV).ok().map(PathBuf::from),
+            lifecycle: LifecycleConfig::from_env(),
+        }
+    }
+}
 
 /// The daemon's public entry point, called by `main.rs`.
 ///
+/// Steps: (1) bind the well-known socket -- `AddrInUse` means another
+/// daemon already won the single-instance race (Plan 12-04's bind-as-mutex,
+/// research Pattern 3); this process exits cleanly (`Ok(())`), not an
+/// error. (2) Build the reconciliation sink and the registry (selecting
+/// [`FakeTestConnector`] instead of [`RealConnector`] when
+/// [`TEST_CONNECTOR_ENV`] is set). (3) Run the startup reconciliation
+/// scan + seed BEFORE accepting any client (DAEMON-04 orphans must be
+/// visible to the first `list`). (4) Spawn the idle reaper and
+/// empty-registry watcher. (5) Accept + authorize + serve connections
+/// until the empty-registry watcher fires the shutdown signal, then clean
+/// up the socket file and return.
+///
 /// # Errors
 ///
-/// Returns [`DaemonError`] if daemon startup fails (Plan 12-06 fills in the
-/// real failure modes: config load, listener bind, etc.).
-pub async fn run() -> Result<(), DaemonError> {
+/// Returns [`DaemonError`] if the bind fails for a reason OTHER than
+/// `AddrInUse`, or if the reconciliation sink's path cannot be resolved.
+pub async fn run(config: RunConfig) -> Result<(), DaemonError> {
+    let local = tokio::task::LocalSet::new();
+    local.run_until(run_inner(config)).await
+}
+
+async fn run_inner(config: RunConfig) -> Result<(), DaemonError> {
+    let listener = match crate::ipc::bind().await {
+        Ok(listener) => listener,
+        Err(err) if err.kind() == std::io::ErrorKind::AddrInUse => {
+            // Benign single-instance loser exit (research Pattern 3): another
+            // daemon already won the bind race. Never an error.
+            eprintln!("rdpilot-daemon: another daemon is already listening -- exiting");
+            return Ok(());
+        }
+        Err(err) => return Err(DaemonError::Io(err.to_string())),
+    };
+
+    let sink = Arc::new(match config.sink_path_override {
+        Some(path) => JsonReconciliationSink::at(path),
+        None => JsonReconciliationSink::new()
+            .ok_or_else(|| DaemonError::Io("could not resolve the platform cache directory for reconciliation state".to_owned()))?,
+    });
+
+    let connector: Arc<dyn SessionConnector> = if std::env::var(TEST_CONNECTOR_ENV).is_ok() {
+        Arc::new(FakeTestConnector)
+    } else {
+        Arc::new(RealConnector)
+    };
+
+    let registry = Arc::new(Registry::new(connector, sink.clone() as Arc<dyn ReconciliationSink>));
+
+    // Startup reconciliation (DAEMON-04): scan + seed BEFORE the accept
+    // loop below, so any leftover orphan from a crashed predecessor is
+    // already visible to the very first `list` a client sends.
+    let orphans = reconcile::scan_orphans(sink.path());
+    reconcile::seed_into(orphans, &registry);
+
+    let shutdown = ShutdownSignal::new();
+    let reaper_handle = tokio::task::spawn_local(lifecycle::idle_reaper(
+        Arc::clone(&registry),
+        config.lifecycle,
+        shutdown.clone(),
+    ));
+    let watcher_handle = tokio::task::spawn_local(lifecycle::empty_watcher(
+        Arc::clone(&registry),
+        config.lifecycle,
+        shutdown.clone(),
+    ));
+
+    loop {
+        tokio::select! {
+            accepted = crate::ipc::accept_and_authorize(&listener) => {
+                match accepted {
+                    Ok(stream) => {
+                        let registry_for_conn = Arc::clone(&registry);
+                        tokio::task::spawn_local(async move {
+                            crate::ipc::serve_connection(stream, &registry_for_conn).await;
+                        });
+                    }
+                    Err(err) => {
+                        // A rejected/failed connection (e.g. a different-uid
+                        // peer, DAEMON-02) is logged and dropped -- never
+                        // fatal to the accept loop. D-31: this error string
+                        // never carries a `Request`/credential -- the
+                        // connection was rejected before any frame was ever
+                        // read.
+                        eprintln!("rdpilot-daemon: rejected/failed connection: {err}");
+                    }
+                }
+            }
+            () = shutdown.wait() => break,
+        }
+    }
+
+    // Graceful join (not abort): both watchers select on the SAME
+    // `shutdown` this loop just observed, so they are already unwinding.
+    let _ = reaper_handle.await;
+    let _ = watcher_handle.await;
+
+    if let Ok(path) = crate::ipc::socket_path() {
+        let _ = std::fs::remove_file(&path);
+    }
+
     Ok(())
+}
+
+/// A light, immediately-resolving, in-process fake [`ManagedSession`] (no
+/// real OS thread, no real RDP target) -- the [`FakeTestConnector`]'s
+/// product. This is the offline lifecycle test's stand-in only; the
+/// DAEMON-01 thread-owning soak proof lives in
+/// `tests/thread_leak_soak.rs`'s own `ThreadOwningFakeSession`, exercised
+/// separately.
+struct FakeTestSession;
+
+impl ManagedSession for FakeTestSession {
+    fn close(self: Box<Self>) -> Pin<Box<dyn Future<Output = Result<(), DaemonError>>>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn describe(&self) -> SessionLifecycle {
+        SessionLifecycle::Live
+    }
+}
+
+/// A light, in-process fake [`SessionConnector`] selected by [`run`]
+/// instead of [`RealConnector`] when [`TEST_CONNECTOR_ENV`] is set --
+/// makes the daemon's auto-start/idle-reap/self-shutdown lifecycle fully
+/// provable offline (no RDP target) against the REAL compiled binary
+/// (`tests/autostart_lifecycle.rs`, Task 3).
+struct FakeTestConnector;
+
+impl SessionConnector for FakeTestConnector {
+    fn connect(&self, _cfg: ConnectionConfig) -> Pin<Box<dyn Future<Output = Result<Box<dyn ManagedSession>, DaemonError>>>> {
+        Box::pin(async { Ok(Box::new(FakeTestSession) as Box<dyn ManagedSession>) })
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)] // Test-only fail-fast assertions -- mirrors this crate's other test modules' established convention (e.g. registry.rs/dispatch.rs/reconcile.rs), which this crate-wide #![deny] has never actually been enforced against with `cargo clippy --all-targets` until this plan's own verification pass.
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    /// The lighter, always-on (never spawns a real process) regression
+    /// guard the plan calls for alongside the heavier real-binary
+    /// integration test: `run()` with an immediately-empty registry and a
+    /// short empty_grace self-shuts-down on its own (no client ever
+    /// connects at all), proving the assembly wiring end-to-end without
+    /// process spawning.
+    #[tokio::test]
+    async fn run_with_an_immediately_empty_registry_and_a_short_grace_self_shuts_down() {
+        let dir = std::env::temp_dir().join(format!("rdpilot-daemon-server-run-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let sink_path = dir.join("sessions.json");
+
+        let config = RunConfig {
+            sink_path_override: Some(sink_path.clone()),
+            lifecycle: LifecycleConfig {
+                idle_timeout: Duration::from_secs(3600),
+                empty_grace: Duration::from_millis(30),
+                reap_interval: Duration::from_millis(10),
+            },
+        };
+
+        // Bypasses `ipc::unix::bind` entirely (no socket, no client) --
+        // this test exercises the reconciliation-seed + lifecycle-task
+        // assembly `run_inner` performs, run to completion under a bounded
+        // timeout so a regression that fails to self-shut-down fails this
+        // test instead of hanging the suite.
+        let local = tokio::task::LocalSet::new();
+        let result = local
+            .run_until(tokio::time::timeout(Duration::from_secs(5), run_inner_without_bind_for_test(config)))
+            .await;
+
+        assert!(result.is_ok(), "run_inner's lifecycle assembly must self-shut-down well within the timeout");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A thin harness mirroring `run_inner`'s post-bind steps (registry +
+    /// reconciliation-seed + lifecycle-task spawn + shutdown-wait), minus
+    /// the `ipc::unix::bind`/accept-loop portion -- this file's own
+    /// `#[tokio::test]` above cannot bind a real socket (no unique-per-test
+    /// path parameter exists on `ipc::unix::bind`, per this file's own
+    /// `RunConfig` doc comment), but every OTHER piece of `run`'s assembly
+    /// (sink resolution, connector selection, orphan seed ordering,
+    /// reaper/watcher spawn, graceful join) is exercised identically.
+    async fn run_inner_without_bind_for_test(config: RunConfig) {
+        let sink = Arc::new(match config.sink_path_override {
+            Some(path) => JsonReconciliationSink::at(path),
+            None => JsonReconciliationSink::new().expect("platform cache dir should resolve in this test environment"),
+        });
+
+        let connector: Arc<dyn SessionConnector> = Arc::new(FakeTestConnector);
+        let registry = Arc::new(Registry::new(connector, sink.clone() as Arc<dyn ReconciliationSink>));
+
+        let orphans = reconcile::scan_orphans(sink.path());
+        reconcile::seed_into(orphans, &registry);
+
+        let shutdown = ShutdownSignal::new();
+        let reaper_handle = tokio::task::spawn_local(lifecycle::idle_reaper(Arc::clone(&registry), config.lifecycle, shutdown.clone()));
+        let watcher_handle =
+            tokio::task::spawn_local(lifecycle::empty_watcher(Arc::clone(&registry), config.lifecycle, shutdown.clone()));
+
+        shutdown.wait().await;
+        let _ = reaper_handle.await;
+        let _ = watcher_handle.await;
+    }
 }

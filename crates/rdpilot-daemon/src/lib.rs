@@ -46,7 +46,7 @@ mod server;
 pub use reconcile::{JsonReconciliationSink, ReconciliationRecord, scan_orphans, seed_into};
 pub use registry::Registry;
 pub use seams::{DaemonError, ManagedSession, ReconciliationSink, SessionConnector, SessionEntry};
-pub use server::run;
+pub use server::{RunConfig, run};
 
 // Re-exported so `tests/ipc_security.rs` (the SC#4 [BLOCKING] DAEMON-02
 // integration test, Plan 12-04) can reach the Unix IPC primitives across
@@ -54,3 +54,10 @@ pub use server::run;
 // dependency and can only see items reachable from the crate root.
 #[cfg(unix)]
 pub use ipc::{accept_and_authorize, authorize_uid, bind, socket_path};
+
+// Re-exported so `tests/autostart_lifecycle.rs` (the SC#5 [BLOCKING]
+// DAEMON-03 integration test, Plan 12-06) can drive the client-side
+// auto-start helper against the real compiled binary across the crate
+// boundary — Unix-only for now (`autostart.rs`'s own `#![cfg(unix)]`).
+#[cfg(unix)]
+pub use autostart::connect_or_spawn;
