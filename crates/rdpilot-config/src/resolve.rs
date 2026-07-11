@@ -96,6 +96,9 @@ pub fn apply_overrides(mut base: ResolvedConfig, overrides: ResolvedConfig) -> R
     if overrides.share_root.is_some() {
         base.share_root = overrides.share_root;
     }
+    if overrides.sensor_binary_path.is_some() {
+        base.sensor_binary_path = overrides.sensor_binary_path;
+    }
     base
 }
 
@@ -151,6 +154,7 @@ fn empty_overrides() -> ResolvedConfig {
         domain: None,
         accept_invalid_certs: false,
         share_root: None,
+        sensor_binary_path: None,
     }
 }
 

@@ -50,6 +50,7 @@ impl ConfigFlags {
             domain: self.domain,
             accept_invalid_certs: self.accept_invalid_certs,
             share_root: None,
+            sensor_binary_path: None,
         }
     }
 }

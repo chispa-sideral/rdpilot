@@ -77,6 +77,21 @@ pub async fn dispatch(registry: &Registry, req: Request) -> WireResponse {
                 Err(e) => return WireResponse::Error(e.into()),
             };
             cfg = cfg.share_root(share_root);
+            // Live-diagnosed (Plan 15-06): the sensor binary path is the
+            // SAME kind of daemon-local operational config as ‘share_root’
+            // above -- it was previously never sourced at all, meaning
+            // ConnectionConfig::sensor_binary_path was never set on any
+            // real Connect (the RDPDR channel was never registered, and
+            // share_root's own staging directory -- created only when a
+            // sensor path is configured, connect.rs -- was never created
+            // either). None (unconfigured) is preserved as a legitimate
+            // session-management-only mode; only a Some resolved value
+            // is wired onto cfg.
+            match resolve_sensor_binary_path() {
+                Ok(Some(sensor_binary_path)) => cfg = cfg.sensor_binary_path(sensor_binary_path),
+                Ok(None) => {}
+                Err(e) => return WireResponse::Error(e.into()),
+            }
             match registry.open(name, host, cfg).await {
                 Ok(session) => WireResponse::Connected { session },
                 Err(e) => WireResponse::Error(e.into()),
@@ -184,6 +199,28 @@ pub async fn dispatch(registry: &Registry, req: Request) -> WireResponse {
 /// override layer passed to `rdpilot_config::resolve` is always the
 /// all-`None` identity value).
 fn resolve_share_root() -> Result<PathBuf, DaemonError> {
+    let resolved = resolve_identity_config()?;
+    Ok(rdpilot_config::share_root_or_default(&resolved))
+}
+
+/// Resolve the daemon-local sensor executable path (Plan 15-06 live-fix),
+/// via the identical file -> env layering as [`resolve_share_root`]. `Ok(None)`
+/// means no sensor path is configured -- a legitimate session-management-only
+/// mode, not an error.
+fn resolve_sensor_binary_path() -> Result<Option<PathBuf>, DaemonError> {
+    let resolved = resolve_identity_config()?;
+    Ok(resolved.sensor_binary_path.map(PathBuf::from))
+}
+
+/// Shared file -> env layered [`rdpilot_config::ResolvedConfig`] resolution
+/// (no flag/MCP-init override layer exists at the daemon for either
+/// `share_root` or `sensor_binary_path`: neither is a wire field, so the
+/// override layer passed to `rdpilot_config::resolve` is always the
+/// all-`None` identity value). Factored out so [`resolve_share_root`] and
+/// [`resolve_sensor_binary_path`] share one resolution call rather than two
+/// independent (and potentially divergent) reads of the same underlying
+/// config layers.
+fn resolve_identity_config() -> Result<rdpilot_config::ResolvedConfig, DaemonError> {
     let identity_overrides = rdpilot_config::ResolvedConfig {
         host: None,
         port: None,
@@ -192,9 +229,9 @@ fn resolve_share_root() -> Result<PathBuf, DaemonError> {
         domain: None,
         accept_invalid_certs: false,
         share_root: None,
+        sensor_binary_path: None,
     };
-    let resolved = rdpilot_config::resolve(identity_overrides).map_err(|e| DaemonError::Config(e.to_string()))?;
-    Ok(rdpilot_config::share_root_or_default(&resolved))
+    rdpilot_config::resolve(identity_overrides).map_err(|e| DaemonError::Config(e.to_string()))
 }
 
 /// Encode a captured [`rdpilot::Screenshot`] as base64 PNG bytes (the

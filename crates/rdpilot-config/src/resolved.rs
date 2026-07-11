@@ -55,6 +55,29 @@ pub struct ResolvedConfig {
     /// unconfigured.
     #[serde(default)]
     pub share_root: Option<String>,
+    /// Local filesystem path of the published Windows sensor executable
+    /// (`ConnectionConfig::sensor_binary_path`) -- daemon-local operational
+    /// config, mirroring `share_root` exactly: never a wire-transmitted
+    /// value from `Request::Connect`, configured via
+    /// `config.toml`/`RDPILOT_SENSOR_BINARY_PATH`.
+    ///
+    /// **Live-diagnosed (Plan 15-06):** before this field existed, the
+    /// daemon's `Connect` handler had no way to source a sensor path at
+    /// all, so `ConnectionConfig::sensor_binary_path` was NEVER set on any
+    /// real (non-fake-connector) daemon session -- the RDPDR static
+    /// channel was never registered, `share_root`'s own staging directory
+    /// was never created (its creation is gated on a `Some` sensor path in
+    /// `connect.rs`), and every perception/input/launch/file-transfer verb
+    /// against a real target failed (DVC timeout for sensor-backed calls,
+    /// "No such file or directory" for `put`/`get` staging). Unlike
+    /// `share_root`, there is no safe platform-data-dir default for an
+    /// executable path -- `None` here means the daemon connects
+    /// session-management-only (no sensor deployed), which is a legitimate
+    /// configuration for a deployment that never calls a sensor-backed
+    /// verb; a caller that needs perception/input/transfer MUST configure
+    /// this explicitly.
+    #[serde(default)]
+    pub sensor_binary_path: Option<String>,
 }
 
 /// Owned configuration error (D-09): no third-party type (`config::ConfigError`,
@@ -107,6 +130,7 @@ mod tests {
         assert_eq!(resolved.domain, None);
         assert!(!resolved.accept_invalid_certs);
         assert_eq!(resolved.share_root, None);
+        assert_eq!(resolved.sensor_binary_path, None);
         Ok(())
     }
 }

@@ -797,6 +797,7 @@ mod tests {
             domain: None,
             accept_invalid_certs: false,
             share_root: None,
+            sensor_binary_path: None,
         }
     }
 
