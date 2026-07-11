@@ -25,6 +25,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::input::{WireKeyAction, WireMouseAction};
+use crate::perception::{WireUiaScope, WireWorldStateOptions};
 use crate::session_id::SessionId;
 
 /// A daemon-bound wire request.
@@ -146,6 +148,47 @@ pub enum Request {
         /// The local destination path.
         local_path: String,
     },
+    /// Fetch the top-level window list (mirrors `Session::get_window_list`).
+    WindowList {
+        /// The session to operate on.
+        session: SessionId,
+    },
+    /// Fetch the remote process tree (mirrors `Session::get_process_tree`).
+    ProcessList {
+        /// The session to operate on.
+        session: SessionId,
+    },
+    /// Fetch a UI Automation tree for one window (mirrors
+    /// `Session::get_uia_tree`).
+    Uia {
+        /// The session to operate on.
+        session: SessionId,
+        /// The target window handle.
+        hwnd: u64,
+        /// How deep to walk the UIA tree.
+        scope: WireUiaScope,
+    },
+    /// Fetch a correlated desktop snapshot (mirrors `Session::world_state`).
+    WorldState {
+        /// The session to operate on.
+        session: SessionId,
+        /// Which components to capture.
+        options: WireWorldStateOptions,
+    },
+    /// Send a mouse action (mirrors `Session::send_mouse`).
+    Mouse {
+        /// The session to operate on.
+        session: SessionId,
+        /// The mouse action to perform.
+        action: WireMouseAction,
+    },
+    /// Send a keyboard action (mirrors `Session::send_key`).
+    Key {
+        /// The session to operate on.
+        session: SessionId,
+        /// The keyboard action to perform.
+        action: WireKeyAction,
+    },
 }
 
 /// Compile-time forcing function (SESSION-02): a future `Request` variant
@@ -167,7 +210,13 @@ impl SessionScoped for Request {
             | Request::LaunchProcess { session, .. }
             | Request::SetForeground { session, .. }
             | Request::Put { session, .. }
-            | Request::Get { session, .. } => Some(session),
+            | Request::Get { session, .. }
+            | Request::WindowList { session }
+            | Request::ProcessList { session }
+            | Request::Uia { session, .. }
+            | Request::WorldState { session, .. }
+            | Request::Mouse { session, .. }
+            | Request::Key { session, .. } => Some(session),
         }
     }
 }
@@ -185,6 +234,12 @@ mod tests {
             r#"{"op":"SetForeground","hwnd":1}"#,
             r#"{"op":"Put","local_path":"a","remote_name":"b"}"#,
             r#"{"op":"Get","remote_name":"a","local_path":"b"}"#,
+            r#"{"op":"WindowList"}"#,
+            r#"{"op":"ProcessList"}"#,
+            r#"{"op":"Uia","hwnd":1,"scope":"Children"}"#,
+            r#"{"op":"WorldState","options":{"screenshot":true,"window_list":true,"uia":"None"}}"#,
+            r#"{"op":"Mouse","action":{"Move":{"x":1,"y":2}}}"#,
+            r#"{"op":"Key","action":{"Type":"hi"}}"#,
         ];
         for json in cases {
             let result: Result<Request, _> = serde_json::from_str(json);
@@ -201,6 +256,12 @@ mod tests {
             r#"{"op":"SetForeground","session":"s","hwnd":1}"#,
             r#"{"op":"Put","session":"s","local_path":"a","remote_name":"b"}"#,
             r#"{"op":"Get","session":"s","remote_name":"a","local_path":"b"}"#,
+            r#"{"op":"WindowList","session":"s"}"#,
+            r#"{"op":"ProcessList","session":"s"}"#,
+            r#"{"op":"Uia","session":"s","hwnd":1,"scope":"Children"}"#,
+            r#"{"op":"WorldState","session":"s","options":{"screenshot":true,"window_list":true,"uia":"None"}}"#,
+            r#"{"op":"Mouse","session":"s","action":{"Move":{"x":1,"y":2}}}"#,
+            r#"{"op":"Key","session":"s","action":{"Type":"hi"}}"#,
         ];
         for json in cases {
             let result: Request = serde_json::from_str(json)?;
@@ -219,6 +280,14 @@ mod tests {
             serde_json::from_str(r#"{"op":"SetForeground","session":"a","hwnd":1}"#)?,
             serde_json::from_str(r#"{"op":"Put","session":"a","local_path":"l","remote_name":"r"}"#)?,
             serde_json::from_str(r#"{"op":"Get","session":"a","remote_name":"r","local_path":"l"}"#)?,
+            serde_json::from_str(r#"{"op":"WindowList","session":"a"}"#)?,
+            serde_json::from_str(r#"{"op":"ProcessList","session":"a"}"#)?,
+            serde_json::from_str(r#"{"op":"Uia","session":"a","hwnd":1,"scope":"Children"}"#)?,
+            serde_json::from_str(
+                r#"{"op":"WorldState","session":"a","options":{"screenshot":true,"window_list":true,"uia":"None"}}"#,
+            )?,
+            serde_json::from_str(r#"{"op":"Mouse","session":"a","action":{"Move":{"x":1,"y":2}}}"#)?,
+            serde_json::from_str(r#"{"op":"Key","session":"a","action":{"Type":"hi"}}"#)?,
         ];
         for req in &requests {
             assert_eq!(req.session().map(SessionId::as_str), Some("a"));

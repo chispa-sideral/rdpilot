@@ -12,6 +12,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::error::WireError;
+use crate::perception::{WireProcessInfo, WireUiaElement, WireWindowInfo};
 use crate::session_id::SessionId;
 use crate::transfer::TransferOutcome;
 
@@ -86,6 +87,39 @@ pub enum WireResponse {
         /// The current sessions known to the daemon.
         sessions: Vec<SessionStatus>,
     },
+    /// The top-level window list (`WindowList`).
+    WindowList {
+        /// The current top-level windows.
+        windows: Vec<WireWindowInfo>,
+    },
+    /// The remote process tree (`ProcessList`).
+    ProcessList {
+        /// The current processes.
+        processes: Vec<WireProcessInfo>,
+    },
+    /// A UI Automation tree walk result (`Uia`).
+    Uia {
+        /// The flat list of UIA elements returned by the walk.
+        elements: Vec<WireUiaElement>,
+    },
+    /// A correlated desktop snapshot (`WorldState`).
+    WorldState {
+        /// ISO-8601 batch timestamp, taken once after all sequenced
+        /// component fetches complete. `SystemTime` has no serde impl —
+        /// converted daemon-side (Plan 13-04), never here.
+        timestamp: String,
+        /// The measured wall-clock elapsed across the sequenced component
+        /// fetches, in milliseconds. `Duration` has no serde impl either —
+        /// converted daemon-side, never here.
+        capture_span_ms: u64,
+        /// The full-desktop screenshot, base64-encoded PNG, if requested —
+        /// same convention as [`WireResponse::Screenshot`].
+        screenshot: Option<String>,
+        /// The top-level window list, if requested.
+        window_list: Option<Vec<WireWindowInfo>>,
+        /// UIA trees grouped by originating window handle, if requested.
+        uia: Option<Vec<(u64, Vec<WireUiaElement>)>>,
+    },
     /// A typed wire error (D-28).
     Error(WireError),
 }
@@ -96,6 +130,7 @@ mod tests {
 
     use super::*;
     use crate::error::WireErrorCode;
+    use crate::perception::{WireRect, WireWindowState};
 
     const PLANTED_SECRET: &str = "RDPILOT-PLANTED-SECRET-SENTINEL";
 
@@ -131,6 +166,48 @@ mod tests {
                     last_activity: None,
                 }],
             },
+            WireResponse::WindowList {
+                windows: vec![WireWindowInfo {
+                    hwnd: 65536,
+                    title: "Notepad".to_owned(),
+                    rect: WireRect { x: 0, y: 0, w: 100, h: 100 },
+                    z_order: 0,
+                    state: WireWindowState::Normal,
+                    class_name: "Notepad".to_owned(),
+                    pid: 4242,
+                }],
+            },
+            WireResponse::ProcessList {
+                processes: vec![WireProcessInfo {
+                    pid: 4242,
+                    parent_pid: 4,
+                    name: "notepad.exe".to_owned(),
+                    path: "C:\\Windows\\notepad.exe".to_owned(),
+                    command_line: None,
+                    owner: None,
+                }],
+            },
+            WireResponse::Uia {
+                elements: vec![WireUiaElement {
+                    id: "1.2.3".to_owned(),
+                    role: "Button".to_owned(),
+                    name: "OK".to_owned(),
+                    bbox: WireRect { x: 0, y: 0, w: 10, h: 10 },
+                    enabled: true,
+                    visible: true,
+                    focusable: true,
+                    focused: false,
+                    depth: 1,
+                    parent_id: "1.2".to_owned(),
+                }],
+            },
+            WireResponse::WorldState {
+                timestamp: "2026-07-11T00:00:00Z".to_owned(),
+                capture_span_ms: 42,
+                screenshot: Some("cGxhY2Vob2xkZXI=".to_owned()),
+                window_list: None,
+                uia: None,
+            },
             WireResponse::Error(WireError {
                 code: WireErrorCode::SessionNotFound,
                 message: "not found".to_owned(),
@@ -145,6 +222,10 @@ mod tests {
                 | WireResponse::Screenshot { .. }
                 | WireResponse::Transfer(_)
                 | WireResponse::SessionList { .. }
+                | WireResponse::WindowList { .. }
+                | WireResponse::ProcessList { .. }
+                | WireResponse::Uia { .. }
+                | WireResponse::WorldState { .. }
                 | WireResponse::Error(_) => {}
             }
         }
