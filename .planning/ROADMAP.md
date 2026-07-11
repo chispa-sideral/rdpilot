@@ -243,3 +243,13 @@ Plans:
 Plans:
 
 - [ ] TBD (promote with /gsd-review-backlog when ready)
+
+### Phase 999.6: Web viewer for daemon sessions (BACKLOG)
+
+**Goal:** Now that Phase 12 introduces a session daemon with a session registry, provide a web viewer so humans can see what agents/sessions are doing in real time, and enable human intervention (takeover/control) when needed.
+**Requirements:** TBD
+**Plans:** 0 plans
+
+Plans:
+
+- [ ] TBD (promote with /gsd-review-backlog when ready)
