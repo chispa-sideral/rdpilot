@@ -33,7 +33,7 @@ Full phase goals, success criteria, and plan-by-plan detail: `.planning/mileston
 - [ ] **Phase 12: Session Daemon** — Long-lived daemon with a leak-free named-session registry, local-only DACL/peer-scoped IPC, auto-start/idle-shutdown, and crash-restart orphan reconciliation.
 - [x] **Phase 13: CLI Surface** — Thin `rdpilot` CLI over the daemon: lifecycle + perception/input/launch/file verbs, each explicitly targeting a named session. (completed 2026-07-11)
 - [x] **Phase 14: MCP Server Surface** — `rmcp` server exposing a computer-use `computer` mega-tool + rdpilot-native tools, with a tested coordinate-scaling bridge and non-blocking per-call isolation. (completed 2026-07-11)
-- [ ] **Phase 15: Proof Harnesses & Live-LLM Capstone** — Scripted per-surface proof (CLI, MCP, no live LLM) plus the capstone live-LLM read/inspect + file-transfer demo through MCP. (2026-07-11: Waves 3-6 LIVE-RUN — single VM provisioned and held UP through 15-05/06/07/08; DAEMON-02 Windows half, PROOF-02, PROOF-03, and PROOF-04 (capstone) all live-verified PASS. Phase not yet closed — Task 3's teardown-authorization checkpoint is still PENDING; VM remains UP.)
+- [x] **Phase 15: Proof Harnesses & Live-LLM Capstone** — Scripted per-surface proof (CLI, MCP, no live LLM) plus the capstone live-LLM read/inspect + file-transfer demo through MCP. (completed 2026-07-11: Waves 3-6 LIVE-RUN — single VM provisioned and held UP through 15-05/06/07/08; DAEMON-02 Windows half, PROOF-02, PROOF-03, and PROOF-04 (capstone) all live-verified PASS. Developer-authorized teardown (`manage-env.ps1 down`) confirmed the test RG destroyed (`az group exists -n rdpilot-test` => `false`), management RG `rdpilot-mgmt` persists. v1.1 milestone's proof/live-gate track is now fully closed.)
 
 ## Phase Details
 
@@ -153,7 +153,7 @@ Full phase goals, success criteria, and plan-by-plan detail: `.planning/mileston
   2. A scripted harness proves the MCP surface end-to-end — tool calls exercised programmatically — with no live LLM (PROOF-03).
   3. A capstone live-LLM demo drives a read/inspect + file-transfer task through the MCP surface against a real remote-only Windows program (PROOF-04).
 
-**Plans**: 7/8 plans executed
+**Plans**: 8/8 plans complete
 
 - [x] 15-01-PLAN.md — OFFLINE-AUTHOR: 12-07 windows-sys owner-only DACL + split live test files (Windows DACL / Linux e2e) (Wave 1) (completed 2026-07-11)
 - [x] 15-02-PLAN.md — OFFLINE-AUTHOR: PROOF-02 CLI harness + CLI-02/03 live re-exercise (gated tests) (Wave 1) (completed 2026-07-11)
@@ -162,7 +162,7 @@ Full phase goals, success criteria, and plan-by-plan detail: `.planning/mileston
 - [x] 15-05-PLAN.md — LIVE-RUN: provision VM + on-VM sensor build + Windows-DACL gate on the VM (DAEMON-02) (Wave 3) (completed 2026-07-11: VM `rdpilot-vm` UP and held for 15-06/07/08; sensor SHA-256 byte-verified; DAEMON-02 Windows half live-verified — owner-only DACL, anti-squatting, genuine cross-account rejection all PASS)
 - [x] 15-06-PLAN.md — LIVE-RUN: orphan-liveness/e2e + CLI-02/03 live + MCP-04 live half, from the Linux host (Wave 4)
 - [x] 15-07-PLAN.md — LIVE-RUN: PROOF-02 + PROOF-03 scripted proofs (no live LLM) (Wave 5)
-- [ ] 15-08-PLAN.md — LIVE-RUN: PROOF-04 capstone (`claude -p`) + teardown authorization checkpoint (Wave 6). **Capstone PASS** (2026-07-11): `claude -p` drove read/inspect + file-transfer through the real MCP surface against the live Azure VM, verified by transcript + independent side-effect (one live-diagnosed fix: `RDPILOT_SENSOR_BINARY_PATH` missing from the rendered `--mcp-config`, mirroring 15-06/15-07's finding). **Teardown checkpoint still PENDING developer authorization** — VM remains UP.
+- [x] 15-08-PLAN.md — LIVE-RUN: PROOF-04 capstone (`claude -p`) + teardown authorization checkpoint (Wave 6) (completed 2026-07-11). **Capstone PASS**: `claude -p` drove read/inspect + file-transfer through the real MCP surface against the live Azure VM, verified by transcript + independent side-effect (one live-diagnosed fix: `RDPILOT_SENSOR_BINARY_PATH` missing from the rendered `--mcp-config`, mirroring 15-06/15-07's finding). **Teardown developer-authorized and confirmed**: `manage-env.ps1 down` ran clean (exit 0), `az group exists -n rdpilot-test` => `false`, `rdpilot-mgmt` persists (`Succeeded`), no stray local daemon/sensor/claude processes or IPC socket left behind.
 
 ## Progress
 
@@ -182,7 +182,7 @@ Full phase goals, success criteria, and plan-by-plan detail: `.planning/mileston
 | 12. Session Daemon | v1.1 | 6/7 | In Progress|  |
 | 13. CLI Surface | v1.1 | 7/7 | Complete   | 2026-07-11 |
 | 14. MCP Server Surface | v1.1 | 5/5 | Complete   | 2026-07-11 |
-| 15. Proof Harnesses & Live-LLM Capstone | v1.1 | 7/8 | In Progress|  |
+| 15. Proof Harnesses & Live-LLM Capstone | v1.1 | 8/8 | Complete   | 2026-07-11 |
 
 ## Backlog
 

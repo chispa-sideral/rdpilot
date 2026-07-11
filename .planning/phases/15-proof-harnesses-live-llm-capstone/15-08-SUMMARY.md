@@ -33,25 +33,25 @@ key-files:
 key-decisions:
   - "Live-diagnosed the exact same RDPILOT_SENSOR_BINARY_PATH gap 15-06/15-07 already found and fixed in three sibling harnesses, but never mirrored into live_capstone.rs (authored in 15-04, before 15-07's discovery). Fixed by adding a sensor_binary_path() helper (mirrors live_proof.rs verbatim) and setting it on render_mcp_config's rendered env block, plus documenting the new __RDPILOT_SENSOR_BINARY_PATH__ substitution token in the committed fixture template's _comment block and env object -- consistent with how every other token is documented there."
   - "PERMISSION_FLAGS's authored default (--permission-mode bypassPermissions --strict-mcp-config) worked on the first genuine attempt once the sensor-path fix was applied -- no fallback to --dangerously-skip-permissions was needed. The TODO-for-15-08 comment in live_capstone.rs is now resolved; the constant's doc comment could be updated to note this in a future pass but was left as-is since it already documents the fallback correctly."
-  - "STOPPED before the Task 3 teardown checkpoint per explicit orchestrator instruction -- the VM remains UP. Task 3 (checkpoint:human-verify, gate=blocking-human) is the sole remaining step of this plan; this summary documents Tasks 1-2 only. A follow-up session executes Task 3 (manage-env.ps1 down + az group exists confirmation) after developer authorization and will append the teardown section to this same summary / update STATE.md's completion status."
+  - "STOPPED before the Task 3 teardown checkpoint per explicit orchestrator instruction, pending developer authorization -- the VM remained UP through that pause. Once the developer replied 'approved: teardown', Task 3 was executed: `pwsh infra/manage-env.ps1 -Action down` (the script's default BLOCKING mode) ran to completion, confirmed by both the script's own internal poll ('Resource group '\''rdpilot-test'\'' is fully deleted.', exit 0) and an independent `az group exists -n rdpilot-test` => `false` check. `rdpilot-mgmt` (the persistent management RG) was left untouched and confirmed still `Succeeded`."
 
 requirements-completed: [PROOF-04]
 
 # Metrics
-duration: ~45min (Tasks 1-2 only; Task 3 pending)
+duration: ~45min (Tasks 1-2) + ~4min (Task 3 teardown, developer-authorized in a follow-up turn)
 completed: 2026-07-11
 ---
 
-# Phase 15 Plan 08: PROOF-04 Live-LLM Capstone (claude -p) — Live Run Summary
+# Phase 15 Plan 08: PROOF-04 Live-LLM Capstone (claude -p) + Teardown — Live Run Summary
 
-**`claude -p` (local, already-authenticated Claude Code CLI, headless print mode) drove a real read/inspect + file-transfer task through the actual `rdpilot-mcp` server against the live Azure VM's 7-Zip File Manager — connect, launch, window discovery, UIA menu-bar enumeration, and a `put`/`get` round trip — with PROOF-04 asserted PASS by both required signals (transcript tool-call evidence AND an independent second-client byte-for-byte side-effect check), after one live-diagnosed fix identical in shape to three prior sibling-harness fixes this phase. Task 3 (VM teardown) is a blocking-human checkpoint intentionally NOT executed — the VM remains UP pending developer authorization.**
+**`claude -p` (local, already-authenticated Claude Code CLI, headless print mode) drove a real read/inspect + file-transfer task through the actual `rdpilot-mcp` server against the live Azure VM's 7-Zip File Manager — connect, launch, window discovery, UIA menu-bar enumeration, and a `put`/`get` round trip — with PROOF-04 asserted PASS by both required signals (transcript tool-call evidence AND an independent second-client byte-for-byte side-effect check), after one live-diagnosed fix identical in shape to three prior sibling-harness fixes this phase. Following explicit developer authorization at the Task 3 blocking-human checkpoint, the Azure test environment was torn down (`manage-env.ps1 down`) and confirmed destroyed, closing the v1.1 milestone's single-VM live session and Phase 15 itself.**
 
 ## Performance
 
-- **Duration:** ~45 min (Tasks 1-2)
+- **Duration:** ~45 min (Tasks 1-2) + ~4 min (Task 3, in a developer-authorized follow-up turn)
 - **Completed:** 2026-07-11
-- **Tasks:** 2 of 3 (Task 3 is a pending checkpoint, not executed this session)
-- **Files modified:** 2
+- **Tasks:** 3 of 3 — Complete
+- **Files modified:** 2 (Tasks 1-2 only; Task 3 was an infrastructure-only teardown, no source files)
 
 ## Accomplishments
 
@@ -89,9 +89,38 @@ test capstone_llm_drives_read_inspect_and_file_transfer_through_mcp ... ok
 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 62.09s
 ```
 
+## Task 3 — Teardown authorization + confirmed destroy
+
+**Developer authorized teardown** ("TEARDOWN AUTHORIZED by the developer... approved") in a follow-up turn after reviewing the PROOF-04 PASS evidence and the phase's full live-gate track record (DAEMON-02 Windows DACL, DAEMON-04/SESSION-01/03/04, CLI-02/03, MCP-04, PROOF-02/03/04 — all PASS).
+
+**Teardown executed:**
+```
+pwsh -NoProfile -Command "infra/manage-env.ps1 -Action down"
+```
+Ran in the script's default BLOCKING mode (no `-NoWait`): `az group delete -n rdpilot-test --yes` (server-side blocking delete) followed by the script's own confirmation poll.
+
+**Result:**
+```
+Deleting TEST resource group 'rdpilot-test' (the management RG 'rdpilot-mgmt' is left in place)...
+Waiting for deletion to complete (this can take several minutes)...
+Resource group 'rdpilot-test' is fully deleted.
+EXIT=0
+```
+
+**Independent confirmation (not just the script's own claim):**
+- `az group exists -n rdpilot-test` → **`false`**
+- `az group exists -n rdpilot-mgmt` → **`true`** (persistent management RG correctly left in place)
+- `az group show -n rdpilot-mgmt --query "properties.provisioningState"` → `Succeeded` (healthy, untouched)
+- Mid-deletion progress was observed directly: `az resource list -g rdpilot-test` showed the VM/disk gone first, then `rdpilot-pip`/`rdpilot-nsg`/`rdpilot-vnet` draining, then all three individually confirmed `ResourceNotFound` before the RG shell itself finished deleting.
+
+**Local process hygiene, final confirmation:**
+- `ps aux | grep -E "rdpilot-daemon|rdpilot-mcp|rdpilot-sensor|claude -p"` → no matches (no stray local daemon/MCP-server/sensor/claude subprocess left running).
+- `/run/user/1000/rdpilot/` → no `daemon.sock` present (no stale local IPC socket).
+
 ## Task Commits
 
 1. **Task 2 fix — RDPILOT_SENSOR_BINARY_PATH live-diagnosed fix** — `d405805` (`fix(15-08): PROOF-04 capstone harness sets RDPILOT_SENSOR_BINARY_PATH on the rendered --mcp-config`)
+2. **Task 3 — teardown** — infrastructure-only (Azure resource deletion via `manage-env.ps1 down`); no source file changes, no code commit. Documented here plus the closing docs commit.
 
 (Task 1 required no code change — a pure verification probe.)
 
@@ -134,10 +163,10 @@ None. VM, sensor binary, `.secrets/connection.json`, and local `claude` CLI auth
 ## Next Phase Readiness
 
 - **PROOF-04 is Complete** — the milestone's third and final finish-line deliverable (alongside PROOF-02/PROOF-03, both already live-verified in 15-07) is now genuinely proven against the same live VM. The v1.1 milestone's dual/triple finish line (PROOF-02/03/04) is complete.
-- **VM confirmed STILL UP** (`az vm get-instance-view` → `PowerState/running`) — teardown was deliberately NOT run.
-- **Task 3 (teardown authorization + confirmed destroy) is PENDING** — this is the plan's sole remaining step, a `checkpoint:human-verify` gated `blocking-human`. Per binding direction 4, this is the ONE kept blocking human checkpoint for the entire phase. A follow-up execution session runs `infra/manage-env.ps1 down` then confirms `az group exists -n rdpilot-test` → `false` once the developer authorizes teardown.
-- No blockers for Task 3 beyond developer authorization itself.
+- **Task 3 (teardown authorization + confirmed destroy) is Complete** — developer-authorized, executed, and independently confirmed: `az group exists -n rdpilot-test` → `false`, `rdpilot-mgmt` persists (`Succeeded`). No stray local processes or sockets left behind.
+- **Plan 15-08 is now fully Complete (3/3 tasks)** — this closes Phase 15 (8/8 plans) and the v1.1 milestone's live-gate/proof-harness track.
+- No blockers. The v1.1 milestone's Consumer Surfaces & File Transfer scope (Phases 10-15) is now fully live-verified end to end.
 
 ---
 *Phase: 15-proof-harnesses-live-llm-capstone*
-*Completed: 2026-07-11 (Tasks 1-2 of 3; Task 3 teardown pending)*
+*Completed: 2026-07-11 (3/3 tasks — capstone PASS + teardown confirmed)*
