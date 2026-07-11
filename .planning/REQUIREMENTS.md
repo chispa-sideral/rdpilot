@@ -10,7 +10,7 @@ Requirements for the v1.1 milestone. Each maps to roadmap phases.
 ### Session Daemon
 
 - [ ] **DAEMON-01**: A long-lived daemon holds N live RDP sessions with keepalive, decoupled from any CLI process lifetime
-- [ ] **DAEMON-02**: A local IPC transport (unix socket / Windows named pipe) carries requests between clients (CLI, MCP) and the daemon, restricted to the local user (permission/DACL-scoped)
+- [ ] **DAEMON-02**: A local IPC transport (unix socket / Windows named pipe) carries requests between clients (CLI, MCP) and the daemon, restricted to the local user (permission/DACL-scoped) — Unix path complete (12-04); Windows DACL path deferred to the 12-07 live gate
 - [ ] **DAEMON-03**: The daemon auto-starts on first client connect and reaps idle sessions / self-shuts-down when the registry empties
 - [ ] **DAEMON-04**: On restart, the daemon detects and tears down orphaned Windows-side sessions (in-memory registry; no reattach)
 
@@ -18,7 +18,7 @@ Requirements for the v1.1 milestone. Each maps to roadmap phases.
 
 - [ ] **SESSION-01**: User can open a session under a caller-supplied name, or receive an auto-generated id when unnamed
 - [x] **SESSION-02**: Every perception/input/file command explicitly targets a session by name/id — no implicit default
-- [ ] **SESSION-03**: User can list active sessions (name/id, target, status)
+- [x] **SESSION-03**: User can list active sessions (name/id, target, status)
 - [ ] **SESSION-04**: User can disconnect a named session; names/ids are unique (collisions rejected)
 
 ### CLI Surface
@@ -91,12 +91,12 @@ Which phases cover which requirements. Updated during roadmap creation.
 | CONFIG-02 | Phase 11 | Complete |
 | CONFIG-03 | Phase 11 | Complete |
 | DAEMON-01 | Phase 12 | In Progress (12-01/02/03: registry-level leak-free session holding proven — SC#3 BLOCKING thread+RSS soak passes across N=50 real connect/disconnect cycles; the long-lived daemon *process* with keepalive, decoupled from any CLI process lifetime, is Wave 4/6, 12-04/12-06) |
-| DAEMON-02 | Phase 12 | Pending |
+| DAEMON-02 | Phase 12 | In Progress (12-04: Unix path complete — `0700` runtime dir (atomic mode-at-creation) + per-connection `peer_cred()` uid check; SC#4 [BLOCKING] offline proof passes `cargo test -p rdpilot-daemon --test ipc_security` — `authorize_uid` rejects a mismatched uid, accepts a matching one, socket dir confirmed mode 0700; a real cross-account variant is gated behind `RDPILOT_SECOND_UID`+`#[ignore]`. Windows explicit-DACL path deferred to the 12-07 live gate) |
 | DAEMON-03 | Phase 12 | Pending |
 | DAEMON-04 | Phase 12 | In Progress (12-05: offline crash-restart reconciliation mechanics proven — kill -9 surrogate + restart surfaces the prior session as `Orphaned` in `list`, never silently forgotten, reconciled only via explicit `close`; SC#5 [BLOCKING] offline portion passes `cargo test -p rdpilot-daemon --test crash_restart_reconcile`. Live confirmation that the remote Windows session is genuinely still live vs. logged off is deferred to Plan 12-07) |
-| SESSION-01 | Phase 12 | In Progress (12-01/02/03: wire verb `Request::Connect` + registry `open()` with caller-name/auto-id (D-29) both implemented and tested — SC#1 concurrency proves auto-id collision-safety; wire-level dispatch routing a client's Connect to `Registry::open` is Wave 4, 12-04) |
-| SESSION-03 | Phase 12 | Pending (dispatch — Wave 4, 12-04) |
-| SESSION-04 | Phase 12 | In Progress (12-01/02/03: wire verb `Request::Disconnect` + registry `close()`/uniqueness enforcement both implemented and tested — SC#1 proves N=16 same-name contention yields exactly one winner; wire-level dispatch is Wave 4, 12-04) |
+| SESSION-01 | Phase 12 | In Progress (12-01/02/03: wire verb `Request::Connect` + registry `open()` with caller-name/auto-id (D-29) both implemented and tested — SC#1 concurrency proves auto-id collision-safety; 12-04: wire-level dispatch now routes `Request::Connect` to `Registry::open` and returns `WireResponse::Connected`/`Error(DuplicateSession)`, unit-tested in `dispatch.rs`. Remaining: the actual daemon process/IPC transport a real client connects through is Wave 5, 12-06) |
+| SESSION-03 | Phase 12 | Complete (12-04: `dispatch`'s `List {}` arm returns the registry's credential-free `SessionList`, with `connected_since`/`last_activity` now wall-clock-populated for live entries — registry.rs/seams.rs extended this wave to finish the wiring their own doc comments had flagged as outstanding; a dispatch-level unit test asserts field completeness) |
+| SESSION-04 | Phase 12 | In Progress (12-01/02/03: wire verb `Request::Disconnect` + registry `close()`/uniqueness enforcement both implemented and tested — SC#1 proves N=16 same-name contention yields exactly one winner; 12-04: wire-level dispatch now routes `Request::Disconnect` to `Registry::close` and returns `Ack`/`Error(SessionNotFound)`, unit-tested in `dispatch.rs`. Remaining: the actual daemon process/IPC transport a real client connects through is Wave 5, 12-06) |
 | CLI-01 | Phase 13 | Pending |
 | CLI-02 | Phase 13 | Pending |
 | CLI-03 | Phase 13 | Pending |

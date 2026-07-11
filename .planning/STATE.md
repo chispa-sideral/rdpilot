@@ -4,13 +4,13 @@ milestone: v1.1
 milestone_name: — Consumer Surfaces & File Transfer
 status: verifying
 stopped_at: Phase 10 complete (5/5 plans). Plan 10-05's live gate found and fixed a Rule 1 bug in finalize_write's completeness rule (real Windows never sends FILE_END_OF_FILE_INFORMATION), measured the real per-IRP chunk size, and validated TRANSFER_TIMEOUT_MS. Ready to plan Phase 11 (Shared Wire Protocol & Config).
-last_updated: "2026-07-11T00:09:19.009Z"
+last_updated: "2026-07-11T00:15:13.312Z"
 last_activity: 2026-07-10 -- Phase 11 execution started
 progress:
   total_phases: 6
   completed_phases: 2
   total_plans: 14
-  completed_plans: 10
+  completed_plans: 12
   percent: 33
 ---
 
@@ -104,6 +104,7 @@ Last activity: 2026-07-10 -- Phase 11 execution started
 | Phase 12 P02 | ~50m | 3 tasks | 5 files |
 | Phase 12 P03 | ~90m | 3 tasks | 3 files |
 | Phase 12 P05 | ~20m | 2 tasks | 2 files |
+| Phase 12 P04 | ~40m | 3 tasks | 8 files |
 
 ## Accumulated Context
 
@@ -198,6 +199,7 @@ Recent decisions affecting current work:
 - [Phase ?]: rdpilot-daemon registry: atomic claim-then-connect (research Pattern 1) + close-not-drop teardown (research Pattern 2) implemented and proven offline -- SC#1 N=16 concurrency race (exactly one winner) and SC#3 BLOCKING thread+RSS soak (N=50 cycles, exact thread-count return to baseline) both pass deterministically (12-03)
 - [Phase ?]: rdpilot-daemon soak-test discipline: per-test dedicated Tokio runtime with a short thread_keep_alive (10ms) avoids a false-positive leak signal from Tokio's own blocking-thread-pool 10s default lingering; the two soak tests in one file are serialized via a shared Mutex since /proc/self/status Threads: is a whole-process metric and Rust's default test harness runs tests in parallel within one process (12-03)
 - [Phase ?]: rdpilot-daemon reconcile: JSON ReconciliationSink (atomic temp-write+rename) + scan_orphans/seed_into startup bridge implemented and proven offline -- kill -9 (drop-without-close) surrogate + restart surfaces the prior session as Orphaned in list(), never silently forgotten, reconciled only via explicit close (DAEMON-04 SC#5 BLOCKING offline portion, 12-05)
+- [Phase ?]: rdpilot-daemon 12-04: Unix IPC transport complete -- 0700 runtime-dir socket (atomic DirBuilder::mode) + peer_cred() uid check (authorize_uid pure decision fn, unit-tested + BLOCKING SC#4 offline proof in tests/ipc_security.rs); 4-byte-BE length-prefixed serde_json framing with a 16MiB max-frame-length cap; dispatch.rs routes Connect/List/Disconnect to the registry (exhaustive match, no wildcard) and returns SessionNotFound/Internal-not-implemented for the six deferred operational verbs. Extended registry.rs/seams.rs (not in the plan's files_modified list, but disjoint from the concurrent 12-05 plan) to finish SESSION-03's list wiring: SessionEntry::Live now carries connected_since_wall/last_activity_wall ISO-8601 strings alongside the existing monotonic Instants, closing the None-hardcoded TODO both files' own doc comments had flagged as Plan 12-04's job.
 
 ### Pending Todos
 
@@ -244,7 +246,7 @@ Pre-close artifact audit surfaced 3 open items. Reviewed and explicitly acknowle
 
 ## Session Continuity
 
-Last session: 2026-07-11T00:00:32.118Z
+Last session: 2026-07-11T00:15:13.306Z
 Stopped at: Phase 11 complete (2/2 plans). rdpilot-ipc (SESSION-02, CONFIG-03) and rdpilot-config (CONFIG-01, CONFIG-02) both built, verified, and workspace-integrated. Ready for Phase 12 (Session Daemon).
 Resume file: .planning/DECISIONS-INDEX.md
 
