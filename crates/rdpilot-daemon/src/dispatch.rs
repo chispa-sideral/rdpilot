@@ -169,6 +169,12 @@ pub async fn dispatch(registry: &Registry, req: Request) -> WireResponse {
                 Err(e) => WireResponse::Error(e.into()),
             }
         }
+        Request::DesktopSize { session } => {
+            match registry.call(&session, |s| Box::pin(async move { Ok(s.desktop_size()) })).await {
+                Ok((w, h)) => WireResponse::DesktopSize { width: w as u16, height: h as u16 },
+                Err(e) => WireResponse::Error(e.into()),
+            }
+        }
     }
 }
 
@@ -506,6 +512,9 @@ mod tests {
         fn ping(&self) -> BoxFuture<'_, Result<std::time::Duration, DaemonError>> {
             Box::pin(async { Ok(std::time::Duration::from_millis(0)) })
         }
+        fn desktop_size(&self) -> (u32, u32) {
+            (1920, 1080)
+        }
     }
 
     /// A fake `SessionConnector` that always succeeds.
@@ -750,6 +759,9 @@ mod tests {
         fn ping(&self) -> BoxFuture<'_, Result<std::time::Duration, DaemonError>> {
             Box::pin(async { Ok(std::time::Duration::from_millis(0)) })
         }
+        fn desktop_size(&self) -> (u32, u32) {
+            (1920, 1080)
+        }
     }
 
     struct RichPerceptionConnector;
@@ -892,6 +904,9 @@ mod tests {
             fn ping(&self) -> BoxFuture<'_, Result<std::time::Duration, DaemonError>> {
                 Box::pin(async { Ok(std::time::Duration::from_millis(0)) })
             }
+            fn desktop_size(&self) -> (u32, u32) {
+                (1920, 1080)
+            }
         }
         struct WithScreenshotConnector;
         impl SessionConnector for WithScreenshotConnector {
@@ -986,6 +1001,31 @@ mod tests {
         let registry = test_registry();
         let session: SessionId = "ghost".parse().expect("non-empty literal");
         let response = dispatch(&registry, Request::Screenshot { session }).await;
+        match response {
+            WireResponse::Error(WireError { code: WireErrorCode::SessionNotFound, .. }) => {}
+            other => panic!("expected Error(SessionNotFound), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn desktop_size_returns_the_fakes_dimensions() {
+        let registry = test_registry();
+        let session = connected_session(&registry).await;
+        let response = dispatch(&registry, Request::DesktopSize { session }).await;
+        match response {
+            WireResponse::DesktopSize { width, height } => {
+                assert_eq!(width, 1920);
+                assert_eq!(height, 1080);
+            }
+            other => panic!("expected DesktopSize, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn desktop_size_for_an_unknown_session_returns_session_not_found() {
+        let registry = test_registry();
+        let session: SessionId = "ghost".parse().expect("non-empty literal");
+        let response = dispatch(&registry, Request::DesktopSize { session }).await;
         match response {
             WireResponse::Error(WireError { code: WireErrorCode::SessionNotFound, .. }) => {}
             other => panic!("expected Error(SessionNotFound), got {other:?}"),

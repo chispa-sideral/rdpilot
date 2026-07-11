@@ -127,6 +127,9 @@ impl ManagedSession for ThreadOwningFakeSession {
     fn ping(&self) -> OpFuture<'_, Result<std::time::Duration, DaemonError>> {
         Box::pin(async { Ok(std::time::Duration::from_millis(0)) })
     }
+    fn desktop_size(&self) -> (u32, u32) {
+        (1920, 1080)
+    }
 }
 
 struct ThreadOwningFakeConnector;

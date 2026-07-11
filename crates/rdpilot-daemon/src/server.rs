@@ -322,6 +322,10 @@ otepad.exe".to_owned(),
     fn ping(&self) -> BoxFuture<'_, Result<std::time::Duration, DaemonError>> {
         Box::pin(async { Ok(std::time::Duration::from_millis(5)) })
     }
+
+    fn desktop_size(&self) -> (u32, u32) {
+        (1920, 1080)
+    }
 }
 
 /// A canned [`rdpilot::WindowInfo`] shared by [`FakeTestSession::get_window_list`]

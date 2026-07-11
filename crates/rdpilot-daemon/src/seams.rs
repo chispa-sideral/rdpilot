@@ -184,6 +184,12 @@ pub trait ManagedSession: Send + 'static {
     ///
     /// Returns [`DaemonError::Sdk`] on any underlying SDK failure.
     fn ping(&self) -> BoxFuture<'_, Result<std::time::Duration, DaemonError>>;
+
+    /// The session's native desktop dimensions (mirrors
+    /// [`rdpilot::Session::desktop_size`]). A plain synchronous getter --
+    /// `desktop_size` is a cheap stored-field read on `rdpilot::Session`, no
+    /// `.await`/`BoxFuture` needed.
+    fn desktop_size(&self) -> (u32, u32);
 }
 
 impl ManagedSession for Session {
@@ -261,6 +267,10 @@ impl ManagedSession for Session {
 
     fn ping(&self) -> BoxFuture<'_, Result<std::time::Duration, DaemonError>> {
         Box::pin(async move { self.ping().await.map_err(DaemonError::Sdk) })
+    }
+
+    fn desktop_size(&self) -> (u32, u32) {
+        self.desktop_size()
     }
 }
 
