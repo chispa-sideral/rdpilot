@@ -98,8 +98,8 @@ Which phases cover which requirements. Updated during roadmap creation.
 | SESSION-03 | Phase 12 | Complete (12-04: `dispatch`'s `List {}` arm returns the registry's credential-free `SessionList`, with `connected_since`/`last_activity` now wall-clock-populated for live entries — registry.rs/seams.rs extended this wave to finish the wiring their own doc comments had flagged as outstanding; a dispatch-level unit test asserts field completeness) |
 | SESSION-04 | Phase 12 | In Progress (12-01/02/03: wire verb `Request::Disconnect` + registry `close()`/uniqueness enforcement both implemented and tested — SC#1 proves N=16 same-name contention yields exactly one winner; 12-04: wire-level dispatch now routes `Request::Disconnect` to `Registry::close` and returns `Ack`/`Error(SessionNotFound)`, unit-tested in `dispatch.rs`. Remaining: the actual daemon process/IPC transport a real client connects through is Wave 5, 12-06) |
 | CLI-01 | Phase 13 | In Progress (13-01: prerequisite transport relocation complete — `socket_path`/`connect_or_spawn`/length-prefixed framing now live in `rdpilot_ipc::transport`, verified `cargo tree` free of `ironrdp`/`rustls`, so the CLI binary (13-05) can auto-start/reach the daemon without depending on `rdpilot`. The `rdpilot` CLI binary itself, and its connect/list/disconnect verbs, remain outstanding) |
-| CLI-02 | Phase 13 | Pending |
-| CLI-03 | Phase 13 | Pending |
+| CLI-02 | Phase 13 | In Progress (13-03: daemon-side seam complete — `ManagedSession` extended with the full `&self` operational method set (screenshot/world_state/window+process list/uia/mouse/key/foreground/launch/ping), `impl` for `rdpilot::Session`, and a deadlock-free `Registry::call` dispatch path. Dispatch is not yet wired to these methods — that is 13-04) |
+| CLI-03 | Phase 13 | In Progress (13-03: daemon-side seam complete — `ManagedSession::upload_file`/`download_file` added and reachable via `Registry::call`; dispatch wiring for `Put`/`Get` remains 13-04) |
 | MCP-01 | Phase 14 | Pending |
 | MCP-02 | Phase 14 | Pending |
 | MCP-03 | Phase 14 | Pending |
