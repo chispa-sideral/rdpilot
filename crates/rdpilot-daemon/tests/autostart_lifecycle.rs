@@ -47,6 +47,12 @@
 //! exercised via `cargo test -- --include-ignored` (this plan's own
 //! `<verify>` block), never in a bare default `cargo test` pass.
 
+// Unix-only: relies on `XDG_RUNTIME_DIR`-based socket-path isolation and
+// a real `tokio::net::UnixStream` directly. Live-VM-confirmed compile
+// fix, Plan 15-05: this file never had a cfg gate before, which broke
+// `cargo test -p rdpilot-daemon` on a Windows target.
+#![cfg(unix)]
+
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 

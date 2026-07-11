@@ -29,6 +29,14 @@
 //! - "connect / list / disconnect work end-to-end against a real Windows
 //!   RDP target" -- `connect_list_disconnect_e2e_against_a_real_target`.
 
+// Unix-only: this file drives the daemon over a real `tokio::net::UnixStream`
+// directly (module doc: "Linux-hostable" -- runs from the Linux
+// orchestration host against the remote Windows VM target, never ON
+// Windows itself). Live-VM-confirmed compile fix, Plan 15-05: this
+// file never had a cfg gate before, which broke
+// `cargo test -p rdpilot-daemon` on a Windows target.
+#![cfg(unix)]
+
 use std::path::PathBuf;
 use std::time::Duration;
 

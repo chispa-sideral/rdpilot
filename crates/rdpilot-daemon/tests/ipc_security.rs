@@ -22,6 +22,13 @@
 //!   The full cross-account proof is re-confirmed on Windows
 //!   (DACL/other-account) in the live-gate Plan 12-07.
 
+// Unix-only: `authorize_uid`/`geteuid()`/`MetadataExt` are all
+// Unix-specific -- the Windows cross-account proof lives in
+// `live_daemon_windows_dacl.rs` instead (live-VM-confirmed compile
+// fix, Plan 15-05: this file never had a cfg gate before, which
+// broke `cargo test -p rdpilot-daemon` on a Windows target).
+#![cfg(unix)]
+
 use std::os::unix::fs::MetadataExt;
 
 use rdpilot_daemon::authorize_uid;
