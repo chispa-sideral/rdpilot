@@ -2899,9 +2899,11 @@ dependencies = [
 name = "rdpilot-ipc"
 version = "0.1.0"
 dependencies = [
+ "directories",
  "serde",
  "serde_json",
  "thiserror",
+ "tokio",
 ]
 
 [[package]]

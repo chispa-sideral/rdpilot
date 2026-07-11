@@ -39,9 +39,13 @@ mod request;
 mod response;
 mod session_id;
 mod transfer;
+#[cfg(unix)]
+pub mod transport;
 
 pub use error::{WireError, WireErrorCode};
 pub use request::{Request, SessionScoped};
 pub use response::{SessionLifecycle, SessionStatus, WireResponse};
 pub use session_id::SessionId;
 pub use transfer::TransferOutcome;
+#[cfg(unix)]
+pub use transport::{TransportError, connect_or_spawn, read_frame, socket_path, write_frame};

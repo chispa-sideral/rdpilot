@@ -11,3 +11,7 @@ repository = "https://github.com/marcfargas/rdpilot"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
+
+[target.'cfg(unix)'.dependencies]
+directories = "6.0.0"
+tokio = { version = "1", features = ["rt", "net", "io-util", "time", "macros"] }
