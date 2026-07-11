@@ -47,3 +47,10 @@ pub use reconcile::{JsonReconciliationSink, ReconciliationRecord, scan_orphans, 
 pub use registry::Registry;
 pub use seams::{DaemonError, ManagedSession, ReconciliationSink, SessionConnector, SessionEntry};
 pub use server::run;
+
+// Re-exported so `tests/ipc_security.rs` (the SC#4 [BLOCKING] DAEMON-02
+// integration test, Plan 12-04) can reach the Unix IPC primitives across
+// the crate boundary — integration tests link this crate as an external
+// dependency and can only see items reachable from the crate root.
+#[cfg(unix)]
+pub use ipc::{accept_and_authorize, authorize_uid, bind, socket_path};
