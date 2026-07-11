@@ -1,0 +1,21 @@
+[package]
+name = "rdpilot-cli"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.78"
+license = "LGPL-3.0-or-later"
+description = "Thin `rdpilot-ipc`/`rdpilot-config` CLI client (`rdpilot` binary) — session lifecycle + operational verbs against the daemon. Never links `rdpilot`/`rdpilot-daemon` (thin-client invariant, D-17)."
+repository = "https://github.com/marcfargas/rdpilot"
+
+[[bin]]
+name = "rdpilot"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.6.1", features = ["derive"] }
+serde = "1"
+rdpilot-ipc = { path = "../rdpilot-ipc" }
+rdpilot-config = { path = "../rdpilot-config" }
+tokio = { version = "1", features = ["rt", "net", "io-util", "macros", "time"] }
+serde_json = "1"
+
