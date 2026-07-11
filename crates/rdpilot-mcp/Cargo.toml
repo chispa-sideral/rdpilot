@@ -22,3 +22,18 @@ serde_json = "1"
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = "0.3"
+
+# rmcp's CLIENT-side dev-dependency (PROOF-03/MCP-04 live half, Plan 15-03):
+# additive `client`/`transport-child-process` FEATURES on the SAME already
+# D-26-approved rmcp version -- never merged into the production
+# `[dependencies] rmcp` entry above (server/macros/transport-io), so the
+# thin-client `cargo tree` gate (D-17) is unaffected (dev-dependencies are
+# excluded from a production `cargo tree` invocation). Used only by
+# `tests/live_proof.rs`/`tests/live_mcp_computer.rs` to drive the REAL
+# compiled `rdpilot-mcp` binary as an rmcp client subprocess
+# (`TokioChildProcess` + `().serve(...)`), speaking actual MCP JSON-RPC over
+# its stdio -- no hand-rolled client, guaranteed wire-compatible by
+# construction. Deliberately NO `reqwest`/`base64`: the capstone (Plan
+# 15-04) drives `claude -p`, not the Anthropic HTTP API.
+[dev-dependencies]
+rmcp = { version = "2.2.0", features = ["client", "transport-child-process"] }
