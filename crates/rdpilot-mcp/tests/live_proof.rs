@@ -92,6 +92,18 @@ fn connection_file() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("..").join(".secrets").join("connection.json")
 }
 
+/// Locate the byte-verified sensor executable relayed by Plan 15-05
+/// (`.secrets/sensor-build/rdpilot-sensor.exe`), same two-levels-up
+/// resolution as [`connection_file`]. The spawned `rdpilot-mcp` subprocess's
+/// `RDPILOT_SENSOR_BINARY_PATH` is pointed at this path below --
+/// **live-diagnosed (Plan 15-06, mirrored here Plan 15-07):** without it,
+/// the real `Connect` path never deploys a sensor at all, so every
+/// sensor-backed step this file exercises (`rdpilot_world_state`,
+/// `rdpilot_put`/`rdpilot_get`) would otherwise fail.
+fn sensor_binary_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("..").join(".secrets").join("sensor-build").join("rdpilot-sensor.exe")
+}
+
 /// Load the live target, or `None` if the suite is not armed (D-18 gate:
 /// `RDPILOT_LIVE` unset, or the secrets file absent). A present-but-
 /// malformed file panics with a descriptive message that never includes the
@@ -197,8 +209,14 @@ async fn mcp_end_to_end_against_a_real_target() {
     // --- spawn the REAL rdpilot-mcp binary as an rmcp client subprocess
     // (Pattern 2) and complete the MCP initialize handshake ---
     let mcp_bin = PathBuf::from(env!("CARGO_BIN_EXE_rdpilot-mcp"));
+    let mut mcp_command = Command::new(&mcp_bin);
+    // Live-diagnosed (Plan 15-06, mirrored here): the real Connect path
+    // only deploys a sensor when this is set -- required for
+    // rdpilot_world_state/rdpilot_put/rdpilot_get to work against a real
+    // target.
+    mcp_command.env("RDPILOT_SENSOR_BINARY_PATH", sensor_binary_path());
     let transport =
-        TokioChildProcess::new(Command::new(&mcp_bin)).expect("spawn the compiled rdpilot-mcp binary as a subprocess");
+        TokioChildProcess::new(mcp_command).expect("spawn the compiled rdpilot-mcp binary as a subprocess");
     let client = ()
         .serve(transport)
         .await
