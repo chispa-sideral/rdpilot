@@ -43,6 +43,7 @@ mod registry;
 mod seams;
 mod server;
 
+pub use reconcile::{JsonReconciliationSink, ReconciliationRecord, scan_orphans, seed_into};
 pub use registry::Registry;
 pub use seams::{DaemonError, ManagedSession, ReconciliationSink, SessionConnector, SessionEntry};
 pub use server::run;
