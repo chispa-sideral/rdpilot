@@ -6,7 +6,7 @@
 
 **Phases completed:** 6 phases (10-15), 33 of 34 authored plans executed (Plan 12-07 intentionally superseded by design — its full scope was re-authored and live-verified via Phase 15's 15-01/15-05/15-06 instead of being re-executed standalone; see ROADMAP.md Phase 12 entry)
 **Timeline:** 2026-07-10 → 2026-07-11 (2 days)
-**Git range:** `e410437`..`a006301` (151 commits, 291 files changed, +38,622/-2,175 LOC)
+**Git range:** `e410437`..`03ed79c` (152 commits; `03ed79c` is this entry's own closing commit, mirroring the v1.0 convention)
 **Known deferred items at close:** 4 (see below)
 
 **Summary accomplishments:**
