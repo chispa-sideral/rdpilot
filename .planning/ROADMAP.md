@@ -135,7 +135,7 @@ Full phase goals, success criteria, and plan-by-plan detail: `.planning/mileston
 **Plans**: 5 plans in 4 waves
 
 - [x] 14-01-PLAN.md — Upstream wire/daemon extensions: DesktopSize verb (native-dim sourcing for the bridge) + shared parse_wire_key + daemon dispatch (MCP-02/04, Wave 1)
-- [ ] 14-02-PLAN.md — rdpilot-mcp thin-client scaffold: rmcp stdio server + bounded-timeout transport + error taxonomy + thin-client cargo-tree gate (MCP-01/06, Wave 1)
+- [x] 14-02-PLAN.md — rdpilot-mcp thin-client scaffold: rmcp stdio server + bounded-timeout transport + error taxonomy + thin-client cargo-tree gate (MCP-01/06, Wave 1)
 - [ ] 14-03-PLAN.md — `computer` mega-tool: scale_to_native [BLOCKING MCP-04] + computer_20250124 action schema + dispatch mapping + 3 explicit gap rejections (MCP-02/04, Wave 2)
 - [ ] 14-04-PLAN.md — 11 rdpilot_* native tools + put/get metadata-only [MCP-05] + connect config resolution + trust-model README + tools/list schema test (MCP-01/03/05, Wave 3)
 - [ ] 14-05-PLAN.md — MCP-06 [BLOCKING] non-blocking isolation proof: slow tool ∥ fast tool against the real compiled daemon + fake-connector slowness hook (MCP-06, Wave 4)
