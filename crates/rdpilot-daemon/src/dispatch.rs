@@ -74,7 +74,13 @@ pub async fn dispatch(registry: &Registry, req: Request) -> WireResponse {
         | Request::LaunchProcess { session, .. }
         | Request::SetForeground { session, .. }
         | Request::Put { session, .. }
-        | Request::Get { session, .. } => not_implemented_for(registry, &session),
+        | Request::Get { session, .. }
+        | Request::WindowList { session }
+        | Request::ProcessList { session }
+        | Request::Uia { session, .. }
+        | Request::WorldState { session, .. }
+        | Request::Mouse { session, .. }
+        | Request::Key { session, .. } => not_implemented_for(registry, &session),
     }
 }
 

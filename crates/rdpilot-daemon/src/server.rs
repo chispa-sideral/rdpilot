@@ -29,7 +29,7 @@ use rdpilot_ipc::SessionLifecycle;
 use crate::lifecycle::{self, LifecycleConfig, ShutdownSignal};
 use crate::reconcile::{self, JsonReconciliationSink};
 use crate::registry::Registry;
-use crate::seams::{DaemonError, ManagedSession, RealConnector, ReconciliationSink, SessionConnector};
+use crate::seams::{BoxFuture, DaemonError, ManagedSession, RealConnector, ReconciliationSink, SessionConnector};
 
 /// When set (to any value), [`run`] selects [`FakeTestConnector`] instead
 /// of [`RealConnector`] -- lets the offline `autostart_lifecycle`
@@ -202,6 +202,156 @@ impl ManagedSession for FakeTestSession {
 
     fn describe(&self) -> SessionLifecycle {
         SessionLifecycle::Live
+    }
+
+    // --- Canned operational stubs (Phase 13) --------------------------
+    //
+    // Every method below returns a plausible, non-empty fixed value so the
+    // offline CLI-02 integration proof (Plan 13-06) can render a real table
+    // against this fake connector with no live RDP target. Dispatch is not
+    // wired to these yet (Plan 13-04) -- this crate does not call them
+    // outside tests until then.
+
+    fn screenshot(&self) -> BoxFuture<'_, Result<rdpilot::Screenshot, DaemonError>> {
+        Box::pin(async {
+            Ok(rdpilot::Screenshot {
+                width: 2,
+                height: 1,
+                rgba: vec![255, 0, 0, 255, 0, 255, 0, 255],
+            })
+        })
+    }
+
+    fn world_state(&self, opts: rdpilot::WorldStateOptions) -> BoxFuture<'_, Result<rdpilot::WorldState, DaemonError>> {
+        Box::pin(async move {
+            let screenshot = if opts.screenshot {
+                Some(rdpilot::Screenshot {
+                    width: 2,
+                    height: 1,
+                    rgba: vec![255, 0, 0, 255, 0, 255, 0, 255],
+                })
+            } else {
+                None
+            };
+            let window_list = if opts.window_list { Some(vec![canned_window_info()]) } else { None };
+            let uia = match opts.uia {
+                rdpilot::UiaMode::None => None,
+                rdpilot::UiaMode::Foreground | rdpilot::UiaMode::Hwnd(_) | rdpilot::UiaMode::AllTopLevel => {
+                    Some(vec![(1u64, vec![canned_uia_element()])])
+                }
+            };
+            Ok(rdpilot::WorldState {
+                timestamp: std::time::SystemTime::now(),
+                capture_span: std::time::Duration::from_millis(1),
+                screenshot,
+                window_list,
+                uia,
+            })
+        })
+    }
+
+    fn get_window_list(&self) -> BoxFuture<'_, Result<Vec<rdpilot::WindowInfo>, DaemonError>> {
+        Box::pin(async { Ok(vec![canned_window_info()]) })
+    }
+
+    fn get_process_tree(&self) -> BoxFuture<'_, Result<Vec<rdpilot::ProcessInfo>, DaemonError>> {
+        Box::pin(async {
+            Ok(vec![rdpilot::ProcessInfo {
+                pid: 1234,
+                parent_pid: 4,
+                name: "notepad.exe".to_owned(),
+                path: r"C:\Windows
+otepad.exe".to_owned(),
+                command_line: None,
+                owner: None,
+            }])
+        })
+    }
+
+    fn get_uia_tree(&self, _hwnd: u64, _scope: rdpilot::UiaScope) -> BoxFuture<'_, Result<Vec<rdpilot::UiaElement>, DaemonError>> {
+        Box::pin(async { Ok(vec![canned_uia_element()]) })
+    }
+
+    fn send_mouse(&self, _action: rdpilot::MouseAction) -> BoxFuture<'_, Result<(), DaemonError>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn send_key(&self, _action: rdpilot::KeyAction) -> BoxFuture<'_, Result<(), DaemonError>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn set_foreground_window(&self, _hwnd: u64) -> BoxFuture<'_, Result<(), DaemonError>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn launch_process(
+        &self,
+        _exe: String,
+        _args: Option<String>,
+        _cwd: Option<String>,
+    ) -> BoxFuture<'_, Result<u32, DaemonError>> {
+        Box::pin(async { Ok(4242) })
+    }
+
+    fn upload_file(
+        &self,
+        _local: std::path::PathBuf,
+        _remote_name: String,
+    ) -> BoxFuture<'_, Result<rdpilot::TransferOutcome, DaemonError>> {
+        Box::pin(async {
+            Ok(rdpilot::TransferOutcome {
+                bytes_transferred: 1024,
+                checksum: "0".repeat(64),
+            })
+        })
+    }
+
+    fn download_file(
+        &self,
+        _remote_name: String,
+        _local: std::path::PathBuf,
+    ) -> BoxFuture<'_, Result<rdpilot::TransferOutcome, DaemonError>> {
+        Box::pin(async {
+            Ok(rdpilot::TransferOutcome {
+                bytes_transferred: 1024,
+                checksum: "0".repeat(64),
+            })
+        })
+    }
+
+    fn ping(&self) -> BoxFuture<'_, Result<std::time::Duration, DaemonError>> {
+        Box::pin(async { Ok(std::time::Duration::from_millis(5)) })
+    }
+}
+
+/// A canned [`rdpilot::WindowInfo`] shared by [`FakeTestSession::get_window_list`]
+/// and [`FakeTestSession::world_state`] so both return the same plausible value.
+fn canned_window_info() -> rdpilot::WindowInfo {
+    rdpilot::WindowInfo {
+        hwnd: 1,
+        title: "Notepad".to_owned(),
+        rect: rdpilot::Rect { x: 0, y: 0, w: 800, h: 600 },
+        z_order: 0,
+        state: rdpilot::WindowState::Normal,
+        class_name: "Notepad".to_owned(),
+        pid: 1234,
+    }
+}
+
+/// A canned [`rdpilot::UiaElement`] shared by [`FakeTestSession::get_uia_tree`]
+/// and [`FakeTestSession::world_state`] so both return the same plausible value.
+fn canned_uia_element() -> rdpilot::UiaElement {
+    rdpilot::UiaElement {
+        id: "42".to_owned(),
+        role: "Button".to_owned(),
+        name: "OK".to_owned(),
+        bbox: rdpilot::Rect { x: 10, y: 10, w: 80, h: 24 },
+        enabled: true,
+        visible: true,
+        focusable: true,
+        focused: false,
+        depth: 1,
+        parent_id: String::new(),
     }
 }
 
