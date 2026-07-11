@@ -50,10 +50,18 @@ use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
 use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ACCESS_DENIED, HANDLE};
 use windows_sys::Win32::Security::{
     ACCESS_ALLOWED_ACE, ACL, ACL_REVISION, AddAccessAllowedAce, GetLengthSid, GetTokenInformation,
-    InitializeAcl, InitializeSecurityDescriptor, OpenProcessToken, PSID, SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR,
-    SECURITY_DESCRIPTOR_REVISION, SetSecurityDescriptorDacl, TOKEN_USER, TokenUser,
+    InitializeAcl, InitializeSecurityDescriptor, PSID, SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR,
+    SetSecurityDescriptorDacl, TOKEN_USER, TokenUser,
 };
-use windows_sys::Win32::System::Threading::GetCurrentProcess;
+// `SECURITY_DESCRIPTOR_REVISION` lives in `Win32::System::SystemServices`, not
+// `Win32::Security`, in windows-sys 0.61.2 (confirmed against the real crate
+// source on the Azure Windows VM, Plan 15-05 -- offline-authored code guessed
+// the wrong module).
+use windows_sys::Win32::System::SystemServices::SECURITY_DESCRIPTOR_REVISION;
+// `OpenProcessToken` lives in `Win32::System::Threading` (alongside
+// `GetCurrentProcess`), not `Win32::Security`, in windows-sys 0.61.2 (same
+// live-VM-confirmed correction).
+use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
 /// The daemon's well-known named-pipe path (mirrors `unix.rs`'s
 /// `rdpilot_ipc::transport::socket_path`'s well-known-path role, but a
@@ -325,7 +333,10 @@ fn current_user_token_user_buffer() -> io::Result<Vec<u8>> {
     // fail.
     let process = unsafe { GetCurrentProcess() };
 
-    let mut token: HANDLE = 0;
+    // `HANDLE` is `*mut c_void` in windows-sys 0.61.2 (it was an integer
+    // type in older versions) -- a bare `0` no longer type-checks as a null
+    // handle (live-VM-confirmed correction, Plan 15-05).
+    let mut token: HANDLE = ptr::null_mut();
     // SAFETY: `process` is the valid pseudo-handle from immediately
     // above; `&mut token` is a valid, uniquely-owned local out-pointer
     // `OpenProcessToken` writes the opened token handle into on success.

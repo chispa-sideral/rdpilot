@@ -54,6 +54,9 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_Security_Authorization",
     "Win32_System_Threading",
     "Win32_System_Memory",
+    # SECURITY_DESCRIPTOR_REVISION lives here, not Win32_Security, in
+    # windows-sys 0.61.2 (live-VM-confirmed correction, Plan 15-05).
+    "Win32_System_SystemServices",
 ] }
 
 [dev-dependencies]
