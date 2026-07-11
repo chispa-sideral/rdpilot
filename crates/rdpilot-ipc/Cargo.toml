@@ -11,7 +11,14 @@ repository = "https://github.com/marcfargas/rdpilot"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
+# `write_frame`/`read_frame` (transport.rs) are cross-platform framing over
+# any `AsyncRead`/`AsyncWrite` -- needed unconditionally, not just on Unix
+# (Plan 15-05 fix: this dependency was wrongly scoped to `cfg(unix)` only,
+# which broke the Windows build of `rdpilot-daemon`'s IPC path that also
+# needs these functions).
+tokio = { version = "1", features = ["rt", "net", "io-util", "time", "macros"] }
 
 [target.'cfg(unix)'.dependencies]
+# Only `socket_dir`/`socket_path` (Unix runtime-dir resolution) need this --
+# genuinely Unix-only, unlike `tokio` above.
 directories = "6.0.0"
-tokio = { version = "1", features = ["rt", "net", "io-util", "time", "macros"] }

@@ -41,7 +41,13 @@ mod request;
 mod response;
 mod session_id;
 mod transfer;
-#[cfg(unix)]
+// `transport`'s framing primitives (`read_frame`/`write_frame`/
+// `TransportError`) are cross-platform (Plan 15-05 fix: `rdpilot-daemon`'s
+// Windows IPC path needs them too, exercised via the generic
+// `serve_connection<S: AsyncRead + AsyncWrite>` loop) -- only its
+// socket-path-resolution/connect-or-spawn items are genuinely Unix-only.
+// The module itself is therefore unconditional; the Unix-only items inside
+// it carry their own `#[cfg(unix)]`.
 pub mod transport;
 
 pub use error::{WireError, WireErrorCode};
@@ -54,5 +60,6 @@ pub use request::{Request, SessionScoped};
 pub use response::{SessionLifecycle, SessionStatus, WireResponse};
 pub use session_id::SessionId;
 pub use transfer::TransferOutcome;
+pub use transport::{TransportError, read_frame, write_frame};
 #[cfg(unix)]
-pub use transport::{TransportError, connect_or_spawn, read_frame, socket_path, write_frame};
+pub use transport::{connect_or_spawn, socket_path};

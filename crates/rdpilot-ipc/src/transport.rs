@@ -10,10 +10,22 @@
 //! `rdpilot-daemon`'s `DaemonError`, so a crate-local [`TransportError`]
 //! replaces it) and the `rdpilot_ipc`-relative crate paths.
 //!
-//! Unix-only for now (`#[cfg(unix)]`, matching the original `autostart.rs`):
-//! the Windows named-pipe transport remains a stub deferred to the
-//! Windows live-gate plan, so there is no Windows stream type to build this
-//! module against yet on this development host.
+//! **Cross-platform:** the length-prefixed JSON framing (`write_frame`/
+//! `read_frame`/[`TransportError`]) has no OS-specific code at all -- it is
+//! generic over any `AsyncRead`/`AsyncWrite` stream, so it compiles and runs
+//! identically on Unix (`UnixStream`) and Windows (a named pipe). Originally
+//! authored `#[cfg(unix)]`-gated at the WHOLE-MODULE level (an offline
+//! mistake never live-compiled against Windows); corrected in Plan 15-05
+//! once `rdpilot-daemon`'s Windows IPC path needed these same functions for
+//! its own `serve_connection` loop -- live-VM-confirmed the framing code
+//! itself needed zero changes, only the cfg gate was wrong.
+//!
+//! Unix-only (`#[cfg(unix)]` on the individual items below, not the whole
+//! module): socket-path resolution (`socket_dir`/`socket_path`) and the
+//! client-side connect-or-spawn helper (`connect_or_spawn`/`try_connect`) --
+//! the Windows named-pipe equivalent lives in
+//! `rdpilot-daemon::ipc::windows::socket_path` instead (a fixed pipe name
+//! has no directory/mode concept to resolve).
 //!
 //! The daemon's single-instance guarantee, listener-side peer-uid
 //! authorization (`bind`/`accept_and_authorize`/`authorize_uid`/
@@ -22,17 +34,22 @@
 //! CLI-side transport module has no business owning listener-side security
 //! decisions.
 
-#![cfg(unix)]
-
-use std::io;
-use std::os::unix::fs::DirBuilderExt;
-use std::path::{Path, PathBuf};
-use std::time::Duration;
-
-use directories::BaseDirs;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+
+#[cfg(unix)]
+use std::io;
+#[cfg(unix)]
+use std::os::unix::fs::DirBuilderExt;
+#[cfg(unix)]
+use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::time::Duration;
+
+#[cfg(unix)]
+use directories::BaseDirs;
+#[cfg(unix)]
 use tokio::net::UnixStream;
 
 /// A transport-layer error: I/O failure, frame encode failure, or frame
@@ -130,6 +147,7 @@ where
 // in the daemon, see module doc)
 // ---------------------------------------------------------------------
 
+#[cfg(unix)]
 /// Resolve (and create, if absent) the `0700`-mode runtime directory the
 /// daemon socket lives under: `<XDG_RUNTIME_DIR>/rdpilot`, falling back to
 /// `<cache_dir>/rdpilot` when no runtime dir is available on this
@@ -155,6 +173,7 @@ pub fn socket_dir() -> io::Result<PathBuf> {
     Ok(dir)
 }
 
+#[cfg(unix)]
 /// The daemon socket's full path: `<socket_dir>/daemon.sock`.
 ///
 /// Both the daemon (binding) and any client (connecting/auto-spawning)
@@ -174,10 +193,12 @@ pub fn socket_path() -> io::Result<PathBuf> {
 // `rdpilot-daemon/src/autostart.rs`)
 // ---------------------------------------------------------------------
 
+#[cfg(unix)]
 /// The bounded backoff sequence (milliseconds) `connect_or_spawn` retries
 /// on after spawning the daemon.
 const BACKOFF_MS: &[u64] = &[50, 100, 200, 400, 800];
 
+#[cfg(unix)]
 /// Attempt one connection to `socket_path`. ANY failure (no such file,
 /// connection refused, a stale special file left by a killed predecessor,
 /// etc.) is uniformly treated as "not listening" by the caller -- this
@@ -186,6 +207,7 @@ async fn try_connect(socket_path: &Path) -> io::Result<UnixStream> {
     UnixStream::connect(socket_path).await
 }
 
+#[cfg(unix)]
 /// Connect to the daemon at `socket_path`, auto-starting it via
 /// `daemon_exe` if it is not already listening (CLI-01/DAEMON-03).
 ///
@@ -289,6 +311,7 @@ mod tests {
 
     // --- Socket-path tests (moved from `rdpilot-daemon/src/ipc/unix.rs`) ---
 
+    #[cfg(unix)]
     #[test]
     fn socket_dir_is_created_with_mode_0700() {
         use std::os::unix::fs::MetadataExt;
@@ -308,6 +331,7 @@ mod tests {
     /// treats as "proceed to spawn". The full spawn+backoff+reconnect path
     /// is exercised end-to-end by the real-binary `autostart_lifecycle`
     /// integration test in `rdpilot-daemon`.
+    #[cfg(unix)]
     #[tokio::test]
     async fn try_connect_against_a_socket_with_no_listener_fails_the_would_spawn_condition() {
         let dir = std::env::temp_dir().join(format!("rdpilot-ipc-transport-autostart-test-{}", std::process::id()));
@@ -322,6 +346,7 @@ mod tests {
     /// Control case: a real listener at the path IS reachable via
     /// `try_connect`, so `connect_or_spawn` would take its early-return
     /// path without ever touching the spawn branch.
+    #[cfg(unix)]
     #[tokio::test]
     async fn try_connect_against_a_real_listener_succeeds() {
         let dir = std::env::temp_dir().join(format!("rdpilot-ipc-transport-autostart-test-listener-{}", std::process::id()));
@@ -337,6 +362,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(unix)]
     /// Structural guard: `BACKOFF_MS` matches the exact bounded sequence
     /// the original `rdpilot-daemon::autostart` module used.
     #[test]
