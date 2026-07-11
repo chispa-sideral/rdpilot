@@ -2,15 +2,15 @@
 gsd_state_version: 1.0
 milestone: v1.1
 milestone_name: — Consumer Surfaces & File Transfer
-status: verifying
-stopped_at: Phase 10 complete (5/5 plans). Plan 10-05's live gate found and fixed a Rule 1 bug in finalize_write's completeness rule (real Windows never sends FILE_END_OF_FILE_INFORMATION), measured the real per-IRP chunk size, and validated TRANSFER_TIMEOUT_MS. Ready to plan Phase 11 (Shared Wire Protocol & Config).
-last_updated: "2026-07-11T00:15:13.312Z"
-last_activity: 2026-07-10 -- Phase 11 execution started
+status: executing
+stopped_at: "Phase 12 Plan 06 complete (6/7 plans). DAEMON-03 fully proven OFFLINE (auto-start on first connect + idle reap + empty-registry grace-period self-shutdown) against the REAL compiled rdpilot-daemon binary via tests/autostart_lifecycle.rs's SC#5 [BLOCKING] test. Ready to plan/execute 12-07 (the live gate: Windows DACL pipe + live orphan-liveness confirmation + e2e session verify)."
+last_updated: "2026-07-11T00:37:12.412Z"
+last_activity: 2026-07-11 -- Phase 12 Plan 06 (server assembly + auto-start/idle-shutdown) executed
 progress:
   total_phases: 6
   completed_phases: 2
   total_plans: 14
-  completed_plans: 12
+  completed_plans: 13
   percent: 33
 ---
 
@@ -21,14 +21,14 @@ progress:
 See: .planning/PROJECT.md (updated 2026-07-10)
 
 **Core value:** A local AI agent can connect to a remote Windows desktop over RDP and read/inspect a program that is only reachable via RDP — using both screenshots and structured accessibility data, without installing or running the agent itself on the remote machine.
-**Current focus:** Phase 11 — Shared Wire Protocol & Config
+**Current focus:** Phase 12 — Session Daemon
 
 ## Current Position
 
-Phase: 11 (Shared Wire Protocol & Config) — EXECUTING
-Plan: 2 of 2
-Status: Phase complete — ready for verification
-Last activity: 2026-07-10 -- Phase 11 execution started
+Phase: 12 (Session Daemon) — EXECUTING
+Plan: 6 of 7
+Status: DAEMON-03 complete (offline); 12-07 (live gate) remaining
+Last activity: 2026-07-11 -- Phase 12 Plan 06 (server assembly + auto-start/idle-shutdown) executed
 
 ## Milestone v1.1 Phases
 
@@ -105,6 +105,7 @@ Last activity: 2026-07-10 -- Phase 11 execution started
 | Phase 12 P03 | ~90m | 3 tasks | 3 files |
 | Phase 12 P05 | ~20m | 2 tasks | 2 files |
 | Phase 12 P04 | ~40m | 3 tasks | 8 files |
+| Phase 12 P06 | ~50min | 3 tasks | 6 files |
 
 ## Accumulated Context
 
@@ -200,6 +201,7 @@ Recent decisions affecting current work:
 - [Phase ?]: rdpilot-daemon soak-test discipline: per-test dedicated Tokio runtime with a short thread_keep_alive (10ms) avoids a false-positive leak signal from Tokio's own blocking-thread-pool 10s default lingering; the two soak tests in one file are serialized via a shared Mutex since /proc/self/status Threads: is a whole-process metric and Rust's default test harness runs tests in parallel within one process (12-03)
 - [Phase ?]: rdpilot-daemon reconcile: JSON ReconciliationSink (atomic temp-write+rename) + scan_orphans/seed_into startup bridge implemented and proven offline -- kill -9 (drop-without-close) surrogate + restart surfaces the prior session as Orphaned in list(), never silently forgotten, reconciled only via explicit close (DAEMON-04 SC#5 BLOCKING offline portion, 12-05)
 - [Phase ?]: rdpilot-daemon 12-04: Unix IPC transport complete -- 0700 runtime-dir socket (atomic DirBuilder::mode) + peer_cred() uid check (authorize_uid pure decision fn, unit-tested + BLOCKING SC#4 offline proof in tests/ipc_security.rs); 4-byte-BE length-prefixed serde_json framing with a 16MiB max-frame-length cap; dispatch.rs routes Connect/List/Disconnect to the registry (exhaustive match, no wildcard) and returns SessionNotFound/Internal-not-implemented for the six deferred operational verbs. Extended registry.rs/seams.rs (not in the plan's files_modified list, but disjoint from the concurrent 12-05 plan) to finish SESSION-03's list wiring: SessionEntry::Live now carries connected_since_wall/last_activity_wall ISO-8601 strings alongside the existing monotonic Instants, closing the None-hardcoded TODO both files' own doc comments had flagged as Plan 12-04's job.
+- [Phase ?]: rdpilot-daemon 12-06: server::run() drives everything via tokio::task::LocalSet/spawn_local (never bare tokio::spawn, per Session::connect's non-Send future); ShutdownSignal uses tokio::sync::watch::Sender::send_replace (not send, which no-ops with zero subscribers) so fire() is reliable regardless of subscriber timing; DAEMON-03 (auto-start + idle-reap + empty-registry self-shutdown) proven fully offline against the REAL compiled binary via tests/autostart_lifecycle.rs's SC#5 [BLOCKING] test
 
 ### Pending Todos
 
@@ -246,10 +248,10 @@ Pre-close artifact audit surfaced 3 open items. Reviewed and explicitly acknowle
 
 ## Session Continuity
 
-Last session: 2026-07-11T00:15:13.306Z
-Stopped at: Phase 11 complete (2/2 plans). rdpilot-ipc (SESSION-02, CONFIG-03) and rdpilot-config (CONFIG-01, CONFIG-02) both built, verified, and workspace-integrated. Ready for Phase 12 (Session Daemon).
+Last session: 2026-07-11T00:37:12.406Z
+Stopped at: Phase 12 Plan 06 complete (6/7 plans). DAEMON-03 (auto-start on first connect, idle reap, empty-registry grace-period self-shutdown) fully proven OFFLINE against the REAL compiled rdpilot-daemon binary. Ready to execute 12-07 (the live gate: Windows explicit-DACL pipe, live orphan-liveness confirmation, e2e session verify, windows-permissions legitimacy checkpoint).
 Resume file: .planning/DECISIONS-INDEX.md
 
 ## Operator Next Steps
 
-- Plan the first v1.1 phase with `/gsd-plan-phase 10`
+- Execute Plan 12-07 (the Phase 12 live gate) to close out Phase 12 and DAEMON-02/DAEMON-04's remaining live components
