@@ -132,7 +132,15 @@ Full phase goals, success criteria, and plan-by-plan detail: `.planning/mileston
   3. **[BLOCKING]** Coordinates round-trip correctly: one fixed advertised resolution + a single tested `scale_to_native(x, y)` bridges rdpilot's 96-DPI physical-pixel space to the computer-use scaled screenshot/coordinate space, verified by a precision click test near screen edges/corners (not just center) (MCP-04; Pitfall 6).
   4. **[BLOCKING]** A slow tool call (large file transfer, `launch_process` wait) does not block a concurrent unrelated fast tool call — per-call task isolation with bounded, explicit timeouts (MCP-06; Pitfall 7).
 
-**Plans**: TBD
+**Plans**: 5 plans in 4 waves
+
+- [ ] 14-01-PLAN.md — Upstream wire/daemon extensions: DesktopSize verb (native-dim sourcing for the bridge) + shared parse_wire_key + daemon dispatch (MCP-02/04, Wave 1)
+- [ ] 14-02-PLAN.md — rdpilot-mcp thin-client scaffold: rmcp stdio server + bounded-timeout transport + error taxonomy + thin-client cargo-tree gate (MCP-01/06, Wave 1)
+- [ ] 14-03-PLAN.md — `computer` mega-tool: scale_to_native [BLOCKING MCP-04] + computer_20250124 action schema + dispatch mapping + 3 explicit gap rejections (MCP-02/04, Wave 2)
+- [ ] 14-04-PLAN.md — 11 rdpilot_* native tools + put/get metadata-only [MCP-05] + connect config resolution + trust-model README + tools/list schema test (MCP-01/03/05, Wave 3)
+- [ ] 14-05-PLAN.md — MCP-06 [BLOCKING] non-blocking isolation proof: slow tool ∥ fast tool against the real compiled daemon + fake-connector slowness hook (MCP-06, Wave 4)
+
+**Offline this phase; batched to Phase 15 live gate**: real screenshot pixel content, real click landing near edges/corners (the live half of MCP-04 — the pure scale_to_native is offline-proven here), and the live-LLM capstone (PROOF-04). Phase 14 is maximally offline-verifiable on the native-Linux substitute: tool schema/registration, dispatch against a fake daemon/session, scale_to_native (pure), the action mapping + 3 rejections, metadata-only file responses, and the non-blocking-isolation test.
 
 ### Phase 15: Proof Harnesses & Live-LLM Capstone
 
