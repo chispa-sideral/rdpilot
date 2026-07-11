@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.1
 milestone_name: — Consumer Surfaces & File Transfer
 status: completed
-stopped_at: "Phase 13 Plan 04 complete (4/7 plans). dispatch.rs's every operational verb (Ping/Screenshot/WindowList/ProcessList/Uia/WorldState/Mouse/Key/LaunchProcess/SetForeground/Put/Get) now routes through Registry::call to the live rdpilot::Session (13-03's ManagedSession seam), converting wire DTOs (13-02) to/from SDK types; the not_implemented_for stub is gone. The pre-existing Phase-12 share_root Connect-arm gap (research Pitfall 6) is fixed via a new rdpilot-config::share_root_or_default resolver. base64 = 0.22.1 added to rdpilot-daemon (developer-approved legitimacy checkpoint, mechanically verified against crates.io). Note: STATE.md's plan counter had drifted at '1/7' since a Wave-2 parallel-execution race (13-02/13-03) clobbered each other's session updates without landing; this session (single-owner, Wave 3) reconciles the counter to reflect all 4 completed plans (13-01/02/03/04), confirmed against the 4 SUMMARY.md files actually on disk. Ready to execute 13-05."
-last_updated: "2026-07-11T08:33:21.088Z"
-last_activity: 2026-07-11 -- Phase 13 Plan 04 (daemon dispatch wiring + share_root fix) executed
+stopped_at: "Phase 13 Plan 06 complete (6/7 plans). CLI-02 delivered: rdpilot perceive {screenshot,world-state,uia,window list,process list} and rdpilot input {click,scroll,drag,type,key,launch,foreground} are wired into the clap tree as grouped-only subcommand families, each requiring --session (D-29). screenshot/world-state base64-decode png_base64 and write raw PNG bytes to --output only (D-13.1, verified bytes never hit stdout). base64 = 0.22.1 added to rdpilot-cli, reusing Plan 13-04's legitimacy-gated pin on rdpilot-daemon verbatim (no second checkpoint). tests/cli_verbs.rs offline-proves every verb against the real rdpilot-daemon binary's canned FakeTestSession; real-Windows semantics deferred to the Phase 15 batched live gate. cargo tree -p rdpilot-cli confirmed still free of ironrdp/rustls/rdpilot-daemon after adding base64. Ready to execute 13-07 (CLI-03: put/get no-clobber + path absolutization + error taxonomy)."
+last_updated: "2026-07-11T08:46:06.089Z"
+last_activity: 2026-07-11 -- Phase 13 Plan 06 (CLI perception+input+launch verb set, CLI-02) executed
 progress:
   total_phases: 6
   completed_phases: 2
   total_plans: 21
-  completed_plans: 18
+  completed_plans: 19
   percent: 33
 ---
 
@@ -26,9 +26,9 @@ See: .planning/PROJECT.md (updated 2026-07-10)
 ## Current Position
 
 Phase: 13 (CLI Surface) — EXECUTING
-Plan: 6 of 7
-Status: Daemon dispatch fully wired to live sessions (13-01/02/03/04 complete); share_root Connect-arm gap fixed; Phase 12's 12-07 live gate remains separately pending (not part of Phase 13)
-Last activity: 2026-07-11 -- Phase 13 Plan 04 (daemon dispatch wiring + share_root fix) executed
+Plan: 7 of 7
+Status: CLI-02 delivered (13-06 complete, 6/7 plans): perception+input+launch verb set live against --session, offline-proven via tests/cli_verbs.rs against the real daemon binary's canned session; Phase 12's 12-07 live gate remains separately pending (not part of Phase 13); 13-07 (CLI-03) remains
+Last activity: 2026-07-11 -- Phase 13 Plan 06 (CLI perception+input+launch verb set, CLI-02) executed
 
 ## Milestone v1.1 Phases
 
@@ -111,6 +111,7 @@ Last activity: 2026-07-11 -- Phase 13 Plan 04 (daemon dispatch wiring + share_ro
 | Phase 13 P03 | ~40min | 2 tasks | 10 files (rdpilot-daemon only: seams.rs, registry.rs, dispatch.rs, server.rs, lifecycle.rs + 3 tests/*.rs; incl. concurrency-induced dispatch.rs fix) |
 | Phase 13 P04 | 70 | 3 tasks | 10 files |
 | Phase 13 P05 | 55min | 2 tasks | 13 files |
+| Phase 13 P06 | 7min | 3 tasks | 9 files |
 
 ## Accumulated Context
 
@@ -215,6 +216,9 @@ Recent decisions affecting current work:
 - [Phase ?]: 13-05: rdpilot-cli's clap Command enum mixes flat leaf variants (Connect/List/Disconnect) with a grouped Session subcommand sharing the same ConnectArgs/SessionArg structs (D-13.1); main.rs dispatch collapses both spellings via or-patterns to one handler.
 - [Phase ?]: 13-05: Added serde as a direct rdpilot-cli dependency (not in the plan's dependency list) so render::print_json's generic Serialize bound resolves the serde path directly — Rust requires a direct crate dependency to name a crate path even when a transitive dependency already uses its traits (Rule 3).
 - [Phase ?]: 13-05: cli_lifecycle.rs redirects the CLI subprocess's stdio to real files (Stdio::from(File) + Command::status()) instead of Command::output(), which would hang: the auto-started, never-.wait()-ed daemon grandchild inherits the CLI's piped stdout/stderr and keeps the pipe's write end open (Rule 3, test-only, no production code changed).
+- [Phase ?]: 13-06: base64 pinned at 0.22.1 on rdpilot-cli, verbatim reuse of Plan 13-04's legitimacy-gated pin on rdpilot-daemon -- no second checkpoint
+- [Phase ?]: 13-06: Perceive/Input are grouped-only clap subcommand families (research D-13.1) -- no flat top-level spelling unlike Session's flat+grouped duality
+- [Phase ?]: 13-06: click uses one leaf with a --double flag rather than a separate double-click leaf
 
 ### Pending Todos
 
@@ -261,8 +265,8 @@ Pre-close artifact audit surfaced 3 open items. Reviewed and explicitly acknowle
 
 ## Session Continuity
 
-Last session: 2026-07-11T08:33:21.082Z
-Stopped at: Phase 13 Plan 01 complete (1/7 plans). Auto-start transport (socket_path/connect_or_spawn/framing) relocated from rdpilot-daemon into rdpilot-ipc::transport, verified rdpilot/IronRDP-free. Ready to execute 13-02 (perception/input wire DTOs). Phase 12's 12-07 live gate (Windows explicit-DACL pipe, live orphan-liveness confirmation, e2e session verify) remains separately pending and is not blocked by Phase 13's progress.
+Last session: 2026-07-11T08:46:06.083Z
+Stopped at: Phase 13 Plan 06 complete (6/7 plans). CLI-02 (perception+input+launch verb set against --session) delivered and offline-proven via tests/cli_verbs.rs against the real daemon binary's canned FakeTestSession. Ready to execute 13-07 (CLI-03: put/get no-clobber + path absolutization + error taxonomy). Phase 12's 12-07 live gate (Windows explicit-DACL pipe, live orphan-liveness confirmation, e2e session verify) remains separately pending and is not blocked by Phase 13's progress.
 Resume file: .planning/DECISIONS-INDEX.md
 
 ## Operator Next Steps

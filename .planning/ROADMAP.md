@@ -108,14 +108,14 @@ Full phase goals, success criteria, and plan-by-plan detail: `.planning/mileston
   2. The full perception + input + launch verb set (screenshot, world_state, uia, window/process list, click/type/key/scroll/drag, launch, foreground) runs against an explicit `--session` (CLI-02).
   3. `put`/`get` transfer files (no-clobber by default with an explicit `--force`), and failures — session-not-found, daemon-unreachable, transfer failure — surface as distinct, legible errors (CLI-03).
 
-**Plans**: 5/7 plans executed
+**Plans**: 6/7 plans executed
 
 - [x] 13-01-PLAN.md — Relocate the auto-start transport (socket_path/framing/connect_or_spawn) from rdpilot-daemon into rdpilot-ipc so the CLI reaches the daemon without the RDP stack (Wave 1)
 - [x] 13-02-PLAN.md — Extend rdpilot-ipc with perception/input wire DTOs + six Request / four WireResponse verbs, preserving SESSION-02 (Wave 2)
 - [x] 13-03-PLAN.md — Extend ManagedSession with operational &self methods + Arc<TokioMutex<Option<Box>>> registry storage + Registry::call (Wave 2)
 - [x] 13-04-PLAN.md — Wire every operational dispatch arm to the live Session + fix the share_root Connect gap from config (Wave 3)
 - [x] 13-05-PLAN.md — rdpilot-cli scaffold + connect/list/disconnect lifecycle verbs, thin-client + auto-start (CLI-01, Wave 4)
-- [ ] 13-06-PLAN.md — CLI perception/input/launch verb set against --session, screenshot --output, base64 legitimacy gate (CLI-02, Wave 5)
+- [x] 13-06-PLAN.md — CLI perception/input/launch verb set against --session, screenshot --output, base64 legitimacy gate (CLI-02, Wave 5)
 - [ ] 13-07-PLAN.md — CLI put/get no-clobber (asymmetric) + path absolutization + distinct error taxonomy/exit codes (CLI-03, Wave 6)
 
 ### Phase 14: MCP Server Surface
@@ -161,7 +161,7 @@ Full phase goals, success criteria, and plan-by-plan detail: `.planning/mileston
 | 10. SDK File-Transfer Extension | v1.1 | 5/5 | Complete   | 2026-07-10 |
 | 11. Shared Wire Protocol & Config | v1.1 | 2/2 | Complete   | 2026-07-10 |
 | 12. Session Daemon | v1.1 | 6/7 | In Progress|  |
-| 13. CLI Surface | v1.1 | 5/7 | In Progress|  |
+| 13. CLI Surface | v1.1 | 6/7 | In Progress|  |
 | 14. MCP Server Surface | v1.1 | 0/? | Not started | - |
 | 15. Proof Harnesses & Live-LLM Capstone | v1.1 | 0/? | Not started | - |
 

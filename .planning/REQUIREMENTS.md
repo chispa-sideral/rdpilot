@@ -24,7 +24,7 @@ Requirements for the v1.1 milestone. Each maps to roadmap phases.
 ### CLI Surface
 
 - [x] **CLI-01**: A `rdpilot` CLI manages session lifecycle (connect [--name] / list / disconnect) over the daemon — COMPLETE (13-05): the `rdpilot-cli` crate/binary implements `connect [--name] / list / disconnect`, transparently auto-starting the daemon via the relocated `rdpilot_ipc::transport::connect_or_spawn` (13-01); offline-proven end-to-end against the real `rdpilot-daemon` binary (fake connector) in `tests/cli_lifecycle.rs`; `cargo tree -p rdpilot-cli` confirmed free of `ironrdp`/`rustls`/`rdpilot`/`rdpilot-daemon` (thin-client invariant, D-17)
-- [ ] **CLI-02**: CLI exposes the full perception + input + launch verb set (screenshot, world_state, UIA, window/process list, click/type/key/scroll/drag, launch, foreground), each targeting a named session
+- [x] **CLI-02**: CLI exposes the full perception + input + launch verb set (screenshot, world_state, UIA, window/process list, click/type/key/scroll/drag, launch, foreground), each targeting a named session
 - [ ] **CLI-03**: CLI exposes file put/get and reports errors clearly (session-not-found, daemon-unreachable, transfer failure)
 
 ### MCP Server Surface
