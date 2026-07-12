@@ -210,6 +210,16 @@ The deliberately rejected alternative is the "obvious" path of running the AI ag
 ## Conventions
 
 Conventions not yet established. Will populate as patterns emerge during development.
+
+### Dogfooding / Local Install
+
+After shipping each milestone, re-run `scripts/install-local.sh` to rebuild
+and reinstall the local `rdpilot` + `rdpilot-daemon` binaries (to
+`~/.cargo/bin`) and refresh the `rdpilot` SKILL.md at both skill surfaces
+(`~/.agents/skills/rdpilot/` and the `~/.claude/skills/rdpilot` symlink), so
+other agents dogfooding rdpilot on this machine pick up the latest build.
+The script is idempotent — safe to re-run — and never clobbers an existing
+populated `~/.config/rdpilot/config.toml`.
 <!-- GSD:conventions-end -->
 
 <!-- GSD:architecture-start source:ARCHITECTURE.md -->

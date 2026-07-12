@@ -174,3 +174,9 @@ to stdout under `--json`.
 | 6 | ChecksumMismatch |
 | 7 | DuplicateSession |
 | 8 | NoClobber |
+
+## Keeping this up to date
+
+After pulling a new milestone, re-run `scripts/install-local.sh` from the
+repo root to rebuild and reinstall the `rdpilot`/`rdpilot-daemon` binaries
+and refresh this skill file at both discovery surfaces.
