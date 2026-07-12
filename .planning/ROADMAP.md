@@ -284,3 +284,26 @@ Plans:
 Plans:
 
 - [ ] TBD (promote with /gsd-review-backlog when ready)
+
+### Phase 999.10: `rdpilot doctor` — environment/health diagnostic subcommand (BACKLOG)
+
+**Goal:** Add a `rdpilot doctor` CLI subcommand that diagnoses why rdpilot or its verbs are inert and prints an actionable green/red checklist, so agents (and humans) get an upfront diagnosis instead of silent per-verb failures. Checks it should perform:
+
+- Both `rdpilot` and `rdpilot-daemon` binaries are present AND co-located in the same directory (the daemon auto-start is a sibling-file lookup via `current_exe().with_file_name(...)`, NOT a `$PATH` search — a split install silently breaks auto-start).
+- The daemon is reachable / auto-starts, and the IPC socket is live (`$XDG_RUNTIME_DIR/rdpilot/daemon.sock`, mode 0700).
+- Config resolves through the layered file→env→flag chain; report which config file is in effect and its resolved path.
+- `sensor_binary_path` / `RDPILOT_SENSOR_BINARY_PATH` is set, the referenced file exists, and is a plausible win-x64 PE executable — and clearly explain that WITHOUT it the daemon connects in session-management-only mode (connect/list/disconnect succeed) but `perceive`/`input`/`launch`/`put`/`get` are inert and fail at call time. This is the single most common silent-inertness cause.
+- (Optional) Target host reachability — TCP connect to the configured host:port — when a target is configured.
+
+Output should be a per-check PASS/FAIL list with remediation hints (e.g. that the sensor is a C#/.NET 8 NativeAOT win-x64 exe that cannot be built on Linux and must be obtained by building on a Windows host or the project's disposable Azure VM).
+
+**Motivation:** Phase 999.8 dogfood recon found rdpilot silently connects session-management-only when the sensor binary is missing or `RDPILOT_SENSOR_BINARY_PATH` is unset; every sensor-backed verb then fails at call time with no upfront signal. During Phase 15, four separate live harnesses independently forgot to set `RDPILOT_SENSOR_BINARY_PATH` (it is daemon-local config, never part of the wire protocol / `--mcp-config`, so nothing surfaces it automatically). A `doctor` subcommand converts these latent, easy-to-miss misconfigurations into a single upfront, self-explaining diagnostic.
+
+**Related (separate smaller fix — do NOT merge into doctor's scope):** the committed `crates/rdpilot-config/assets/config.toml.template` has no commented `sensor_binary_path` line despite SKILL.md documenting the field as functionally critical — flagged as informational in `999.8-VERIFICATION.md`. A trivial config-template completeness fix that `doctor` would otherwise have to compensate for.
+
+**Requirements:** TBD (extends the CLI surface / CLI-02)
+**Plans:** 0 plans
+
+Plans:
+
+- [ ] TBD (promote with /gsd-review-backlog when ready)
