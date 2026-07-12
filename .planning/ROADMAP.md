@@ -254,6 +254,16 @@ Plans:
 
 - [ ] TBD (promote with /gsd-review-backlog when ready)
 
+### Phase 999.8: Dogfood rdpilot locally — SKILL.md on the CLI + install for other agents in this box (BACKLOG)
+
+**Goal:** Make rdpilot available in this box for other agents so we can dogfood it — author a `SKILL.md` documenting the `rdpilot` CLI (commands, connection setup, common workflows) and install the CLI so other agents on this machine can discover and invoke it.
+**Requirements:** TBD
+**Plans:** 0 plans
+
+Plans:
+
+- [ ] TBD (promote with /gsd-review-backlog when ready)
+
 ### Phase 999.7: Session recording with timestamps/annotations (BACKLOG)
 
 **Goal:** Support recording sessions (relates to the daemon/session lifecycle from Phase 12), capturing timestamps and annotations, with a config option to enable/disable (default-configurable).
