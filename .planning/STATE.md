@@ -2,17 +2,16 @@
 gsd_state_version: 1.0
 milestone: v1.1
 milestone_name: — Consumer Surfaces & File Transfer
-status: shipped
+status: verifying
 stopped_at: "v1.1 MILESTONE COMPLETE (2026-07-11): all six phases (10-15) done, all 27 v1.1 requirements Complete, PROOF-02/03/04 all live-verified against a real Azure VM target, VM torn down and confirmed absent. Post-close cleanup pass (same day): DAEMON-01 checkbox drift corrected (soak evidence confirmed, tests/thread_leak_soak.rs N=50 re-passes), a test-only FakeTestSession string-literal typo fixed, rdpilot-daemon's 28 pre-existing clippy::expect_used/unwrap_used test-module violations resolved via one crate-wide #![cfg_attr(test, ...)], and this STATE.md's narrative fields reconciled to the true end state. Offline workspace suite reconfirmed green post-cleanup (467 passed / 0 failed / 40 ignored) and cargo clippy --all-targets -p rdpilot-daemon is clean. ROADMAP.md/MILESTONES.md updated to mark v1.1 Complete/SHIPPED."
-last_updated: "2026-07-11T23:00:00.000Z"
-last_activity: 2026-07-11 -- v1.1 milestone CLOSED (Phases 10-15 all Complete, PROOF-02/03/04 live-verified, VM torn down); same-day consolidated cleanup pass reconciled tracked debt (DAEMON-01 checkbox, FakeTestSession typo, daemon clippy debt) and closed the milestone in ROADMAP.md/MILESTONES.md
+last_updated: "2026-07-12T11:11:10.674Z"
+last_activity: 2026-07-11 -- v1.1 milestone CLOSED and SHIPPED; same-day consolidated cleanup + milestone-close docs pass completed
 progress:
   total_phases: 6
   completed_phases: 6
   total_plans: 34
   completed_plans: 33
-  percent: 100
-  note: "34 plans authored across Phases 10-15; 33 executed. The 1 gap is Plan 12-07, intentionally superseded by design (not an incomplete phase) — its full scope (Windows explicit-DACL pipe + live orphan-liveness + e2e session verify) was re-authored and re-scoped into Phase 15's 15-01 (offline author) / 15-05 (Windows DACL live-run) / 15-06 (orphan-liveness + e2e live-run), all of which completed and live-verified. Phase 12 itself is functionally 7/7-equivalent-complete; see ROADMAP.md Phase 12 entry."
+  percent: 97
 ---
 
 # Project State
@@ -313,9 +312,9 @@ Pre-close artifact audit surfaced 3 open items. Reviewed and explicitly acknowle
 
 ## Session Continuity
 
-Last session: 2026-07-11T23:00:00.000Z
-Stopped at: v1.1 MILESTONE COMPLETE and SHIPPED. Phases 10-15 all Complete (33/34 plans executed; the 1 gap, Plan 12-07, is intentionally superseded by design — its scope was re-authored and live-verified via Phase 15's 15-01/15-05/15-06 instead). All 27 v1.1 requirements are `[x]` Complete in REQUIREMENTS.md. PROOF-02/PROOF-03/PROOF-04 are all live-verified against a real Azure VM target; the VM is torn down and confirmed absent. A same-day consolidated cleanup pass closed out tracked debt (DAEMON-01 checkbox drift, a test-only FakeTestSession string-literal typo, rdpilot-daemon's clippy::expect_used/unwrap_used test-module debt) and reconfirmed the full offline workspace suite green (467 passed / 0 failed / 40 ignored, cargo clippy --all-targets -p rdpilot-daemon clean). ROADMAP.md and MILESTONES.md now mark v1.1 Complete/SHIPPED 2026-07-11, mirroring the v1.0 close pattern. No active phase; the project is between milestones.
-Resume file: .planning/MILESTONES.md
+Last session: 2026-07-12T11:11:10.666Z
+Stopped at: Phase 999.8 context gathered
+Resume file: .planning/phases/999.8-dogfood-rdpilot-locally-skill-md-cli/999.8-CONTEXT.md
 
 ## Operator Next Steps
 
