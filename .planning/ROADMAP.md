@@ -254,11 +254,12 @@ Plans:
 
 - [ ] TBD (promote with /gsd-review-backlog when ready)
 
-### Phase 999.8: Dogfood rdpilot locally — SKILL.md on the CLI + install for other agents in this box (BACKLOG)
+### Phase 999.8: Dogfood rdpilot locally — SKILL.md on the CLI + install for other agents in this box (BACKLOG — COMPLETE & VERIFIED)
 
 **Goal:** Make rdpilot available in this box for other agents so we can dogfood it — author a `SKILL.md` documenting the `rdpilot` CLI (commands, connection setup, common workflows) and install the CLI (and its companion daemon) so other agents on this machine can discover and invoke it.
 **Requirements:** D-1..D-8 (CONTEXT.md locked decisions serve as de facto acceptance criteria; no formal REQ IDs)
 **Plans:** 1/1 plans complete
+**Verification:** PASSED 2026-07-12 (6/6 must-haves, all D-1..D-8 honored, live re-exercised on this box — see `999.8-VERIFICATION.md`)
 
 Plans:
 

@@ -315,11 +315,12 @@ Pre-close artifact audit surfaced 3 open items. Reviewed and explicitly acknowle
 
 ## Session Continuity
 
-Last session: 2026-07-12T11:47:27.885Z
-Stopped at: Phase 999.8 context gathered
-Resume file: .planning/phases/999.8-dogfood-rdpilot-locally-skill-md-cli/999.8-CONTEXT.md
+Last session: 2026-07-12T14:30:00.000Z
+Stopped at: Phase 999.8 executed AND verified (PASSED, 6/6 must-haves, all D-1..D-8 honored). rdpilot is now genuinely dogfoodable on this box: both binaries live in ~/.cargo/bin, config seeded 0600 placeholder-only at ~/.config/rdpilot/config.toml, SKILL.md discoverable at ~/.claude/skills/rdpilot (symlink) and ~/.agents/skills/rdpilot (real copy), CLI->daemon IPC path live-confirmed, idempotency guard live re-proven by the verifier (not just trusted from SUMMARY.md).
+Resume file: .planning/phases/999.8-dogfood-rdpilot-locally-skill-md-cli/999.8-VERIFICATION.md
 
 ## Operator Next Steps
 
 - v1.1 (Consumer Surfaces & File Transfer) is SHIPPED — no phase currently in progress.
-- Scope and kick off the next milestone (v1.2 or later), or promote a Backlog item (999.1-999.7 in ROADMAP.md) into a planned phase via `/gsd-review-backlog` — notable candidates: 999.5 (symmetric remote no-clobber for `put`), 999.6 (web viewer for daemon sessions), 999.7 (session recording).
+- Phase 999.8 (dogfood install + SKILL.md) is now complete and verified — no further action needed unless the CLI verb surface changes (SKILL.md would then need a sync pass).
+- Scope and kick off the next milestone (v1.2 or later), or promote a Backlog item (999.1-999.7, 999.9 in ROADMAP.md) into a planned phase via `/gsd-review-backlog` — notable candidates: 999.5 (symmetric remote no-clobber for `put`), 999.6 (web viewer for daemon sessions), 999.7 (session recording), 999.9 (WinRM/PSRemoting over the RDP channel).
