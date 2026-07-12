@@ -258,11 +258,11 @@ Plans:
 
 **Goal:** Make rdpilot available in this box for other agents so we can dogfood it — author a `SKILL.md` documenting the `rdpilot` CLI (commands, connection setup, common workflows) and install the CLI (and its companion daemon) so other agents on this machine can discover and invoke it.
 **Requirements:** D-1..D-8 (CONTEXT.md locked decisions serve as de facto acceptance criteria; no formal REQ IDs)
-**Plans:** 1 plan
+**Plans:** 1/1 plans complete
 
 Plans:
 
-- [ ] 999.8-01-PLAN.md — Author `.claude/skills/rdpilot/SKILL.md` (quickstart-first, full verb surface, D-4/D-6/D-7 safety) + `scripts/install-local.sh` (dual-binary same-root install, placeholder config seed, dual-surface skill install, D-8 smoke test) (Wave 1)
+- [x] 999.8-01-PLAN.md — Author `.claude/skills/rdpilot/SKILL.md` (quickstart-first, full verb surface, D-4/D-6/D-7 safety) + `scripts/install-local.sh` (dual-binary same-root install, placeholder config seed, dual-surface skill install, D-8 smoke test) (Wave 1)
 
 ### Phase 999.7: Session recording with timestamps/annotations (BACKLOG)
 
@@ -281,4 +281,5 @@ Plans:
 **Plans:** 0 plans
 
 Plans:
+
 - [ ] TBD (promote with /gsd-review-backlog when ready)

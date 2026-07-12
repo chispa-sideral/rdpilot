@@ -4,7 +4,7 @@ milestone: v1.1
 milestone_name: — Consumer Surfaces & File Transfer
 status: verifying
 stopped_at: "v1.1 MILESTONE COMPLETE (2026-07-11): all six phases (10-15) done, all 27 v1.1 requirements Complete, PROOF-02/03/04 all live-verified against a real Azure VM target, VM torn down and confirmed absent. Post-close cleanup pass (same day): DAEMON-01 checkbox drift corrected (soak evidence confirmed, tests/thread_leak_soak.rs N=50 re-passes), a test-only FakeTestSession string-literal typo fixed, rdpilot-daemon's 28 pre-existing clippy::expect_used/unwrap_used test-module violations resolved via one crate-wide #![cfg_attr(test, ...)], and this STATE.md's narrative fields reconciled to the true end state. Offline workspace suite reconfirmed green post-cleanup (467 passed / 0 failed / 40 ignored) and cargo clippy --all-targets -p rdpilot-daemon is clean. ROADMAP.md/MILESTONES.md updated to mark v1.1 Complete/SHIPPED."
-last_updated: "2026-07-12T11:11:10.674Z"
+last_updated: "2026-07-12T11:47:27.893Z"
 last_activity: 2026-07-11 -- v1.1 milestone CLOSED and SHIPPED; same-day consolidated cleanup + milestone-close docs pass completed
 progress:
   total_phases: 6
@@ -128,6 +128,7 @@ Last activity: 2026-07-11 -- v1.1 milestone CLOSED and SHIPPED; same-day consoli
 | Phase 15 P05 | ~7h | 3 tasks | 9 files |
 | Phase 15 P06 | 2.5h | 3 tasks | 16 files |
 | Phase 15 P07 | 45m | 2 tasks | 2 files |
+| Phase 999.8 P01 | 25min | 3 tasks | 2 files |
 
 ## Accumulated Context
 
@@ -266,6 +267,8 @@ Recent decisions affecting current work:
 - [Phase ?]: PROOF-02/PROOF-03 harnesses now self-sufficiently set RDPILOT_SENSOR_BINARY_PATH rather than depending on an externally-exported shell variable, matching the live_cli_verbs.rs pattern from 15-06
 - [Phase ?]: PROOF-04 live-LLM capstone LIVE-VERIFIED PASS (15-08): claude -p drove read/inspect + file-transfer through the real MCP surface against the live Azure VM; live-diagnosed RDPILOT_SENSOR_BINARY_PATH fix (identical to 15-06/15-07's finding) was required and committed (d405805). VM teardown deliberately deferred pending developer authorization (Task 3 blocking-human checkpoint).
 - [Phase ?]: Phase 15 CLOSED (15-08 Task 3): developer authorized teardown; pwsh infra/manage-env.ps1 -Action down ran clean (exit 0); independently confirmed az group exists -n rdpilot-test => false, rdpilot-mgmt persists (Succeeded). v1.1 milestone's Consumer Surfaces & File Transfer scope (Phases 10-15) now fully live-verified end to end.
+- [Phase ?]: Install mechanism: plain POSIX/bash script (scripts/install-local.sh), not a justfile — portability, just not guaranteed on every dogfood box
+- [Phase ?]: install-local.sh exports PATH=$HOME/.cargo/bin:$PATH internally so its own D-8 smoke test is self-sufficient regardless of invoking shell type
 
 ### Pending Todos
 
@@ -312,7 +315,7 @@ Pre-close artifact audit surfaced 3 open items. Reviewed and explicitly acknowle
 
 ## Session Continuity
 
-Last session: 2026-07-12T11:11:10.666Z
+Last session: 2026-07-12T11:47:27.885Z
 Stopped at: Phase 999.8 context gathered
 Resume file: .planning/phases/999.8-dogfood-rdpilot-locally-skill-md-cli/999.8-CONTEXT.md
 
