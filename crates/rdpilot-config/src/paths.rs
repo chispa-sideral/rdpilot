@@ -81,14 +81,25 @@ mod tests {
         assert_eq!(resolved.domain, None);
         assert!(!resolved.accept_invalid_certs);
         assert_eq!(resolved.share_root, None);
+        assert_eq!(resolved.sensor_binary_path, None);
         Ok(())
     }
 
     /// CONFIG-02: the template documents every D-27 key by name, plus the
-    /// Phase-13-added `share_root` daemon-local operational key.
+    /// Phase-13-added `share_root` and Plan-15-06-added `sensor_binary_path`
+    /// daemon-local operational keys.
     #[test]
     fn template_documents_every_d27_key() {
-        for key in ["host", "port", "username", "password", "domain", "accept_invalid_certs", "share_root"] {
+        for key in [
+            "host",
+            "port",
+            "username",
+            "password",
+            "domain",
+            "accept_invalid_certs",
+            "share_root",
+            "sensor_binary_path",
+        ] {
             assert!(
                 crate::CONFIG_TEMPLATE.contains(key),
                 "template must mention key `{key}`"

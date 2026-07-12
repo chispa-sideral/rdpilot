@@ -46,3 +46,16 @@
 # (e.g. ~/.local/share/rdpilot/transfer-staging on Linux,
 # %APPDATA%\rdpilot\transfer-staging on Windows).
 # share_root = "/var/lib/rdpilot/transfer-staging"
+
+# Absolute path of the published win-x64 NativeAOT sensor executable
+# (rdpilot-sensor.exe) that the daemon deploys to the RDP target to provide
+# structured perception (process/window/UIA tree) and sensor-mediated
+# file transfer. Without it, connect/list/disconnect still work
+# (session-management-only), but perceive/input/launch/put/get are inert
+# and fail at call time. This is C#/.NET 8 NativeAOT, win-x64 only, and
+# CANNOT be built on Linux -- build it on a Windows host (or the project's
+# Azure VM) via:
+#   dotnet publish sensor/RdpilotSensor.csproj -c Release -r win-x64 \
+#     -p:PublishAot=true --self-contained
+# Can also be set via the RDPILOT_SENSOR_BINARY_PATH environment variable.
+# sensor_binary_path = "/absolute/path/to/rdpilot-sensor.exe"
