@@ -22,9 +22,6 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 CARGO_ROOT="$HOME/.cargo"
 CONFIG_DIR="$HOME/.config/rdpilot"
 CONFIG_FILE="$CONFIG_DIR/config.toml"
-AGENTS_SKILL_DIR="$HOME/.agents/skills/rdpilot"
-CLAUDE_SKILLS_DIR="$HOME/.claude/skills"
-CLAUDE_SKILL_LINK="$CLAUDE_SKILLS_DIR/rdpilot"
 
 # LOCAL-ONLY sensor staging (phase 999.8 dogfood decision): the win-x64
 # NativeAOT sensor binary is never committed to git (C#/.NET8, can't be
@@ -45,23 +42,14 @@ CONFIG_JUST_SEEDED=0
 # `~/.cargo/env` (e.g. non-login/non-interactive shells).
 export PATH="$CARGO_ROOT/bin:$PATH"
 
-echo "==> [1/6] Detecting host target triple"
-# This box's rust-toolchain.toml + .cargo/config.toml are pinned for the
-# project's original ARM64-Windows dev machine (stable-x86_64-pc-windows-gnu
-# channel, forced Windows-GNU cross target). A bare `cargo build`/`cargo
-# install` fails outright here (toolchain-channel error) or cross-compiles
-# to Windows. Both the `+stable` toolchain override AND an explicit
-# `--target` override are REQUIRED on every cargo invocation below.
-HOST_TRIPLE="$(rustc +stable -vV | awk '/^host:/ {print $2}')"
-echo "    host triple: $HOST_TRIPLE"
+echo "==> [1/5] Using the workspace-selected stable host toolchain"
+cargo --version
 
-echo "==> [2/6] Building + installing rdpilot and rdpilot-daemon to $CARGO_ROOT/bin"
-cargo +stable install --path "$REPO_ROOT/crates/rdpilot-cli" \
-  --target "$HOST_TRIPLE" --root "$CARGO_ROOT"
-cargo +stable install --path "$REPO_ROOT/crates/rdpilot-daemon" \
-  --target "$HOST_TRIPLE" --root "$CARGO_ROOT"
+echo "==> [2/5] Building + installing rdpilot and rdpilot-daemon to $CARGO_ROOT/bin"
+cargo install --path "$REPO_ROOT/crates/rdpilot-cli" --root "$CARGO_ROOT"
+cargo install --path "$REPO_ROOT/crates/rdpilot-daemon" --root "$CARGO_ROOT"
 
-echo "==> [3/6] Staging local sensor binary (local-only, never committed to git)"
+echo "==> [3/5] Staging local sensor binary (local-only, never committed to git)"
 if [ -f "$SENSOR_SRC" ]; then
   mkdir -p "$SENSOR_DATA_DIR"
   cp "$SENSOR_SRC" "$SENSOR_DEST"
@@ -71,7 +59,7 @@ else
   echo "    no local sensor binary found at $SENSOR_SRC — skipping (session-management-only install)"
 fi
 
-echo "==> [4/6] Seeding config (idempotent — never overwrites an existing file)"
+echo "==> [4/5] Seeding config (idempotent — never overwrites an existing file)"
 mkdir -p "$CONFIG_DIR"
 chmod 700 "$CONFIG_DIR"
 if [ ! -f "$CONFIG_FILE" ]; then
@@ -98,15 +86,7 @@ else
   fi
 fi
 
-echo "==> [5/6] Installing the skill to both discovery surfaces"
-mkdir -p "$AGENTS_SKILL_DIR"
-cp "$REPO_ROOT/.claude/skills/rdpilot/SKILL.md" "$AGENTS_SKILL_DIR/SKILL.md"
-mkdir -p "$CLAUDE_SKILLS_DIR"
-ln -sf "$AGENTS_SKILL_DIR" "$CLAUDE_SKILL_LINK"
-echo "    real copy: $AGENTS_SKILL_DIR/SKILL.md"
-echo "    symlink:   $CLAUDE_SKILL_LINK -> $AGENTS_SKILL_DIR"
-
-echo "==> [6/6] Smoke test (D-8): confirming the CLI -> daemon IPC path works"
+echo "==> [5/5] Smoke test (D-8): confirming the CLI -> daemon IPC path works"
 if ! rdpilot --version; then
   echo "FAILED: 'rdpilot --version' did not exit 0" >&2
   exit 1

@@ -52,6 +52,7 @@ const SECOND_ACCOUNT_ENV: &str = "RDPILOT_SECOND_WINDOWS_ACCOUNT";
 /// doc for why a Scheduled Task, not `runas`, is the correct mechanism
 /// here -- live-VM-confirmed, Plan 15-05).
 const SECOND_ACCOUNT_PASSWORD_ENV: &str = "RDPILOT_SECOND_WINDOWS_PASSWORD";
+const TASK_NAME_ENV: &str = "RDPILOT_DACL_TASK_NAME";
 
 fn armed() -> bool {
     std::env::var_os(LIVE_ENV).is_some()
@@ -114,7 +115,7 @@ fn cross_account_connection_is_rejected_by_the_owner_only_dacl() {
         // this process) which is the actual ground-truth assertion below
         // -- not merely the daemon-side timeout, which alone cannot
         // distinguish "genuinely rejected" from "probe never ran".
-        let task_name = "RdpilotDaclCrossAccountProbe";
+        let task_name = std::env::var(TASK_NAME_ENV).unwrap_or_else(|_| "RdpilotDaclCrossAccountProbe".to_owned());
         // NOT `std::env::temp_dir()`: under this test's execution context
         // (`az vm run-command` runs as `NT AUTHORITY\SYSTEM`), that
         // resolves to SYSTEM's own profile-scoped temp directory
@@ -171,12 +172,12 @@ $out | Out-File -FilePath '{result}' -Encoding utf8 -Force
             String::from_utf8_lossy(&grant_write.stderr)
         );
 
-        let _ = Command::new("schtasks").args(["/delete", "/tn", task_name, "/f"]).output();
+        let _ = Command::new("schtasks").args(["/delete", "/tn", &task_name, "/f"]).output();
         let create = Command::new("schtasks")
             .args([
                 "/create",
                 "/tn",
-                task_name,
+                &task_name,
                 "/tr",
                 &format!("powershell.exe -NoProfile -ExecutionPolicy Bypass -File {}", inner_script_path.display()),
                 "/sc",
@@ -197,7 +198,7 @@ $out | Out-File -FilePath '{result}' -Encoding utf8 -Force
             String::from_utf8_lossy(&create.stderr)
         );
 
-        let run = Command::new("schtasks").args(["/run", "/tn", task_name]).output().expect("failed to invoke schtasks /run");
+        let run = Command::new("schtasks").args(["/run", "/tn", &task_name]).output().expect("failed to invoke schtasks /run");
         assert!(run.status.success(), "[FAIL] {name}: schtasks /run failed: {}", String::from_utf8_lossy(&run.stderr));
 
         let accepted = tokio::time::timeout(Duration::from_secs(5), rdpilot_daemon::accept_and_authorize(&listener)).await;
@@ -217,7 +218,7 @@ $out | Out-File -FilePath '{result}' -Encoding utf8 -Force
             .trim_start_matches('\u{feff}')
             .to_owned();
 
-        let _ = Command::new("schtasks").args(["/delete", "/tn", task_name, "/f"]).output();
+        let _ = Command::new("schtasks").args(["/delete", "/tn", &task_name, "/f"]).output();
         let _ = std::fs::remove_file(&result_path);
         let _ = std::fs::remove_file(&inner_script_path);
 

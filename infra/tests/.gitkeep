@@ -1,2 +1,0 @@
-# Placeholder so git tracks infra/tests/. Test files (ManageEnv.Tests.ps1,
-# Validate-Target.ps1) are added in this same plan (01); kept for an explicit, stable layout.

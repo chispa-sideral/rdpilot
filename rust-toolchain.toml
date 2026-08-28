@@ -1,12 +1,2 @@
-# This machine is ARM64 (aarch64) Windows with no MSVC toolchain / Windows SDK,
-# and the developer declined to install Visual Studio. Build with the GNU
-# (MinGW-w64) toolchain targeting x86_64 instead: the x64 rustc and the x64
-# artifacts (including host build-scripts/proc-macros) run under Windows-on-ARM
-# x64 emulation (a tier-1 Rust target). This is functionally equivalent for a
-# pure-Rust RDP client (IronRDP + rustls, no MSVC-specific dependencies).
-#
-# Pinning the toolchain here makes the workspace build on a non-MSVC host
-# without changing the global rustup default. Requires MinGW-w64 gcc on PATH
-# (e.g. `scoop install mingw`); the linker is pinned in .cargo/config.toml.
 [toolchain]
-channel = "stable-x86_64-pc-windows-gnu"
+channel = "stable"

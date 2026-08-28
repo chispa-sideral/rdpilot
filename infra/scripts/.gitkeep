@@ -1,2 +1,0 @@
-# Placeholder so git tracks infra/scripts/ before Plan 02/03/04 add the real scripts.
-# Future contents: Configure-Target.ps1 (in-guest hardening, CSE), Delete-ResourceGroup.ps1 (auto-destroy runbook body).

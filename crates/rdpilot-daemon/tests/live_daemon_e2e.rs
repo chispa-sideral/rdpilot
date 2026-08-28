@@ -8,7 +8,9 @@
 //! mirroring `tests/autostart_lifecycle.rs`'s own real-binary pattern) over
 //! its real Unix IPC transport (already offline-proven) against the real
 //! remote Windows VM -- no Windows build host needed, only network
-//! reachability to the target `.secrets/connection.json` names.
+//! reachability to the target connection file names. The file defaults to
+//! `.secrets/connection.json`, but a fresh file can be supplied with
+//! `RDPILOT_CONNECTION_FILE`.
 //!
 //! Every test is `#[ignore]` + `RDPILOT_LIVE`-gated (D-18), loading the
 //! live target the same way `crates/rdpilot/tests/common/mod.rs` does
@@ -17,7 +19,7 @@
 //! compilation unit, mirroring how `tests/ipc_security.rs`/
 //! `tests/autostart_lifecycle.rs` already duplicate their own small
 //! test-local helpers rather than depending on a sibling crate's private
-//! test support). Absent `RDPILOT_LIVE` or `.secrets/connection.json`, both
+//! test support). Absent `RDPILOT_LIVE` or a connection file, both
 //! tests print `[SKIP]` and return cleanly -- nothing here runs during
 //! offline CI. Real execution happens from the Linux host against the
 //! Azure VM in Plan 15-06.
@@ -47,8 +49,10 @@ use tokio::net::UnixStream;
 /// Name of the opt-in env var that arms this live suite (D-18) -- mirrors
 /// `crates/rdpilot/tests/common/mod.rs::LIVE_ENV`.
 const LIVE_ENV: &str = "RDPILOT_LIVE";
+const CONNECTION_FILE_ENV: &str = "RDPILOT_CONNECTION_FILE";
 
-/// A real live RDP target, loaded from `.secrets/connection.json` -- the
+/// A real live RDP target, loaded from a caller-supplied connection file (or
+/// the legacy default) -- the
 /// non-secret fields (`host`/`port`) plus the credential fields
 /// (`user`/`password`), which this file never logs (mirrors
 /// `crates/rdpilot/tests/common/mod.rs::load_config`'s own D-31 discipline:
@@ -61,16 +65,34 @@ struct LiveTarget {
     password: String,
 }
 
-/// Locate `.secrets/connection.json` relative to the workspace root.
+/// Locate the configured connection file. `RDPILOT_CONNECTION_FILE` keeps a
+/// live run from accidentally using a stale checked-out secret; the legacy
+/// project-relative path remains the default for existing manual workflows.
 /// `CARGO_MANIFEST_DIR` points at `crates/rdpilot-daemon`, the same depth
 /// below the workspace root as `crates/rdpilot`
 /// (`tests/common/mod.rs::connection_file`'s own two-levels-up resolution).
 fn connection_file() -> PathBuf {
+    if let Some(path) = std::env::var_os(CONNECTION_FILE_ENV) {
+        return PathBuf::from(path);
+    }
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("..").join(".secrets").join("connection.json")
 }
 
+#[test]
+fn connection_file_honors_the_explicit_override() {
+    let path = std::env::temp_dir().join(format!("rdpilot-e2e-target-{}", std::process::id()));
+    let prior = std::env::var_os(CONNECTION_FILE_ENV);
+    std::env::set_var(CONNECTION_FILE_ENV, &path);
+    assert_eq!(connection_file(), path);
+    if let Some(prior) = prior {
+        std::env::set_var(CONNECTION_FILE_ENV, prior);
+    } else {
+        std::env::remove_var(CONNECTION_FILE_ENV);
+    }
+}
+
 /// Load the live target, or `None` if the suite is not armed (D-18 gate 1:
-/// `RDPILOT_LIVE` unset; gate 2: `.secrets/connection.json` absent). A
+/// `RDPILOT_LIVE` unset; gate 2: the configured connection file absent). A
 /// present-but-malformed file panics with a descriptive message -- a
 /// deliberate armed-run misconfiguration is a hard error, not a silent
 /// skip -- but the panic message never includes the password (mirrors
@@ -81,12 +103,12 @@ fn load_live_target() -> Option<LiveTarget> {
     if !path.exists() {
         return None;
     }
-    let raw = std::fs::read_to_string(&path).expect("RDPILOT_LIVE is set and .secrets/connection.json exists but could not be read");
-    let json: serde_json::Value = serde_json::from_str(&raw).expect(".secrets/connection.json is not valid JSON");
-    let host = json.get("host").and_then(|v| v.as_str()).expect(".secrets/connection.json is missing a string `host`").to_owned();
-    let user = json.get("user").and_then(|v| v.as_str()).expect(".secrets/connection.json is missing a string `user`").to_owned();
+    let raw = std::fs::read_to_string(&path).expect("RDPILOT_LIVE is set and the configured connection file could not be read");
+    let json: serde_json::Value = serde_json::from_str(&raw).expect("configured connection file is not valid JSON");
+    let host = json.get("host").and_then(|v| v.as_str()).expect("configured connection file is missing a string `host`").to_owned();
+    let user = json.get("user").and_then(|v| v.as_str()).expect("configured connection file is missing a string `user`").to_owned();
     let password =
-        json.get("password").and_then(|v| v.as_str()).expect(".secrets/connection.json is missing a string `password`").to_owned();
+        json.get("password").and_then(|v| v.as_str()).expect("configured connection file is missing a string `password`").to_owned();
     let port: u16 = json.get("rdpPort").and_then(serde_json::Value::as_u64).and_then(|p| u16::try_from(p).ok()).unwrap_or(3389);
     Some(LiveTarget { host, port, user, password })
 }
@@ -134,6 +156,45 @@ fn unique_temp_root(label: &str) -> PathBuf {
     std::env::temp_dir().join(format!("rdpilot-e2e-{label}-{}-{short_nanos}", std::process::id()))
 }
 
+/// Owns the per-test runtime directory so failures and timeouts do not leave
+/// daemon state behind on the Linux orchestration host.
+struct TestRoot(PathBuf);
+
+impl TestRoot {
+    fn new(label: &str) -> Self {
+        Self(unique_temp_root(label))
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for TestRoot {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Ensures a live test's daemon dies even if an assertion or timeout ends the
+/// test before its explicit happy-path cleanup.
+struct LiveDaemon {
+    child: std::process::Child,
+}
+
+impl LiveDaemon {
+    fn stop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+impl Drop for LiveDaemon {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
 /// Connect to the daemon socket with a bounded retry backoff -- spawning a
 /// real OS process and waiting for it to bind is inherently racy; this
 /// mirrors `rdpilot_ipc::transport::connect_or_spawn`'s own backoff
@@ -160,7 +221,7 @@ async fn connect_with_backoff(socket_path: &std::path::Path) -> UnixStream {
 /// suite needs the REAL `RealConnector` (a genuine RDP connect to the live
 /// target), unlike `tests/autostart_lifecycle.rs`'s offline fake-connector
 /// run.
-fn spawn_real_daemon(root: &std::path::Path) -> (std::process::Child, PathBuf) {
+fn spawn_real_daemon(root: &std::path::Path) -> (LiveDaemon, PathBuf) {
     let xdg_runtime_dir = root.join("xdg-runtime");
     std::fs::create_dir_all(&xdg_runtime_dir).expect("create the isolated XDG_RUNTIME_DIR");
     let sink_path = root.join("sessions.json");
@@ -177,22 +238,22 @@ fn spawn_real_daemon(root: &std::path::Path) -> (std::process::Child, PathBuf) {
         .spawn()
         .expect("failed to spawn the real rdpilot-daemon binary");
 
-    (child, socket_path)
+    (LiveDaemon { child }, socket_path)
 }
 
 /// (b) SESSION-01/03/04: connect / list / disconnect succeed end-to-end
 /// against the real target, with correct name/id/status/timestamps.
 #[tokio::test]
-#[ignore = "requires RDPILOT_LIVE=1, .secrets/connection.json, and network reachability to the live target"]
+#[ignore = "requires RDPILOT_LIVE=1, a configured connection file, and network reachability to the live target"]
 async fn connect_list_disconnect_e2e_against_a_real_target() {
     let name = "connect_list_disconnect_e2e_against_a_real_target";
     let Some(target) = load_live_target() else {
-        println!("[SKIP] {name}: {LIVE_ENV} unset or .secrets/connection.json absent");
+        println!("[SKIP] {name}: {LIVE_ENV} unset or configured connection file absent");
         return;
     };
 
-    let root = unique_temp_root("connect-list-disconnect");
-    let (mut child, socket_path) = spawn_real_daemon(&root);
+    let root = TestRoot::new("connect-list-disconnect");
+    let (mut daemon, socket_path) = spawn_real_daemon(root.path());
     let mut stream = connect_with_backoff(&socket_path).await;
     println!("[PASS] {name}: daemon reachable at {}", socket_path.display());
 
@@ -241,9 +302,7 @@ async fn connect_list_disconnect_e2e_against_a_real_target() {
     }
 
     drop(stream);
-    let _ = child.kill();
-    let _ = child.wait();
-    let _ = std::fs::remove_dir_all(&root);
+    daemon.stop();
 }
 
 /// (a) DAEMON-04 live: after `kill -9` mid-session against a real target
@@ -261,18 +320,18 @@ async fn connect_list_disconnect_e2e_against_a_real_target() {
 /// distinctly as `Orphaned` with the correct host preserved, and only ever
 /// clears it via an explicit reconcile -- exactly DAEMON-04's contract.
 #[tokio::test]
-#[ignore = "requires RDPILOT_LIVE=1, .secrets/connection.json, and network reachability to the live target"]
+#[ignore = "requires RDPILOT_LIVE=1, a configured connection file, and network reachability to the live target"]
 async fn kill_minus_9_mid_session_then_restart_surfaces_the_orphan_which_is_then_explicitly_reconciled() {
     let name = "kill_minus_9_mid_session_then_restart_surfaces_the_orphan_which_is_then_explicitly_reconciled";
     let Some(target) = load_live_target() else {
-        println!("[SKIP] {name}: {LIVE_ENV} unset or .secrets/connection.json absent");
+        println!("[SKIP] {name}: {LIVE_ENV} unset or configured connection file absent");
         return;
     };
 
-    let root = unique_temp_root("kill9-orphan");
+    let root = TestRoot::new("kill9-orphan");
 
     // --- Phase A: daemon A connects to the real target. ---
-    let (mut child_a, socket_path) = spawn_real_daemon(&root);
+    let (mut daemon_a, socket_path) = spawn_real_daemon(root.path());
     let mut stream_a = connect_with_backoff(&socket_path).await;
 
     write_frame(
@@ -298,8 +357,7 @@ async fn kill_minus_9_mid_session_then_restart_surfaces_the_orphan_which_is_then
     // --- Phase B: kill -9 the daemon process mid-session (no graceful
     // teardown -- Disconnect is never sent, mirroring a genuine crash). ---
     drop(stream_a);
-    child_a.kill().expect("kill -9 the daemon process");
-    child_a.wait().expect("reap the killed daemon process");
+    daemon_a.stop();
     println!("[PASS] {name}: daemon A killed (SIGKILL) mid-session -- no graceful teardown ran");
 
     // --- Phase C: restart -- daemon B, SAME root (`spawn_real_daemon`
@@ -307,7 +365,7 @@ async fn kill_minus_9_mid_session_then_restart_surfaces_the_orphan_which_is_then
     // time it is called), so daemon B resolves the SAME reconciliation-
     // state sink file daemon A wrote to -- the whole point of this test is
     // restart-on-the-same-state, not a fresh one.
-    let (mut child_b, socket_path_b) = spawn_real_daemon(&root);
+    let (mut daemon_b, socket_path_b) = spawn_real_daemon(root.path());
     assert_eq!(socket_path_b, socket_path, "daemon B must resolve the identical socket path as daemon A (same root)");
     let mut stream_b = connect_with_backoff(&socket_path).await;
     println!("[PASS] {name}: daemon B restarted and reachable at the same socket path");
@@ -350,7 +408,5 @@ async fn kill_minus_9_mid_session_then_restart_surfaces_the_orphan_which_is_then
     }
 
     drop(stream_b);
-    let _ = child_b.kill();
-    let _ = child_b.wait();
-    let _ = std::fs::remove_dir_all(&root);
+    daemon_b.stop();
 }
