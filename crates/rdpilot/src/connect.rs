@@ -32,6 +32,7 @@
 //! T-02-02). No `unwrap`/`expect`/`panic` in non-test code (API-01).
 
 use std::fs;
+use std::fmt::Write as _;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
@@ -168,7 +169,7 @@ pub(crate) async fn connect(
 
     let should_upgrade = ironrdp_tokio::connect_begin(&mut framed, &mut connector)
         .await
-        .map_err(|e| Error::Connect(format!("connect_begin failed: {e}")))?;
+        .map_err(|e| Error::Connect(format!("connect_begin failed: {}", format_error_chain(&e))))?;
 
     // TLS upgrade over the raw stream (no leftover bytes expected at this point).
     let initial_stream = framed.into_inner_no_leftover();
@@ -191,9 +192,28 @@ pub(crate) async fn connect(
         None,
     )
     .await
-    .map_err(|e| Error::Connect(format!("connect_finalize failed: {e}")))?;
+    .map_err(|e| Error::Connect(format!("connect_finalize failed: {}", format_error_chain(&e))))?;
 
     Ok((connection_result, upgraded_framed, sensor))
+}
+
+/// Render an upstream error together with its retained source chain.
+///
+/// IronRDP intentionally displays its catch-all connector kind as `custom
+/// error`, while retaining the actionable I/O or PDU-decoding error as an
+/// [`std::error::Error::source`]. Keeping that source in the owned SDK error
+/// makes negotiation failures actionable after they cross the daemon/IPC
+/// boundary, where the original typed error is no longer available.
+fn format_error_chain(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut rendered = error.to_string();
+    let mut source = error.source();
+
+    while let Some(cause) = source {
+        let _ = write!(rendered, "; caused by: {cause}");
+        source = cause.source();
+    }
+
+    rendered
 }
 
 /// Resolve `host:port` to a single socket address.
@@ -404,6 +424,41 @@ mod danger {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fmt;
+
+    #[derive(Debug)]
+    struct TestCause;
+
+    impl fmt::Display for TestCause {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("socket closed before negotiation response")
+        }
+    }
+
+    impl std::error::Error for TestCause {}
+
+    #[derive(Debug)]
+    struct TestWrapper(TestCause);
+
+    impl fmt::Display for TestWrapper {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("custom error")
+        }
+    }
+
+    impl std::error::Error for TestWrapper {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(&self.0)
+        }
+    }
+
+    #[test]
+    fn connector_error_rendering_keeps_the_underlying_cause() {
+        assert_eq!(
+            format_error_chain(&TestWrapper(TestCause)),
+            "custom error; caused by: socket closed before negotiation response"
+        );
+    }
 
     /// The cert-policy branch must always disable resumption (CredSSP), and must
     /// build successfully for the lab opt-out (no-op verifier) path without a
