@@ -200,7 +200,7 @@ fn launch_command() -> String {
     let name = crate::connect::SENSOR_EXE_NAME;
     format!(
         "cmd /c taskkill /F /IM {name} >nul 2>&1 & timeout /t 1 /nobreak >nul & \
-         copy \\\\tsclient\\RDPILOT\\{name} %TEMP%\\{name} && start \"\" %TEMP%\\{name}"
+         cd /d %TEMP% && copy /Y \\\\tsclient\\RDPILOT\\{name} {name} >nul && start \"\" {name}"
     )
 }
 
@@ -2667,9 +2667,9 @@ mod tests {
 
     // --- Task 2: deploy_and_launch -- launch-command helper + Error::Bootstrap (D-5.1/D-5.2) ---
 
-    /// The launch command copies the RDPDR-announced sensor exe from the
-    /// redirected `RDPILOT` drive to `%TEMP%` and starts it (D-5.1) — pure,
-    /// offline-testable, no VM.
+    /// The launch command changes to `%TEMP%`, copies the RDPDR-announced
+    /// sensor exe from the redirected `RDPILOT` drive, and starts it (D-5.1)
+    /// — pure, offline-testable, no VM.
     #[test]
     fn launch_command_references_redirected_drive_temp_dest_and_start() {
         let cmd = launch_command();
@@ -2682,6 +2682,24 @@ mod tests {
         assert!(
             cmd.contains(crate::connect::SENSOR_EXE_NAME),
             "must reference the RDPDR-announced sensor filename (Task 1) so the two can never drift apart: {cmd}"
+        );
+    }
+
+    /// The Run dialog/ShellExecute path has a MAX_PATH-sized command buffer.
+    /// Keep this below that limit after expanding a long Crabbox-style TEMP
+    /// path, so its trailing executable name cannot be truncated.
+    #[test]
+    fn launch_command_fits_run_dialog_limit_with_long_temp_path() {
+        const WINDOWS_RUN_COMMAND_LIMIT: usize = 260;
+        const LONG_CRABBOX_TEMP: &str =
+            r"C:\Users\crabbox.very-long-machine-name\AppData\Local\Temp\2";
+
+        let expanded = launch_command().replace("%TEMP%", LONG_CRABBOX_TEMP);
+
+        assert!(
+            expanded.len() < WINDOWS_RUN_COMMAND_LIMIT,
+            "expanded launch command is {} bytes, but must stay below the {WINDOWS_RUN_COMMAND_LIMIT}-byte Run/ShellExecute limit: {expanded}",
+            expanded.len(),
         );
     }
 
