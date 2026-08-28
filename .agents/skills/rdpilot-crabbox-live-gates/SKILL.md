@@ -33,10 +33,20 @@ Never print credential values, copied connection JSON, or Azure secrets. Do not 
 
 ## Execute and close the loop
 
-1. Check that the image is hydrated with Cargo and the MSVC toolchain before attempting the test. If it is not, stop the lease and report the missing image prerequisite; do not bootstrap a large toolchain ad hoc without an approved plan.
-2. Transfer the checked-out source through Crabbox, run the narrow Windows gate, and collect only non-secret diagnostics.
+Use the project entry points instead of reconstructing commands:
+
+- `just windows-build-host` checks the ephemeral Windows bootstrap only.
+- `just windows-dacl` bootstraps and runs the Windows DACL gate.
+- `just rdp-e2e /path/to/connection.json` runs the Linux-hosted RDP gate against a caller-supplied target.
+
+`scripts/live/Initialize-BuildHost.ps1` is the approved, idempotent build-host bootstrap. It installs missing Rust MSVC and Visual Studio Build Tools from official installers, imports the VS developer environment, uses bounded waits, and removes installer binaries. Do not replace it with an ad hoc package-manager setup.
+
+1. Sync the checked-out source through Crabbox, then use the project bootstrap and narrow Windows gate. Generic Windows images expose built-in `powershell`, not necessarily `pwsh`.
+2. Collect only non-secret diagnostics from the narrow Windows gate.
 3. Create only temporary test accounts and remove them even when the test fails.
 4. Stop the lease promptly, then independently confirm the VM no longer exists. Treat a nonzero cleanup result as a failure to report, not as permission to delete shared resources directly.
+
+Windows archive synchronization has previously stalled before any remote command ran. Treat a sync-quiet/watchdog failure as a Crabbox failure, not a bootstrap or test result: stop only the owned lease, verify its slug is absent from provider inventory and `inspect`, and preserve unrelated leases.
 
 For an RDP E2E run, validate the supplied target with rdpilot before the full suite. A client stuck in `Connecting` must be treated as a disconnect/cancellation regression: record the observable state and endpoint metadata without secrets, then clean up the local daemon/session. Do not claim the E2E gate passed unless it used a fresh, credentialed target.
 
