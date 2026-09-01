@@ -143,6 +143,15 @@ pub struct Registry {
     sessions: Mutex<HashMap<SessionId, SessionEntry>>,
     connector: Arc<dyn SessionConnector>,
     sink: Arc<dyn ReconciliationSink>,
+    next_generation: AtomicU64,
+}
+
+/// Private ownership handle retained until the `Connected` IPC response is
+/// written. A public session id alone cannot safely reclaim a reused name.
+#[derive(Debug, Clone)]
+pub(crate) struct ConnectLease {
+    pub(crate) id: SessionId,
+    generation: u64,
 }
 
 impl Registry {
@@ -155,6 +164,7 @@ impl Registry {
             sessions: Mutex::new(HashMap::new()),
             connector,
             sink,
+            next_generation: AtomicU64::new(1),
         }
     }
 
@@ -210,6 +220,17 @@ impl Registry {
     /// [`DaemonError`]) if the connect itself fails — in which case the
     /// claim is released so a retry with the same name can succeed.
     pub async fn open(&self, name: Option<String>, host: String, cfg: ConnectionConfig) -> Result<SessionId, DaemonError> {
+        Ok(self.open_tracked(name, host, cfg).await?.id)
+    }
+
+    /// Like [`Registry::open`], but returns an internal exact-generation
+    /// ownership handle for the IPC response path.
+    pub(crate) async fn open_tracked(
+        &self,
+        name: Option<String>,
+        host: String,
+        cfg: ConnectionConfig,
+    ) -> Result<ConnectLease, DaemonError> {
         let id = match &name {
             Some(n) => {
                 let id = SessionId::from_str(n).map_err(DaemonError::Connect)?;
@@ -222,6 +243,7 @@ impl Registry {
 
         match self.connector.connect(cfg).await {
             Ok(session) => {
+                let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
                 // A single wall-clock capture shared by the entry's
                 // `connected_since_wall`/`last_activity_wall` and the
                 // reconciliation sink's `record_open` call below — avoids
@@ -235,6 +257,7 @@ impl Registry {
                         id.clone(),
                         SessionEntry::Live {
                             session: Arc::new(tokio::sync::Mutex::new(Some(session))),
+                            generation,
                             status: SessionLifecycle::Live,
                             connected_since: Instant::now(),
                             connected_since_wall: now_wall.clone(),
@@ -246,7 +269,7 @@ impl Registry {
                     );
                 } // guard dropped here — never held across the .await below
                 self.sink.record_open(&id, &host, &now_wall);
-                Ok(id)
+                Ok(ConnectLease { id, generation })
             }
             Err(e) => {
                 #[allow(clippy::expect_used)] // A poisoned registry mutex is unrecoverable.
@@ -317,6 +340,29 @@ impl Registry {
             }
             None => Err(DaemonError::SessionNotFound(id.as_str().to_owned())),
         }
+    }
+
+    /// Reclaim only the exact live generation created for a Connect response
+    /// whose IPC peer closed. A normal Disconnect or a reused public name is
+    /// benignly left untouched.
+    pub(crate) async fn close_if_generation(&self, lease: &ConnectLease) -> Result<bool, DaemonError> {
+        let entry = {
+            #[allow(clippy::expect_used)] // A poisoned registry mutex is unrecoverable.
+            let mut guard = self.sessions.lock().expect("registry mutex poisoned");
+            match guard.get(&lease.id) {
+                Some(SessionEntry::Live { generation, .. }) if *generation == lease.generation => guard.remove(&lease.id),
+                _ => None,
+            }
+        };
+
+        let Some(SessionEntry::Live { session, .. }) = entry else {
+            return Ok(false);
+        };
+        if let Some(session) = session.lock().await.take() {
+            session.close().await?;
+        }
+        self.sink.record_closed(&lease.id);
+        Ok(true)
     }
 
     /// Dispatch an operation onto the live session `id` WITHOUT holding the

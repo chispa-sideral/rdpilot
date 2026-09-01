@@ -54,6 +54,7 @@
 #![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used))]
 
 mod dispatch;
+mod diagnostics;
 mod error_map;
 mod ipc;
 mod lifecycle;

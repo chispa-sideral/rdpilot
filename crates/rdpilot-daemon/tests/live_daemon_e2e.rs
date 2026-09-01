@@ -50,6 +50,8 @@ use tokio::net::UnixStream;
 /// `crates/rdpilot/tests/common/mod.rs::LIVE_ENV`.
 const LIVE_ENV: &str = "RDPILOT_LIVE";
 const CONNECTION_FILE_ENV: &str = "RDPILOT_CONNECTION_FILE";
+const CONNECT_TIMEOUT_SECS_ENV: &str = "RDPILOT_CONNECT_TIMEOUT_SECS";
+const CONNECT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A real live RDP target, loaded from a caller-supplied connection file (or
 /// the legacy default) -- the
@@ -135,6 +137,46 @@ async fn read_frame<T: serde::de::DeserializeOwned>(stream: &mut UnixStream) -> 
     let mut body = vec![0_u8; len as usize];
     stream.read_exact(&mut body).await?;
     Ok(serde_json::from_slice(&body).expect("test response must deserialize"))
+}
+
+/// Read only the Connect response under the finite deadline supplied by the
+/// checked-in shell harness. A timeout is not a raw process kill: this test
+/// asks the daemon for List and explicitly Disconnects only its named owned
+/// session before failing. The whole-suite shell timeout remains separate.
+async fn read_connect_response_with_deadline(stream: &mut UnixStream, owned_name: &str) -> WireResponse {
+    let seconds = std::env::var(CONNECT_TIMEOUT_SECS_ENV)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|seconds| (45..=120).contains(seconds))
+        .expect("run-rdp-e2e.sh must pass RDPILOT_CONNECT_TIMEOUT_SECS in the validated 45..=120 range");
+
+    match tokio::time::timeout(Duration::from_secs(seconds), read_frame::<WireResponse>(stream)).await {
+        Ok(Ok(response)) => response,
+        Ok(Err(error)) => panic!("read Connect response: {error}"),
+        Err(_) => {
+            write_frame(stream, &Request::List {}).await.expect("write List after Connect timeout");
+            let listed = tokio::time::timeout(CONNECT_CLEANUP_TIMEOUT, read_frame::<WireResponse>(stream))
+                .await
+                .expect("bounded List response after Connect timeout")
+                .expect("read List response after Connect timeout");
+            let owned = match listed {
+                WireResponse::SessionList { sessions } => sessions
+                    .into_iter()
+                    .find(|session| session.id == owned_name)
+                    .map(|session| session.id.parse().expect("daemon returned a valid owned session id")),
+                other => panic!("expected SessionList after Connect timeout, got {other:?}"),
+            };
+            if let Some(session) = owned {
+                write_frame(stream, &Request::Disconnect { session }).await.expect("write owned Disconnect after Connect timeout");
+                let cleanup = tokio::time::timeout(CONNECT_CLEANUP_TIMEOUT, read_frame::<WireResponse>(stream))
+                    .await
+                    .expect("bounded Disconnect response after Connect timeout")
+                    .expect("read Disconnect response after Connect timeout");
+                assert!(matches!(cleanup, WireResponse::Ack), "owned Disconnect after Connect timeout must acknowledge: {cleanup:?}");
+            }
+            panic!("Connect response exceeded the validated {seconds}s deadline; owned session cleanup was attempted through IPC");
+        }
+    }
 }
 
 /// A unique temp root per test invocation -- isolates `XDG_RUNTIME_DIR`
@@ -272,7 +314,7 @@ async fn connect_list_disconnect_e2e_against_a_real_target() {
     )
     .await
     .expect("write Connect frame");
-    let session = match read_frame::<WireResponse>(&mut stream).await.expect("read Connect response") {
+    let session = match read_connect_response_with_deadline(&mut stream, "live-e2e").await {
         WireResponse::Connected { session } => session,
         other => panic!("[FAIL] {name}: expected Connected, got {other:?}"),
     };
@@ -348,7 +390,7 @@ async fn kill_minus_9_mid_session_then_restart_surfaces_the_orphan_which_is_then
     )
     .await
     .expect("write Connect frame");
-    let session = match read_frame::<WireResponse>(&mut stream_a).await.expect("read Connect response") {
+    let session = match read_connect_response_with_deadline(&mut stream_a, "live-orphan").await {
         WireResponse::Connected { session } => session,
         other => panic!("[FAIL] {name}: expected Connected, got {other:?}"),
     };

@@ -381,6 +381,10 @@ pub enum SessionEntry {
         /// compile (research Pitfall 2); the `Box` (a sized pointer) is what
         /// actually moves.
         session: Arc<tokio::sync::Mutex<Option<Box<dyn ManagedSession>>>>,
+        /// Internal monotonic lease generation. It is never exposed over the
+        /// IPC wire; it identifies the exact Connect response owner when a
+        /// peer closes before receiving `Connected`.
+        generation: u64,
         /// A cheap, lock-free snapshot of the session's lifecycle status,
         /// captured at insert time and never updated by this phase (mirrors
         /// `describe()`'s current baseline-`Live` behavior exactly). Storing
@@ -580,4 +584,3 @@ mod tests {
         assert_eq!(format!("{err}"), inner_message);
     }
 }
-

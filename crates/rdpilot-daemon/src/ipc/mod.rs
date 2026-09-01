@@ -35,7 +35,8 @@ pub use windows::{accept_and_authorize, bind, socket_path};
 
 use tokio::io::{AsyncRead, AsyncWrite};
 
-use crate::dispatch::dispatch;
+use crate::diagnostics::{Diagnostics, Stage};
+use crate::dispatch::dispatch_for_ipc;
 use crate::registry::Registry;
 use rdpilot_ipc::transport::{read_frame, write_frame};
 
@@ -46,7 +47,7 @@ use rdpilot_ipc::transport::{read_frame, write_frame};
 /// Generic over any `AsyncRead + AsyncWrite` stream — the same loop serves
 /// both the Unix `UnixStream` (this plan) and the Windows named pipe
 /// (Plan 12-07). Used by Plan 12-06's accept loop.
-pub(crate) async fn serve_connection<S>(mut stream: S, registry: &Registry)
+pub(crate) async fn serve_connection<S>(mut stream: S, registry: &Registry, diagnostics: Option<&Diagnostics>)
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -59,9 +60,24 @@ where
             // decoded `Request` to begin with on this branch).
             Err(_) => return,
         };
-        let resp = dispatch(registry, req).await;
-        if write_frame(&mut stream, &resp).await.is_err() {
+        let outcome = dispatch_for_ipc(registry, req, diagnostics).await;
+        if write_frame(&mut stream, &outcome.response).await.is_err() {
+            if let Some(lease) = outcome.connect_lease {
+                if let Some(diagnostics) = diagnostics {
+                    diagnostics.record(lease.id.as_str(), Stage::IpcPeerClosed);
+                }
+                if matches!(registry.close_if_generation(&lease).await, Ok(true)) {
+                    if let Some(diagnostics) = diagnostics {
+                        diagnostics.record(lease.id.as_str(), Stage::RegistryClosed);
+                    }
+                }
+            }
             return;
+        }
+        if let Some(lease) = outcome.connect_lease {
+            if let Some(diagnostics) = diagnostics {
+                diagnostics.record(lease.id.as_str(), Stage::IpcResponseWritten);
+            }
         }
     }
 }

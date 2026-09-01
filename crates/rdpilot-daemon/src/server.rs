@@ -27,6 +27,7 @@ use std::time::Duration;
 use rdpilot::ConnectionConfig;
 use rdpilot_ipc::SessionLifecycle;
 
+use crate::diagnostics::Diagnostics;
 use crate::lifecycle::{self, LifecycleConfig, ShutdownSignal};
 use crate::reconcile::{self, JsonReconciliationSink};
 use crate::registry::Registry;
@@ -50,6 +51,11 @@ const TEST_CONNECTOR_ENV: &str = "RDPILOT_DAEMON_TEST_CONNECTOR";
 /// produces -- never consulted anywhere near [`RealConnector`], so the
 /// production connector is untouched (T-14-16).
 const TEST_SLOW_MS_ENV: &str = "RDPILOT_DAEMON_TEST_SLOW_MS";
+
+/// Fake-connector-only delay before the canned sensor bootstrap reports
+/// success. It is read only when the explicit fake connector is selected and
+/// is unreachable by [`RealConnector`].
+const TEST_BOOTSTRAP_DELAY_MS_ENV: &str = "RDPILOT_DAEMON_TEST_BOOTSTRAP_DELAY_MS";
 
 /// The env var overriding [`RunConfig`]'s reconciliation-state sink path
 /// (test injection point -- production always resolves the platform
@@ -139,12 +145,14 @@ async fn run_inner(config: RunConfig) -> Result<(), DaemonError> {
 
     let connector: Arc<dyn SessionConnector> = if std::env::var(TEST_CONNECTOR_ENV).is_ok() {
         let slow_ms = std::env::var(TEST_SLOW_MS_ENV).ok().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
-        Arc::new(FakeTestConnector { slow_ms })
+        let bootstrap_delay_ms = std::env::var(TEST_BOOTSTRAP_DELAY_MS_ENV).ok().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+        Arc::new(FakeTestConnector { slow_ms, bootstrap_delay_ms })
     } else {
         Arc::new(RealConnector)
     };
 
     let registry = Arc::new(Registry::new(connector, sink.clone() as Arc<dyn ReconciliationSink>));
+    let diagnostics = Diagnostics::from_env().map(Arc::new);
 
     // Startup reconciliation (DAEMON-04): scan + seed BEFORE the accept
     // loop below, so any leftover orphan from a crashed predecessor is
@@ -170,8 +178,9 @@ async fn run_inner(config: RunConfig) -> Result<(), DaemonError> {
                 match accepted {
                     Ok(stream) => {
                         let registry_for_conn = Arc::clone(&registry);
+                        let diagnostics_for_conn = diagnostics.clone();
                         tokio::task::spawn_local(async move {
-                            crate::ipc::serve_connection(stream, &registry_for_conn).await;
+                            crate::ipc::serve_connection(stream, &registry_for_conn, diagnostics_for_conn.as_deref()).await;
                         });
                     }
                     Err(err) => {
@@ -216,6 +225,7 @@ async fn run_inner(config: RunConfig) -> Result<(), DaemonError> {
 /// same immediately-resolving behavior as before this plan.
 struct FakeTestSession {
     slow_ms: u64,
+    bootstrap_delay_ms: u64,
 }
 
 impl ManagedSession for FakeTestSession {
@@ -363,7 +373,13 @@ impl ManagedSession for FakeTestSession {
         (1920, 1080)
     }
     fn deploy_and_launch(&self) -> BoxFuture<'_, Result<std::time::Duration, DaemonError>> {
-        Box::pin(async move { Ok(std::time::Duration::from_millis(0)) })
+        let bootstrap_delay_ms = self.bootstrap_delay_ms;
+        Box::pin(async move {
+            if bootstrap_delay_ms > 0 {
+                tokio::time::sleep(Duration::from_millis(bootstrap_delay_ms)).await;
+            }
+            Ok(std::time::Duration::from_millis(0))
+        })
     }
 }
 
@@ -407,12 +423,14 @@ struct FakeTestConnector {
     /// Threaded into every [`FakeTestSession`] this connector produces --
     /// see [`TEST_SLOW_MS_ENV`].
     slow_ms: u64,
+    bootstrap_delay_ms: u64,
 }
 
 impl SessionConnector for FakeTestConnector {
     fn connect(&self, _cfg: ConnectionConfig) -> Pin<Box<dyn Future<Output = Result<Box<dyn ManagedSession>, DaemonError>>>> {
         let slow_ms = self.slow_ms;
-        Box::pin(async move { Ok(Box::new(FakeTestSession { slow_ms }) as Box<dyn ManagedSession>) })
+        let bootstrap_delay_ms = self.bootstrap_delay_ms;
+        Box::pin(async move { Ok(Box::new(FakeTestSession { slow_ms, bootstrap_delay_ms }) as Box<dyn ManagedSession>) })
     }
 }
 
@@ -472,7 +490,7 @@ mod tests {
             None => JsonReconciliationSink::new().expect("platform cache dir should resolve in this test environment"),
         });
 
-        let connector: Arc<dyn SessionConnector> = Arc::new(FakeTestConnector { slow_ms: 0 });
+        let connector: Arc<dyn SessionConnector> = Arc::new(FakeTestConnector { slow_ms: 0, bootstrap_delay_ms: 0 });
         let registry = Arc::new(Registry::new(connector, sink.clone() as Arc<dyn ReconciliationSink>));
 
         let orphans = reconcile::scan_orphans(sink.path());
@@ -496,7 +514,7 @@ mod tests {
     /// method immediately, byte-for-byte the same as before this plan.
     #[tokio::test]
     async fn fake_session_slow_class_methods_resolve_immediately_when_slow_ms_is_zero() {
-        let session = FakeTestSession { slow_ms: 0 };
+        let session = FakeTestSession { slow_ms: 0, bootstrap_delay_ms: 0 };
         let immediate_bound = Duration::from_millis(50);
 
         let start = std::time::Instant::now();
@@ -525,7 +543,7 @@ mod tests {
     #[tokio::test]
     async fn fake_session_slow_class_methods_sleep_the_configured_slow_ms() {
         const SLOW_MS: u64 = 30;
-        let session = FakeTestSession { slow_ms: SLOW_MS };
+        let session = FakeTestSession { slow_ms: SLOW_MS, bootstrap_delay_ms: 0 };
         let bound = Duration::from_millis(SLOW_MS);
 
         let start = std::time::Instant::now();

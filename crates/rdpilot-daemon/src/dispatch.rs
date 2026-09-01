@@ -30,8 +30,16 @@ use rdpilot_ipc::{
     WireWindowState, WireWorldStateOptions,
 };
 
-use crate::registry::Registry;
+use crate::diagnostics::{Diagnostics, Stage};
+use crate::registry::{ConnectLease, Registry};
 use crate::seams::DaemonError;
+
+/// Response plus a private cleanup handle retained only by the IPC server
+/// until the response has crossed the local transport.
+pub(crate) struct DispatchOutcome {
+    pub(crate) response: WireResponse,
+    pub(crate) connect_lease: Option<ConnectLease>,
+}
 
 /// Route one decoded `Request` to `registry` and produce the corresponding
 /// `WireResponse`.
@@ -49,7 +57,17 @@ use crate::seams::DaemonError;
 ///   session via the `ManagedSession` seam (Plan 13-03), converting wire
 ///   DTOs (Plan 13-02) to/from the corresponding SDK types (Plan 13-04).
 pub async fn dispatch(registry: &Registry, req: Request) -> WireResponse {
-    match req {
+    dispatch_for_ipc(registry, req, None).await.response
+}
+
+/// Dispatch one request for the IPC server. Connect is special: the returned
+/// private lease is valid only until the matching Connected frame is written.
+pub(crate) async fn dispatch_for_ipc(
+    registry: &Registry,
+    req: Request,
+    diagnostics: Option<&Diagnostics>,
+) -> DispatchOutcome {
+    let response = match req {
         Request::Connect {
             name,
             host,
@@ -74,7 +92,7 @@ pub async fn dispatch(registry: &Registry, req: Request) -> WireResponse {
             // wire; only this one value is resolved here.
             let share_root = match resolve_share_root() {
                 Ok(path) => path,
-                Err(e) => return WireResponse::Error(e.into()),
+                Err(e) => return DispatchOutcome { response: WireResponse::Error(e.into()), connect_lease: None },
             };
             cfg = cfg.share_root(share_root);
             // Live-diagnosed (Plan 15-06): the sensor binary path is the
@@ -93,12 +111,16 @@ pub async fn dispatch(registry: &Registry, req: Request) -> WireResponse {
                     true
                 }
                 Ok(None) => false,
-                Err(e) => return WireResponse::Error(e.into()),
+                Err(e) => return DispatchOutcome { response: WireResponse::Error(e.into()), connect_lease: None },
             };
-            let session = match registry.open(name, host, cfg).await {
-                Ok(session) => session,
-                Err(e) => return WireResponse::Error(e.into()),
+            let lease = match registry.open_tracked(name, host, cfg).await {
+                Ok(lease) => lease,
+                Err(e) => return DispatchOutcome { response: WireResponse::Error(e.into()), connect_lease: None },
             };
+            let session = lease.id.clone();
+            if let Some(diagnostics) = diagnostics {
+                diagnostics.record(session.as_str(), Stage::RegistryOpened);
+            }
             // Live-diagnosed (Plan 15-06): every `rdpilot`-crate live test
             // calls `deploy_and_launch` explicitly right after connect,
             // before any sensor-mediated request -- this daemon path never
@@ -112,12 +134,22 @@ pub async fn dispatch(registry: &Registry, req: Request) -> WireResponse {
             // sensor-backed verbs to work; a silent partial success would
             // be more confusing than a clear upfront error.
             if sensor_configured {
+                if let Some(diagnostics) = diagnostics {
+                    diagnostics.record(session.as_str(), Stage::SensorBootstrapStarted);
+                }
                 if let Err(e) = registry.call(&session, |s| s.deploy_and_launch()).await {
-                    let _ = registry.close(&session).await;
-                    return WireResponse::Error(e.into());
+                    if matches!(registry.close_if_generation(&lease).await, Ok(true)) {
+                        if let Some(diagnostics) = diagnostics {
+                            diagnostics.record(session.as_str(), Stage::RegistryClosed);
+                        }
+                    }
+                    return DispatchOutcome { response: WireResponse::Error(e.into()), connect_lease: None };
+                }
+                if let Some(diagnostics) = diagnostics {
+                    diagnostics.record(session.as_str(), Stage::SensorBootstrapFinished);
                 }
             }
-            WireResponse::Connected { session }
+            return DispatchOutcome { response: WireResponse::Connected { session }, connect_lease: Some(lease) };
         }
         Request::List {} => WireResponse::SessionList { sessions: registry.list() },
         Request::Disconnect { session } => match registry.close(&session).await {
@@ -212,7 +244,8 @@ pub async fn dispatch(registry: &Registry, req: Request) -> WireResponse {
                 Err(e) => WireResponse::Error(e.into()),
             }
         }
-    }
+    };
+    DispatchOutcome { response, connect_lease: None }
 }
 
 /// Resolve the daemon-local file-transfer staging root (research Pitfall 6)
