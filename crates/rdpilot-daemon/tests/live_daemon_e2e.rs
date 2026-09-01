@@ -42,7 +42,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use rdpilot_ipc::{Request, SessionLifecycle, WireResponse};
+use rdpilot_ipc::{Request, SessionLifecycle, WireResponse, WireUiaMode, WireWorldStateOptions};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 
@@ -310,14 +310,17 @@ async fn connect_list_disconnect_e2e_against_a_real_target() {
             password: target.password.clone(),
             domain: None,
             accept_invalid_certs: true, // lab VM self-signed cert (D-15) -- test-only opt-out
+            connect_ack: true,
         },
     )
     .await
     .expect("write Connect frame");
     let session = match read_connect_response_with_deadline(&mut stream, "live-e2e").await {
-        WireResponse::Connected { session } => session,
+        WireResponse::Connected { session, connect_ack_required: true } => session,
         other => panic!("[FAIL] {name}: expected Connected, got {other:?}"),
     };
+    write_frame(&mut stream, &Request::ConnectAck { session: session.clone() }).await.expect("write ConnectAck");
+    assert!(matches!(read_frame::<WireResponse>(&mut stream).await.expect("read ConnectAck"), WireResponse::Ack));
     println!("[PASS] {name}: connected, session id = {}", session.as_str());
 
     // --- List -> exactly one Live session with the right host/name ---
@@ -335,6 +338,12 @@ async fn connect_list_disconnect_e2e_against_a_real_target() {
         }
         other => panic!("[FAIL] {name}: expected SessionList, got {other:?}"),
     }
+
+    write_frame(&mut stream, &Request::WorldState {
+        session: session.clone(),
+        options: WireWorldStateOptions { screenshot: true, window_list: true, uia: WireUiaMode::Foreground },
+    }).await.expect("write WorldState");
+    assert!(matches!(read_frame::<WireResponse>(&mut stream).await.expect("read WorldState"), WireResponse::WorldState { screenshot: Some(_), window_list: Some(_), uia: Some(_), .. }));
 
     // --- Disconnect -> Ack ---
     write_frame(&mut stream, &Request::Disconnect { session }).await.expect("write Disconnect frame");
@@ -386,12 +395,13 @@ async fn kill_minus_9_mid_session_then_restart_surfaces_the_orphan_which_is_then
             password: target.password.clone(),
             domain: None,
             accept_invalid_certs: true,
+            connect_ack: false,
         },
     )
     .await
     .expect("write Connect frame");
     let session = match read_connect_response_with_deadline(&mut stream_a, "live-orphan").await {
-        WireResponse::Connected { session } => session,
+        WireResponse::Connected { session, .. } => session,
         other => panic!("[FAIL] {name}: expected Connected, got {other:?}"),
     };
     println!("[PASS] {name}: daemon A connected to the real target, session id = {}", session.as_str());

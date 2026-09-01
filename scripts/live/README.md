@@ -20,3 +20,11 @@ test against a fresh, caller-supplied RDP target. It validates the file
 without printing credentials, passes it through `RDPILOT_CONNECTION_FILE`,
 and bounds the run with `RDPILOT_E2E_TIMEOUT` (default: 20 minutes). A normal
 Crabbox Windows build lease is not an RDP E2E target.
+
+The individual Connect response deadline is `RDPILOT_CONNECT_TIMEOUT`, parsed
+by the shared `validate-connect-timeout.sh` helper: it defaults to `60s`
+and accepts only whole-second `s` durations from `45s` through `120s`. This is intentionally
+separate from the whole-suite `RDPILOT_E2E_TIMEOUT`. If that per-Connect
+deadline expires, the harness drops the timed-out connection, reconnects, and
+uses `List` -> conditional `Disconnect` -> required `Ack` -> `List` absence
+verification; it does not kill a daemon and infer cleanup.

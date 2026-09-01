@@ -48,3 +48,23 @@ pub async fn round_trip(req: Request) -> Result<WireResponse, CliError> {
     write_frame(&mut stream, &req).await.map_err(|e| CliError::Transport(e.to_string()))?;
     read_frame(&mut stream).await.map_err(|e| CliError::Transport(e.to_string()))
 }
+
+pub async fn connect_round_trip(req: Request) -> Result<WireResponse, CliError> {
+    let mut stream = open_stream().await?;
+    write_frame(&mut stream, &req).await.map_err(|e| CliError::Transport(e.to_string()))?;
+    let response: WireResponse = read_frame(&mut stream).await.map_err(|e| CliError::Transport(e.to_string()))?;
+    let WireResponse::Connected { session, connect_ack_required } = &response else {
+        return Ok(response);
+    };
+    if *connect_ack_required {
+        write_frame(&mut stream, &Request::ConnectAck { session: session.clone() })
+            .await
+            .map_err(|e| CliError::Transport(e.to_string()))?;
+        match read_frame(&mut stream).await.map_err(|e| CliError::Transport(e.to_string()))? {
+            WireResponse::Ack => {}
+            WireResponse::Error(error) => return Err(CliError::from(error)),
+            other => return Err(CliError::Internal(format!("unexpected response to ConnectAck: {other:?}"))),
+        }
+    }
+    Ok(response)
+}

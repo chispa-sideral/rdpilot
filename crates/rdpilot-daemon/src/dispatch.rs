@@ -76,6 +76,7 @@ pub(crate) async fn dispatch_for_ipc(
             password,
             domain,
             accept_invalid_certs,
+            connect_ack,
         } => {
             let mut cfg = ConnectionConfig::new(host.clone(), username, password).accept_invalid_certs(accept_invalid_certs);
             if let Some(port) = port {
@@ -149,8 +150,14 @@ pub(crate) async fn dispatch_for_ipc(
                     diagnostics.record(session.as_str(), Stage::SensorBootstrapFinished);
                 }
             }
-            return DispatchOutcome { response: WireResponse::Connected { session }, connect_lease: Some(lease) };
+            return DispatchOutcome {
+                response: WireResponse::Connected { session, connect_ack_required: connect_ack },
+                connect_lease: Some(lease),
+            };
         }
+        Request::ConnectAck { .. } => WireResponse::Error(DaemonError::Connect(
+            "ConnectAck is only valid immediately after Connect".to_owned(),
+        ).into()),
         Request::List {} => WireResponse::SessionList { sessions: registry.list() },
         Request::Disconnect { session } => match registry.close(&session).await {
             Ok(()) => WireResponse::Ack,
@@ -634,6 +641,7 @@ mod tests {
             password: "pw".to_owned(),
             domain: None,
             accept_invalid_certs: false,
+            connect_ack: false,
         }
     }
 
@@ -642,7 +650,7 @@ mod tests {
         let registry = test_registry();
         let response = dispatch(&registry, connect_request(Some("web"), "10.0.0.5")).await;
         match response {
-            WireResponse::Connected { session } => assert_eq!(session.as_str(), "web"),
+            WireResponse::Connected { session, .. } => assert_eq!(session.as_str(), "web"),
             other => panic!("expected Connected, got {other:?}"),
         }
     }
@@ -685,7 +693,7 @@ mod tests {
     async fn disconnect_closes_the_session_and_returns_ack() {
         let registry = test_registry();
         let connected = dispatch(&registry, connect_request(Some("web"), "10.0.0.5")).await;
-        let WireResponse::Connected { session } = connected else {
+        let WireResponse::Connected { session, .. } = connected else {
             panic!("expected Connected");
         };
 
@@ -720,7 +728,7 @@ mod tests {
     /// `SessionId`, for the per-verb dispatch tests below.
     async fn connected_session(registry: &Registry) -> SessionId {
         let connected = dispatch(registry, connect_request(Some("web"), "10.0.0.5")).await;
-        let WireResponse::Connected { session } = connected else {
+        let WireResponse::Connected { session, .. } = connected else {
             panic!("expected Connected, got {connected:?}");
         };
         session

@@ -42,7 +42,7 @@ use rmcp::{tool, tool_router};
 use schemars::JsonSchema;
 use serde::Deserialize;
 
-use crate::connect::round_trip_bounded;
+use crate::connect::{connect_round_trip_bounded, round_trip_bounded};
 use crate::error::McpError;
 use crate::handler::RdpilotMcpHandler;
 use crate::timeouts;
@@ -325,7 +325,7 @@ fn require_connect_fields(resolved: &ResolvedConfig) -> Result<(String, String, 
 
 fn render_connected(resp: WireResponse) -> Result<CallToolResult, McpError> {
     match resp {
-        WireResponse::Connected { session } => json_result(&serde_json::json!({ "session": session.as_str() })),
+        WireResponse::Connected { session, .. } => json_result(&serde_json::json!({ "session": session.as_str() })),
         WireResponse::Error(err) => Err(McpError::from(err)),
         other => Err(McpError::invalid_argument(format!("expected Connected, got {other:?}"))),
     }
@@ -465,8 +465,9 @@ impl RdpilotMcpHandler {
             password,
             domain: resolved.domain,
             accept_invalid_certs: resolved.accept_invalid_certs,
+            connect_ack: true,
         };
-        let resp = round_trip_bounded(req, timeouts::CONNECT).await?;
+        let resp = connect_round_trip_bounded(req, timeouts::CONNECT).await?;
         render_connected(resp)
     }
 
@@ -843,7 +844,7 @@ mod tests {
     #[test]
     fn render_connected_renders_the_session_id() {
         let session = SessionId::from_str("brave-otter").expect("fixture");
-        let result = render_connected(WireResponse::Connected { session }).expect("success must render");
+        let result = render_connected(WireResponse::Connected { session, connect_ack_required: false }).expect("success must render");
         assert!(text_of(&result).contains("brave-otter"));
     }
 

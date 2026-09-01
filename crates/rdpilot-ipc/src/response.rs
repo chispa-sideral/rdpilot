@@ -67,6 +67,10 @@ pub enum WireResponse {
     Connected {
         /// The newly opened session's id.
         session: SessionId,
+        /// Whether this client must send the matching `ConnectAck` before
+        /// daemon ownership is transferred.
+        #[serde(default)]
+        connect_ack_required: bool,
     },
     /// A launched process's id (`LaunchProcess`).
     Pid {
@@ -157,6 +161,7 @@ mod tests {
             WireResponse::Ack,
             WireResponse::Connected {
                 session: SessionId::from_str("brave-otter").unwrap_or_else(|_| unreachable!()),
+                connect_ack_required: false,
             },
             WireResponse::Pid { pid: 4242 },
             WireResponse::Screenshot {

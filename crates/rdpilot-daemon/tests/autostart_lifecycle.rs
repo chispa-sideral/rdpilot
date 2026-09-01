@@ -142,10 +142,11 @@ async fn daemon_auto_starts_on_first_connect_and_self_exits_once_the_registry_em
         password: "pw".to_owned(),
         domain: None,
         accept_invalid_certs: false,
+        connect_ack: false,
     };
     write_frame(&mut stream, &connect_req).await.expect("write Connect frame");
     let session = match read_frame::<WireResponse>(&mut stream).await.expect("read Connect response") {
-        WireResponse::Connected { session } => session,
+        WireResponse::Connected { session, .. } => session,
         other => panic!("expected WireResponse::Connected, got {other:?}"),
     };
 

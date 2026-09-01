@@ -33,12 +33,16 @@ pub use rdpilot_ipc::transport::socket_path;
 #[cfg(windows)]
 pub use windows::{accept_and_authorize, bind, socket_path};
 
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::diagnostics::{Diagnostics, Stage};
 use crate::dispatch::dispatch_for_ipc;
 use crate::registry::Registry;
 use rdpilot_ipc::transport::{read_frame, write_frame};
+use rdpilot_ipc::{Request, WireResponse};
+
+const CONNECT_ACK_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Serve one accepted connection: loop `read_frame::<Request>` ->
 /// `dispatch` -> `write_frame::<WireResponse>` until the peer closes the
@@ -77,6 +81,22 @@ where
         if let Some(lease) = outcome.connect_lease {
             if let Some(diagnostics) = diagnostics {
                 diagnostics.record(lease.id.as_str(), Stage::IpcResponseWritten);
+            }
+            if matches!(outcome.response, WireResponse::Connected { connect_ack_required: true, .. }) {
+                match tokio::time::timeout(CONNECT_ACK_TIMEOUT, read_frame::<_, Request>(&mut stream)).await {
+                    Ok(Ok(Request::ConnectAck { session })) if session == lease.id => {
+                        if write_frame(&mut stream, &WireResponse::Ack).await.is_err() {
+                            return;
+                        }
+                    }
+                    _ => {
+                        if let Some(diagnostics) = diagnostics {
+                            diagnostics.record(lease.id.as_str(), Stage::IpcPeerClosed);
+                        }
+                        let _ = registry.close_if_generation(&lease).await;
+                        return;
+                    }
+                }
             }
         }
     }

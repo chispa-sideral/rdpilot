@@ -82,6 +82,15 @@ pub enum Request {
         /// When `true`, the server certificate is accepted without
         /// validation (D-15 risk-named passthrough).
         accept_invalid_certs: bool,
+        /// Opt in to the same-stream ownership acknowledgement used by
+        /// current clients. Missing fields preserve legacy clients.
+        #[serde(default)]
+        connect_ack: bool,
+    },
+    /// Accept a capability-negotiated successful Connect response.
+    ConnectAck {
+        /// The session returned by the preceding Connected response.
+        session: SessionId,
     },
     /// List the sessions currently known to the daemon (D-30, SESSION-03).
     ///
@@ -212,7 +221,8 @@ impl SessionScoped for Request {
     fn session(&self) -> Option<&SessionId> {
         match self {
             Request::Connect { .. } | Request::List {} => None,
-            Request::Disconnect { session }
+            Request::ConnectAck { session }
+            | Request::Disconnect { session }
             | Request::Ping { session }
             | Request::Screenshot { session }
             | Request::LaunchProcess { session, .. }
@@ -312,7 +322,14 @@ mod tests {
         let json = r#"{"op":"Connect","host":"h","username":"u","password":"p","name":null,"port":null,"domain":null,"accept_invalid_certs":false}"#;
         let req: Request = serde_json::from_str(json)?;
         assert!(req.session().is_none());
-        assert!(matches!(req, Request::Connect { .. }));
+        assert!(matches!(req, Request::Connect { connect_ack: false, .. }));
+        Ok(())
+    }
+
+    #[test]
+    fn connect_ack_is_session_scoped() -> Result<(), Box<dyn std::error::Error>> {
+        let req: Request = serde_json::from_str(r#"{"op":"ConnectAck","session":"s"}"#)?;
+        assert_eq!(req.session().map(SessionId::as_str), Some("s"));
         Ok(())
     }
 

@@ -7,7 +7,7 @@
 use rdpilot_ipc::{Request, SessionLifecycle, WireResponse};
 
 use crate::cli::{ConnectArgs, SessionArg};
-use crate::connect::round_trip;
+use crate::connect::{connect_round_trip, round_trip};
 use crate::exit_codes::CliError;
 use crate::render::{print_json, render_table};
 
@@ -41,10 +41,11 @@ pub async fn connect(args: ConnectArgs, json: bool) -> Result<(), CliError> {
         password,
         domain: resolved.domain,
         accept_invalid_certs: resolved.accept_invalid_certs,
+        connect_ack: true,
     };
 
-    match round_trip(req).await? {
-        WireResponse::Connected { session } => {
+    match connect_round_trip(req).await? {
+        WireResponse::Connected { session, .. } => {
             if json {
                 print_json(&serde_json::json!({ "session": session.as_str() }))
             } else {

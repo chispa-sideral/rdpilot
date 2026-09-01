@@ -72,6 +72,26 @@ async fn round_trip(req: Request) -> Result<WireResponse, McpError> {
     read_frame(&mut stream).await.map_err(McpError::transport)
 }
 
+async fn connect_round_trip(req: Request) -> Result<WireResponse, McpError> {
+    let mut stream = open_stream().await?;
+    write_frame(&mut stream, &req).await.map_err(McpError::transport)?;
+    let response: WireResponse = read_frame(&mut stream).await.map_err(McpError::transport)?;
+    let WireResponse::Connected { session, connect_ack_required } = &response else {
+        return Ok(response);
+    };
+    if *connect_ack_required {
+        write_frame(&mut stream, &Request::ConnectAck { session: session.clone() })
+            .await
+            .map_err(McpError::transport)?;
+        match read_frame(&mut stream).await.map_err(McpError::transport)? {
+            WireResponse::Ack => {}
+            WireResponse::Error(error) => return Err(error.into()),
+            other => return Err(McpError::invalid_argument(format!("unexpected response to ConnectAck: {other:?}"))),
+        }
+    }
+    Ok(response)
+}
+
 /// Wrap `fut` in `tokio::time::timeout(bound, fut)`, mapping an elapsed
 /// bound to [`McpError::Timeout`]. Factored out of [`round_trip_bounded`]
 /// so the timeout-mapping behavior itself is directly unit-testable against
@@ -96,6 +116,10 @@ where
 #[allow(dead_code)] // see `open_stream`'s note above
 pub async fn round_trip_bounded(req: Request, bound: Duration) -> Result<WireResponse, McpError> {
     timeout_wrap(bound, round_trip(req)).await
+}
+
+pub async fn connect_round_trip_bounded(req: Request, bound: Duration) -> Result<WireResponse, McpError> {
+    timeout_wrap(bound, connect_round_trip(req)).await
 }
 
 #[cfg(test)]
