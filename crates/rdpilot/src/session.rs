@@ -30,6 +30,7 @@ use ironrdp_input::Database;
 use tokio::sync::mpsc;
 
 use crate::config::ConnectionConfig;
+use crate::BootstrapStage;
 use crate::connect;
 use crate::error::{Error, Result};
 use crate::framebuffer::SharedFrame;
@@ -199,8 +200,8 @@ fn chunk_str(s: &str, max_len: usize) -> Vec<String> {
 fn launch_command() -> String {
     let name = crate::connect::SENSOR_EXE_NAME;
     format!(
-        "cmd /c taskkill /F /IM {name} >nul 2>&1 & timeout /t 1 /nobreak >nul & \
-         cd /d %TEMP% && copy /Y \\\\tsclient\\RDPILOT\\{name} {name} >nul && start \"\" {name}"
+        "cmd /c taskkill /F /IM {name} >nul 2>&1 & timeout /t 1 >nul & \
+         cd /d \"%TEMP%\" && copy /Y \"\\\\tsclient\\RDPILOT\\{name}\" \"{name}\" >nul && start \"\" \"{name}\""
     )
 }
 
@@ -1168,7 +1169,8 @@ impl Session {
         }
 
         Err(Error::bootstrap(format!(
-            "sensor did not respond after {LAUNCH_ATTEMPTS} launch attempt(s),              {PINGS_PER_LAUNCH_ATTEMPT} ping polls each — check RDPDR drive              redirection is enabled on the target, AV/EDR is not blocking the              copied exe, and the launch is reaching the correct interactive              session"
+            "sensor did not respond after {LAUNCH_ATTEMPTS} launch attempt(s), {PINGS_PER_LAUNCH_ATTEMPT} ping polls each; stages={}",
+            self.bootstrap_summary()
         )))
     }
 
@@ -1194,6 +1196,7 @@ impl Session {
     /// resolve between bursts and reliably produces the exact intended
     /// command line.
     async fn inject_launch_sequence(&self) -> Result<()> {
+        self.sensor.bootstrap.record(BootstrapStage::LaunchInputAttempted);
         self.send_key(KeyAction::Combo(vec![Key::Win, Key::R])).await?;
         tokio::time::sleep(RUN_DIALOG_SETTLE).await;
         for chunk in chunk_str(&launch_command(), TYPE_CHUNK_LEN) {
@@ -1201,7 +1204,23 @@ impl Session {
             tokio::time::sleep(TYPE_CHUNK_GAP).await;
         }
         self.send_key(KeyAction::Combo(vec![Key::Enter])).await?;
+        self.sensor.bootstrap.record(BootstrapStage::LaunchInputSent);
         Ok(())
+    }
+
+    /// Snapshot the fixed, redacted bootstrap stages accumulated so far.
+    #[must_use]
+    pub fn bootstrap_stages(&self) -> Vec<BootstrapStage> {
+        self.sensor.bootstrap.snapshot()
+    }
+
+    fn bootstrap_summary(&self) -> String {
+        let stages = self.bootstrap_stages();
+        if stages.is_empty() {
+            "none".to_owned()
+        } else {
+            stages.into_iter().map(BootstrapStage::as_str).collect::<Vec<_>>().join(",")
+        }
     }
 
     /// Capture the latest full-desktop framebuffer as an owned [`Screenshot`].
@@ -2678,6 +2697,12 @@ mod tests {
             "must reference the RDPDR-redirected drive: {cmd}"
         );
         assert!(cmd.contains("%TEMP%"), "must copy to %TEMP%: {cmd}");
+        assert!(cmd.contains(r#"cd /d "%TEMP%""#), "TEMP must be quoted: {cmd}");
+        assert!(
+            cmd.contains(r#""\\tsclient\RDPILOT\rdpilot-sensor.exe" "rdpilot-sensor.exe""#),
+            "redirected source and destination must be quoted: {cmd}"
+        );
+        assert!(cmd.contains(r#"start "" "rdpilot-sensor.exe""#), "started executable must be quoted: {cmd}");
         assert!(cmd.contains("start"), "must start the copied exe: {cmd}");
         assert!(
             cmd.contains(crate::connect::SENSOR_EXE_NAME),
@@ -2746,5 +2771,25 @@ mod tests {
 
         let err = session.deploy_and_launch().await;
         assert!(matches!(err, Err(Error::Session(_))));
+        assert_eq!(session.bootstrap_stages(), vec![BootstrapStage::LaunchInputAttempted]);
+    }
+
+    #[test]
+    fn bootstrap_summary_is_a_compact_redacted_stage_vector() {
+        let sensor = test_sensor();
+        sensor.bootstrap.record(BootstrapStage::RdpdrFileAccess);
+        sensor.bootstrap.record(BootstrapStage::LaunchInputSent);
+        let (input_tx, _input_rx) = mpsc::channel(1);
+        let session = Session {
+            thread: None,
+            input_tx,
+            frame: SharedFrame::new(),
+            input_db: test_input_db(),
+            desktop_size: TEST_DESKTOP_SIZE,
+            sensor,
+            next_req_id: AtomicU64::new(1),
+            share_root: None,
+        };
+        assert_eq!(session.bootstrap_summary(), "rdpdr_file_access,launch_input_sent");
     }
 }

@@ -138,7 +138,15 @@ pub(crate) async fn dispatch_for_ipc(
                 if let Some(diagnostics) = diagnostics {
                     diagnostics.record(session.as_str(), Stage::SensorBootstrapStarted);
                 }
-                if let Err(e) = registry.call(&session, |s| s.deploy_and_launch()).await {
+                let bootstrap = registry.call(&session, |s| s.deploy_and_launch()).await;
+                let bootstrap_stages = registry
+                    .call(&session, |s| Box::pin(async move { Ok(s.bootstrap_stages()) }))
+                    .await
+                    .unwrap_or_default();
+                if let Some(diagnostics) = diagnostics {
+                    diagnostics.record_bootstrap_stages(session.as_str(), &bootstrap_stages);
+                }
+                if let Err(e) = bootstrap {
                     if matches!(registry.close_if_generation(&lease).await, Ok(true)) {
                         if let Some(diagnostics) = diagnostics {
                             diagnostics.record(session.as_str(), Stage::RegistryClosed);

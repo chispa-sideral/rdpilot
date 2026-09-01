@@ -145,10 +145,11 @@ pub(crate) async fn connect(
             })?;
         }
 
-        let drive_backend = crate::rdpdr_backend::RdpilotDriveBackend::new(
+        let drive_backend = crate::rdpdr_backend::RdpilotDriveBackend::new_with_sensor(
             sensor_path.to_path_buf(),
             SENSOR_EXE_NAME,
             share_root,
+            sensor.clone(),
         );
         let rdpdr = Rdpdr::new(Box::new(drive_backend), "rdpilot".to_owned())
             .with_drives(Some(vec![(0, "RDPILOT".to_owned())]));

@@ -30,6 +30,7 @@
 #![deny(clippy::expect_used)]
 
 mod config;
+mod bootstrap;
 mod connect;
 mod error;
 mod framebuffer;
@@ -45,6 +46,7 @@ mod session_loop;
 mod worldstate;
 
 pub use config::ConnectionConfig;
+pub use bootstrap::BootstrapStage;
 pub use error::{Error, Result};
 pub use input::{Button, Key, KeyAction, MouseAction};
 pub use perception::{ProcessInfo, UiaElement, UiaScope, WindowInfo, WindowState};

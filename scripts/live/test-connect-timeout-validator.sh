@@ -32,7 +32,7 @@ connection_file="$tmpdir/connection.json"
 printf '%s\n' '{"host":"192.0.2.1","user":"user","password":"password"}' > "$connection_file"
 cat > "$tmpdir/cargo" <<'SH'
 #!/usr/bin/env bash
-printf '%s\n' "${RDPILOT_CONNECT_TIMEOUT:-missing}" > "$RDPILOT_TIMEOUT_CAPTURE"
+printf '%s:%s\n' "${RDPILOT_CONNECT_TIMEOUT:-missing}" "${RDPILOT_CONNECT_TIMEOUT_SECS:-missing}" > "$RDPILOT_TIMEOUT_CAPTURE"
 SH
 chmod 700 "$tmpdir/cargo"
 
@@ -41,11 +41,11 @@ for raw in '<unset>' 45s 60s 120s; do
   if [[ "$raw" == '<unset>' ]]; then
     env -u RDPILOT_CONNECT_TIMEOUT PATH="$tmpdir:$PATH" RDPILOT_TIMEOUT_CAPTURE="$capture" \
       bash "$root/scripts/live/run-rdp-e2e.sh" "$connection_file"
-    expected=60s
+    expected=60s:60
   else
     PATH="$tmpdir:$PATH" RDPILOT_TIMEOUT_CAPTURE="$capture" RDPILOT_CONNECT_TIMEOUT="$raw" \
       bash "$root/scripts/live/run-rdp-e2e.sh" "$connection_file"
-    expected="$raw"
+    expected="$raw:${raw%s}"
   fi
   [[ "$(<"$capture")" == "$expected" ]] || { echo "wrapper passed wrong timeout for $raw" >&2; exit 1; }
 done

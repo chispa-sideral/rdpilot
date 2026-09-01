@@ -30,6 +30,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use tracing::trace;
 
@@ -52,6 +53,9 @@ use ironrdp_rdpdr::pdu::efs::{
     ServerDriveQueryInformationRequest, ServerDriveQueryVolumeInformationRequest, ServerDriveSetInformationRequest,
 };
 use ironrdp_rdpdr::pdu::esc::{ScardCall, ScardIoCtlCode};
+
+use crate::bootstrap::BootstrapStage;
+use crate::sensor::SensorShared;
 
 /// What a previously-granted RDPDR file id refers to: the drive root (a
 /// directory), a resolved read-only file path, or an in-progress staged
@@ -106,6 +110,7 @@ enum OpenEntry {
 pub(crate) struct RdpilotDriveBackend {
     sensor_path: PathBuf,
     sensor_name: String,
+    sensor: Arc<SensorShared>,
     /// The configured share root, if any (D-10.1). Canonicalized fresh on
     /// every [`RdpilotDriveBackend::resolve_under_root`] call rather than
     /// cached at construction time -- cheap for a per-IRP validator, and
@@ -131,10 +136,21 @@ impl RdpilotDriveBackend {
     /// [`RdpilotDriveBackend::resolve_under_root`] accepts. `sensor_path` is
     /// read lazily (on each `Read` IRP) -- the file does not need to exist
     /// yet at construction time.
+    #[cfg(test)]
     pub(crate) fn new(sensor_path: PathBuf, sensor_name: impl Into<String>, share_root: Option<PathBuf>) -> Self {
+        Self::new_with_sensor(sensor_path, sensor_name, share_root, Arc::new(SensorShared::new()))
+    }
+
+    pub(crate) fn new_with_sensor(
+        sensor_path: PathBuf,
+        sensor_name: impl Into<String>,
+        share_root: Option<PathBuf>,
+        sensor: Arc<SensorShared>,
+    ) -> Self {
         Self {
             sensor_path,
             sensor_name: sensor_name.into(),
+            sensor,
             share_root,
             open_files: HashMap::new(),
             next_file_id: 1,
@@ -319,6 +335,9 @@ impl RdpilotDriveBackend {
 
         let file_id = self.allocate_file_id();
         self.open_files.insert(file_id, entry);
+        if normalized.eq_ignore_ascii_case(&self.sensor_name) {
+            self.sensor.bootstrap.record(BootstrapStage::RdpdrFileAccess);
+        }
         let response = DeviceCreateResponse {
             device_io_reply: DeviceIoResponse::new(device_io_request, NtStatus::SUCCESS),
             file_id,
@@ -468,6 +487,10 @@ impl RdpilotDriveBackend {
             // (API-01, T-05-05).
             Err(_io_error) => (NtStatus::UNSUCCESSFUL, Vec::new()),
         };
+
+        if status == NtStatus::SUCCESS && path == &self.sensor_path {
+            self.sensor.bootstrap.record(BootstrapStage::RdpdrFileRead);
+        }
 
         let response = DeviceReadResponse {
             device_io_reply: DeviceIoResponse::new(device_io_request, status),
@@ -957,6 +980,8 @@ mod tests {
     };
 
     use super::RdpilotDriveBackend;
+    use crate::bootstrap::BootstrapStage;
+    use crate::sensor::SensorShared;
 
     /// Write `bytes` to a fresh temp file and return its path -- the local
     /// "served file" backing store for these tests. Every caller removes it
@@ -1104,6 +1129,35 @@ mod tests {
         assert_eq!(file_id, 0);
 
         let _ = std::fs::remove_file(&served_path);
+    }
+
+    #[test]
+    fn successful_sensor_create_and_read_record_only_the_rdpdr_milestones() {
+        let served_path = write_temp_file(b"payload");
+        let sensor = std::sync::Arc::new(SensorShared::new());
+        let mut backend = RdpilotDriveBackend::new_with_sensor(
+            served_path.clone(),
+            "served.bin",
+            None,
+            sensor.clone(),
+        );
+        let created = backend
+            .handle_drive_io_request(ServerDriveIoRequest::ServerCreateDriveRequest(create_req(1, "\\served.bin")))
+            .expect("sensor create succeeds");
+        let (_, file_id) = create_response_fields(&created[0]);
+        let read = backend
+            .handle_drive_io_request(ServerDriveIoRequest::DeviceReadRequest(DeviceReadRequest {
+                device_io_request: dev_io_req(file_id, MajorFunction::Read),
+                length: 7,
+                offset: 0,
+            }))
+            .expect("sensor read succeeds");
+        assert_eq!(read_response_fields(&read[0]).0, NtStatus::SUCCESS);
+        assert_eq!(
+            sensor.bootstrap.snapshot(),
+            vec![BootstrapStage::RdpdrFileAccess, BootstrapStage::RdpdrFileRead]
+        );
+        let _ = std::fs::remove_file(served_path);
     }
 
     /// A `Read` against a `file_id` that was never granted `OpenEntry::File`

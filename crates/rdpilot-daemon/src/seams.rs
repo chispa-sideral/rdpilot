@@ -212,6 +212,12 @@ pub trait ManagedSession: Send + 'static {
     /// RDPDR copy-and-launch sequence never got a sensor pong within its
     /// own bounded retry budget).
     fn deploy_and_launch(&self) -> BoxFuture<'_, Result<std::time::Duration, DaemonError>>;
+
+    /// Fixed, redacted bootstrap milestones observed by this session. The
+    /// default keeps existing fake sessions source-compatible.
+    fn bootstrap_stages(&self) -> Vec<rdpilot::BootstrapStage> {
+        Vec::new()
+    }
 }
 
 impl ManagedSession for Session {
@@ -297,6 +303,10 @@ impl ManagedSession for Session {
 
     fn deploy_and_launch(&self) -> BoxFuture<'_, Result<std::time::Duration, DaemonError>> {
         Box::pin(async move { self.deploy_and_launch().await.map_err(DaemonError::Sdk) })
+    }
+
+    fn bootstrap_stages(&self) -> Vec<rdpilot::BootstrapStage> {
+        self.bootstrap_stages()
     }
 }
 

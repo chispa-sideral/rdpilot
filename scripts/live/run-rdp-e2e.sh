@@ -39,6 +39,6 @@ timeout_limit="${RDPILOT_E2E_TIMEOUT:-20m}"
 connect_timeout="$($repo_root/scripts/live/validate-connect-timeout.sh "${RDPILOT_CONNECT_TIMEOUT:-}")"
 
 cd "$repo_root"
-RDPILOT_LIVE=1 RDPILOT_CONNECTION_FILE="$connection_file" RDPILOT_CONNECT_TIMEOUT="${connect_timeout}s" \
+RDPILOT_LIVE=1 RDPILOT_CONNECTION_FILE="$connection_file" RDPILOT_CONNECT_TIMEOUT="${connect_timeout}s" RDPILOT_CONNECT_TIMEOUT_SECS="$connect_timeout" \
   timeout --foreground "$timeout_limit" \
   cargo test -p rdpilot-daemon --test live_daemon_e2e -- --ignored --test-threads=1

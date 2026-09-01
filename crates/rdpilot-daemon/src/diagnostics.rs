@@ -1,9 +1,10 @@
 //! Opt-in, redacted Connect lifecycle diagnostics.
 //!
-//! This module intentionally has no request or error-string input. Its fixed
-//! stage enum prevents the diagnostic sink from becoming an accidental path
-//! for RDP target details, credentials, command lines, or sensor payloads.
+//! Its fixed stage enum and numeric attempt correlation prevent the diagnostic
+//! sink from becoming an accidental path for RDP target details, credentials,
+//! command lines, session names, sensor payloads, or error strings.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -25,6 +26,7 @@ pub(crate) enum Stage {
     IpcResponseWritten,
     IpcPeerClosed,
     RegistryClosed,
+    Bootstrap(rdpilot::BootstrapStage),
 }
 
 impl Stage {
@@ -36,6 +38,7 @@ impl Stage {
             Self::IpcResponseWritten => "ipc_response_written",
             Self::IpcPeerClosed => "ipc_peer_closed",
             Self::RegistryClosed => "registry_closed",
+            Self::Bootstrap(stage) => stage.as_str(),
         }
     }
 }
@@ -45,7 +48,7 @@ struct Event {
     schema_version: u8,
     daemon_pid: u32,
     daemon_generation: u64,
-    session_id: String,
+    attempt: u64,
     elapsed_ms: u128,
     stage: String,
 }
@@ -57,6 +60,8 @@ pub(crate) struct Diagnostics {
     started: Instant,
     generation: u64,
     write_lock: Mutex<()>,
+    attempts: Mutex<HashMap<String, u64>>,
+    next_attempt: AtomicU64,
 }
 
 impl Diagnostics {
@@ -82,6 +87,8 @@ impl Diagnostics {
             started: Instant::now(),
             generation: TMP_SUFFIX.fetch_add(1, Ordering::Relaxed),
             write_lock: Mutex::new(()),
+            attempts: Mutex::new(HashMap::new()),
+            next_attempt: AtomicU64::new(1),
         })
     }
 
@@ -101,17 +108,38 @@ impl Diagnostics {
             return;
         };
         let mut events = load_events(&self.path).unwrap_or_default();
+        let attempt = {
+            let mut attempts = match self.attempts.lock() {
+                Ok(attempts) => attempts,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            *attempts
+                .entry(session_id.to_owned())
+                .or_insert_with(|| self.next_attempt.fetch_add(1, Ordering::Relaxed))
+        };
         events.push(Event {
             schema_version: 1,
             daemon_pid: std::process::id(),
             daemon_generation: self.generation,
-            session_id: session_id.to_owned(),
+            attempt,
             elapsed_ms: self.started.elapsed().as_millis(),
             stage: stage.as_str().to_owned(),
         });
         let first = events.len().saturating_sub(MAX_EVENTS);
         let events = &events[first..];
         let _ = save_owner_only(&self.path, events);
+    }
+
+    /// Persist a fixed bootstrap vector. Each element is an enum value owned
+    /// by `rdpilot`, never caller-provided text.
+    pub(crate) fn record_bootstrap_stages(
+        &self,
+        session_id: &str,
+        stages: &[rdpilot::BootstrapStage],
+    ) {
+        for stage in stages {
+            self.record(session_id, Stage::Bootstrap(*stage));
+        }
     }
 }
 
@@ -158,4 +186,45 @@ fn save_owner_only(_path: &Path, _events: &[Event]) -> std::io::Result<()> {
     Err(std::io::Error::other(
         "owner-only diagnostics unavailable on this platform",
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn bootstrap_vector_is_fixed_and_does_not_persist_free_form_text() {
+        let parent = std::env::temp_dir().join(format!(
+            "rdpilot-daemon-diagnostics-test-{}-{}",
+            std::process::id(),
+            TMP_SUFFIX.fetch_add(1, Ordering::Relaxed)
+        ));
+        let path = parent.join("diagnostics.json");
+        let diagnostics = Diagnostics::at_owner_only_path(path.clone()).expect("owner-only diagnostics");
+        let stages = [
+            rdpilot::BootstrapStage::RdpdrFileAccess,
+            rdpilot::BootstrapStage::RdpdrFileRead,
+            rdpilot::BootstrapStage::LaunchInputAttempted,
+            rdpilot::BootstrapStage::LaunchInputSent,
+            rdpilot::BootstrapStage::DvcChannelCreated,
+            rdpilot::BootstrapStage::DvcChannelOpen,
+            rdpilot::BootstrapStage::VersionReceived,
+            rdpilot::BootstrapStage::PingSent,
+            rdpilot::BootstrapStage::PongReceived,
+        ];
+        diagnostics.record_bootstrap_stages("attempt-1", &stages);
+
+        let json = std::fs::read_to_string(path).expect("diagnostics written");
+        let events: Vec<Event> = serde_json::from_str(&json).expect("fixed event schema");
+        assert_eq!(
+            events.iter().map(|event| event.stage.as_str()).collect::<Vec<_>>(),
+            stages.iter().map(|stage| stage.as_str()).collect::<Vec<_>>()
+        );
+        assert!(!json.contains("attempt-1"));
+        assert!(!json.contains("password"));
+        assert!(!json.contains("command"));
+        assert!(!json.contains("path"));
+        std::fs::remove_dir_all(parent).expect("temporary diagnostics removed");
+    }
 }

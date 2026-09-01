@@ -140,6 +140,8 @@ mod tests {
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use crate::bootstrap::{BootstrapProgress, BootstrapStage};
+
 use ironrdp::core::{ensure_size, impl_as_any, Encode, EncodeResult, WriteCursor};
 use ironrdp::dvc::{DvcEncode, DvcMessage, DvcProcessor};
 use ironrdp::pdu::PduResult;
@@ -185,6 +187,7 @@ impl DvcEncode for JsonDvcMessage {}
 /// `Session::ping()` (a later plan) checks this before attempting a round
 /// trip and fails fast with `Error::Dvc` if `Mismatched` — a version skew is
 /// always a clear typed error, never silent corruption (T-04-02).
+#[derive(Debug)]
 pub(crate) enum HandshakeState {
     /// No `Version` reply has been processed yet.
     Pending,
@@ -205,6 +208,7 @@ pub(crate) enum HandshakeState {
 /// (RESEARCH Q1). `std::sync::Mutex` is correct here because both fields are
 /// only ever locked for a brief synchronous mutation, never held across an
 /// `.await`.
+#[derive(Debug)]
 pub(crate) struct SensorShared {
     /// Fields are `pub(crate)` (not accessed via getters): `Session::ping()`
     /// (session.rs) and `RdpilotSensorProcessor::process()` (this module)
@@ -212,6 +216,7 @@ pub(crate) struct SensorShared {
     /// already crate-internal-only (D-09) — no accessor indirection needed.
     pub(crate) pending: Mutex<HashMap<u64, oneshot::Sender<serde_json::Value>>>,
     pub(crate) handshake: Mutex<HandshakeState>,
+    pub(crate) bootstrap: BootstrapProgress,
 }
 
 impl SensorShared {
@@ -221,6 +226,7 @@ impl SensorShared {
         Self {
             pending: Mutex::new(HashMap::new()),
             handshake: Mutex::new(HandshakeState::Pending),
+            bootstrap: BootstrapProgress::new(),
         }
     }
 }
@@ -274,6 +280,10 @@ impl RdpilotSensorProcessor {
         let msg = JsonDvcMessage::new(&envelope)?;
         Ok(vec![Box::new(msg)])
     }
+
+    pub(crate) fn sensor_shared(&self) -> Arc<SensorShared> {
+        self.shared.clone()
+    }
 }
 
 impl DvcProcessor for RdpilotSensorProcessor {
@@ -291,6 +301,7 @@ impl DvcProcessor for RdpilotSensorProcessor {
         let msg = JsonDvcMessage::new(&envelope).map_err(|e| {
             ironrdp::pdu::pdu_other_err!("rdpilot-sensor: version envelope encode failed", source: e)
         })?;
+        self.shared.bootstrap.record(BootstrapStage::DvcChannelCreated);
         Ok(vec![Box::new(msg)])
     }
 
@@ -316,6 +327,7 @@ impl DvcProcessor for RdpilotSensorProcessor {
                         remote: envelope.version,
                     }
                 };
+                self.shared.bootstrap.record(BootstrapStage::VersionReceived);
                 // The handshake is a terminal two-message exchange; no reply.
                 Ok(Vec::new())
             }
@@ -333,6 +345,9 @@ impl DvcProcessor for RdpilotSensorProcessor {
                     Err(poisoned) => poisoned.into_inner(),
                 };
                 if let Some(sender) = pending.remove(&envelope.req_id) {
+                    if envelope.msg_type == MsgType::Pong {
+                        self.shared.bootstrap.record(BootstrapStage::PongReceived);
+                    }
                     // Ignore the Result: the receiver may already be gone if
                     // a caller-side timeout fired first.
                     let _ = sender.send(envelope.payload.unwrap_or(serde_json::Value::Null));
@@ -357,7 +372,7 @@ mod processor_tests {
     /// message (SC#3 first-message guard).
     #[test]
     fn start_emits_single_version_envelope_with_req_id_zero() {
-        let (mut processor, _shared) = fresh_processor();
+        let (mut processor, shared) = fresh_processor();
 
         let messages = processor.start(0).expect("start() succeeds");
         assert_eq!(messages.len(), 1, "start() must emit exactly one message");
@@ -372,6 +387,7 @@ mod processor_tests {
         assert_eq!(decoded.req_id, 0);
         assert_eq!(decoded.version, PROTOCOL_VERSION);
         assert_eq!(decoded.msg_type, MsgType::Version);
+        assert_eq!(shared.bootstrap.snapshot(), vec![BootstrapStage::DvcChannelCreated]);
     }
 
     /// `channel_name()` returns the same reserved constant `connect.rs` uses
@@ -407,6 +423,7 @@ mod processor_tests {
             Err(poisoned) => poisoned.into_inner(),
         };
         assert!(matches!(*handshake, HandshakeState::Ok));
+        assert_eq!(shared.bootstrap.snapshot(), vec![BootstrapStage::VersionReceived]);
     }
 
     /// A mismatched-version `Version` reply sets `HandshakeState::Mismatched`
@@ -477,6 +494,7 @@ mod processor_tests {
             Err(poisoned) => poisoned.into_inner(),
         };
         assert!(!pending.contains_key(&7), "entry must be removed after fulfilling");
+        assert_eq!(shared.bootstrap.snapshot(), vec![BootstrapStage::PongReceived]);
     }
 
     /// A `Version` reply (req_id 0) still drives the handshake state machine

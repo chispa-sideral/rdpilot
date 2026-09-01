@@ -226,7 +226,7 @@ fn build_request_frame(
     req_id: u64,
     payload: Option<serde_json::Value>,
 ) -> Result<Vec<u8>> {
-    let (channel_id, dvc_messages) = {
+    let (channel_id, dvc_messages, sensor) = {
         // Block-scoped: `get_dvc()` borrows `&mut active_stage`; that borrow
         // MUST end before the second `&mut active_stage` call below
         // (Pitfall 3) — this scope is load-bearing.
@@ -242,14 +242,25 @@ fn build_request_frame(
         let dvc_messages = processor
             .encode_request(msg_type, req_id, payload)
             .map_err(|e| Error::Dvc(e.to_string()))?;
-        (channel_id, dvc_messages)
+        (channel_id, dvc_messages, processor.sensor_shared())
     };
     let svc_messages =
         ironrdp::dvc::encode_dvc_messages(channel_id, dvc_messages, ironrdp::svc::ChannelFlags::empty())
             .map_err(|e| Error::Dvc(e.to_string()))?;
-    active_stage
+    let frame = active_stage
         .encode_dvc_messages(svc_messages)
-        .map_err(|e| Error::Dvc(e.to_string()))
+        .map_err(|e| Error::Dvc(e.to_string()))?;
+    record_request_stages(&sensor, msg_type);
+    Ok(frame)
+}
+
+/// Mark only requests that were fully encoded for outbound dispatch. A DVC
+/// lookup or encoding failure therefore cannot claim that a Ping was sent.
+fn record_request_stages(sensor: &crate::sensor::SensorShared, msg_type: crate::sensor::MsgType) {
+    sensor.bootstrap.record(crate::BootstrapStage::DvcChannelOpen);
+    if msg_type == crate::sensor::MsgType::Ping {
+        sensor.bootstrap.record(crate::BootstrapStage::PingSent);
+    }
 }
 
 /// Run the Deactivation-Reactivation sequence and rebuild the framebuffer.
@@ -321,6 +332,7 @@ async fn reactivate(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     /// The keepalive event the loop emits is a well-formed null pointer move
     /// (sanity that the loop's keepalive source is the no-op input, no VM).
@@ -331,5 +343,15 @@ mod tests {
             ev,
             ironrdp::pdu::input::fast_path::FastPathInputEvent::MouseEvent(_)
         ));
+    }
+
+    #[test]
+    fn encoded_ping_dispatch_records_dvc_open_and_ping_sent() {
+        let sensor = Arc::new(crate::sensor::SensorShared::new());
+        record_request_stages(&sensor, crate::sensor::MsgType::Ping);
+        assert_eq!(
+            sensor.bootstrap.snapshot(),
+            vec![crate::BootstrapStage::DvcChannelOpen, crate::BootstrapStage::PingSent]
+        );
     }
 }
