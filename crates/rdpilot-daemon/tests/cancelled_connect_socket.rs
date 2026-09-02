@@ -89,6 +89,7 @@ async fn acknowledge(stream: &mut UnixStream, name: &str) -> rdpilot_ipc::Sessio
         WireResponse::Connected {
             session,
             connect_ack_required: true,
+            ..
         } => session,
         other => panic!("expected provisional Connected, got {other:?}"),
     };

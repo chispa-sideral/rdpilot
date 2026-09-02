@@ -71,6 +71,13 @@ pub enum WireResponse {
         /// daemon ownership is transferred.
         #[serde(default)]
         connect_ack_required: bool,
+        /// Whether the configured sensor completed bootstrap and answered a
+        /// ping before this response was sent. `false` means the connection
+        /// is usable for RDP-only capabilities but no live sensor was
+        /// configured; a configured sensor that fails bootstrap makes
+        /// `Connect` fail instead of returning this response.
+        #[serde(default)]
+        sensor_live: bool,
     },
     /// A launched process's id (`LaunchProcess`).
     Pid {
@@ -162,6 +169,7 @@ mod tests {
             WireResponse::Connected {
                 session: SessionId::from_str("brave-otter").unwrap_or_else(|_| unreachable!()),
                 connect_ack_required: false,
+                sensor_live: true,
             },
             WireResponse::Pid { pid: 4242 },
             WireResponse::Screenshot {

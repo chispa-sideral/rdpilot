@@ -76,7 +76,7 @@ async fn connect_round_trip(req: Request) -> Result<WireResponse, McpError> {
     let mut stream = open_stream().await?;
     write_frame(&mut stream, &req).await.map_err(McpError::transport)?;
     let response: WireResponse = read_frame(&mut stream).await.map_err(McpError::transport)?;
-    let WireResponse::Connected { session, connect_ack_required } = &response else {
+    let WireResponse::Connected { session, connect_ack_required, .. } = &response else {
         return Ok(response);
     };
     if *connect_ack_required {

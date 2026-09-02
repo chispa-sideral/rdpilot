@@ -45,11 +45,15 @@ pub async fn connect(args: ConnectArgs, json: bool) -> Result<(), CliError> {
     };
 
     match connect_round_trip(req).await? {
-        WireResponse::Connected { session, .. } => {
+        WireResponse::Connected { session, sensor_live, .. } => {
             if json {
-                print_json(&serde_json::json!({ "session": session.as_str() }))
+                print_json(&serde_json::json!({ "session": session.as_str(), "sensor_live": sensor_live }))
             } else {
-                println!("connected {}", session.as_str());
+                if sensor_live {
+                    println!("connected {}; sensor live", session.as_str());
+                } else {
+                    println!("connected {}; sensor not configured", session.as_str());
+                }
                 Ok(())
             }
         }

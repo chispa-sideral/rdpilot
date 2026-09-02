@@ -325,7 +325,9 @@ fn require_connect_fields(resolved: &ResolvedConfig) -> Result<(String, String, 
 
 fn render_connected(resp: WireResponse) -> Result<CallToolResult, McpError> {
     match resp {
-        WireResponse::Connected { session, .. } => json_result(&serde_json::json!({ "session": session.as_str() })),
+        WireResponse::Connected { session, sensor_live, .. } => {
+            json_result(&serde_json::json!({ "session": session.as_str(), "sensor_live": sensor_live }))
+        }
         WireResponse::Error(err) => Err(McpError::from(err)),
         other => Err(McpError::invalid_argument(format!("expected Connected, got {other:?}"))),
     }
@@ -842,10 +844,17 @@ mod tests {
     }
 
     #[test]
-    fn render_connected_renders_the_session_id() {
+    fn render_connected_reports_the_sensor_liveness_proof() {
         let session = SessionId::from_str("brave-otter").expect("fixture");
-        let result = render_connected(WireResponse::Connected { session, connect_ack_required: false }).expect("success must render");
-        assert!(text_of(&result).contains("brave-otter"));
+        let result = render_connected(WireResponse::Connected {
+            session,
+            connect_ack_required: false,
+            sensor_live: true,
+        })
+        .expect("success must render");
+        let text = text_of(&result);
+        assert!(text.contains("brave-otter"));
+        assert!(text.contains("\"sensor_live\":true"));
     }
 
     #[test]

@@ -316,7 +316,7 @@ async fn connect_list_disconnect_e2e_against_a_real_target() {
     .await
     .expect("write Connect frame");
     let session = match read_connect_response_with_deadline(&mut stream, "live-e2e").await {
-        WireResponse::Connected { session, connect_ack_required: true } => session,
+        WireResponse::Connected { session, connect_ack_required: true, .. } => session,
         other => panic!("[FAIL] {name}: expected Connected, got {other:?}"),
     };
     write_frame(&mut stream, &Request::ConnectAck { session: session.clone() }).await.expect("write ConnectAck");

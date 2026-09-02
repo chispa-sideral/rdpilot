@@ -159,7 +159,14 @@ pub(crate) async fn dispatch_for_ipc(
                 }
             }
             return DispatchOutcome {
-                response: WireResponse::Connected { session, connect_ack_required: connect_ack },
+                // A successful configured bootstrap has observed a sensor
+                // pong. Surface that fact to clients so they do not infer
+                // sensor readiness merely from an RDP connection.
+                response: WireResponse::Connected {
+                    session,
+                    connect_ack_required: connect_ack,
+                    sensor_live: sensor_configured,
+                },
                 connect_lease: Some(lease),
             };
         }
@@ -654,11 +661,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn connect_dispatches_to_registry_open_and_returns_connected() {
+    async fn connect_reports_sensor_liveness_matching_the_resolved_configuration() {
         let registry = test_registry();
         let response = dispatch(&registry, connect_request(Some("web"), "10.0.0.5")).await;
+        let expected_sensor_live = resolve_sensor_binary_path()
+            .expect("test configuration resolves")
+            .is_some();
         match response {
-            WireResponse::Connected { session, .. } => assert_eq!(session.as_str(), "web"),
+            WireResponse::Connected { session, sensor_live, .. } => {
+                assert_eq!(session.as_str(), "web");
+                assert_eq!(
+                    sensor_live, expected_sensor_live,
+                    "the Connect response must distinguish a verified configured sensor from RDP-only mode"
+                );
+            }
             other => panic!("expected Connected, got {other:?}"),
         }
     }
