@@ -49,16 +49,28 @@ pub async fn connect(args: ConnectArgs, json: bool) -> Result<(), CliError> {
             if json {
                 print_json(&serde_json::json!({ "session": session.as_str(), "sensor_live": sensor_live }))
             } else {
-                if sensor_live {
-                    println!("connected {}; sensor live", session.as_str());
-                } else {
-                    println!("connected {}; sensor not configured", session.as_str());
-                }
+                println!("{}", connect_status_message(session.as_str(), sensor_live));
                 Ok(())
             }
         }
         WireResponse::Error(err) => Err(CliError::from(err)),
         other => Err(CliError::Internal(format!("unexpected response to Connect: {other:?}"))),
+    }
+}
+
+/// Human-readable result for a successful connect.
+///
+/// A session can be usable for basic RDP operations without the optional
+/// sensor executable, but sensor-backed perception and automation will not
+/// work. Make that degraded mode unmissable instead of presenting it as a
+/// routine connection status.
+fn connect_status_message(session: &str, sensor_live: bool) -> String {
+    if sensor_live {
+        format!("connected {session}; sensor live")
+    } else {
+        format!(
+            "connected {session}; WARNING: rdpilot-sensor.exe is unavailable on this local machine; sensor-backed operations will not work (configure sensor_binary_path or RDPILOT_SENSOR_BINARY_PATH)"
+        )
     }
 }
 
@@ -105,6 +117,27 @@ fn lifecycle_str(status: SessionLifecycle) -> &'static str {
         SessionLifecycle::Reconnecting => "Reconnecting",
         SessionLifecycle::Disconnected => "Disconnected",
         SessionLifecycle::Orphaned => "Orphaned",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::connect_status_message;
+
+    #[test]
+    fn unavailable_sensor_status_is_an_actionable_warning() {
+        assert_eq!(
+            connect_status_message("desktop", false),
+            "connected desktop; WARNING: rdpilot-sensor.exe is unavailable on this local machine; sensor-backed operations will not work (configure sensor_binary_path or RDPILOT_SENSOR_BINARY_PATH)"
+        );
+    }
+
+    #[test]
+    fn live_sensor_status_remains_concise() {
+        assert_eq!(
+            connect_status_message("desktop", true),
+            "connected desktop; sensor live"
+        );
     }
 }
 
