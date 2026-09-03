@@ -1,6 +1,6 @@
 ---
 name: rdpilot
-description: Use when you need to inspect, read, or control a remote Windows desktop that is reachable only over RDP — take a screenshot or read the UI Automation tree of a remote machine, list its windows/processes, or drive mouse/keyboard/launch input against a Windows box you cannot SSH into. Not for local/non-RDP GUI automation.
+description: Inspect or control a remote Windows GUI over RDP when the task requires screenshots, UI Automation, window/process inspection, input, launch, or sensor-backed transfer. Not for local GUI automation.
 ---
 
 # rdpilot
@@ -16,11 +16,24 @@ actual RDP session and forwards perception reads (screenshots, UI Automation
 tree, window/process lists) and input writes (click/type/key/launch) to the
 remote machine over the RDP connection.
 
+## Capability result
+
+`connect` can establish either of these successful modes:
+
+- `sensor live`: session management and sensor-backed perception, input, and
+  transfer are available.
+- `sensor not configured`: session management is available; sensor-backed
+  operations are unavailable.
+
+A sensor result describes RDPilot automation only. Use separately observed SSH
+and manual-RDP results for those capabilities. Configure or investigate a
+sensor only when the current task requires sensor-backed operations.
+
 ## Quickstart
 
 ```bash
-# One-time setup (installs rdpilot + rdpilot-daemon, seeds config, installs
-# this skill to both discovery surfaces). Safe to re-run.
+# If the selected capability needs rdpilot and it is not installed, perform
+# this one-time local setup. Safe to re-run.
 scripts/install-local.sh
 
 # Edit the seeded config with YOUR OWN target host + credentials

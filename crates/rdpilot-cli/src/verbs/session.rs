@@ -68,9 +68,7 @@ fn connect_status_message(session: &str, sensor_live: bool) -> String {
     if sensor_live {
         format!("connected {session}; sensor live")
     } else {
-        format!(
-            "connected {session}; WARNING: rdpilot-sensor.exe is unavailable on this local machine; sensor-backed operations will not work (configure sensor_binary_path or RDPILOT_SENSOR_BINARY_PATH)"
-        )
+        format!("connected {session}; sensor not configured; session management available")
     }
 }
 
@@ -125,10 +123,10 @@ mod tests {
     use super::connect_status_message;
 
     #[test]
-    fn unavailable_sensor_status_is_an_actionable_warning() {
+    fn sensorless_status_reports_session_management_only() {
         assert_eq!(
             connect_status_message("desktop", false),
-            "connected desktop; WARNING: rdpilot-sensor.exe is unavailable on this local machine; sensor-backed operations will not work (configure sensor_binary_path or RDPILOT_SENSOR_BINARY_PATH)"
+            "connected desktop; sensor not configured; session management available"
         );
     }
 
