@@ -29,8 +29,8 @@ use ironrdp::pdu::input::fast_path::FastPathInputEvent;
 use ironrdp_input::Database;
 use tokio::sync::mpsc;
 
-use crate::config::ConnectionConfig;
 use crate::BootstrapStage;
+use crate::config::ConnectionConfig;
 use crate::connect;
 use crate::error::{Error, Result};
 use crate::framebuffer::SharedFrame;
@@ -197,12 +197,37 @@ fn chunk_str(s: &str, max_len: usize) -> Vec<String> {
 /// the very first launch in a session) and give the OS a moment to release
 /// the file handle before copying, so every call is idempotent regardless
 /// of prior launches in the same reused session.
+const REMOTE_SENSOR_DEPLOYMENT_DIR: &str = "%TEMP%";
+const SENSOR_LAUNCH_LOG_FILE: &str = "s.log";
+const REMOTE_SENSOR_LAUNCH_LOG_PATH: &str = r#"\\tsclient\RDPILOT\s.log"#;
+
+fn remote_sensor_deployment_path() -> String {
+    format!(r#"{REMOTE_SENSOR_DEPLOYMENT_DIR}\{}"#, crate::connect::SENSOR_EXE_NAME)
+}
+
+fn remote_sensor_deployment_diagnostic_path() -> String {
+    format!(
+        r#"{REMOTE_SENSOR_DEPLOYMENT_DIR}\{}"#,
+        crate::connect::SENSOR_EXE_NAME
+    )
+}
+
 fn launch_command() -> String {
     let name = crate::connect::SENSOR_EXE_NAME;
+    let deployment_path = remote_sensor_deployment_path();
     format!(
-        "cmd /c taskkill /F /IM {name} >nul 2>&1 & timeout /t 1 >nul & \
-         cd /d \"%TEMP%\" && copy /Y \"\\\\tsclient\\RDPILOT\\{name}\" \"{name}\" >nul && start \"\" \"{name}\""
+        "cmd /c taskkill /f /im {name}>nul 2>&1&\
+         copy /y \"\\\\tsclient\\RDPILOT\\{name}\" \"{deployment_path}\">nul&&\
+         \"{deployment_path}\" > \"{REMOTE_SENSOR_LAUNCH_LOG_PATH}\" 2>&1"
     )
+}
+
+fn sensor_open_error(log: &str) -> Option<u32> {
+    let value = log.split_once("LastError=")?.1;
+    let end = value
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(value.len());
+    value[..end].parse().ok()
 }
 
 /// Pure crop-mapping helper behind [`Session::screenshot_window`] (D-6.1),
@@ -305,14 +330,21 @@ pub struct TransferOutcome {
 fn sha256_file(path: &Path) -> Result<String> {
     use sha2::{Digest, Sha256};
 
-    let mut file = fs::File::open(path)
-        .map_err(|e| Error::dvc(format!("failed to open {} for checksum: {e}", path.display())))?;
+    let mut file = fs::File::open(path).map_err(|e| {
+        Error::dvc(format!(
+            "failed to open {} for checksum: {e}",
+            path.display()
+        ))
+    })?;
     let mut hasher = Sha256::new();
     let mut buf = [0u8; 65536];
     loop {
-        let read = file
-            .read(&mut buf)
-            .map_err(|e| Error::dvc(format!("failed to read {} while hashing: {e}", path.display())))?;
+        let read = file.read(&mut buf).map_err(|e| {
+            Error::dvc(format!(
+                "failed to read {} while hashing: {e}",
+                path.display()
+            ))
+        })?;
         if read == 0 {
             break;
         }
@@ -366,7 +398,12 @@ impl Session {
                     .enable_all()
                     .build()
                     .map_err(|e| Error::Session(format!("could not start session runtime: {e}")))?;
-                runtime.block_on(session_loop::run(framed, connection_result, input_rx, loop_frame))
+                runtime.block_on(session_loop::run(
+                    framed,
+                    connection_result,
+                    input_rx,
+                    loop_frame,
+                ))
             })
             .map_err(|e| Error::Session(format!("could not spawn session thread: {e}")))?;
 
@@ -436,7 +473,9 @@ impl Session {
         let gap = match action {
             MouseAction::DoubleClick { .. } => Some(DOUBLE_CLICK_GAP),
             MouseAction::Drag { .. } => Some(DRAG_STEP_GAP),
-            MouseAction::Move { .. } | MouseAction::Click { .. } | MouseAction::Scroll { .. } => None,
+            MouseAction::Move { .. } | MouseAction::Click { .. } | MouseAction::Scroll { .. } => {
+                None
+            }
         };
 
         let batches = crate::input::mouse_operations(&action);
@@ -537,7 +576,9 @@ impl Session {
             }
         } // guard dropped here — never held across the .await below
 
-        let req_id = self.next_req_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let req_id = self
+            .next_req_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let (tx, rx) = tokio::sync::oneshot::channel();
         {
             let mut pending = match self.sensor.pending.lock() {
@@ -550,7 +591,11 @@ impl Session {
         let started = std::time::Instant::now();
 
         self.input_tx
-            .send(RdpInputEvent::Request(crate::sensor::MsgType::Ping, req_id, None))
+            .send(RdpInputEvent::Request(
+                crate::sensor::MsgType::Ping,
+                req_id,
+                None,
+            ))
             .await
             .map_err(|_| Error::dvc("input channel closed"))?;
 
@@ -608,7 +653,9 @@ impl Session {
             }
         } // guard dropped here — never held across the .await below
 
-        let req_id = self.next_req_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let req_id = self
+            .next_req_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let (tx, rx) = tokio::sync::oneshot::channel();
         {
             let mut pending = match self.sensor.pending.lock() {
@@ -630,7 +677,10 @@ impl Session {
                     .and_then(serde_json::Value::as_bool)
                     .unwrap_or(false);
                 if success {
-                    Ok(value.get("data").cloned().unwrap_or(serde_json::Value::Null))
+                    Ok(value
+                        .get("data")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null))
                 } else {
                     let reason = value
                         .get("error")
@@ -661,7 +711,9 @@ impl Session {
                     Err(poisoned) => poisoned.into_inner(),
                 };
                 pending.remove(&req_id);
-                Err(Error::dvc(format!("request timed out after {timeout_ms}ms")))
+                Err(Error::dvc(format!(
+                    "request timed out after {timeout_ms}ms"
+                )))
             }
         }
     }
@@ -683,10 +735,14 @@ impl Session {
     /// closed channel, a malformed reply, or a timeout.
     pub async fn get_window_list(&self) -> Result<Vec<WindowInfo>> {
         let data = self
-            .sensor_request(crate::sensor::MsgType::WindowList, None, ENUMERATION_TIMEOUT_MS)
+            .sensor_request(
+                crate::sensor::MsgType::WindowList,
+                None,
+                ENUMERATION_TIMEOUT_MS,
+            )
             .await?;
-        let wires: Vec<crate::perception::WindowInfoWire> =
-            serde_json::from_value(data).map_err(|e| Error::dvc(format!("malformed WindowList reply: {e}")))?;
+        let wires: Vec<crate::perception::WindowInfoWire> = serde_json::from_value(data)
+            .map_err(|e| Error::dvc(format!("malformed WindowList reply: {e}")))?;
         Ok(wires
             .into_iter()
             .map(crate::perception::WindowInfoWire::into_owned)
@@ -708,10 +764,14 @@ impl Session {
     /// closed channel, a malformed reply, or a timeout.
     pub async fn get_process_tree(&self) -> Result<Vec<ProcessInfo>> {
         let data = self
-            .sensor_request(crate::sensor::MsgType::ProcessTree, None, ENUMERATION_TIMEOUT_MS)
+            .sensor_request(
+                crate::sensor::MsgType::ProcessTree,
+                None,
+                ENUMERATION_TIMEOUT_MS,
+            )
             .await?;
-        let wires: Vec<crate::perception::ProcessInfoWire> =
-            serde_json::from_value(data).map_err(|e| Error::dvc(format!("malformed ProcessTree reply: {e}")))?;
+        let wires: Vec<crate::perception::ProcessInfoWire> = serde_json::from_value(data)
+            .map_err(|e| Error::dvc(format!("malformed ProcessTree reply: {e}")))?;
         Ok(wires
             .into_iter()
             .map(crate::perception::ProcessInfoWire::into_owned)
@@ -759,8 +819,8 @@ impl Session {
                 ENUMERATION_TIMEOUT_MS,
             )
             .await?;
-        let wires: Vec<crate::perception::UiaElementWire> =
-            serde_json::from_value(data).map_err(|e| Error::dvc(format!("malformed Uia reply: {e}")))?;
+        let wires: Vec<crate::perception::UiaElementWire> = serde_json::from_value(data)
+            .map_err(|e| Error::dvc(format!("malformed Uia reply: {e}")))?;
         Ok(wires
             .into_iter()
             .map(crate::perception::UiaElementWire::into_owned)
@@ -838,9 +898,15 @@ impl Session {
                     // titled-only (always-on-top untitled shell chrome
                     // otherwise outranks real app windows in raw z-order),
                     // then minimum `z_order` among those.
-                    let foreground = list.iter().filter(|w| !w.title.is_empty()).min_by_key(|w| w.z_order);
+                    let foreground = list
+                        .iter()
+                        .filter(|w| !w.title.is_empty())
+                        .min_by_key(|w| w.z_order);
                     match foreground {
-                        Some(w) => Some(vec![(w.hwnd, self.get_uia_tree(w.hwnd, UiaScope::Children).await?)]),
+                        Some(w) => Some(vec![(
+                            w.hwnd,
+                            self.get_uia_tree(w.hwnd, UiaScope::Children).await?,
+                        )]),
                         None => Some(vec![]),
                     }
                 }
@@ -915,7 +981,12 @@ impl Session {
     /// — e.g. the exe could not start (D-6.4) — or [`Error::Dvc`] for a
     /// handshake mismatch, a closed channel, a malformed reply, or a
     /// timeout.
-    pub async fn launch_process(&self, exe: &str, args: Option<&str>, cwd: Option<&str>) -> Result<u32> {
+    pub async fn launch_process(
+        &self,
+        exe: &str,
+        args: Option<&str>,
+        cwd: Option<&str>,
+    ) -> Result<u32> {
         let data = self
             .sensor_request(
                 crate::sensor::MsgType::LaunchProcess,
@@ -969,7 +1040,9 @@ impl Session {
     /// computed digest of `local` (D-10.5).
     pub async fn upload_file(&self, local: &Path, remote_name: &str) -> Result<TransferOutcome> {
         let share_root = self.share_root.as_deref().ok_or_else(|| {
-            Error::Config("upload_file requires ConnectionConfig::share_root to be configured".to_owned())
+            Error::Config(
+                "upload_file requires ConnectionConfig::share_root to be configured".to_owned(),
+            )
         })?;
 
         let local_hash = sha256_file(local)?;
@@ -989,7 +1062,11 @@ impl Session {
             "share_name": share_name,
         });
         let result = self
-            .sensor_request(crate::sensor::MsgType::FileTransfer, Some(payload), TRANSFER_TIMEOUT_MS)
+            .sensor_request(
+                crate::sensor::MsgType::FileTransfer,
+                Some(payload),
+                TRANSFER_TIMEOUT_MS,
+            )
             .await;
 
         // Best-effort cleanup regardless of outcome — never leave the
@@ -1000,7 +1077,9 @@ impl Session {
         let bytes_transferred = data
             .get("bytes_transferred")
             .and_then(serde_json::Value::as_u64)
-            .ok_or_else(|| Error::dvc("FileTransfer reply missing/invalid \"bytes_transferred\" field"))?;
+            .ok_or_else(|| {
+                Error::dvc("FileTransfer reply missing/invalid \"bytes_transferred\" field")
+            })?;
         let sensor_sha256 = data
             .get("sha256")
             .and_then(serde_json::Value::as_str)
@@ -1052,7 +1131,9 @@ impl Session {
     /// downloaded local file (D-10.5).
     pub async fn download_file(&self, remote_name: &str, local: &Path) -> Result<TransferOutcome> {
         let share_root = self.share_root.as_deref().ok_or_else(|| {
-            Error::Config("download_file requires ConnectionConfig::share_root to be configured".to_owned())
+            Error::Config(
+                "download_file requires ConnectionConfig::share_root to be configured".to_owned(),
+            )
         })?;
 
         let share_name = self.unique_share_name();
@@ -1064,13 +1145,19 @@ impl Session {
             "share_name": share_name,
         });
         let data = self
-            .sensor_request(crate::sensor::MsgType::FileTransfer, Some(payload), TRANSFER_TIMEOUT_MS)
+            .sensor_request(
+                crate::sensor::MsgType::FileTransfer,
+                Some(payload),
+                TRANSFER_TIMEOUT_MS,
+            )
             .await?;
 
         let bytes_transferred = data
             .get("bytes_transferred")
             .and_then(serde_json::Value::as_u64)
-            .ok_or_else(|| Error::dvc("FileTransfer reply missing/invalid \"bytes_transferred\" field"))?;
+            .ok_or_else(|| {
+                Error::dvc("FileTransfer reply missing/invalid \"bytes_transferred\" field")
+            })?;
         let sensor_sha256 = data
             .get("sha256")
             .and_then(serde_json::Value::as_str)
@@ -1085,7 +1172,10 @@ impl Session {
             // Cross-device destinations can't be renamed (EXDEV) — fall
             // back to copy+remove, same net effect.
             fs::copy(&staged, local).map_err(|e| {
-                Error::dvc(format!("failed to move the downloaded file to {}: {e}", local.display()))
+                Error::dvc(format!(
+                    "failed to move the downloaded file to {}: {e}",
+                    local.display()
+                ))
             })?;
             let _ = fs::remove_file(&staged);
         }
@@ -1109,12 +1199,17 @@ impl Session {
     /// `remote_name`/`local` name so two concurrent transfers on the same
     /// `Session` can never collide under the share root.
     fn unique_share_name(&self) -> String {
-        let counter = self.next_req_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let counter = self
+            .next_req_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        format!("rdpilot-transfer-{nanos}-{}-{counter}.tmp", std::process::id())
+        format!(
+            "rdpilot-transfer-{nanos}-{}-{counter}.tmp",
+            std::process::id()
+        )
     }
 
     /// Deploy and launch the sensor exe in-band over RDPDR + injected input
@@ -1152,6 +1247,7 @@ impl Session {
         tokio::time::sleep(SESSION_SETTLE).await;
 
         for _attempt in 1..=LAUNCH_ATTEMPTS {
+            self.clear_sensor_launch_log();
             self.inject_launch_sequence().await?;
 
             for _poll in 0..PINGS_PER_LAUNCH_ATTEMPT {
@@ -1169,13 +1265,41 @@ impl Session {
         }
 
         Err(Error::bootstrap(format!(
-            "sensor did not respond after {LAUNCH_ATTEMPTS} launch attempt(s), {PINGS_PER_LAUNCH_ATTEMPT} ping polls each; stages={}",
+            "sensor did not respond after {LAUNCH_ATTEMPTS} launch attempt(s), {PINGS_PER_LAUNCH_ATTEMPT} ping polls each; remote_deployment={}; {}; stages={}",
+            remote_sensor_deployment_diagnostic_path(),
+            self.sensor_launch_detail(),
             self.bootstrap_summary()
         )))
     }
 
+    /// Return a redacted, bounded detail from the sensor's redirected stderr.
+    ///
+    /// The remote launcher writes its output into the RDPDR-backed staging
+    /// directory. The sensor's channel-open failure has a stable numeric Win32
+    /// error code, which is enough to distinguish an early channel-open exit
+    /// from a missing/never-started executable without persisting a command,
+    /// target, account, or arbitrary remote output.
+    fn sensor_launch_detail(&self) -> String {
+        let Some(share_root) = self.share_root.as_deref() else {
+            return "sensor_launch_log=unconfigured".to_owned();
+        };
+        let Ok(log) = fs::read_to_string(share_root.join(SENSOR_LAUNCH_LOG_FILE)) else {
+            return "sensor_launch_log=unavailable".to_owned();
+        };
+        match sensor_open_error(&log) {
+            Some(error) => format!("sensor_open_error={error}"),
+            None => "sensor_launch_log=present_without_open_error".to_owned(),
+        }
+    }
+
+    fn clear_sensor_launch_log(&self) {
+        if let Some(share_root) = self.share_root.as_deref() {
+            let _ = fs::remove_file(share_root.join(SENSOR_LAUNCH_LOG_FILE));
+        }
+    }
+
     /// Inject the Win+R launch sequence (D-5.1): open Run, settle, type the
-    /// copy-and-start command in small chunks, press Enter. Applied via the
+    /// copy-and-execute command in small chunks, press Enter. Applied via the
     /// same [`Session::send_key`] path real user input uses — no separate
     /// PDU-building code, no direct `ironrdp_input` construction here.
     ///
@@ -1196,15 +1320,20 @@ impl Session {
     /// resolve between bursts and reliably produces the exact intended
     /// command line.
     async fn inject_launch_sequence(&self) -> Result<()> {
-        self.sensor.bootstrap.record(BootstrapStage::LaunchInputAttempted);
-        self.send_key(KeyAction::Combo(vec![Key::Win, Key::R])).await?;
+        self.sensor
+            .bootstrap
+            .record(BootstrapStage::LaunchInputAttempted);
+        self.send_key(KeyAction::Combo(vec![Key::Win, Key::R]))
+            .await?;
         tokio::time::sleep(RUN_DIALOG_SETTLE).await;
         for chunk in chunk_str(&launch_command(), TYPE_CHUNK_LEN) {
             self.send_key(KeyAction::Type(chunk)).await?;
             tokio::time::sleep(TYPE_CHUNK_GAP).await;
         }
         self.send_key(KeyAction::Combo(vec![Key::Enter])).await?;
-        self.sensor.bootstrap.record(BootstrapStage::LaunchInputSent);
+        self.sensor
+            .bootstrap
+            .record(BootstrapStage::LaunchInputSent);
         Ok(())
     }
 
@@ -1219,7 +1348,11 @@ impl Session {
         if stages.is_empty() {
             "none".to_owned()
         } else {
-            stages.into_iter().map(BootstrapStage::as_str).collect::<Vec<_>>().join(",")
+            stages
+                .into_iter()
+                .map(BootstrapStage::as_str)
+                .collect::<Vec<_>>()
+                .join(",")
         }
     }
 
@@ -1458,7 +1591,9 @@ mod tests {
 
     /// Build a `Session` wired to a real (undrained) channel, so tests can
     /// drain `input_rx` and assert on what `send_mouse` actually sent.
-    fn test_session_with_channel(desktop_size: (u32, u32)) -> (Session, mpsc::Receiver<RdpInputEvent>) {
+    fn test_session_with_channel(
+        desktop_size: (u32, u32),
+    ) -> (Session, mpsc::Receiver<RdpInputEvent>) {
         let (input_tx, input_rx) = mpsc::channel(INPUT_CHANNEL_CAPACITY);
         let session = Session {
             thread: None,
@@ -1488,11 +1623,16 @@ mod tests {
             .await
             .expect("in-range click succeeds");
 
-        let RdpInputEvent::FastPath(events) = input_rx.try_recv().expect("a FastPath message was sent") else {
+        let RdpInputEvent::FastPath(events) =
+            input_rx.try_recv().expect("a FastPath message was sent")
+        else {
             panic!("expected a FastPath event");
         };
         assert!(!events.is_empty());
-        assert!(input_rx.try_recv().is_err(), "Click must send exactly one batch");
+        assert!(
+            input_rx.try_recv().is_err(),
+            "Click must send exactly one batch"
+        );
     }
 
     /// `Scroll` sends a `FastPath` batch containing a wheel event (D-3.3).
@@ -1503,11 +1643,17 @@ mod tests {
         let (session, mut input_rx) = test_session_with_channel((1920, 1080));
 
         session
-            .send_mouse(MouseAction::Scroll { x: 100, y: 100, dy: 120 })
+            .send_mouse(MouseAction::Scroll {
+                x: 100,
+                y: 100,
+                dy: 120,
+            })
             .await
             .expect("in-range scroll succeeds");
 
-        let RdpInputEvent::FastPath(events) = input_rx.try_recv().expect("a FastPath message was sent") else {
+        let RdpInputEvent::FastPath(events) =
+            input_rx.try_recv().expect("a FastPath message was sent")
+        else {
             panic!("expected a FastPath event");
         };
         assert!(events.iter().any(|e| match e {
@@ -1530,7 +1676,10 @@ mod tests {
             })
             .await;
         assert!(matches!(err, Err(Error::CoordinateOutOfBounds { .. })));
-        assert!(input_rx.try_recv().is_err(), "nothing should have been sent");
+        assert!(
+            input_rx.try_recv().is_err(),
+            "nothing should have been sent"
+        );
     }
 
     /// `DoubleClick` synthesizes two single-click sequences, sent as two
@@ -1568,11 +1717,16 @@ mod tests {
             .await
             .expect("Type send succeeds");
 
-        let RdpInputEvent::FastPath(events) = input_rx.try_recv().expect("a FastPath message was sent") else {
+        let RdpInputEvent::FastPath(events) =
+            input_rx.try_recv().expect("a FastPath message was sent")
+        else {
             panic!("expected a FastPath event");
         };
         assert!(!events.is_empty());
-        assert!(input_rx.try_recv().is_err(), "Type must send exactly one batch");
+        assert!(
+            input_rx.try_recv().is_err(),
+            "Type must send exactly one batch"
+        );
     }
 
     /// `send_key(KeyAction::Combo([Ctrl, A]))` sends a single non-empty
@@ -1586,7 +1740,9 @@ mod tests {
             .await
             .expect("Ctrl+A combo send succeeds");
 
-        let RdpInputEvent::FastPath(events) = input_rx.try_recv().expect("a FastPath message was sent") else {
+        let RdpInputEvent::FastPath(events) =
+            input_rx.try_recv().expect("a FastPath message was sent")
+        else {
             panic!("expected a FastPath event");
         };
         assert!(!events.is_empty());
@@ -1603,7 +1759,9 @@ mod tests {
             .await
             .expect("Alt+F4 combo send succeeds");
 
-        let RdpInputEvent::FastPath(events) = input_rx.try_recv().expect("a FastPath message was sent") else {
+        let RdpInputEvent::FastPath(events) =
+            input_rx.try_recv().expect("a FastPath message was sent")
+        else {
             panic!("expected a FastPath event");
         };
         assert!(!events.is_empty());
@@ -1626,7 +1784,9 @@ mod tests {
     /// Build a `Session` wired to a real (undrained) channel with a
     /// caller-supplied `SensorShared`, so `ping()` tests can control the
     /// handshake state (no VM — no real `RdpilotSensorProcessor` involved).
-    fn test_session_with_sensor(sensor: Arc<SensorShared>) -> (Session, mpsc::Receiver<RdpInputEvent>) {
+    fn test_session_with_sensor(
+        sensor: Arc<SensorShared>,
+    ) -> (Session, mpsc::Receiver<RdpInputEvent>) {
         let (input_tx, input_rx) = mpsc::channel(INPUT_CHANNEL_CAPACITY);
         let session = Session {
             thread: None,
@@ -1649,7 +1809,10 @@ mod tests {
         let sensor = Arc::new(SensorShared::new());
         {
             let mut handshake = sensor.handshake.lock().expect("lock");
-            *handshake = crate::sensor::HandshakeState::Mismatched { local: 1, remote: 2 };
+            *handshake = crate::sensor::HandshakeState::Mismatched {
+                local: 1,
+                remote: 2,
+            };
         }
         let (session, mut input_rx) = test_session_with_sensor(sensor);
 
@@ -1703,7 +1866,9 @@ mod tests {
 
         let tx = {
             let mut pending = sensor.pending.lock().expect("lock");
-            pending.remove(&req_id).expect("req_id registered in pending map")
+            pending
+                .remove(&req_id)
+                .expect("req_id registered in pending map")
         };
         tx.send(serde_json::json!({
             "success": true,
@@ -1746,7 +1911,9 @@ mod tests {
         };
         let tx = {
             let mut pending = sensor.pending.lock().expect("lock");
-            pending.remove(&req_id).expect("req_id registered in pending map")
+            pending
+                .remove(&req_id)
+                .expect("req_id registered in pending map")
         };
         tx.send(serde_json::json!({ "success": false, "error": "enum failed" }))
             .expect("reply delivered before the receiver was dropped");
@@ -1754,7 +1921,9 @@ mod tests {
         let err = handle.await.expect("task did not panic");
         match err {
             Err(Error::SensorRejected(msg)) => assert!(msg.contains("enum failed")),
-            other => panic!("expected Err(Error::SensorRejected(_)) mentioning the reason, got {other:?}"),
+            other => panic!(
+                "expected Err(Error::SensorRejected(_)) mentioning the reason, got {other:?}"
+            ),
         }
     }
 
@@ -1767,7 +1936,8 @@ mod tests {
         let sensor = Arc::new(SensorShared::new());
         let (session, mut input_rx) = test_session_with_sensor(sensor.clone());
 
-        let handle = tokio::spawn(async move { session.get_uia_tree(65536, UiaScope::Children).await });
+        let handle =
+            tokio::spawn(async move { session.get_uia_tree(65536, UiaScope::Children).await });
 
         let RdpInputEvent::Request(msg_type, req_id, payload) =
             input_rx.recv().await.expect("a Request was sent")
@@ -1781,7 +1951,9 @@ mod tests {
 
         let tx = {
             let mut pending = sensor.pending.lock().expect("lock");
-            pending.remove(&req_id).expect("req_id registered in pending map")
+            pending
+                .remove(&req_id)
+                .expect("req_id registered in pending map")
         };
         tx.send(canned_uia_reply())
             .expect("reply delivered before the receiver was dropped");
@@ -1802,8 +1974,11 @@ mod tests {
         let sensor = Arc::new(SensorShared::new());
         let (session, mut input_rx) = test_session_with_sensor(sensor.clone());
 
-        let handle =
-            tokio::spawn(async move { session.get_uia_tree(65536, UiaScope::Subtree { max_depth: 3 }).await });
+        let handle = tokio::spawn(async move {
+            session
+                .get_uia_tree(65536, UiaScope::Subtree { max_depth: 3 })
+                .await
+        });
 
         let RdpInputEvent::Request(msg_type, req_id, payload) =
             input_rx.recv().await.expect("a Request was sent")
@@ -1817,7 +1992,9 @@ mod tests {
 
         let tx = {
             let mut pending = sensor.pending.lock().expect("lock");
-            pending.remove(&req_id).expect("req_id registered in pending map")
+            pending
+                .remove(&req_id)
+                .expect("req_id registered in pending map")
         };
         tx.send(canned_uia_reply())
             .expect("reply delivered before the receiver was dropped");
@@ -1835,7 +2012,8 @@ mod tests {
         let sensor = Arc::new(SensorShared::new());
         let (session, mut input_rx) = test_session_with_sensor(sensor.clone());
 
-        let handle = tokio::spawn(async move { session.launch_process("notepad.exe", None, None).await });
+        let handle =
+            tokio::spawn(async move { session.launch_process("notepad.exe", None, None).await });
 
         let RdpInputEvent::Request(msg_type, req_id, payload) =
             input_rx.recv().await.expect("a Request was sent")
@@ -1843,11 +2021,16 @@ mod tests {
             panic!("expected a Request event");
         };
         assert!(matches!(msg_type, crate::sensor::MsgType::LaunchProcess));
-        assert_eq!(payload.expect("launch_process sends a payload")["exe"], "notepad.exe");
+        assert_eq!(
+            payload.expect("launch_process sends a payload")["exe"],
+            "notepad.exe"
+        );
 
         let tx = {
             let mut pending = sensor.pending.lock().expect("lock");
-            pending.remove(&req_id).expect("req_id registered in pending map")
+            pending
+                .remove(&req_id)
+                .expect("req_id registered in pending map")
         };
         tx.send(serde_json::json!({ "success": true, "data": { "pid": 4321 } }))
             .expect("reply delivered before the receiver was dropped");
@@ -1896,15 +2079,26 @@ mod tests {
         let sensor = Arc::new(SensorShared::new());
         let (session, mut input_rx) = test_session_with_sensor(sensor.clone());
 
-        let handle =
-            tokio::spawn(async move { session.sensor_request(crate::sensor::MsgType::FileTransfer, None, TRANSFER_TIMEOUT_MS).await });
+        let handle = tokio::spawn(async move {
+            session
+                .sensor_request(
+                    crate::sensor::MsgType::FileTransfer,
+                    None,
+                    TRANSFER_TIMEOUT_MS,
+                )
+                .await
+        });
 
-        let RdpInputEvent::Request(_, req_id, _) = input_rx.recv().await.expect("a Request was sent") else {
+        let RdpInputEvent::Request(_, req_id, _) =
+            input_rx.recv().await.expect("a Request was sent")
+        else {
             panic!("expected a Request event");
         };
         let tx = {
             let mut pending = sensor.pending.lock().expect("lock");
-            pending.remove(&req_id).expect("req_id registered in pending map")
+            pending
+                .remove(&req_id)
+                .expect("req_id registered in pending map")
         };
         tx.send(serde_json::json!({
             "success": false,
@@ -1926,22 +2120,36 @@ mod tests {
     /// (WindowList/Uia/LaunchProcess never set `error_kind` and must be
     /// completely unaffected).
     #[tokio::test]
-    async fn sensor_request_failure_without_path_traversal_error_kind_still_maps_to_sensor_rejected() {
+    async fn sensor_request_failure_without_path_traversal_error_kind_still_maps_to_sensor_rejected()
+     {
         let sensor = Arc::new(SensorShared::new());
         let (session, mut input_rx) = test_session_with_sensor(sensor.clone());
 
-        let handle =
-            tokio::spawn(async move { session.sensor_request(crate::sensor::MsgType::FileTransfer, None, TRANSFER_TIMEOUT_MS).await });
+        let handle = tokio::spawn(async move {
+            session
+                .sensor_request(
+                    crate::sensor::MsgType::FileTransfer,
+                    None,
+                    TRANSFER_TIMEOUT_MS,
+                )
+                .await
+        });
 
-        let RdpInputEvent::Request(_, req_id, _) = input_rx.recv().await.expect("a Request was sent") else {
+        let RdpInputEvent::Request(_, req_id, _) =
+            input_rx.recv().await.expect("a Request was sent")
+        else {
             panic!("expected a Request event");
         };
         let tx = {
             let mut pending = sensor.pending.lock().expect("lock");
-            pending.remove(&req_id).expect("req_id registered in pending map")
+            pending
+                .remove(&req_id)
+                .expect("req_id registered in pending map")
         };
-        tx.send(serde_json::json!({ "success": false, "error": "copy failed", "error_kind": "io" }))
-            .expect("reply delivered before the receiver was dropped");
+        tx.send(
+            serde_json::json!({ "success": false, "error": "copy failed", "error_kind": "io" }),
+        )
+        .expect("reply delivered before the receiver was dropped");
 
         let err = handle.await.expect("task did not panic");
         assert!(
@@ -1960,7 +2168,10 @@ mod tests {
             .map(|d| d.as_nanos())
             .unwrap_or(0);
         let mut dir = std::env::temp_dir();
-        dir.push(format!("rdpilot-session-test-share-{nanos}-{}", std::process::id()));
+        dir.push(format!(
+            "rdpilot-session-test-share-{nanos}-{}",
+            std::process::id()
+        ));
         fs::create_dir_all(&dir).expect("create test share root");
         dir
     }
@@ -2022,7 +2233,9 @@ mod tests {
         let sensor = Arc::new(SensorShared::new());
         let (session, mut input_rx) = test_session_with_sensor(sensor);
 
-        let err = session.upload_file(Path::new("/does/not/matter"), "dest.txt").await;
+        let err = session
+            .upload_file(Path::new("/does/not/matter"), "dest.txt")
+            .await;
         assert!(matches!(err, Err(Error::Config(_))));
         assert!(
             input_rx.try_recv().is_err(),
@@ -2039,7 +2252,9 @@ mod tests {
         let sensor = Arc::new(SensorShared::new());
         let (session, mut input_rx) = test_session_with_sensor(sensor);
 
-        let err = session.download_file("remote.txt", Path::new("/does/not/matter")).await;
+        let err = session
+            .download_file("remote.txt", Path::new("/does/not/matter"))
+            .await;
         assert!(matches!(err, Err(Error::Config(_))));
         assert!(
             input_rx.try_recv().is_err(),
@@ -2059,10 +2274,15 @@ mod tests {
         let local = share_root.join("local-source.txt");
         fs::write(&local, b"hello upload").expect("write local source");
 
-        let (session, mut input_rx) = test_session_with_sensor_and_share_root(sensor.clone(), share_root.clone());
+        let (session, mut input_rx) =
+            test_session_with_sensor_and_share_root(sensor.clone(), share_root.clone());
         let local_for_task = local.clone();
 
-        let handle = tokio::spawn(async move { session.upload_file(&local_for_task, "nested/dest.txt").await });
+        let handle = tokio::spawn(async move {
+            session
+                .upload_file(&local_for_task, "nested/dest.txt")
+                .await
+        });
 
         let RdpInputEvent::Request(msg_type, req_id, payload) =
             input_rx.recv().await.expect("a Request was sent")
@@ -2078,12 +2298,17 @@ mod tests {
             .expect("share_name present")
             .to_owned();
         assert!(!share_name.is_empty());
-        assert_ne!(share_name, "nested/dest.txt", "the staging name must never reuse the caller's remote_name");
+        assert_ne!(
+            share_name, "nested/dest.txt",
+            "the staging name must never reuse the caller's remote_name"
+        );
 
         let expected_hash = sha256_file(&local).expect("hash local source");
         let tx = {
             let mut pending = sensor.pending.lock().expect("lock");
-            pending.remove(&req_id).expect("req_id registered in pending map")
+            pending
+                .remove(&req_id)
+                .expect("req_id registered in pending map")
         };
         tx.send(serde_json::json!({
             "success": true,
@@ -2115,17 +2340,23 @@ mod tests {
         let local = share_root.join("local-source.txt");
         fs::write(&local, b"hello upload").expect("write local source");
 
-        let (session, mut input_rx) = test_session_with_sensor_and_share_root(sensor.clone(), share_root.clone());
+        let (session, mut input_rx) =
+            test_session_with_sensor_and_share_root(sensor.clone(), share_root.clone());
         let local_for_task = local.clone();
 
-        let handle = tokio::spawn(async move { session.upload_file(&local_for_task, "dest.txt").await });
+        let handle =
+            tokio::spawn(async move { session.upload_file(&local_for_task, "dest.txt").await });
 
-        let RdpInputEvent::Request(_, req_id, _) = input_rx.recv().await.expect("a Request was sent") else {
+        let RdpInputEvent::Request(_, req_id, _) =
+            input_rx.recv().await.expect("a Request was sent")
+        else {
             panic!("expected a Request event");
         };
         let tx = {
             let mut pending = sensor.pending.lock().expect("lock");
-            pending.remove(&req_id).expect("req_id registered in pending map")
+            pending
+                .remove(&req_id)
+                .expect("req_id registered in pending map")
         };
         tx.send(serde_json::json!({
             "success": true,
@@ -2152,23 +2383,32 @@ mod tests {
         let local = share_root.join("local-source.txt");
         fs::write(&local, b"hello upload").expect("write local source");
 
-        let (session, mut input_rx) = test_session_with_sensor_and_share_root(sensor.clone(), share_root.clone());
+        let (session, mut input_rx) =
+            test_session_with_sensor_and_share_root(sensor.clone(), share_root.clone());
         let local_for_task = local.clone();
 
-        let handle = tokio::spawn(async move { session.upload_file(&local_for_task, "dest.txt").await });
+        let handle =
+            tokio::spawn(async move { session.upload_file(&local_for_task, "dest.txt").await });
 
-        let RdpInputEvent::Request(_, req_id, _) = input_rx.recv().await.expect("a Request was sent") else {
+        let RdpInputEvent::Request(_, req_id, _) =
+            input_rx.recv().await.expect("a Request was sent")
+        else {
             panic!("expected a Request event");
         };
         let tx = {
             let mut pending = sensor.pending.lock().expect("lock");
-            pending.remove(&req_id).expect("req_id registered in pending map")
+            pending
+                .remove(&req_id)
+                .expect("req_id registered in pending map")
         };
         tx.send(serde_json::json!({ "success": true, "data": {} }))
             .expect("reply delivered before the receiver was dropped");
 
         let err = handle.await.expect("task did not panic");
-        assert!(matches!(err, Err(Error::Dvc(_))), "expected Error::Dvc, got {err:?}");
+        assert!(
+            matches!(err, Err(Error::Dvc(_))),
+            "expected Error::Dvc, got {err:?}"
+        );
 
         let _ = fs::remove_dir_all(&share_root);
     }
@@ -2187,10 +2427,15 @@ mod tests {
         let dest_dir = test_share_root_dir(); // an independent temp dir standing in for an arbitrary caller destination
         let dest = dest_dir.join("downloaded.txt");
 
-        let (session, mut input_rx) = test_session_with_sensor_and_share_root(sensor.clone(), share_root.clone());
+        let (session, mut input_rx) =
+            test_session_with_sensor_and_share_root(sensor.clone(), share_root.clone());
         let dest_for_task = dest.clone();
 
-        let handle = tokio::spawn(async move { session.download_file("remote/file.txt", &dest_for_task).await });
+        let handle = tokio::spawn(async move {
+            session
+                .download_file("remote/file.txt", &dest_for_task)
+                .await
+        });
 
         let RdpInputEvent::Request(msg_type, req_id, payload) =
             input_rx.recv().await.expect("a Request was sent")
@@ -2215,7 +2460,9 @@ mod tests {
 
         let tx = {
             let mut pending = sensor.pending.lock().expect("lock");
-            pending.remove(&req_id).expect("req_id registered in pending map")
+            pending
+                .remove(&req_id)
+                .expect("req_id registered in pending map")
         };
         tx.send(serde_json::json!({
             "success": true,
@@ -2252,12 +2499,19 @@ mod tests {
         let dest_dir = test_share_root_dir();
         let dest = dest_dir.join("downloaded.txt");
 
-        let (session, mut input_rx) = test_session_with_sensor_and_share_root(sensor.clone(), share_root.clone());
+        let (session, mut input_rx) =
+            test_session_with_sensor_and_share_root(sensor.clone(), share_root.clone());
         let dest_for_task = dest.clone();
 
-        let handle = tokio::spawn(async move { session.download_file("remote/file.txt", &dest_for_task).await });
+        let handle = tokio::spawn(async move {
+            session
+                .download_file("remote/file.txt", &dest_for_task)
+                .await
+        });
 
-        let RdpInputEvent::Request(_, req_id, payload) = input_rx.recv().await.expect("a Request was sent") else {
+        let RdpInputEvent::Request(_, req_id, payload) =
+            input_rx.recv().await.expect("a Request was sent")
+        else {
             panic!("expected a Request event");
         };
         let share_name = payload.expect("download_file sends a payload")["share_name"]
@@ -2269,7 +2523,9 @@ mod tests {
 
         let tx = {
             let mut pending = sensor.pending.lock().expect("lock");
-            pending.remove(&req_id).expect("req_id registered in pending map")
+            pending
+                .remove(&req_id)
+                .expect("req_id registered in pending map")
         };
         tx.send(serde_json::json!({
             "success": true,
@@ -2302,13 +2558,20 @@ mod tests {
         let local = share_root.join("local-source.txt");
         fs::write(&local, b"hello").expect("write local source");
 
-        let (session, _input_rx) = test_session_with_sensor_and_share_root(sensor.clone(), share_root.clone());
+        let (session, _input_rx) =
+            test_session_with_sensor_and_share_root(sensor.clone(), share_root.clone());
 
         let err = session.upload_file(&local, "dest.txt").await;
-        assert!(matches!(err, Err(Error::Dvc(_))), "expected a timeout Error::Dvc, got {err:?}");
+        assert!(
+            matches!(err, Err(Error::Dvc(_))),
+            "expected a timeout Error::Dvc, got {err:?}"
+        );
 
         let pending = sensor.pending.lock().expect("lock");
-        assert!(pending.is_empty(), "the pending entry must be removed on timeout, not leaked");
+        assert!(
+            pending.is_empty(),
+            "the pending entry must be removed on timeout, not leaked"
+        );
         drop(pending);
 
         let _ = fs::remove_dir_all(&share_root);
@@ -2336,9 +2599,12 @@ mod tests {
         assert_eq!(msg_type, expected);
         let tx = {
             let mut pending = sensor.pending.lock().expect("lock");
-            pending.remove(&req_id).expect("req_id registered in pending map")
+            pending
+                .remove(&req_id)
+                .expect("req_id registered in pending map")
         };
-        tx.send(reply).expect("reply delivered before the receiver was dropped");
+        tx.send(reply)
+            .expect("reply delivered before the receiver was dropped");
         payload
     }
 
@@ -2392,7 +2658,8 @@ mod tests {
         let (session, mut input_rx) = test_session_with_sensor(sensor.clone());
         session.frame.write(2, 2, vec![255u8; 2 * 2 * 4]);
 
-        let handle = tokio::spawn(async move { session.world_state(WorldStateOptions::default()).await });
+        let handle =
+            tokio::spawn(async move { session.world_state(WorldStateOptions::default()).await });
 
         drive_one_request(
             &sensor,
@@ -2407,9 +2674,13 @@ mod tests {
             .expect("task did not panic")
             .expect("world_state succeeds with default options");
 
-        let shot = world.screenshot.expect("default options request a screenshot");
+        let shot = world
+            .screenshot
+            .expect("default options request a screenshot");
         assert_eq!((shot.width, shot.height), (2, 2));
-        let windows = world.window_list.expect("default options request the window list");
+        let windows = world
+            .window_list
+            .expect("default options request the window list");
         assert_eq!(windows.len(), 1);
         assert!(world.uia.is_none(), "default options request no UIA");
         assert!(world.capture_span >= Duration::ZERO);
@@ -2439,7 +2710,7 @@ mod tests {
             &mut input_rx,
             crate::sensor::MsgType::WindowList,
             canned_window_list_reply(&[
-                (999, "", 0),                // untitled, topmost by raw z_order -- must be excluded
+                (999, "", 0), // untitled, topmost by raw z_order -- must be excluded
                 (111, "Background Window", 5),
                 (222, "Foreground Window", 2), // minimum z_order among titled windows
             ]),
@@ -2459,7 +2730,10 @@ mod tests {
             "the foreground selection must pick the titled window with the minimum z_order"
         );
 
-        let world = handle.await.expect("task did not panic").expect("world_state succeeds");
+        let world = handle
+            .await
+            .expect("task did not panic")
+            .expect("world_state succeeds");
         assert!(
             world.window_list.is_none(),
             "window_list was not requested, so it must stay None even though fetched internally"
@@ -2512,9 +2786,17 @@ mod tests {
         .await;
         assert_eq!(payload_2.expect("payload present")["hwnd"], 222);
 
-        let world = handle.await.expect("task did not panic").expect("world_state succeeds");
-        assert_eq!(world.window_list.expect("window_list was requested").len(), 2);
-        let uia = world.uia.expect("AllTopLevel requests a UIA group per window");
+        let world = handle
+            .await
+            .expect("task did not panic")
+            .expect("world_state succeeds");
+        assert_eq!(
+            world.window_list.expect("window_list was requested").len(),
+            2
+        );
+        let uia = world
+            .uia
+            .expect("AllTopLevel requests a UIA group per window");
         assert_eq!(uia.len(), 2);
         assert_eq!(uia[0].0, 111);
         assert_eq!(uia[1].0, 222);
@@ -2554,9 +2836,17 @@ mod tests {
         .await;
         assert_eq!(payload_2.expect("payload present")["hwnd"], 222);
 
-        let world = handle.await.expect("task did not panic").expect("world_state succeeds");
-        assert!(world.window_list.is_none(), "Hwnd mode never fetches the window list");
-        let uia = world.uia.expect("Hwnd mode requests a UIA group per handle");
+        let world = handle
+            .await
+            .expect("task did not panic")
+            .expect("world_state succeeds");
+        assert!(
+            world.window_list.is_none(),
+            "Hwnd mode never fetches the window list"
+        );
+        let uia = world
+            .uia
+            .expect("Hwnd mode requests a UIA group per handle");
         assert_eq!(uia.len(), 2);
         assert_eq!(uia[0].0, 111);
         assert_eq!(uia[1].0, 222);
@@ -2573,7 +2863,8 @@ mod tests {
         let (session, mut input_rx) = test_session_with_sensor(sensor.clone());
         session.frame.write(2, 2, vec![255u8; 2 * 2 * 4]);
 
-        let handle = tokio::spawn(async move { session.world_state(WorldStateOptions::default()).await });
+        let handle =
+            tokio::spawn(async move { session.world_state(WorldStateOptions::default()).await });
 
         drive_one_request(
             &sensor,
@@ -2586,7 +2877,9 @@ mod tests {
         let err = handle.await.expect("task did not panic");
         match err {
             Err(Error::SensorRejected(msg)) => assert!(msg.contains("enum failed")),
-            other => panic!("expected Err(Error::SensorRejected(_)) mentioning the reason, got {other:?}"),
+            other => panic!(
+                "expected Err(Error::SensorRejected(_)) mentioning the reason, got {other:?}"
+            ),
         }
     }
 
@@ -2629,7 +2922,12 @@ mod tests {
     #[test]
     fn crop_to_window_in_bounds_matches_rect_and_origin_pixel() {
         let shot = checkerboard(10, 8);
-        let window = test_window(crate::Rect { x: 2, y: 3, w: 4, h: 2 });
+        let window = test_window(crate::Rect {
+            x: 2,
+            y: 3,
+            w: 4,
+            h: 2,
+        });
 
         let cropped = crop_to_window(shot, &window).expect("in-bounds crop succeeds");
         assert_eq!(cropped.width, 4);
@@ -2645,7 +2943,12 @@ mod tests {
     #[test]
     fn crop_to_window_out_of_bounds_returns_typed_error() {
         let shot = checkerboard(10, 8);
-        let window = test_window(crate::Rect { x: 8, y: 0, w: 10, h: 1 });
+        let window = test_window(crate::Rect {
+            x: 8,
+            y: 0,
+            w: 10,
+            h: 1,
+        });
 
         let err = crop_to_window(shot, &window);
         assert!(matches!(err, Err(Error::CropOutOfBounds { .. })));
@@ -2670,7 +2973,12 @@ mod tests {
             next_req_id: AtomicU64::new(1),
             share_root: None,
         };
-        let window = test_window(crate::Rect { x: 1, y: 1, w: 2, h: 2 });
+        let window = test_window(crate::Rect {
+            x: 1,
+            y: 1,
+            w: 2,
+            h: 2,
+        });
 
         let shot = session
             .screenshot_window(&window)
@@ -2686,45 +2994,77 @@ mod tests {
 
     // --- Task 2: deploy_and_launch -- launch-command helper + Error::Bootstrap (D-5.1/D-5.2) ---
 
-    /// The launch command changes to `%TEMP%`, copies the RDPDR-announced
-    /// sensor exe from the redirected `RDPILOT` drive, and starts it (D-5.1)
+    /// The launch command copies the RDPDR-announced
+    /// sensor exe from the redirected `RDPILOT` drive, and executes it (D-5.1)
     /// — pure, offline-testable, no VM.
     #[test]
-    fn launch_command_references_redirected_drive_temp_dest_and_start() {
+    fn launch_command_references_redirected_drive_temp_dest_and_sensor_execution() {
         let cmd = launch_command();
         assert!(
             cmd.contains(r"\tsclient\RDPILOT"),
             "must reference the RDPDR-redirected drive: {cmd}"
         );
-        assert!(cmd.contains("%TEMP%"), "must copy to %TEMP%: {cmd}");
-        assert!(cmd.contains(r#"cd /d "%TEMP%""#), "TEMP must be quoted: {cmd}");
         assert!(
-            cmd.contains(r#""\\tsclient\RDPILOT\rdpilot-sensor.exe" "rdpilot-sensor.exe""#),
+            cmd.contains(REMOTE_SENSOR_DEPLOYMENT_DIR),
+            "must copy to the stable remote deployment directory: {cmd}"
+        );
+        assert!(
+            cmd.contains(&format!(
+                r#""\\tsclient\RDPILOT\rdpilot-sensor.exe" "{}""#,
+                remote_sensor_deployment_path()
+            )),
             "redirected source and destination must be quoted: {cmd}"
         );
-        assert!(cmd.contains(r#"start "" "rdpilot-sensor.exe""#), "started executable must be quoted: {cmd}");
-        assert!(cmd.contains("start"), "must start the copied exe: {cmd}");
+        assert!(
+            cmd.contains(&format!(
+                r#""{}" >"#,
+                remote_sensor_deployment_path()
+            )),
+            "executed sensor path must be quoted: {cmd}"
+        );
+        assert!(
+            cmd.contains(REMOTE_SENSOR_LAUNCH_LOG_PATH),
+            "sensor stderr must be captured through the RDPDR share: {cmd}"
+        );
         assert!(
             cmd.contains(crate::connect::SENSOR_EXE_NAME),
             "must reference the RDPDR-announced sensor filename (Task 1) so the two can never drift apart: {cmd}"
         );
+        assert_eq!(
+            remote_sensor_deployment_diagnostic_path(),
+            r#"%TEMP%\rdpilot-sensor.exe"#,
+            "diagnostics must name the stable remote target without exposing a user profile"
+        );
+    }
+
+    #[test]
+    fn sensor_open_error_extracts_only_the_numeric_win32_code() {
+        assert_eq!(
+            sensor_open_error("[rdpilot-sensor] WTSVirtualChannelOpenEx failed (LastError=31)."),
+            Some(31)
+        );
+        assert_eq!(sensor_open_error("LastError=not-a-number"), None);
+        assert_eq!(sensor_open_error("no channel error"), None);
     }
 
     /// The Run dialog/ShellExecute path has a MAX_PATH-sized command buffer.
-    /// Keep this below that limit after expanding a long Crabbox-style TEMP
-    /// path, so its trailing executable name cannot be truncated.
+    /// Keep this below that limit even when the remote local-app-data path is
+    /// long: the command expands that environment value inside `cmd.exe`,
+    /// after the Run dialog has accepted this short command line.
     #[test]
     fn launch_command_fits_run_dialog_limit_with_long_temp_path() {
         const WINDOWS_RUN_COMMAND_LIMIT: usize = 260;
-        const LONG_CRABBOX_TEMP: &str =
-            r"C:\Users\crabbox.very-long-machine-name\AppData\Local\Temp\2";
-
-        let expanded = launch_command().replace("%TEMP%", LONG_CRABBOX_TEMP);
+        let command = launch_command();
 
         assert!(
-            expanded.len() < WINDOWS_RUN_COMMAND_LIMIT,
-            "expanded launch command is {} bytes, but must stay below the {WINDOWS_RUN_COMMAND_LIMIT}-byte Run/ShellExecute limit: {expanded}",
-            expanded.len(),
+            command.len() < WINDOWS_RUN_COMMAND_LIMIT,
+            "launch command is {} bytes, but must stay below the {WINDOWS_RUN_COMMAND_LIMIT}-byte Run/ShellExecute limit: {command}",
+            command.len(),
+        );
+        assert_eq!(
+            command.matches("%TEMP%").count(),
+            2,
+            "the remote temp path must be used only for the copied executable and its launch: {command}"
         );
     }
 
@@ -2771,7 +3111,10 @@ mod tests {
 
         let err = session.deploy_and_launch().await;
         assert!(matches!(err, Err(Error::Session(_))));
-        assert_eq!(session.bootstrap_stages(), vec![BootstrapStage::LaunchInputAttempted]);
+        assert_eq!(
+            session.bootstrap_stages(),
+            vec![BootstrapStage::LaunchInputAttempted]
+        );
     }
 
     #[test]
@@ -2790,6 +3133,9 @@ mod tests {
             next_req_id: AtomicU64::new(1),
             share_root: None,
         };
-        assert_eq!(session.bootstrap_summary(), "rdpdr_file_access,launch_input_sent");
+        assert_eq!(
+            session.bootstrap_summary(),
+            "rdpdr_file_access,launch_input_sent"
+        );
     }
 }
