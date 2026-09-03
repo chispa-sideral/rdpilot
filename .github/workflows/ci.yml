@@ -31,7 +31,7 @@ jobs:
     needs: [linux, windows-dacl]
     environment: devtest-e2e
     if: >-
-      github.event_name == 'push' && github.repository == 'lachispa/rdpilot' &&
+      github.event_name == 'push' && github.repository == 'chispa-sideral/rdpilot' &&
       vars.AZURE_DEVTEST_LABS_ID != '' && vars.RDPILOT_DEVTEST_NSG_ID != '' &&
       vars.RDPILOT_DEVTEST_FORMULA != ''
     runs-on: ubuntu-latest
