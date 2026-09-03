@@ -26,7 +26,7 @@ from typing import Any
 API_VERSION = '2018-09-15'
 NETWORK_API_VERSION = '2024-05-01'
 REQUIRED_ENV = ('AZURE_DEVTEST_LABS_ID', 'RDPILOT_DEVTEST_NSG_ID', 'RDPILOT_DEVTEST_FORMULA')
-LAB_ID = re.compile(r'^/subscriptions/[^/]+/resourceGroups/[^/]+/providers/Microsoft\\.DevTestLab/labs/[^/]+$', re.I)
+LAB_ID = re.compile(r'^/subscriptions/[^/]+/resourceGroups/[^/]+/providers/Microsoft\.DevTestLab/labs/[^/]+$', re.I)
 NOT_FOUND = re.compile(r'(?:\bResourceNotFound\b|\bHTTP\s*404\b|\bStatus\s*Code:\s*404\b)', re.I)
 
 
@@ -135,7 +135,7 @@ def required_config() -> tuple[str, str, str]:
         fail('devtest-configuration-missing')
     if not LAB_ID.fullmatch(values[0]):
         fail('devtest-lab-id-invalid')
-    if not re.fullmatch(r'/subscriptions/[^/]+/resourceGroups/[^/]+/providers/Microsoft\\.Network/networkSecurityGroups/[^/]+', values[1], re.I):
+    if not re.fullmatch(r'/subscriptions/[^/]+/resourceGroups/[^/]+/providers/Microsoft\.Network/networkSecurityGroups/[^/]+', values[1], re.I):
         # Require a resource ID rather than accepting a name that could resolve elsewhere.
         fail('devtest-nsg-id-invalid')
     return values

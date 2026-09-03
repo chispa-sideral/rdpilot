@@ -109,5 +109,28 @@ class CleanupTests(unittest.TestCase):
         self.assertEqual(observed, ['present'])
 
 
+class RequiredConfigTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.values = {
+            'AZURE_DEVTEST_LABS_ID': '/subscriptions/s/resourceGroups/rg/providers/Microsoft.DevTestLab/labs/lab',
+            'RDPILOT_DEVTEST_NSG_ID': '/subscriptions/s/resourceGroups/rg/providers/Microsoft.Network/networkSecurityGroups/nsg',
+            'RDPILOT_DEVTEST_FORMULA': 'formula',
+        }
+
+    def test_valid_arm_resource_ids_are_accepted(self) -> None:
+        with patch.dict(RUNNER.os.environ, self.values, clear=True):
+            self.assertEqual(RUNNER.required_config(), tuple(self.values.values()))
+
+    def test_malformed_lab_provider_is_rejected(self) -> None:
+        values = {**self.values, 'AZURE_DEVTEST_LABS_ID': self.values['AZURE_DEVTEST_LABS_ID'].replace('Microsoft.DevTestLab', 'Microsoft-DevTestLab')}
+        with patch.dict(RUNNER.os.environ, values, clear=True), self.assertRaisesRegex(RUNNER.LeaseError, 'devtest-lab-id-invalid'):
+            RUNNER.required_config()
+
+    def test_malformed_nsg_provider_is_rejected(self) -> None:
+        values = {**self.values, 'RDPILOT_DEVTEST_NSG_ID': self.values['RDPILOT_DEVTEST_NSG_ID'].replace('Microsoft.Network', 'Microsoft-Network')}
+        with patch.dict(RUNNER.os.environ, values, clear=True), self.assertRaisesRegex(RUNNER.LeaseError, 'devtest-nsg-id-invalid'):
+            RUNNER.required_config()
+
+
 if __name__ == '__main__':
     unittest.main()
