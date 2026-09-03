@@ -45,7 +45,6 @@ jobs:
       RDPILOT_DEVTEST_NSG_ID: ${{ vars.RDPILOT_DEVTEST_NSG_ID }}
       RDPILOT_DEVTEST_FORMULA: ${{ vars.RDPILOT_DEVTEST_FORMULA }}
       RDPILOT_E2E_TIMEOUT: 20m
-      RDPILOT_DEVTEST_STATE: ${{ runner.temp }}/rdpilot-devtest-lease.json
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -56,6 +55,7 @@ jobs:
           subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
       - name: Run bounded DevTest RDP E2E
         run: >-
+          RDPILOT_DEVTEST_STATE="$RUNNER_TEMP/rdpilot-devtest-lease.json";
           python3 scripts/e2e/devtest-rdp-e2e.py run
           --state "$RDPILOT_DEVTEST_STATE"
           --lease-expiry 45m
@@ -64,6 +64,7 @@ jobs:
       - name: Release any persisted DevTest lease
         if: always()
         run: >-
+          RDPILOT_DEVTEST_STATE="$RUNNER_TEMP/rdpilot-devtest-lease.json";
           test ! -f "$RDPILOT_DEVTEST_STATE" ||
           timeout --foreground 10m
           python3 scripts/e2e/devtest-rdp-e2e.py cleanup
