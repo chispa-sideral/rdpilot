@@ -29,6 +29,7 @@ jobs:
   devtest-rdp-e2e:
     name: DevTest Labs RDP E2E
     needs: [linux, windows-dacl]
+    environment: devtest-e2e
     if: >-
       github.event_name == 'push' && github.repository == 'lachispa/rdpilot' &&
       vars.AZURE_DEVTEST_LABS_ID != '' && vars.RDPILOT_DEVTEST_NSG_ID != '' &&

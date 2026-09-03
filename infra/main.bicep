@@ -70,6 +70,7 @@ resource labVirtualNetwork 'Microsoft.DevTestLab/labs/virtualNetworks@2018-09-15
   name: virtualNetworkName
   properties: {
     description: 'GitHub Actions DevTest E2E network'
+    externalProviderResourceId: virtualNetwork.id
     subnetOverrides: [
       {
         labSubnetName: subnetName
