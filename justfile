@@ -20,15 +20,10 @@ daemon-test:
 install-local:
     ./scripts/install-local.sh
 
-# Leases one short-lived shared-infrastructure Azure Windows VM, bootstraps
-# missing official Rust/MSVC tools, then runs the Windows-only DACL gate.
+# Runs the Windows-only DACL gate on the GitHub-hosted Windows runner.
 windows-dacl:
-    ./scripts/live/run-crabbox-windows-dacl.sh
+    pwsh -NoProfile -File ./scripts/ci/run-windows-dacl.ps1
 
-# Same lease and bootstrap, without the DACL test; useful to prove image setup.
-windows-build-host:
-    RDPILOT_DACL_SETUP_ONLY=1 ./scripts/live/run-crabbox-windows-dacl.sh
-
-# Requires a fresh caller-owned connection JSON; never falls back to .secrets.
-rdp-e2e connection_file:
-    ./scripts/live/run-rdp-e2e.sh "{{connection_file}}"
+# Creates, uses, and removes a bounded DevTest Labs target using workflow env.
+rdp-e2e state_file:
+    python3 ./scripts/e2e/devtest-rdp-e2e.py run --state "{{state_file}}"

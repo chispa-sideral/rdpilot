@@ -1,120 +1,55 @@
-// rdpilot test target — declarative provisioning (ENV-01).
-//
-// Deploys, into a single resource group so `az group delete` cascades (Pitfall 5):
-//   VNet + subnet, NSG (RDP 3389 + WinRM 5986 scoped to the dev IP),
-//   Standard/Static public IP, NIC, and a WS2022 Datacenter Gen2 Desktop VM.
-//
-// All API versions are pinned explicitly (no "latest" API).
-//
-// AUTO-DESTROY TOPOLOGY (ENV-03): SEPARATE-MANAGEMENT (Task 1 decision).
-// The Automation Account + runbook + daily schedule live in a PERSISTENT
-// management resource group that OUTLIVES the disposable TEST RG. Its
-// system-assigned managed identity is granted Contributor over the TEST RG
-// ONLY (tightest least-privilege — never the full-access subscription role).
-// Because the
-// deleter is not inside the RG it deletes, the job host survives the delete
-// and the final job status reports cleanly (avoids self-delete caveat,
-// RESEARCH.md Pitfall 4). The management RG is NOT torn down by `down`.
-//
-// Scope: resourceGroup (default for `az deployment group create`). This template
-// is deployed INTO the TEST RG; the management-RG resources are declared via a
-// module scoped to the management RG (see below).
+// CI-only Azure DevTest Labs foundation for the final RDP E2E gate.
+// It deliberately has no standing inbound allow rule. The E2E runner creates
+// and removes one lease-owned RDP /32 rule for the VM's private address.
 targetScope = 'resourceGroup'
 
-// ---------------------------------------------------------------------------
-// Parameters
-// ---------------------------------------------------------------------------
+@description('Azure DevTest Labs instance used only by GitHub Actions E2E.')
+param labName string = 'rdpilot-ci'
 
-@secure()
-@description('Admin/automation account password. Passed by manage-env.ps1 at up-time; never defaulted, never logged, never committed (D-06). @secure() keeps it out of ARM deployment history.')
-param adminPassword string
+@description('Formula selected by the GitHub Actions DevTest runner.')
+param formulaName string = 'rdpilot-rdp-e2e'
 
-@description('Local admin / automation username on the VM.')
-param adminUsername string = 'rdpadmin'
+@description('Virtual network name dedicated to the lab workload.')
+param virtualNetworkName string = 'rdpilot-ci-vnet'
 
-@description('Developer public IP, detected at up-time by manage-env.ps1 (D-05). NSG scopes RDP/WinRM to this single source only — never the open internet.')
-param allowedSourceIp string
+@description('Subnet that holds ephemeral DevTest VMs.')
+param subnetName string = 'devtest'
 
-@description('VM size. Default Standard_B2ms (D-02). One-flag switch to Standard_D2s_v5 if burst throttling distorts later-phase latency (Pitfall 6).')
-param vmSize string = 'Standard_B2ms'
+@description('Address range of the DevTest virtual network.')
+param virtualNetworkPrefix string = '10.42.0.0/16'
 
-@description('Azure region. Defaults to the resource group location.')
+@description('Address range of the DevTest VM subnet.')
+param subnetPrefix string = '10.42.1.0/24'
+
+@description('NSG used exclusively by the DevTest VM subnet.')
+param workloadNsgName string = 'rdpilot-ci-workload-nsg'
+
+@description('Windows VM size encoded in the formula.')
+param vmSize string = 'Standard_D2s_v5'
+
 param location string = resourceGroup().location
 
-@description('Public URL where Configure-Target.ps1 is published at deploy time (raw URL or storage-blob URL). Supplied by manage-env.ps1 in Plan 04; consumed by the CustomScriptExtension fileUris.')
-param scriptUri string
-
-// ---------------------------------------------------------------------------
-// Auto-destroy parameters (ENV-03, separate-management topology)
-// ---------------------------------------------------------------------------
-
-@description('Name of the PERSISTENT management resource group that holds the auto-destroy Automation Account + runbook. This RG is NOT torn down by `down`; it outlives the disposable TEST RG. Created/managed by manage-env.ps1.')
-param managementResourceGroupName string = 'rdpilot-mgmt'
-
-@description('Name of the Automation Account (in the management RG) that runs the auto-destroy runbook.')
-param automationAccountName string = 'rdpilot-autodestroy'
-
-@description('Daily auto-destroy fire time (TTL). ISO-8601 datetime for the FIRST schedule occurrence; the schedule then recurs every 1 day. Must be in the future at deploy time. Defaults to ~1 day after deployment.')
-param autoDestroyStartTime string = dateTimeAdd(utcNow(), 'P1D')
-
-@description('Read-only SAS blob URI of the published Delete-ResourceGroup.ps1 (the auto-destroy runbook body). Minted per-deploy by manage-env.ps1 from the in-repo source, so the runbook is pinned to the repo rather than fetched from "latest" off the internet. Only needs to be reachable during deployment (Automation imports the content at publish time).')
-param deleteRunbookContentUri string
-
-// ---------------------------------------------------------------------------
-// Networking
-// ---------------------------------------------------------------------------
-
-resource nsg 'Microsoft.Network/networkSecurityGroups@2024-05-01' = {
-  name: 'rdpilot-nsg'
+resource workloadNsg 'Microsoft.Network/networkSecurityGroups@2024-05-01' = {
+  name: workloadNsgName
   location: location
-  properties: {
-    securityRules: [
-      {
-        name: 'allow-rdp'
-        properties: {
-          priority: 1000
-          access: 'Allow'
-          direction: 'Inbound'
-          protocol: 'Tcp'
-          sourcePortRange: '*'
-          destinationPortRange: '3389'
-          sourceAddressPrefix: allowedSourceIp
-          destinationAddressPrefix: '*'
-        }
-      }
-      {
-        name: 'allow-winrm-https'
-        properties: {
-          priority: 1010
-          access: 'Allow'
-          direction: 'Inbound'
-          protocol: 'Tcp'
-          sourcePortRange: '*'
-          destinationPortRange: '5986'
-          sourceAddressPrefix: allowedSourceIp
-          destinationAddressPrefix: '*'
-        }
-      }
-    ]
-  }
 }
 
-resource vnet 'Microsoft.Network/virtualNetworks@2024-05-01' = {
-  name: 'rdpilot-vnet'
+resource virtualNetwork 'Microsoft.Network/virtualNetworks@2024-05-01' = {
+  name: virtualNetworkName
   location: location
   properties: {
     addressSpace: {
       addressPrefixes: [
-        '10.0.0.0/16'
+        virtualNetworkPrefix
       ]
     }
     subnets: [
       {
-        name: 'default'
+        name: subnetName
         properties: {
-          addressPrefix: '10.0.0.0/24'
+          addressPrefix: subnetPrefix
           networkSecurityGroup: {
-            id: nsg.id
+            id: workloadNsg.id
           }
         }
       }
@@ -122,176 +57,59 @@ resource vnet 'Microsoft.Network/virtualNetworks@2024-05-01' = {
   }
 }
 
-resource publicIp 'Microsoft.Network/publicIPAddresses@2024-05-01' = {
-  name: 'rdpilot-pip'
+resource lab 'Microsoft.DevTestLab/labs@2018-09-15' = {
+  name: labName
   location: location
-  sku: {
-    name: 'Standard'
-  }
   properties: {
-    publicIPAllocationMethod: 'Static'
+    labStorageType: 'Standard'
   }
 }
 
-resource nic 'Microsoft.Network/networkInterfaces@2024-05-01' = {
-  name: 'rdpilot-nic'
-  location: location
+resource labVirtualNetwork 'Microsoft.DevTestLab/labs/virtualNetworks@2018-09-15' = {
+  parent: lab
+  name: virtualNetworkName
   properties: {
-    ipConfigurations: [
+    description: 'GitHub Actions DevTest E2E network'
+    subnetOverrides: [
       {
-        name: 'ipconfig1'
-        properties: {
-          privateIPAllocationMethod: 'Dynamic'
-          subnet: {
-            id: vnet.properties.subnets[0].id
-          }
-          publicIPAddress: {
-            id: publicIp.id
-          }
-        }
+        labSubnetName: subnetName
+        resourceId: '${virtualNetwork.id}/subnets/${subnetName}'
+        useInVmCreationPermission: 'Allow'
+        usePublicIpAddressPermission: 'Allow'
       }
     ]
   }
 }
 
-// ---------------------------------------------------------------------------
-// Virtual machine — WS2022 Datacenter Gen2 Desktop Experience (D-01)
-// ---------------------------------------------------------------------------
-
-resource vm 'Microsoft.Compute/virtualMachines@2024-07-01' = {
-  name: 'rdpilot-vm'
+resource rdpFormula 'Microsoft.DevTestLab/labs/formulas@2018-09-15' = {
+  parent: lab
+  name: formulaName
   location: location
   properties: {
-    hardwareProfile: {
-      vmSize: vmSize
-    }
-    osProfile: {
-      computerName: 'rdpilot-vm'
-      adminUsername: adminUsername
-      adminPassword: adminPassword
-      // NLA is the Azure default — do NOT disable it here. It is verified
-      // post-deploy in Validate-Target.ps1, not configured (Pitfall 2).
-      windowsConfiguration: {
-        provisionVMAgent: true
-        enableAutomaticUpdates: true
-      }
-    }
-    storageProfile: {
-      imageReference: {
-        publisher: 'MicrosoftWindowsServer'
-        offer: 'WindowsServer'
-        sku: '2022-datacenter-g2' // Gen2 Desktop Experience. NOT '-core', NOT '-azure-edition' (D-01).
-        version: 'latest'
-      }
-      osDisk: {
-        createOption: 'FromImage'
-        managedDisk: {
-          storageAccountType: 'StandardSSD_LRS'
+    description: 'Short-lived GitHub Actions RDP E2E target'
+    formulaContent: {
+      name: formulaName
+      location: location
+      properties: {
+        size: vmSize
+        allowClaim: false
+        disallowPublicIpAddress: false
+        labVirtualNetworkId: labVirtualNetwork.id
+        labSubnetName: subnetName
+        storageType: 'Standard'
+        galleryImageReference: {
+          publisher: 'MicrosoftWindowsServer'
+          offer: 'WindowsServer'
+          sku: '2022-datacenter-g2'
+          osType: 'Windows'
+          version: 'latest'
         }
       }
     }
-    networkProfile: {
-      networkInterfaces: [
-        {
-          id: nic.id
-        }
-      ]
-    }
-  }
-  // ARM the kill-switch BEFORE the billable VM exists. Without this, ARM may create
-  // the VM before the auto-destroy module + role assignment, leaving a window where a
-  // billing VM exists with no reaper armed (orphaned-VM risk if `up` crashes mid-deploy).
-  // Force the VM to provision ONLY AFTER: (a) the auto-destroy module (Automation
-  // Account + runbook + schedule + jobSchedule in the mgmt RG), AND (b) the Contributor
-  // role assignment scoped to this TEST RG. No cycle: the role assignment depends on the
-  // module's principalId output; the module depends on neither the VM nor the role.
-  dependsOn: [
-    autoDestroy
-    autoDestroyRoleAssignment
-  ]
-}
-
-// ---------------------------------------------------------------------------
-// In-guest configuration — one CustomScriptExtension runs one idempotent script.
-//
-// The script body lives in infra/scripts/Configure-Target.ps1 (authored in Plan 03,
-// not here). It performs ALL in-guest hardening in a single idempotent pass:
-// WinRM HTTPS listener + firewall rule, default-user-hive 96 DPI (LogPixels=96 /
-// Win8DpiScaling=1) + RemoteDesktop_SuppressWhenMinimized, HKLM SuppressWhenMinimized,
-// and a SHA-256-verified 7-Zip install — with no reboot.
-//
-// CSE is used deliberately over the deployment-script resource type: that type
-// runs in a managed container and CANNOT touch the guest registry/WinRM, so it is
-// the wrong tool for in-guest config (RESEARCH.md L93). The `scriptUri` is
-// set at deploy time by manage-env.ps1 (Plan 04). This resource DEFINES the
-// CSE -> script contract that Plan 03 implements (filename, no-arg invocation).
-// ---------------------------------------------------------------------------
-
-resource configureTarget 'Microsoft.Compute/virtualMachines/extensions@2024-07-01' = {
-  parent: vm
-  name: 'Configure-Target'
-  location: location
-  properties: {
-    publisher: 'Microsoft.Compute'
-    type: 'CustomScriptExtension'
-    typeHandlerVersion: '1.10'
-    autoUpgradeMinorVersion: true
-    settings: {
-      fileUris: [
-        scriptUri
-      ]
-    }
-    protectedSettings: {
-      commandToExecute: 'powershell -ExecutionPolicy Unrestricted -File Configure-Target.ps1'
-    }
+    osType: 'Windows'
   }
 }
 
-// ---------------------------------------------------------------------------
-// Auto-destroy (ENV-03) — SEPARATE-MANAGEMENT topology.
-//
-// The Automation Account + runbook + daily schedule are declared in the
-// PERSISTENT management RG via a module scoped to that RG (it outlives the TEST
-// RG, so the deleter survives the delete and reports clean job status —
-// RESEARCH.md Pitfall 4). The role assignment below grants that account's
-// managed identity Contributor over the TEST RG (this deployment's scope) ONLY
-// — the tightest least-privilege grant. NEVER the subscription full-access role.
-// ---------------------------------------------------------------------------
-
-// Built-in role definition: Contributor (can manage/delete resources, but NOT
-// grant access). Referenced by its well-known GUID, scoped to the TEST RG.
-var contributorRoleId = subscriptionResourceId(
-  'Microsoft.Authorization/roleDefinitions',
-  'b24988ac-6180-42a0-ab88-20f7382dd24c'
-)
-
-module autoDestroy 'modules/autodestroy.bicep' = {
-  name: 'autodestroy'
-  scope: resourceGroup(managementResourceGroupName)
-  params: {
-    automationAccountName: automationAccountName
-    location: location
-    targetResourceGroupName: resourceGroup().name
-    autoDestroyStartTime: autoDestroyStartTime
-    deleteRunbookContentUri: deleteRunbookContentUri
-  }
-}
-
-// Contributor scoped to THIS (TEST) resource group only — tightest privilege.
-resource autoDestroyRoleAssignment 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(resourceGroup().id, automationAccountName, 'Contributor')
-  properties: {
-    roleDefinitionId: contributorRoleId
-    principalId: autoDestroy.outputs.principalId
-    principalType: 'ServicePrincipal'
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Outputs — connection details consumed by manage-env.ps1 / Validate-Target.ps1
-// ---------------------------------------------------------------------------
-
-output publicIp string = publicIp.properties.ipAddress
-output adminUsername string = adminUsername
-output rdpPort int = 3389
-output winrmPort int = 5986
+output devtestLabsId string = lab.id
+output devtestFormula string = rdpFormula.name
+output devtestWorkloadNsgId string = workloadNsg.id

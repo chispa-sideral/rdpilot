@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    name: Linux checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo check --workspace --all-targets
+      - run: cargo test --workspace
+
+  windows-dacl:
+    name: Windows DACL
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - shell: pwsh
+        run: ./scripts/ci/run-windows-dacl.ps1
+
+  devtest-rdp-e2e:
+    name: DevTest Labs RDP E2E
+    needs: [linux, windows-dacl]
+    if: >-
+      github.event_name == 'push' && github.repository == 'lachispa/rdpilot' &&
+      vars.AZURE_DEVTEST_LABS_ID != '' && vars.RDPILOT_DEVTEST_NSG_ID != '' &&
+      vars.RDPILOT_DEVTEST_FORMULA != ''
+    runs-on: ubuntu-latest
+    # 15m provisioning + 20m E2E + 20m cleanup/recovery margin.
+    timeout-minutes: 55
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      AZURE_DEVTEST_LABS_ID: ${{ vars.AZURE_DEVTEST_LABS_ID }}
+      RDPILOT_DEVTEST_NSG_ID: ${{ vars.RDPILOT_DEVTEST_NSG_ID }}
+      RDPILOT_DEVTEST_FORMULA: ${{ vars.RDPILOT_DEVTEST_FORMULA }}
+      RDPILOT_E2E_TIMEOUT: 20m
+      RDPILOT_DEVTEST_STATE: ${{ runner.temp }}/rdpilot-devtest-lease.json
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      - name: Run bounded DevTest RDP E2E
+        run: >-
+          python3 scripts/e2e/devtest-rdp-e2e.py run
+          --state "$RDPILOT_DEVTEST_STATE"
+          --lease-expiry 45m
+          --provision-timeout 15m
+          --cleanup-timeout 10m
+      - name: Release any persisted DevTest lease
+        if: always()
+        run: >-
+          test ! -f "$RDPILOT_DEVTEST_STATE" ||
+          timeout --foreground 10m
+          python3 scripts/e2e/devtest-rdp-e2e.py cleanup
+          --state "$RDPILOT_DEVTEST_STATE"
+          --cleanup-timeout 10m
