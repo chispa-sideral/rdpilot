@@ -256,32 +256,27 @@ fn cross_account_connection_is_rejected_by_the_owner_only_dacl() {
         );
 
         let _ = Command::new("schtasks").args(["/delete", "/tn", &task_name, "/f"]).output();
-        let create = Command::new("schtasks")
+        // The hosted diagnostic proved that schtasks /run left the
+        // 23:59 one-shot task in Ready/has-not-run state. Register a
+        // one-shot trigger a few seconds ahead instead, so Task Scheduler
+        // itself launches the cross-account process within the bounded poll.
+        let create = Command::new("powershell.exe")
             .args([
-                "/create",
-                "/tn",
-                &task_name,
-                "/tr",
-                &format!("powershell.exe -NoProfile -ExecutionPolicy Bypass -File {}", inner_script_path.display()),
-                "/sc",
-                "once",
-                "/st",
-                "23:59",
-                "/ru",
-                &second_account,
-                "/rp",
-                &second_password,
-                "/f",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "$trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddSeconds(10); $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument ('-NoProfile -ExecutionPolicy Bypass -File ' + $env:RDPILOT_DACL_INNER_SCRIPT_PATH); Register-ScheduledTask -TaskName $env:RDPILOT_DACL_TASK_NAME -Action $action -Trigger $trigger -User $env:RDPILOT_DACL_ACCOUNT -Password $env:RDPILOT_DACL_PASSWORD -RunLevel Limited -Force | Out-Null",
             ])
+            .env(TASK_NAME_ENV, &task_name)
+            .env("RDPILOT_DACL_INNER_SCRIPT_PATH", &inner_script_path)
+            .env("RDPILOT_DACL_ACCOUNT", &second_account)
+            .env("RDPILOT_DACL_PASSWORD", &second_password)
             .output()
-            .expect("failed to invoke schtasks /create (check RDPILOT_SECOND_WINDOWS_ACCOUNT/RDPILOT_SECOND_WINDOWS_PASSWORD provisioning)");
+            .expect("failed to invoke scheduled-task registration (check RDPILOT_SECOND_WINDOWS_ACCOUNT/RDPILOT_SECOND_WINDOWS_PASSWORD provisioning)");
         assert!(
             create.status.success(),
-            "[FAIL] {name}: schtasks /create failed"
+            "[FAIL] {name}: scheduled-task registration failed"
         );
-
-        let run = Command::new("schtasks").args(["/run", "/tn", &task_name]).output().expect("failed to invoke schtasks /run");
-        assert!(run.status.success(), "[FAIL] {name}: schtasks /run failed");
 
         let accepted = tokio::time::timeout(Duration::from_secs(5), rdpilot_daemon::accept_and_authorize(&listener)).await;
 
