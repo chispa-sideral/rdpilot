@@ -203,9 +203,12 @@ $out | Out-File -FilePath '{result}' -Encoding utf8 -Force
 
         let accepted = tokio::time::timeout(Duration::from_secs(5), rdpilot_daemon::accept_and_authorize(&listener)).await;
 
-        // Give the scheduled task a moment to finish writing its result
-        // file even if the accept above already timed out first.
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        // `schtasks /run` only queues the task: it does not wait for the
+        // second-account process to start. The result file is pre-touched
+        // above so that its ACL can be granted, which means a fixed delay
+        // can observe the empty sentinel before Task Scheduler has written
+        // the probe outcome. Wait for a non-empty outcome instead, but keep
+        // the wait bounded so a task that never starts remains a failure.
         // `Out-File -Encoding utf8` (the inner script above) writes a
         // leading UTF-8 BOM (U+FEFF) by PowerShell's own default -- NOT
         // whitespace, so `str::trim_start()` alone leaves it in place and
@@ -213,10 +216,19 @@ $out | Out-File -FilePath '{result}' -Encoding utf8 -Force
         // genuine rejection (live-VM-confirmed, Plan 15-05: the probe DID
         // correctly receive "Access to the path ... is denied", but the
         // BOM-prefixed string failed the original un-stripped check).
-        let probe_result = std::fs::read_to_string(&result_path)
-            .unwrap_or_else(|_| "MISSING: probe never wrote a result".to_owned())
-            .trim_start_matches('\u{feff}')
-            .to_owned();
+        let probe_result = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                if let Ok(result) = std::fs::read_to_string(&result_path) {
+                    let result = result.trim_start_matches('\u{feff}').trim().to_owned();
+                    if !result.is_empty() {
+                        return result;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| "MISSING: scheduled task did not write a result within 20 seconds".to_owned());
 
         let _ = Command::new("schtasks").args(["/delete", "/tn", &task_name, "/f"]).output();
         let _ = std::fs::remove_file(&result_path);
