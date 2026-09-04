@@ -164,7 +164,7 @@ fn cross_account_connection_is_rejected_by_the_owner_only_dacl() {
                 "-NoProfile",
                 "-NonInteractive",
                 "-Command",
-                "$password = ConvertTo-SecureString $env:RDPILOT_DACL_PASSWORD -AsPlainText -Force; $credential = [pscredential]::new($env:RDPILOT_DACL_ACCOUNT, $password); Start-Process -FilePath powershell.exe -ArgumentList @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', $env:RDPILOT_DACL_INNER_SCRIPT_PATH) -Credential $credential -LoadUserProfile | Out-Null",
+                "$password = ConvertTo-SecureString $env:RDPILOT_DACL_PASSWORD -AsPlainText -Force; $credential = [pscredential]::new($env:RDPILOT_DACL_ACCOUNT, $password); Start-Process -FilePath powershell.exe -ArgumentList @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', $env:RDPILOT_DACL_INNER_SCRIPT_PATH) -Credential $credential -LoadUserProfile -RedirectStandardOutput NUL -RedirectStandardError NUL | Out-Null",
             ])
             .env("RDPILOT_DACL_INNER_SCRIPT_PATH", &inner_script_path)
             .env("RDPILOT_DACL_ACCOUNT", &second_account)
