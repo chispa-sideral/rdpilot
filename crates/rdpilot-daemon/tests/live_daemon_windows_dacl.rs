@@ -32,6 +32,11 @@
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
+use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
+use windows_sys::Win32::System::Threading::{
+    CreateProcessWithLogonW, GetExitCodeProcess, TerminateProcess, WaitForSingleObject,
+    CREATE_NO_WINDOW, LOGON_WITH_PROFILE, PROCESS_INFORMATION, STARTUPINFOW,
+};
 
 /// Name of the opt-in env var that arms this live suite (D-18) -- mirrors
 /// `crates/rdpilot/tests/common/mod.rs::LIVE_ENV` without depending on
@@ -49,6 +54,103 @@ const SECOND_ACCOUNT_ENV: &str = "RDPILOT_SECOND_WINDOWS_ACCOUNT";
 /// The second account's password, used only to launch the cross-account
 /// probe through PowerShell's credentialed process API.
 const SECOND_ACCOUNT_PASSWORD_ENV: &str = "RDPILOT_SECOND_WINDOWS_PASSWORD";
+
+const PROBE_WAIT_MILLIS: u32 = 20_000;
+const TERMINATION_WAIT_MILLIS: u32 = 1_000;
+
+fn utf16z(value: &str) -> Vec<u16> {
+    value.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// Launch the fixed PowerShell probe directly under the supplied local
+/// account, then retain ownership of the native process through completion.
+///
+/// The command line deliberately contains only the already-created script
+/// path; the password stays in the `CreateProcessWithLogonW` UTF-16 buffer.
+fn run_cross_account_probe(
+    second_account: &str,
+    second_password: &str,
+    inner_script_path: &std::path::Path,
+) -> Result<u32, String> {
+    let username = utf16z(second_account);
+    let domain = utf16z(".");
+    let password = utf16z(second_password);
+    let application = utf16z(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe");
+    let mut command_line = utf16z(&format!(
+        "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"{}\"",
+        inner_script_path.display()
+    ));
+    let startup = STARTUPINFOW {
+        cb: std::mem::size_of::<STARTUPINFOW>() as u32,
+        ..Default::default()
+    };
+    let mut process = PROCESS_INFORMATION::default();
+
+    let launched = unsafe {
+        CreateProcessWithLogonW(
+            username.as_ptr(),
+            domain.as_ptr(),
+            password.as_ptr(),
+            LOGON_WITH_PROFILE,
+            application.as_ptr(),
+            command_line.as_mut_ptr(),
+            CREATE_NO_WINDOW,
+            std::ptr::null(),
+            std::ptr::null(),
+            &startup,
+            &mut process,
+        )
+    };
+    if launched == 0 {
+        return Err(format!(
+            "launch failed (os error {})",
+            std::io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or_default()
+        ));
+    }
+
+    let thread_closed = unsafe { CloseHandle(process.hThread) } != 0;
+    if !thread_closed {
+        let launch_error = std::io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or_default();
+        let _ = unsafe { TerminateProcess(process.hProcess, 1) };
+        let _ = unsafe { WaitForSingleObject(process.hProcess, TERMINATION_WAIT_MILLIS) };
+        let mut exit_code = 0;
+        let exit_code_observed =
+            unsafe { GetExitCodeProcess(process.hProcess, &mut exit_code) } != 0;
+        let _ = unsafe { CloseHandle(process.hProcess) };
+        return Err(format!(
+            "thread-handle close failed (os error {launch_error}, exit_observed={exit_code_observed})"
+        ));
+    }
+
+    let first_wait = unsafe { WaitForSingleObject(process.hProcess, PROBE_WAIT_MILLIS) };
+    if first_wait != WAIT_OBJECT_0 {
+        let terminated = unsafe { TerminateProcess(process.hProcess, 1) } != 0;
+        let terminal_wait =
+            unsafe { WaitForSingleObject(process.hProcess, TERMINATION_WAIT_MILLIS) };
+        let mut exit_code = 0;
+        let exit_code_observed =
+            unsafe { GetExitCodeProcess(process.hProcess, &mut exit_code) } != 0;
+        let process_closed = unsafe { CloseHandle(process.hProcess) } != 0;
+        return Err(format!(
+            "probe did not complete (wait={first_wait}, terminated={terminated}, terminal_wait={terminal_wait}, exit_observed={exit_code_observed}, process_closed={process_closed})"
+        ));
+    }
+
+    let mut exit_code = 0;
+    let exit_code_observed = unsafe { GetExitCodeProcess(process.hProcess, &mut exit_code) } != 0;
+    let process_closed = unsafe { CloseHandle(process.hProcess) } != 0;
+    if !exit_code_observed || !process_closed {
+        return Err(format!(
+            "probe completion inspection failed (exit_observed={exit_code_observed}, process_closed={process_closed})"
+        ));
+    }
+    Ok(exit_code)
+}
+
 fn probe_observation(result_path: &std::path::Path) -> (&'static str, bool, u64) {
     match std::fs::read(result_path) {
         Ok(bytes) if bytes.is_empty() => ("empty", true, 0),
@@ -159,48 +261,43 @@ fn cross_account_connection_is_rejected_by_the_owner_only_dacl() {
             "[FAIL] {name}: icacls grant on the probe result file failed"
         );
 
-        let launch = Command::new("powershell.exe")
-            .args([
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                "$password = ConvertTo-SecureString $env:RDPILOT_DACL_PASSWORD -AsPlainText -Force; $credential = [pscredential]::new($env:RDPILOT_DACL_ACCOUNT, $password); Start-Process -FilePath powershell.exe -ArgumentList @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', $env:RDPILOT_DACL_INNER_SCRIPT_PATH) -Credential $credential -LoadUserProfile -RedirectStandardOutput NUL -RedirectStandardError NUL | Out-Null",
-            ])
-            .env("RDPILOT_DACL_INNER_SCRIPT_PATH", &inner_script_path)
-            .env("RDPILOT_DACL_ACCOUNT", &second_account)
-            .env("RDPILOT_DACL_PASSWORD", &second_password)
-            .output()
-            .expect("failed to invoke credentialed cross-account probe launch (check RDPILOT_SECOND_WINDOWS_ACCOUNT/RDPILOT_SECOND_WINDOWS_PASSWORD provisioning)");
-        assert!(
-            launch.status.success(),
-            "[FAIL] {name}: credentialed cross-account probe launch failed"
-        );
+        let probe_completion =
+            run_cross_account_probe(&second_account, &second_password, &inner_script_path);
 
         let accepted = tokio::time::timeout(Duration::from_secs(5), rdpilot_daemon::accept_and_authorize(&listener)).await;
 
-        // The credentialed process starts asynchronously. The result file is pre-touched
-        // above so that its ACL can be granted, which means a fixed delay
-        // can observe the empty sentinel before Task Scheduler has written
-        // the probe outcome. Wait for a non-empty outcome instead, but keep
-        // the wait bounded so a task that never starts remains a failure.
+        // The native launcher above has already observed bounded child
+        // completion. The result file is still the ground-truth DACL signal;
+        // poll it briefly because the child may release its final file write
+        // just before process termination becomes observable.
         // The inner script emits only a fixed classification. Observe it
         // before cleanup so an absent launch cannot be mistaken for denial.
-        let wrote_probe = tokio::time::timeout(Duration::from_secs(20), async {
-            loop {
-                let (classification, _, _) = probe_observation(&result_path);
-                if classification != "missing" && classification != "empty" {
-                    return;
+        let wrote_probe = if probe_completion.is_ok() {
+            tokio::time::timeout(Duration::from_secs(20), async {
+                loop {
+                    let (classification, _, _) = probe_observation(&result_path);
+                    if classification != "missing" && classification != "empty" {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(200)).await;
                 }
-                tokio::time::sleep(Duration::from_millis(200)).await;
-            }
-        })
-        .await
-        .is_ok();
+            })
+            .await
+            .is_ok()
+        } else {
+            false
+        };
 
         let (probe_classification, _, _) = probe_observation(&result_path);
 
         let _ = std::fs::remove_file(&result_path);
         let _ = std::fs::remove_file(&inner_script_path);
+
+        match probe_completion {
+            Ok(0) => {}
+            Ok(_) => panic!("[FAIL] {name}: credentialed cross-account probe exited unsuccessfully"),
+            Err(error) => panic!("[FAIL] {name}: credentialed cross-account probe failed: {error}"),
+        }
 
         // The cross-account probe's result file is the ground truth: it
         // must report a genuine "denied" (ERROR_ACCESS_DENIED from
