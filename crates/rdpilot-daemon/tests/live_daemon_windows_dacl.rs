@@ -33,8 +33,6 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
 
-use serde::Deserialize;
-
 /// Name of the opt-in env var that arms this live suite (D-18) -- mirrors
 /// `crates/rdpilot/tests/common/mod.rs::LIVE_ENV` without depending on
 /// that crate's test-support module (this is a daemon-crate integration
@@ -48,32 +46,9 @@ const LIVE_ENV: &str = "RDPILOT_LIVE";
 /// 15-05's job.
 const SECOND_ACCOUNT_ENV: &str = "RDPILOT_SECOND_WINDOWS_ACCOUNT";
 
-/// The second account's password, needed to register the one-shot
-/// Scheduled Task that runs the cross-account probe AS that account (see
-/// [`cross_account_connection_is_rejected_by_the_owner_only_dacl`]'s body
-/// doc for why a Scheduled Task, not `runas`, is the correct mechanism
-/// here -- live-VM-confirmed, Plan 15-05).
+/// The second account's password, used only to launch the cross-account
+/// probe through PowerShell's credentialed process API.
 const SECOND_ACCOUNT_PASSWORD_ENV: &str = "RDPILOT_SECOND_WINDOWS_PASSWORD";
-const TASK_NAME_ENV: &str = "RDPILOT_DACL_TASK_NAME";
-
-#[derive(Deserialize)]
-struct SchedulerDiagnostic {
-    #[serde(rename = "State")]
-    state: Option<String>,
-    #[serde(rename = "LastRunTime")]
-    last_run_time: Option<String>,
-    #[serde(rename = "LastTaskResult")]
-    last_task_result: Option<i64>,
-    #[serde(rename = "LogonType")]
-    logon_type: Option<String>,
-    #[serde(rename = "RunLevel")]
-    run_level: Option<String>,
-    #[serde(rename = "ActionExecutable")]
-    action_executable: Option<String>,
-    #[serde(rename = "ArgumentsPresent")]
-    arguments_present: Option<bool>,
-}
-
 fn probe_observation(result_path: &std::path::Path) -> (&'static str, bool, u64) {
     match std::fs::read(result_path) {
         Ok(bytes) if bytes.is_empty() => ("empty", true, 0),
@@ -99,44 +74,6 @@ fn probe_observation(result_path: &std::path::Path) -> (&'static str, bool, u64)
             )
         }
     }
-}
-
-fn scheduler_observation(task_name: &str) -> Result<SchedulerDiagnostic, ()> {
-    let script = "$task = Get-ScheduledTask -TaskName $env:RDPILOT_DACL_TASK_NAME; $info = Get-ScheduledTaskInfo -TaskName $env:RDPILOT_DACL_TASK_NAME; $action = @($task.Actions)[0]; [pscustomobject]@{ State = [string]$task.State; LastRunTime = if ($info.LastRunTime -and $info.LastRunTime -ne [datetime]::MinValue) { $info.LastRunTime.ToUniversalTime().ToString('o') } else { $null }; LastTaskResult = [int64]$info.LastTaskResult; LogonType = [string]$task.Principal.LogonType; RunLevel = [string]$task.Principal.RunLevel; ActionExecutable = if ($action.Execute) { [IO.Path]::GetFileName([string]$action.Execute) } else { $null }; ArgumentsPresent = [bool](-not [string]::IsNullOrEmpty([string]$action.Arguments)) } | ConvertTo-Json -Compress";
-    let output = Command::new("powershell.exe")
-        .args(["-NoProfile", "-NonInteractive", "-Command", script])
-        .env(TASK_NAME_ENV, task_name)
-        .output()
-        .map_err(|_| ())?;
-    if !output.status.success() {
-        return Err(());
-    }
-    serde_json::from_slice(&output.stdout).map_err(|_| ())
-}
-
-fn print_diagnostic(task_name: &str, result_path: &std::path::Path) {
-    let (probe_classification, probe_present, probe_byte_size) = probe_observation(result_path);
-    let value = match scheduler_observation(task_name) {
-        Ok(scheduler) => serde_json::json!({
-            "State": scheduler.state,
-            "LastRunTime": scheduler.last_run_time,
-            "LastTaskResult": scheduler.last_task_result,
-            "LogonType": scheduler.logon_type,
-            "RunLevel": scheduler.run_level,
-            "ActionExecutable": scheduler.action_executable,
-            "ArgumentsPresent": scheduler.arguments_present,
-            "ProbeClassification": probe_classification,
-            "ProbePresent": probe_present,
-            "ProbeByteSize": probe_byte_size,
-        }),
-        Err(()) => serde_json::json!({
-            "SchedulerDiagnostic": "scheduler-diagnostic-unavailable",
-            "ProbeClassification": probe_classification,
-            "ProbePresent": probe_present,
-            "ProbeByteSize": probe_byte_size,
-        }),
-    };
-    println!("{value}");
 }
 
 fn armed() -> bool {
@@ -176,49 +113,16 @@ fn cross_account_connection_is_rejected_by_the_owner_only_dacl() {
         let pipe_path = rdpilot_daemon::socket_path().expect("socket_path should resolve");
 
         // A minimal probe attempting to OPEN the pipe path directly as
-        // `second_account`, via a one-shot Scheduled Task -- NOT `runas`
-        // (the originally-authored mechanism, offline-plausible but never
-        // live-compiled/run against this project's actual execution
-        // topology). Live-VM-confirmed root cause (Plan 15-05): `runas`
-        // internally calls `CreateProcessWithLogonW`, which requires an
-        // interactive window station to attach the new logon session to.
-        // This whole test suite runs via `az vm run-command invoke`, i.e.
-        // as `NT AUTHORITY\SYSTEM` in the non-interactive services session
-        // (Session 0) -- `runas` fails there IMMEDIATELY (exit code 1,
-        // Secondary Logon service state irrelevant) WITHOUT ever spawning
-        // the second-account process, so the daemon-side accept below
-        // would time out for the WRONG reason (no probe ever ran) and
-        // silently report a false-positive PASS. This file's own original
-        // module doc already anticipated exactly this failure mode and
-        // named the fix: "a scheduled task trigger is the documented
-        // fallback" -- Task Scheduler creates its own logon session
-        // without needing an interactive desktop, independently verified
-        // live (via a manual `whoami` probe) to genuinely run as the
-        // second account and receive a real `ERROR_ACCESS_DENIED` from
-        // the owner-only DACL. The probe writes its outcome to a result
-        // file (a scheduled task has no direct stdout channel back to
-        // this process) which is the actual ground-truth assertion below
-        // -- not merely the daemon-side timeout, which alone cannot
-        // distinguish "genuinely rejected" from "probe never ran".
-        let task_name = std::env::var(TASK_NAME_ENV).unwrap_or_else(|_| "RdpilotDaclCrossAccountProbe".to_owned());
-        // NOT `std::env::temp_dir()`: under this test's execution context
-        // (`az vm run-command` runs as `NT AUTHORITY\SYSTEM`), that
-        // resolves to SYSTEM's own profile-scoped temp directory
-        // (`...\systemprofile\AppData\Local\Temp`), which the second
-        // account has no ACL access to at all (live-VM-confirmed, Plan
-        // 15-05). `C:\Windows\Temp` is the shared location instead --
-        // but even THIS is not automatically readable/writable by every
-        // account on a hardened image: this VM's `Configure-Target.ps1`
-        // in-guest hardening (Plan 1) leaves files written there by
-        // `NT AUTHORITY\SYSTEM` with an inherited DACL scoped to
-        // `BUILTIN\Administrators`/`NT AUTHORITY\SYSTEM` ONLY (verified
-        // live via `icacls`) -- a non-admin second account can neither
-        // read the inner probe script nor write the result file, so the
-        // scheduled task fails before ever reaching the pipe-open call,
-        // producing the exact same "MISSING" result as "the probe never
-        // ran at all". The explicit `icacls /grant` calls below close
-        // that gap precisely for the two files this probe creates
-        // (least-privilege: NOT a blanket `C:\Windows\Temp` ACL change).
+        // `second_account`. The hosted diagnostic showed that the
+        // Scheduled Task remained Ready with 0x41303 (has not run), so it
+        // never exercised the DACL. This hosted runner is an ordinary
+        // runner account, not LocalSystem: PowerShell's credentialed
+        // process launch can create the probe directly under the second
+        // account. The result file remains the ground-truth assertion;
+        // a timeout or missing result is failure.
+        // The cross-account process needs a location shared with the hosted
+        // runner account. The explicit `icacls /grant` calls below grant
+        // access only to the two probe files, never to the temp directory.
         let shared_temp = PathBuf::from(r"C:\Windows\Temp");
         let result_path = shared_temp.join("rdpilot-dacl-probe-result.txt");
         let inner_script_path = shared_temp.join("rdpilot-dacl-probe-inner.ps1");
@@ -255,40 +159,32 @@ fn cross_account_connection_is_rejected_by_the_owner_only_dacl() {
             "[FAIL] {name}: icacls grant on the probe result file failed"
         );
 
-        let _ = Command::new("schtasks").args(["/delete", "/tn", &task_name, "/f"]).output();
-        // The hosted diagnostic proved that schtasks /run left the
-        // 23:59 one-shot task in Ready/has-not-run state. Register a
-        // one-shot trigger a few seconds ahead instead, so Task Scheduler
-        // itself launches the cross-account process within the bounded poll.
-        let create = Command::new("powershell.exe")
+        let launch = Command::new("powershell.exe")
             .args([
                 "-NoProfile",
                 "-NonInteractive",
                 "-Command",
-                "$trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddSeconds(10); $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument ('-NoProfile -ExecutionPolicy Bypass -File ' + $env:RDPILOT_DACL_INNER_SCRIPT_PATH); Register-ScheduledTask -TaskName $env:RDPILOT_DACL_TASK_NAME -Action $action -Trigger $trigger -User $env:RDPILOT_DACL_ACCOUNT -Password $env:RDPILOT_DACL_PASSWORD -RunLevel Limited -Force | Out-Null",
+                "$password = ConvertTo-SecureString $env:RDPILOT_DACL_PASSWORD -AsPlainText -Force; $credential = [pscredential]::new($env:RDPILOT_DACL_ACCOUNT, $password); Start-Process -FilePath powershell.exe -ArgumentList @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', $env:RDPILOT_DACL_INNER_SCRIPT_PATH) -Credential $credential -LoadUserProfile | Out-Null",
             ])
-            .env(TASK_NAME_ENV, &task_name)
             .env("RDPILOT_DACL_INNER_SCRIPT_PATH", &inner_script_path)
             .env("RDPILOT_DACL_ACCOUNT", &second_account)
             .env("RDPILOT_DACL_PASSWORD", &second_password)
             .output()
-            .expect("failed to invoke scheduled-task registration (check RDPILOT_SECOND_WINDOWS_ACCOUNT/RDPILOT_SECOND_WINDOWS_PASSWORD provisioning)");
+            .expect("failed to invoke credentialed cross-account probe launch (check RDPILOT_SECOND_WINDOWS_ACCOUNT/RDPILOT_SECOND_WINDOWS_PASSWORD provisioning)");
         assert!(
-            create.status.success(),
-            "[FAIL] {name}: scheduled-task registration failed"
+            launch.status.success(),
+            "[FAIL] {name}: credentialed cross-account probe launch failed"
         );
 
         let accepted = tokio::time::timeout(Duration::from_secs(5), rdpilot_daemon::accept_and_authorize(&listener)).await;
 
-        // `schtasks /run` only queues the task: it does not wait for the
-        // second-account process to start. The result file is pre-touched
+        // The credentialed process starts asynchronously. The result file is pre-touched
         // above so that its ACL can be granted, which means a fixed delay
         // can observe the empty sentinel before Task Scheduler has written
         // the probe outcome. Wait for a non-empty outcome instead, but keep
         // the wait bounded so a task that never starts remains a failure.
         // The inner script emits only a fixed classification. Observe it
-        // before cleanup so the hosted diagnostic can distinguish launch,
-        // artifact, and DACL failures without exposing script output.
+        // before cleanup so an absent launch cannot be mistaken for denial.
         let wrote_probe = tokio::time::timeout(Duration::from_secs(20), async {
             loop {
                 let (classification, _, _) = probe_observation(&result_path);
@@ -301,19 +197,16 @@ fn cross_account_connection_is_rejected_by_the_owner_only_dacl() {
         .await
         .is_ok();
 
-        print_diagnostic(&task_name, &result_path);
         let (probe_classification, _, _) = probe_observation(&result_path);
 
-        let _ = Command::new("schtasks").args(["/delete", "/tn", &task_name, "/f"]).output();
         let _ = std::fs::remove_file(&result_path);
         let _ = std::fs::remove_file(&inner_script_path);
 
-        // The scheduled task's own result file is the ground truth: it
+        // The cross-account probe's result file is the ground truth: it
         // must report a genuine "denied" (ERROR_ACCESS_DENIED from
         // the owner-only DACL), never "opened" and never a missing
         // result (a missing result means the probe never genuinely ran as
-        // the second account at all -- exactly the false-positive `runas`
-        // silently produced before this fix).
+        // the second account at all).
         assert!(
             wrote_probe && probe_classification == "denied",
             "[FAIL] {name}: expected the cross-account probe to be denied by the owner-only DACL, observed classification: {probe_classification}"
