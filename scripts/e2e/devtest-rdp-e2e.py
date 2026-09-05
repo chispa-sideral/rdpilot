@@ -300,7 +300,7 @@ def run(args: argparse.Namespace) -> int:
     state_path = args.state.resolve()
     if state_path.exists():
         fail('lease-state-already-exists')
-    lease_id, vm_name = str(uuid.uuid4()), f'rdpilot-{secrets.token_hex(6)}'
+    lease_id, vm_name = str(uuid.uuid4()), f'rdp{secrets.token_hex(6)}'
     state = {'lease_id': lease_id, 'vm_name': vm_name, 'lab_id': lab_id, 'nsg_id': nsg_id, 'resources': []}
     # This checkpoint is deliberately before the VM request and is the signal/EXIT recovery contract.
     save_state(state_path, state)
