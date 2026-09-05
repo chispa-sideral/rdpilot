@@ -57,85 +57,10 @@ const SECOND_ACCOUNT_PASSWORD_ENV: &str = "RDPILOT_SECOND_WINDOWS_PASSWORD";
 
 const PROBE_WAIT_MILLIS: u32 = 20_000;
 const TERMINATION_WAIT_MILLIS: u32 = 1_000;
-const DIAGNOSTIC_PREFIX: &str = "rdpilot/windows-dacl-probe-phase/v1";
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum DiagnosticPhase {
-    ChildStarted,
-    ProbeArtifactAccess,
-    BeforePipeOpen,
-    PipeOpenOutcome,
-    ResultWriteOutcome,
-    Completion,
-}
-
-impl DiagnosticPhase {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::ChildStarted => "child_started",
-            Self::ProbeArtifactAccess => "probe_artifact_access",
-            Self::BeforePipeOpen => "before_pipe_open",
-            Self::PipeOpenOutcome => "pipe_open_outcome",
-            Self::ResultWriteOutcome => "result_write_outcome",
-            Self::Completion => "completion",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum DiagnosticCategory {
-    Reached,
-    AccessDenied,
-    Opened,
-    IoFailure,
-    Timeout,
-    Missing,
-    Unexpected,
-}
-
-impl DiagnosticCategory {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Reached => "reached",
-            Self::AccessDenied => "access_denied",
-            Self::Opened => "opened",
-            Self::IoFailure => "io_failure",
-            Self::Timeout => "timeout",
-            Self::Missing => "missing",
-            Self::Unexpected => "unexpected",
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-struct DiagnosticRecord {
-    phase: DiagnosticPhase,
-    category: DiagnosticCategory,
-}
-
-fn emit_diagnostic(records: &[DiagnosticRecord]) {
-    for record in records {
-        println!(
-            "{DIAGNOSTIC_PREFIX} {} {}",
-            record.phase.as_str(),
-            record.category.as_str()
-        );
-    }
-}
-
-fn cleanup_probe_artifacts(
-    result_path: &std::path::Path,
-    phase_path: &std::path::Path,
-    inner_script_path: &std::path::Path,
-) {
+fn cleanup_probe_artifacts(result_path: &std::path::Path, inner_script_path: &std::path::Path) {
     let _ = std::fs::remove_file(result_path);
-    let _ = std::fs::remove_file(phase_path);
     let _ = std::fs::remove_file(inner_script_path);
-}
-
-fn diagnostic_stop(records: Vec<DiagnosticRecord>) -> ! {
-    emit_diagnostic(&records);
-    panic!("rdpilot/windows-dacl-probe-phase/v1 completion unexpected");
 }
 
 fn utf16z(value: &str) -> Vec<u16> {
@@ -279,137 +204,6 @@ fn probe_observation(result_path: &std::path::Path) -> (&'static str, bool, u64)
     }
 }
 
-fn parse_phase(phase: &str) -> Option<DiagnosticPhase> {
-    match phase {
-        "probe_artifact_access" => Some(DiagnosticPhase::ProbeArtifactAccess),
-        "before_pipe_open" => Some(DiagnosticPhase::BeforePipeOpen),
-        "pipe_open_outcome" => Some(DiagnosticPhase::PipeOpenOutcome),
-        "result_write_outcome" => Some(DiagnosticPhase::ResultWriteOutcome),
-        "completion" => Some(DiagnosticPhase::Completion),
-        _ => None,
-    }
-}
-
-fn parse_category(category: &str) -> Option<DiagnosticCategory> {
-    match category {
-        "reached" => Some(DiagnosticCategory::Reached),
-        "access_denied" => Some(DiagnosticCategory::AccessDenied),
-        "opened" => Some(DiagnosticCategory::Opened),
-        "io_failure" => Some(DiagnosticCategory::IoFailure),
-        "timeout" => Some(DiagnosticCategory::Timeout),
-        "missing" => Some(DiagnosticCategory::Missing),
-        "unexpected" => Some(DiagnosticCategory::Unexpected),
-        _ => None,
-    }
-}
-
-/// Decode only the fixed diagnostic vocabulary. The returned error is itself
-/// a fixed record, so callers never render artifact content or I/O errors.
-fn phase_records(phase_path: &std::path::Path) -> Result<Vec<DiagnosticRecord>, DiagnosticRecord> {
-    let bytes = match std::fs::read(phase_path) {
-        Ok(bytes) if !bytes.is_empty() => bytes,
-        Ok(_) => {
-            return Err(DiagnosticRecord {
-                phase: DiagnosticPhase::ProbeArtifactAccess,
-                category: DiagnosticCategory::Missing,
-            });
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Err(DiagnosticRecord {
-                phase: DiagnosticPhase::ProbeArtifactAccess,
-                category: DiagnosticCategory::Missing,
-            });
-        }
-        Err(_) => {
-            return Err(DiagnosticRecord {
-                phase: DiagnosticPhase::ProbeArtifactAccess,
-                category: DiagnosticCategory::IoFailure,
-            });
-        }
-    };
-    let Ok(text) = std::str::from_utf8(&bytes) else {
-        return Err(DiagnosticRecord {
-            phase: DiagnosticPhase::ProbeArtifactAccess,
-            category: DiagnosticCategory::Unexpected,
-        });
-    };
-    if !text.ends_with('\n') {
-        return Err(DiagnosticRecord {
-            phase: DiagnosticPhase::ProbeArtifactAccess,
-            category: DiagnosticCategory::Unexpected,
-        });
-    }
-
-    let expected = [
-        DiagnosticPhase::ProbeArtifactAccess,
-        DiagnosticPhase::BeforePipeOpen,
-        DiagnosticPhase::PipeOpenOutcome,
-        DiagnosticPhase::ResultWriteOutcome,
-        DiagnosticPhase::Completion,
-    ];
-    let mut records = Vec::new();
-    for (index, line) in text.lines().enumerate() {
-        let mut fields = line.split(' ');
-        let (Some(prefix), Some(phase), Some(category), None) =
-            (fields.next(), fields.next(), fields.next(), fields.next())
-        else {
-            return Err(DiagnosticRecord {
-                phase: expected
-                    .get(index)
-                    .copied()
-                    .unwrap_or(DiagnosticPhase::Completion),
-                category: DiagnosticCategory::Unexpected,
-            });
-        };
-        let (Some(phase), Some(category)) = (parse_phase(phase), parse_category(category)) else {
-            return Err(DiagnosticRecord {
-                phase: expected
-                    .get(index)
-                    .copied()
-                    .unwrap_or(DiagnosticPhase::Completion),
-                category: DiagnosticCategory::Unexpected,
-            });
-        };
-        if prefix != DIAGNOSTIC_PREFIX || expected.get(index).copied() != Some(phase) {
-            return Err(DiagnosticRecord {
-                phase: expected
-                    .get(index)
-                    .copied()
-                    .unwrap_or(DiagnosticPhase::Completion),
-                category: DiagnosticCategory::Unexpected,
-            });
-        }
-        let valid_category = match phase {
-            DiagnosticPhase::PipeOpenOutcome => matches!(
-                category,
-                DiagnosticCategory::AccessDenied
-                    | DiagnosticCategory::Opened
-                    | DiagnosticCategory::IoFailure
-                    | DiagnosticCategory::Unexpected
-            ),
-            DiagnosticPhase::ResultWriteOutcome => matches!(
-                category,
-                DiagnosticCategory::Reached | DiagnosticCategory::IoFailure
-            ),
-            _ => category == DiagnosticCategory::Reached,
-        };
-        if !valid_category {
-            return Err(DiagnosticRecord {
-                phase,
-                category: DiagnosticCategory::Unexpected,
-            });
-        }
-        records.push(DiagnosticRecord { phase, category });
-    }
-    if records.len() < expected.len() {
-        return Err(DiagnosticRecord {
-            phase: expected[records.len()],
-            category: DiagnosticCategory::Missing,
-        });
-    }
-    Ok(records)
-}
-
 fn armed() -> bool {
     std::env::var_os(LIVE_ENV).is_some()
 }
@@ -443,100 +237,55 @@ fn cross_account_connection_is_rejected_by_the_owner_only_dacl() {
     };
 
     current_thread_runtime().block_on(async {
-        let listener = match rdpilot_daemon::bind().await {
-            Ok(listener) => listener,
-            Err(_) => diagnostic_stop(vec![DiagnosticRecord {
-                phase: DiagnosticPhase::Completion,
-                category: DiagnosticCategory::Unexpected,
-            }]),
-        };
-        let pipe_path = match rdpilot_daemon::socket_path() {
-            Ok(path) => path,
-            Err(_) => diagnostic_stop(vec![DiagnosticRecord {
-                phase: DiagnosticPhase::Completion,
-                category: DiagnosticCategory::Unexpected,
-            }]),
-        };
+        let listener = rdpilot_daemon::bind()
+            .await
+            .expect("the owner-only pipe should bind");
 
-        // A minimal probe attempting to OPEN the pipe path directly as
-        // `second_account`. The hosted diagnostic showed that the
-        // Scheduled Task remained Ready with 0x41303 (has not run), so it
-        // never exercised the DACL. This hosted runner is an ordinary
-        // runner account, not LocalSystem: PowerShell's credentialed
-        // process launch can create the probe directly under the second
-        // account. The result file remains the ground-truth assertion;
-        // a timeout or missing result is failure.
-        // The cross-account process needs a location shared with the hosted
-        // runner account. The explicit `icacls /grant` calls below grant
-        // access only to the two probe files, never to the temp directory.
+        // These two explicit per-file grants let the credentialed account
+        // read only its probe and overwrite only its answer, never the temp
+        // directory or the pipe itself.
         let shared_temp = PathBuf::from(r"C:\Windows\Temp");
         let result_path = shared_temp.join("rdpilot-dacl-probe-result.txt");
-        let phase_path = shared_temp.join("rdpilot-dacl-probe-phase.txt");
         let inner_script_path = shared_temp.join("rdpilot-dacl-probe-inner.ps1");
-        cleanup_probe_artifacts(&result_path, &phase_path, &inner_script_path);
+        cleanup_probe_artifacts(&result_path, &inner_script_path);
 
         let inner_script = format!(
-            "$phasePath = '{phase}'
-$resultPath = '{result}'
-function Write-Phase([string]$phase, [string]$category) {{ try {{ [System.IO.File]::AppendAllText($phasePath, 'rdpilot/windows-dacl-probe-phase/v1 ' + $phase + ' ' + $category + \"`n\", [System.Text.Encoding]::ASCII) }} catch {{ }} }}
-Write-Phase 'probe_artifact_access' 'reached'
-Write-Phase 'before_pipe_open' 'reached'
-$out = try {{ [System.IO.File]::Open('{pipe}', 'Open', 'ReadWrite').Close(); Write-Phase 'pipe_open_outcome' 'opened'; 'opened' }} catch {{ if ($_.Exception -is [System.UnauthorizedAccessException]) {{ Write-Phase 'pipe_open_outcome' 'access_denied'; 'denied' }} elseif ($_.Exception -is [System.IO.IOException]) {{ Write-Phase 'pipe_open_outcome' 'io_failure'; 'unexpected-error' }} else {{ Write-Phase 'pipe_open_outcome' 'unexpected'; 'unexpected-error' }} }}
-try {{ [System.IO.File]::WriteAllText($resultPath, $out); Write-Phase 'result_write_outcome' 'reached' }} catch {{ Write-Phase 'result_write_outcome' 'io_failure' }}
-Write-Phase 'completion' 'reached'
+            "$resultPath = '{result}'
+$out = 'unexpected-error'
+try {{
+    $client = [System.IO.Pipes.NamedPipeClientStream]::new('.', 'rdpilot-daemon', [System.IO.Pipes.PipeDirection]::InOut, [System.IO.Pipes.PipeOptions]::None)
+    try {{ $client.Connect(5000); $out = 'opened' }} finally {{ $client.Dispose() }}
+}} catch {{
+    $exception = $_.Exception
+    $denied = $false
+    while ($null -ne $exception) {{
+        if (($exception -is [System.UnauthorizedAccessException]) -or (($exception -is [System.ComponentModel.Win32Exception]) -and $exception.NativeErrorCode -eq 5)) {{ $denied = $true; break }}
+        $exception = $exception.InnerException
+    }}
+    if ($denied) {{ $out = 'denied' }}
+}}
+[System.IO.File]::WriteAllText($resultPath, $out)
 ",
-            pipe = pipe_path.display(),
             result = result_path.display(),
-            phase = phase_path.display(),
         );
-        if std::fs::write(&inner_script_path, inner_script).is_err() {
-            cleanup_probe_artifacts(&result_path, &phase_path, &inner_script_path);
-            diagnostic_stop(vec![DiagnosticRecord {
-                phase: DiagnosticPhase::ProbeArtifactAccess,
-                category: DiagnosticCategory::IoFailure,
-            }]);
-        }
-        // Pre-touch the result file (empty) so `icacls` has a real target
-        // to grant Modify rights on -- `icacls` cannot ACL a path that
-        // does not exist yet, and the probe itself (running as the
-        // second account) needs write access to CREATE/overwrite it.
-        if std::fs::write(&result_path, "").is_err() || std::fs::write(&phase_path, "").is_err() {
-            cleanup_probe_artifacts(&result_path, &phase_path, &inner_script_path);
-            diagnostic_stop(vec![DiagnosticRecord {
-                phase: DiagnosticPhase::ProbeArtifactAccess,
-                category: DiagnosticCategory::IoFailure,
-            }]);
+        if std::fs::write(&inner_script_path, inner_script).is_err()
+            || std::fs::write(&result_path, "").is_err()
+        {
+            cleanup_probe_artifacts(&result_path, &inner_script_path);
+            panic!("[FAIL] {name}: could not create the credentialed probe artifacts");
         }
 
         let grant_read = Command::new("icacls")
             .args([inner_script_path.to_str().expect("inner script path should be valid UTF-8"), "/grant", &format!("{second_account}:(RX)")])
             .output();
-        if !matches!(grant_read, Ok(output) if output.status.success()) {
-            cleanup_probe_artifacts(&result_path, &phase_path, &inner_script_path);
-            diagnostic_stop(vec![DiagnosticRecord {
-                phase: DiagnosticPhase::ProbeArtifactAccess,
-                category: DiagnosticCategory::IoFailure,
-            }]);
-        }
         let grant_write = Command::new("icacls")
             .args([result_path.to_str().expect("result path should be valid UTF-8"), "/grant", &format!("{second_account}:(M)")])
             .output();
-        if !matches!(grant_write, Ok(output) if output.status.success()) {
-            cleanup_probe_artifacts(&result_path, &phase_path, &inner_script_path);
-            diagnostic_stop(vec![DiagnosticRecord {
-                phase: DiagnosticPhase::ProbeArtifactAccess,
-                category: DiagnosticCategory::IoFailure,
-            }]);
-        }
-        let grant_phase_write = Command::new("icacls")
-            .args([phase_path.to_str().expect("phase path should be valid UTF-8"), "/grant", &format!("{second_account}:(M)")])
-            .output();
-        if !matches!(grant_phase_write, Ok(output) if output.status.success()) {
-            cleanup_probe_artifacts(&result_path, &phase_path, &inner_script_path);
-            diagnostic_stop(vec![DiagnosticRecord {
-                phase: DiagnosticPhase::ProbeArtifactAccess,
-                category: DiagnosticCategory::IoFailure,
-            }]);
+        if !matches!(grant_read, Ok(output) if output.status.success())
+            || !matches!(grant_write, Ok(output) if output.status.success())
+        {
+            cleanup_probe_artifacts(&result_path, &inner_script_path);
+            panic!("[FAIL] {name}: could not grant probe artifact access");
         }
 
         let owned_probe = match launch_cross_account_probe(
@@ -546,17 +295,8 @@ Write-Phase 'completion' 'reached'
         ) {
             Ok(probe) => probe,
             Err(_) => {
-                cleanup_probe_artifacts(&result_path, &phase_path, &inner_script_path);
-                diagnostic_stop(vec![
-                    DiagnosticRecord {
-                        phase: DiagnosticPhase::ChildStarted,
-                        category: DiagnosticCategory::Missing,
-                    },
-                    DiagnosticRecord {
-                        phase: DiagnosticPhase::Completion,
-                        category: DiagnosticCategory::Missing,
-                    },
-                ]);
+                cleanup_probe_artifacts(&result_path, &inner_script_path);
+                panic!("[FAIL] {name}: could not launch the credentialed probe");
             }
         };
         let probe_completion = tokio::task::spawn_blocking(move || {
@@ -568,74 +308,24 @@ Write-Phase 'completion' 'reached'
             rdpilot_daemon::accept_and_authorize(&listener),
         )
         .await;
-        let completion = match probe_completion.await {
-            Ok(Ok(0)) => None,
-            Ok(Err(error)) if error.starts_with("probe did not complete") => Some(DiagnosticRecord {
-                phase: DiagnosticPhase::Completion,
-                category: DiagnosticCategory::Timeout,
-            }),
-            _ => Some(DiagnosticRecord {
-                phase: DiagnosticPhase::Completion,
-                category: DiagnosticCategory::Unexpected,
-            }),
-        };
-        let mut records = match phase_records(&phase_path) {
-            Ok(records) => records,
-            Err(record) => vec![record],
-        };
-        if let Some(record) = completion {
-            // A process-timeout category is parent-derived and replaces any
-            // untrustworthy terminal child claim.
-            records.retain(|record| record.phase != DiagnosticPhase::Completion);
-            records.push(record);
-        }
+        let completion = probe_completion.await;
         let (probe_classification, result_exists, _) = probe_observation(&result_path);
-        let result_record = match (result_exists, probe_classification) {
-            (false, _) => Some(DiagnosticRecord {
-                phase: DiagnosticPhase::ResultWriteOutcome,
-                category: DiagnosticCategory::Missing,
-            }),
-            (true, "denied") => None,
-            _ => Some(DiagnosticRecord {
-                phase: DiagnosticPhase::ResultWriteOutcome,
-                category: DiagnosticCategory::Unexpected,
-            }),
-        };
-        let daemon_accepted = matches!(accepted, Ok(Ok(_)));
+        cleanup_probe_artifacts(&result_path, &inner_script_path);
 
-        cleanup_probe_artifacts(&result_path, &phase_path, &inner_script_path);
-
-        // Preserve the strict security assertions. The phase report is the
-        // only hosted diagnostic output; every non-denial is a fixed code.
-        if let Some(record) = result_record {
-            records.retain(|existing| existing.phase != record.phase);
-            records.push(record);
-            diagnostic_stop(records);
-        }
-        if daemon_accepted
-            || !records.iter().any(|record| {
-                record.phase == DiagnosticPhase::PipeOpenOutcome
-                    && record.category == DiagnosticCategory::AccessDenied
-            })
-            || !records.iter().any(|record| {
-                record.phase == DiagnosticPhase::Completion
-                    && record.category == DiagnosticCategory::Reached
-            })
-        {
-            records.push(DiagnosticRecord {
-                phase: DiagnosticPhase::Completion,
-                category: DiagnosticCategory::Unexpected,
-            });
-            diagnostic_stop(records);
-        }
-
-        // This is a purpose-labelled evidence run, never a green repair
-        // proof. Fail after the retained DACL assertions so CI skips DevTest.
-        records.push(DiagnosticRecord {
-            phase: DiagnosticPhase::Completion,
-            category: DiagnosticCategory::Unexpected,
-        });
-        diagnostic_stop(records);
+        assert!(
+            matches!(completion, Ok(Ok(0))),
+            "[FAIL] {name}: the credentialed probe must complete successfully"
+        );
+        assert_eq!(
+            probe_classification,
+            "denied",
+            "[FAIL] {name}: the cross-account client must receive explicit access denial (result_exists={result_exists})"
+        );
+        assert!(
+            !matches!(accepted, Ok(Ok(_))),
+            "[FAIL] {name}: a cross-account client must never be accepted"
+        );
+        println!("[PASS] {name}: the cross-account named-pipe client was denied and never accepted");
     });
 }
 
