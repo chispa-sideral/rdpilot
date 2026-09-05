@@ -6,7 +6,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-foreach ($command in 'cargo', 'rustc', 'cl.exe', 'link.exe', 'schtasks.exe') {
+foreach ($command in 'cargo', 'rustc', 'cl.exe', 'link.exe') {
     if (-not (Get-Command $command -ErrorAction SilentlyContinue)) {
         throw "Windows DACL gate requires '$command' on the hosted runner PATH."
     }
@@ -23,7 +23,6 @@ if ($hostTriple -notmatch 'pc-windows-msvc$') {
 }
 
 $testAccount = "rdpDacl$PID$(Get-Random -Minimum 1000 -Maximum 9999)"
-$taskName = "RdpilotDacl-$testAccount"
 $accountCreated = $false
 
 try {
@@ -37,7 +36,6 @@ try {
     $env:RDPILOT_LIVE = '1'
     $env:RDPILOT_SECOND_WINDOWS_ACCOUNT = $testAccount
     $env:RDPILOT_SECOND_WINDOWS_PASSWORD = $password
-    $env:RDPILOT_DACL_TASK_NAME = $taskName
 
     $test = Start-Process -FilePath (Get-Command cargo).Source -WorkingDirectory $repoRoot `
         -ArgumentList @('test', '-p', 'rdpilot-daemon', '--test', 'live_daemon_windows_dacl', '--', '--ignored', '--test-threads=1') `
@@ -49,7 +47,6 @@ try {
     if ($test.ExitCode -ne 0) { throw "Windows DACL test failed with exit code $($test.ExitCode)." }
 }
 finally {
-    & schtasks.exe /delete /tn $taskName /f *> $null
     if ($accountCreated) { Remove-LocalUser -Name $testAccount -ErrorAction SilentlyContinue }
     Remove-Item Env:RDPILOT_SECOND_WINDOWS_PASSWORD -ErrorAction SilentlyContinue
 }
