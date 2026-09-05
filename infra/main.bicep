@@ -25,7 +25,7 @@ param subnetPrefix string = '10.42.1.0/24'
 param workloadNsgName string = 'rdpilot-ci-workload-nsg'
 
 @description('Windows VM size encoded in the formula.')
-param vmSize string = 'Standard_D2s_v5'
+param vmSize string = 'Standard_D2s_v3'
 
 param location string = resourceGroup().location
 
