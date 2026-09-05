@@ -35,9 +35,7 @@ jobs:
     needs: [linux, windows-dacl]
     environment: devtest-e2e
     if: >-
-      github.event_name == 'push' && github.repository == 'chispa-sideral/rdpilot' &&
-      vars.AZURE_DEVTEST_LABS_ID != '' && vars.RDPILOT_DEVTEST_NSG_ID != '' &&
-      vars.RDPILOT_DEVTEST_FORMULA != ''
+      github.event_name == 'push' && github.repository == 'chispa-sideral/rdpilot'
     runs-on: ubuntu-latest
     # 15m provisioning + 20m E2E + 20m cleanup/recovery margin.
     timeout-minutes: 55
