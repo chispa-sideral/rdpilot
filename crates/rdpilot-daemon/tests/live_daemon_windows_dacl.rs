@@ -32,7 +32,7 @@
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
-use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
+use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
 use windows_sys::Win32::System::Threading::{
     CreateProcessWithLogonW, GetExitCodeProcess, TerminateProcess, WaitForSingleObject,
     CREATE_NO_WINDOW, LOGON_WITH_PROFILE, PROCESS_INFORMATION, STARTUPINFOW,
@@ -66,28 +66,34 @@ fn utf16z(value: &str) -> Vec<u16> {
 /// is consumed by `wait_terminate_inspect_close`, so no caller can forget the
 /// bounded wait/termination/close sequence.
 struct OwnedProbeProcess {
-    handle: windows_sys::Win32::Foundation::HANDLE,
+    // A real same-process kernel handle is opaque: retain its integer value
+    // privately so this single-owner wrapper can cross Tokio's blocking-task
+    // Send boundary. Convert it back only at the Windows FFI call sites.
+    handle_value: usize,
 }
 
 impl OwnedProbeProcess {
     fn wait_terminate_inspect_close(self) -> Result<u32, String> {
-        let first_wait = unsafe { WaitForSingleObject(self.handle, PROBE_WAIT_MILLIS) };
+        let first_wait =
+            unsafe { WaitForSingleObject(self.handle_value as HANDLE, PROBE_WAIT_MILLIS) };
         if first_wait != WAIT_OBJECT_0 {
-            let terminated = unsafe { TerminateProcess(self.handle, 1) } != 0;
-            let terminal_wait =
-                unsafe { WaitForSingleObject(self.handle, TERMINATION_WAIT_MILLIS) };
+            let terminated = unsafe { TerminateProcess(self.handle_value as HANDLE, 1) } != 0;
+            let terminal_wait = unsafe {
+                WaitForSingleObject(self.handle_value as HANDLE, TERMINATION_WAIT_MILLIS)
+            };
             let mut exit_code = 0;
             let exit_code_observed =
-                unsafe { GetExitCodeProcess(self.handle, &mut exit_code) } != 0;
-            let process_closed = unsafe { CloseHandle(self.handle) } != 0;
+                unsafe { GetExitCodeProcess(self.handle_value as HANDLE, &mut exit_code) } != 0;
+            let process_closed = unsafe { CloseHandle(self.handle_value as HANDLE) } != 0;
             return Err(format!(
                 "probe did not complete (wait={first_wait}, terminated={terminated}, terminal_wait={terminal_wait}, exit_observed={exit_code_observed}, process_closed={process_closed})"
             ));
         }
 
         let mut exit_code = 0;
-        let exit_code_observed = unsafe { GetExitCodeProcess(self.handle, &mut exit_code) } != 0;
-        let process_closed = unsafe { CloseHandle(self.handle) } != 0;
+        let exit_code_observed =
+            unsafe { GetExitCodeProcess(self.handle_value as HANDLE, &mut exit_code) } != 0;
+        let process_closed = unsafe { CloseHandle(self.handle_value as HANDLE) } != 0;
         if !exit_code_observed || !process_closed {
             return Err(format!(
                 "probe completion inspection failed (exit_observed={exit_code_observed}, process_closed={process_closed})"
@@ -146,7 +152,7 @@ fn launch_cross_account_probe(
     }
 
     let owned_process = OwnedProbeProcess {
-        handle: process.hProcess,
+        handle_value: process.hProcess as usize,
     };
     let thread_closed = unsafe { CloseHandle(process.hThread) } != 0;
     if !thread_closed {
