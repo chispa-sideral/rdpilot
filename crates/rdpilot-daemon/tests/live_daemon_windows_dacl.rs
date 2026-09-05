@@ -62,16 +62,51 @@ fn utf16z(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
+/// The exact child process launched for the cross-account probe.  Its handle
+/// is consumed by `wait_terminate_inspect_close`, so no caller can forget the
+/// bounded wait/termination/close sequence.
+struct OwnedProbeProcess {
+    handle: windows_sys::Win32::Foundation::HANDLE,
+}
+
+impl OwnedProbeProcess {
+    fn wait_terminate_inspect_close(self) -> Result<u32, String> {
+        let first_wait = unsafe { WaitForSingleObject(self.handle, PROBE_WAIT_MILLIS) };
+        if first_wait != WAIT_OBJECT_0 {
+            let terminated = unsafe { TerminateProcess(self.handle, 1) } != 0;
+            let terminal_wait =
+                unsafe { WaitForSingleObject(self.handle, TERMINATION_WAIT_MILLIS) };
+            let mut exit_code = 0;
+            let exit_code_observed =
+                unsafe { GetExitCodeProcess(self.handle, &mut exit_code) } != 0;
+            let process_closed = unsafe { CloseHandle(self.handle) } != 0;
+            return Err(format!(
+                "probe did not complete (wait={first_wait}, terminated={terminated}, terminal_wait={terminal_wait}, exit_observed={exit_code_observed}, process_closed={process_closed})"
+            ));
+        }
+
+        let mut exit_code = 0;
+        let exit_code_observed = unsafe { GetExitCodeProcess(self.handle, &mut exit_code) } != 0;
+        let process_closed = unsafe { CloseHandle(self.handle) } != 0;
+        if !exit_code_observed || !process_closed {
+            return Err(format!(
+                "probe completion inspection failed (exit_observed={exit_code_observed}, process_closed={process_closed})"
+            ));
+        }
+        Ok(exit_code)
+    }
+}
+
 /// Launch the fixed PowerShell probe directly under the supplied local
-/// account, then retain ownership of the native process through completion.
+/// account and return the one owned native process handle to its caller.
 ///
 /// The command line deliberately contains only the already-created script
 /// path; the password stays in the `CreateProcessWithLogonW` UTF-16 buffer.
-fn run_cross_account_probe(
+fn launch_cross_account_probe(
     second_account: &str,
     second_password: &str,
     inner_script_path: &std::path::Path,
-) -> Result<u32, String> {
+) -> Result<OwnedProbeProcess, String> {
     let username = utf16z(second_account);
     let domain = utf16z(".");
     let password = utf16z(second_password);
@@ -110,45 +145,25 @@ fn run_cross_account_probe(
         ));
     }
 
+    let owned_process = OwnedProbeProcess {
+        handle: process.hProcess,
+    };
     let thread_closed = unsafe { CloseHandle(process.hThread) } != 0;
     if !thread_closed {
         let launch_error = std::io::Error::last_os_error()
             .raw_os_error()
             .unwrap_or_default();
-        let _ = unsafe { TerminateProcess(process.hProcess, 1) };
-        let _ = unsafe { WaitForSingleObject(process.hProcess, TERMINATION_WAIT_MILLIS) };
-        let mut exit_code = 0;
-        let exit_code_observed =
-            unsafe { GetExitCodeProcess(process.hProcess, &mut exit_code) } != 0;
-        let _ = unsafe { CloseHandle(process.hProcess) };
-        return Err(format!(
-            "thread-handle close failed (os error {launch_error}, exit_observed={exit_code_observed})"
-        ));
+        let completion = owned_process.wait_terminate_inspect_close();
+        return Err(match completion {
+            Ok(exit_code) => format!(
+                "thread-handle close failed (os error {launch_error}, exit_code={exit_code})"
+            ),
+            Err(error) => format!(
+                "thread-handle close failed (os error {launch_error}, process cleanup failed: {error})"
+            ),
+        });
     }
-
-    let first_wait = unsafe { WaitForSingleObject(process.hProcess, PROBE_WAIT_MILLIS) };
-    if first_wait != WAIT_OBJECT_0 {
-        let terminated = unsafe { TerminateProcess(process.hProcess, 1) } != 0;
-        let terminal_wait =
-            unsafe { WaitForSingleObject(process.hProcess, TERMINATION_WAIT_MILLIS) };
-        let mut exit_code = 0;
-        let exit_code_observed =
-            unsafe { GetExitCodeProcess(process.hProcess, &mut exit_code) } != 0;
-        let process_closed = unsafe { CloseHandle(process.hProcess) } != 0;
-        return Err(format!(
-            "probe did not complete (wait={first_wait}, terminated={terminated}, terminal_wait={terminal_wait}, exit_observed={exit_code_observed}, process_closed={process_closed})"
-        ));
-    }
-
-    let mut exit_code = 0;
-    let exit_code_observed = unsafe { GetExitCodeProcess(process.hProcess, &mut exit_code) } != 0;
-    let process_closed = unsafe { CloseHandle(process.hProcess) } != 0;
-    if !exit_code_observed || !process_closed {
-        return Err(format!(
-            "probe completion inspection failed (exit_observed={exit_code_observed}, process_closed={process_closed})"
-        ));
-    }
-    Ok(exit_code)
+    Ok(owned_process)
 }
 
 fn probe_observation(result_path: &std::path::Path) -> (&'static str, bool, u64) {
@@ -261,13 +276,34 @@ fn cross_account_connection_is_rejected_by_the_owner_only_dacl() {
             "[FAIL] {name}: icacls grant on the probe result file failed"
         );
 
-        let probe_completion =
-            run_cross_account_probe(&second_account, &second_password, &inner_script_path);
+        let owned_probe = match launch_cross_account_probe(
+            &second_account,
+            &second_password,
+            &inner_script_path,
+        ) {
+            Ok(probe) => probe,
+            Err(error) => {
+                let _ = std::fs::remove_file(&result_path);
+                let _ = std::fs::remove_file(&inner_script_path);
+                panic!("[FAIL] {name}: credentialed cross-account probe failed: {error}");
+            }
+        };
+        let probe_completion = tokio::task::spawn_blocking(move || {
+            owned_probe.wait_terminate_inspect_close()
+        });
 
-        let accepted = tokio::time::timeout(Duration::from_secs(5), rdpilot_daemon::accept_and_authorize(&listener)).await;
+        let accepted = tokio::time::timeout(
+            Duration::from_secs(5),
+            rdpilot_daemon::accept_and_authorize(&listener),
+        )
+        .await;
+        let probe_completion = match probe_completion.await {
+            Ok(completion) => completion,
+            Err(_) => Err("probe completion task failed".to_owned()),
+        };
 
-        // The native launcher above has already observed bounded child
-        // completion. The result file is still the ground-truth DACL signal;
+        // The owned native process above has now completed its bounded
+        // completion path. The result file is still the ground-truth DACL signal;
         // poll it briefly because the child may release its final file write
         // just before process termination becomes observable.
         // The inner script emits only a fixed classification. Observe it
