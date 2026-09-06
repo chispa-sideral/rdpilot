@@ -18,8 +18,8 @@ RUNNER = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(RUNNER)
 
 
-def result(code: int = 0, stderr: str = '') -> subprocess.CompletedProcess[str]:
-    return subprocess.CompletedProcess(['az'], code, '', stderr)
+def result(code: int = 0, stderr: str = '', stdout: str = '') -> subprocess.CompletedProcess[str]:
+    return subprocess.CompletedProcess(['az'], code, stdout, stderr)
 
 
 class CleanupTests(unittest.TestCase):
@@ -130,6 +130,68 @@ class RequiredConfigTests(unittest.TestCase):
         values = {**self.values, 'RDPILOT_DEVTEST_NSG_ID': self.values['RDPILOT_DEVTEST_NSG_ID'].replace('Microsoft.Network', 'Microsoft-Network')}
         with patch.dict(RUNNER.os.environ, values, clear=True), self.assertRaisesRegex(RUNNER.LeaseError, 'devtest-nsg-id-invalid'):
             RUNNER.required_config()
+
+
+class BackingVmVisibilityTests(unittest.TestCase):
+    compute_id = '/subscriptions/s/resourceGroups/rg/providers/Microsoft.Compute/virtualMachines/owned'
+
+    def vm_record(self) -> str:
+        return '{"networkProfile":{"networkInterfaces":[{"id":"nic","primary":true}]},"storageProfile":{"osDisk":{"managedDisk":{"id":"disk"}},"dataDisks":[]}}'
+
+    def nic_record(self) -> str:
+        return '{"ipConfigurations":[{"primary":true,"subnet":{"id":"subnet"},"privateIPAddress":"10.0.0.4"}]}'
+
+    def test_explicit_404_retries_exact_compute_vm_then_uses_strict_parser(self) -> None:
+        responses = [result(1, 'ResourceNotFound'), result(stdout=self.vm_record()), result(stdout=self.nic_record())]
+        calls = []
+
+        def az_responder(*args, **_kwargs):
+            calls.append(args)
+            return responses.pop(0)
+
+        with patch.object(RUNNER, 'az', side_effect=az_responder), \
+             patch.object(RUNNER.time, 'monotonic', side_effect=(0, 0, 0, 1, 1)), \
+             patch.object(RUNNER.time, 'sleep') as sleep:
+            resources, subnet_id, private_ip = RUNNER.resource_ids(self.compute_id, 15 * 60)
+
+        self.assertEqual(resources, [self.compute_id, 'nic', 'disk'])
+        self.assertEqual((subnet_id, private_ip), ('subnet', '10.0.0.4'))
+        self.assertEqual(calls[:2], [('vm', 'show', '--ids', self.compute_id, '--output', 'json'),
+                                     ('vm', 'show', '--ids', self.compute_id, '--output', 'json')])
+        sleep.assert_called_once_with(RUNNER.BACKING_VM_VISIBILITY_POLL_INTERVAL)
+
+    def test_404_retry_stops_at_named_deadline(self) -> None:
+        with patch.object(RUNNER, 'az', return_value=result(1, 'HTTP 404')), \
+             patch.object(RUNNER.time, 'monotonic', side_effect=(0, 0, 120)), \
+             patch.object(RUNNER.time, 'sleep') as sleep, \
+             self.assertRaisesRegex(RUNNER.LeaseError, 'devtest-backing-vm-not-ready'):
+            RUNNER.resource_ids(self.compute_id, 15 * 60)
+        sleep.assert_not_called()
+
+    def test_authorization_failure_is_not_retried(self) -> None:
+        with patch.object(RUNNER, 'az', return_value=result(1, 'AuthorizationFailed')) as az_mock, \
+             patch.object(RUNNER.time, 'monotonic', side_effect=(0, 0)), \
+             patch.object(RUNNER.time, 'sleep') as sleep, \
+             self.assertRaisesRegex(RUNNER.LeaseError, 'azure-command-failed:vm'):
+            RUNNER.resource_ids(self.compute_id, 15 * 60)
+        az_mock.assert_called_once()
+        sleep.assert_not_called()
+
+    def test_transport_failure_is_not_retried(self) -> None:
+        with patch.object(RUNNER, 'az', return_value=result(1, 'connection reset')) as az_mock, \
+             patch.object(RUNNER.time, 'monotonic', side_effect=(0, 0)), \
+             patch.object(RUNNER.time, 'sleep') as sleep, \
+             self.assertRaisesRegex(RUNNER.LeaseError, 'azure-command-failed:vm'):
+            RUNNER.resource_ids(self.compute_id, 15 * 60)
+        az_mock.assert_called_once()
+        sleep.assert_not_called()
+
+    def test_malformed_vm_output_is_not_retried(self) -> None:
+        with patch.object(RUNNER, 'az', return_value=result(stdout='{')) as az_mock, \
+             patch.object(RUNNER.time, 'monotonic', side_effect=(0, 0)), \
+             self.assertRaisesRegex(RUNNER.LeaseError, 'devtest-backing-resource-invalid'):
+            RUNNER.resource_ids(self.compute_id, 15 * 60)
+        az_mock.assert_called_once()
 
 
 if __name__ == '__main__':

@@ -28,6 +28,8 @@ NETWORK_API_VERSION = '2024-05-01'
 REQUIRED_ENV = ('AZURE_DEVTEST_LABS_ID', 'RDPILOT_DEVTEST_NSG_ID', 'RDPILOT_DEVTEST_FORMULA')
 LAB_ID = re.compile(r'^/subscriptions/[^/]+/resourceGroups/[^/]+/providers/Microsoft\.DevTestLab/labs/[^/]+$', re.I)
 NOT_FOUND = re.compile(r'(?:\bResourceNotFound\b|\bHTTP\s*404\b|\bStatus\s*Code:\s*404\b)', re.I)
+BACKING_VM_VISIBILITY_TIMEOUT = 120
+BACKING_VM_VISIBILITY_POLL_INTERVAL = 5
 
 
 class LeaseError(RuntimeError):
@@ -156,8 +158,29 @@ def source_cidr() -> str:
     raise AssertionError
 
 
-def resource_ids(compute_id: str) -> tuple[list[str], str, str]:
-    vm = az('vm', 'show', '--ids', compute_id, '--output', 'json')
+def visible_backing_vm(compute_id: str, provision_timeout: int) -> subprocess.CompletedProcess[str]:
+    """Read the exact owned backing VM after DevTest reports it ready.
+
+    DevTest completion can precede Compute's first readable observation. Only an
+    explicit not-found response is retried; every other Azure failure remains
+    fail-closed.
+    """
+    deadline = time.monotonic() + min(BACKING_VM_VISIBILITY_TIMEOUT, provision_timeout)
+    while True:
+        vm = az('vm', 'show', '--ids', compute_id, '--output', 'json', check=False,
+                timeout=max(1, deadline - time.monotonic()))
+        if vm.returncode == 0:
+            return vm
+        if not is_confirmed_not_found(vm):
+            fail('azure-command-failed:vm')
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            fail('devtest-backing-vm-not-ready')
+        time.sleep(min(BACKING_VM_VISIBILITY_POLL_INTERVAL, remaining))
+
+
+def resource_ids(compute_id: str, provision_timeout: int) -> tuple[list[str], str, str]:
+    vm = visible_backing_vm(compute_id, provision_timeout)
     try:
         record = json.loads(vm.stdout)
         nics = record['networkProfile']['networkInterfaces']
@@ -341,7 +364,7 @@ def run(args: argparse.Namespace) -> int:
         if not isinstance(compute_id, str) or not isinstance(host, str):
             fail('devtest-connection-coordinates-missing')
 
-        resources, subnet_id, private_ip = resource_ids(compute_id)
+        resources, subnet_id, private_ip = resource_ids(compute_id, args.provision_timeout)
         # Persist all backing resources before source-IP discovery or NSG mutation.
         state['resources'] = resources
         save_state(state_path, state)
