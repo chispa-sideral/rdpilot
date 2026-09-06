@@ -106,8 +106,88 @@ class CleanupTests(unittest.TestCase):
         observed = []
         with patch.object(RUNNER.time, 'monotonic', side_effect=(0, 0, 10)), \
              patch.object(RUNNER.time, 'sleep'):
-            self.assertFalse(RUNNER.wait_for_absence(lambda: observed.append('present') or 'present', 5))
+            self.assertEqual(RUNNER.wait_for_absence(lambda: observed.append('present') or 'present', 5),
+                             'present-timeout')
         self.assertEqual(observed, ['present'])
+
+    def test_cleanup_failure_vocabulary_is_complete_and_closed(self) -> None:
+        expected = {
+            'backing-resource-absence-present-timeout', 'backing-resource-absence-unknown',
+            'backing-resource-delete-authorization', 'backing-resource-delete-other',
+            'backing-resource-delete-timeout', 'backing-resource-delete-transport',
+            'devtest-vm-absence-present-timeout', 'devtest-vm-absence-unknown',
+            'devtest-vm-delete-authorization', 'devtest-vm-delete-other',
+            'devtest-vm-delete-timeout', 'devtest-vm-delete-transport',
+            'ingress-absence-present-timeout', 'ingress-absence-unknown',
+            'ingress-delete-authorization', 'ingress-delete-other',
+            'ingress-delete-timeout', 'ingress-delete-transport',
+        }
+        self.assertEqual(RUNNER.CLEANUP_FAILURE_CLASSES, expected)
+        for scope in ('ingress', 'devtest-vm', 'backing-resource'):
+            for result_class in ('authorization', 'transport', 'timeout', 'other'):
+                self.assertIn(RUNNER.cleanup_failure_class(scope, 'delete', result_class), expected)
+            for absence in ('present-timeout', 'unknown'):
+                self.assertIn(RUNNER.cleanup_failure_class(scope, 'absence', absence), expected)
+        with self.assertRaises(AssertionError):
+            RUNNER.cleanup_failure_class('ingress', 'absence', 'absent')
+
+    def test_cleanup_failure_event_is_sorted_deduplicated_and_redacted(self) -> None:
+        self.state(resources=(
+            '/subscriptions/s/resourceGroups/rg/providers/Microsoft.Compute/virtualMachines/owned',
+            '/subscriptions/s/resourceGroups/rg/providers/Microsoft.Compute/virtualMachines/owned',
+        ))
+        output = io.StringIO()
+        with patch.object(RUNNER, 'rest_result', return_value=result(1, 'AuthorizationFailed secret-user')), \
+             patch.object(RUNNER, 'az', return_value=result(1, 'connection reset private-password')), \
+             redirect_stdout(output):
+            self.assertEqual(RUNNER.cleanup(self.state_path, cleanup_timeout=1), 1)
+        event = json.loads(output.getvalue())
+        self.assertEqual(event['failure_classes'], sorted({
+            'backing-resource-absence-unknown',
+            'ingress-delete-authorization',
+            'devtest-vm-delete-authorization',
+            'backing-resource-delete-transport',
+        }))
+        self.assertEqual(event['failures'], sorted({
+            'ingress-rule-delete-failed',
+            'devtest-vm-delete-failed',
+            'backing-resource-delete-failed',
+            'backing-resource-remains',
+        }))
+        self.assertEqual(event['phase'], 'deletion')
+        self.assertEqual(output.getvalue().count('"phase"'), 1)
+        self.assertNotIn('secret-user', output.getvalue())
+        self.assertNotIn('private-password', output.getvalue())
+
+    def test_absence_observations_have_fixed_classes_and_keep_generic_failures(self) -> None:
+        self.state(resources=('/subscriptions/s/resourceGroups/rg/providers/Microsoft.Compute/virtualMachines/owned',))
+        output = io.StringIO()
+        with patch.object(RUNNER, 'rest_result', return_value=result(0)), \
+             patch.object(RUNNER, 'az', return_value=result(0)), \
+             patch.object(RUNNER, 'wait_for_absence', side_effect=('present-timeout', 'unknown', 'present-timeout')), \
+             redirect_stdout(output):
+            self.assertEqual(RUNNER.cleanup(self.state_path, cleanup_timeout=1), 1)
+        event = json.loads(output.getvalue())
+        self.assertEqual(event['failure_classes'], [
+            'backing-resource-absence-present-timeout',
+            'devtest-vm-absence-unknown',
+            'ingress-absence-present-timeout',
+        ])
+        self.assertEqual(event['failures'], [
+            'backing-resource-remains',
+            'devtest-vm-cleanup-failed',
+            'ingress-cleanup-failed',
+        ])
+
+    def test_successful_explicit_404_cleanup_has_no_failure_classes(self) -> None:
+        self.state()
+        output = io.StringIO()
+        with patch.object(RUNNER, 'rest_result', side_effect=lambda method, *_args, **_kwargs: result(0) if method == 'DELETE' else result(1, 'ResourceNotFound')), \
+             redirect_stdout(output):
+            self.assertEqual(RUNNER.cleanup(self.state_path, cleanup_timeout=1), 0)
+        self.assertEqual(json.loads(output.getvalue()), {
+            'event': 'down', 'lease_id': '00000000-0000-0000-0000-000000000001',
+        })
 
 
 class RequiredConfigTests(unittest.TestCase):

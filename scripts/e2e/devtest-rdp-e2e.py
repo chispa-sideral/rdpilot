@@ -32,6 +32,26 @@ BACKING_VM_VISIBILITY_TIMEOUT = 120
 BACKING_VM_VISIBILITY_POLL_INTERVAL = 5
 PHASES = frozenset(('provisioning', 'resource-discovery', 'nsg', 'rdp', 'deletion'))
 BACKING_VM_FAILURE_CLASSES = frozenset(('authorization', 'transport', 'timeout', 'other'))
+CLEANUP_FAILURE_CLASSES = frozenset((
+    'backing-resource-absence-present-timeout',
+    'backing-resource-absence-unknown',
+    'backing-resource-delete-authorization',
+    'backing-resource-delete-other',
+    'backing-resource-delete-timeout',
+    'backing-resource-delete-transport',
+    'devtest-vm-absence-present-timeout',
+    'devtest-vm-absence-unknown',
+    'devtest-vm-delete-authorization',
+    'devtest-vm-delete-other',
+    'devtest-vm-delete-timeout',
+    'devtest-vm-delete-transport',
+    'ingress-absence-present-timeout',
+    'ingress-absence-unknown',
+    'ingress-delete-authorization',
+    'ingress-delete-other',
+    'ingress-delete-timeout',
+    'ingress-delete-transport',
+))
 AUTHORIZATION_FAILURE = re.compile(r'\b(?:authorization\w*|forbidden|unauthorized)\b', re.I)
 TIMEOUT_FAILURE = re.compile(r'\b(?:timeout|timed out|deadline exceeded)\b', re.I)
 TRANSPORT_FAILURE = re.compile(r'\b(?:connection|connect|network|dns|socket|tls|proxy|reset|unreachable)\b', re.I)
@@ -105,6 +125,11 @@ def is_confirmed_not_found(result: subprocess.CompletedProcess[str]) -> bool:
 
 def classify_backing_vm_failure(result: subprocess.CompletedProcess[str]) -> str:
     """Classify only a non-404 exact Compute VM read without retaining Azure output."""
+    return classify_azure_failure(result)
+
+
+def classify_azure_failure(result: subprocess.CompletedProcess[str]) -> str:
+    """Map an Azure result to one fixed class without exposing its contents."""
     if result.returncode == 124 or TIMEOUT_FAILURE.search(result.stderr):
         return 'timeout'
     if AUTHORIZATION_FAILURE.search(result.stderr):
@@ -271,7 +296,7 @@ def delete_resource(resource_id: str, timeout: float) -> str:
     result = az('resource', 'delete', '--ids', resource_id, check=False, timeout=timeout)
     if result.returncode == 0 or is_confirmed_not_found(result):
         return 'requested'
-    return 'failed'
+    return classify_azure_failure(result)
 
 
 def observe_resource(resource_id: str, timeout: float) -> str:
@@ -293,26 +318,35 @@ def observe_rest(url: str, timeout: float) -> str:
     return 'failed'
 
 
-def wait_for_absence(observe: Any, deadline: float) -> bool:
-    """Poll one exact resource; unknown Azure results fail closed, never become absence."""
+def wait_for_absence(observe: Any, deadline: float) -> str:
+    """Return only absent, present-timeout, or unknown for one exact resource."""
     while time.monotonic() < deadline:
         state = observe()
         if state == 'absent':
-            return True
+            return 'absent'
         if state != 'present':
-            return False
+            return 'unknown'
         time.sleep(min(5, max(0, deadline - time.monotonic())))
-    return False
+    return 'present-timeout'
 
 
 def remaining_timeout(deadline: float) -> float:
     return max(1, deadline - time.monotonic())
 
 
+def cleanup_failure_class(scope: str, operation: str, outcome: str) -> str:
+    """Build one closed cleanup diagnostic label from code-selected values only."""
+    failure_class = f'{scope}-{operation}-{outcome}'
+    if failure_class not in CLEANUP_FAILURE_CLASSES:
+        raise AssertionError('invalid cleanup failure class')
+    return failure_class
+
+
 def cleanup(state_path: Path, cleanup_timeout: int = 10 * 60) -> int:
     state = load_state(state_path)
     deadline = time.monotonic() + cleanup_timeout
     failures: list[str] = []
+    failure_classes: list[str] = []
     nsg_id = state.get('nsg_id')
     rule = state.get('ingress_rule')
     if isinstance(nsg_id, str) and isinstance(rule, str):
@@ -320,8 +354,13 @@ def cleanup(state_path: Path, cleanup_timeout: int = 10 * 60) -> int:
         deleted = rest_result('DELETE', rule_url, timeout=remaining_timeout(deadline))
         if deleted.returncode and not is_confirmed_not_found(deleted):
             failures.append('ingress-rule-delete-failed')
-        elif not wait_for_absence(lambda: observe_rest(rule_url, remaining_timeout(deadline)), deadline):
-            failures.append('ingress-cleanup-failed')
+            failure_classes.append(cleanup_failure_class(
+                'ingress', 'delete', classify_azure_failure(deleted)))
+        else:
+            absence = wait_for_absence(lambda: observe_rest(rule_url, remaining_timeout(deadline)), deadline)
+            if absence != 'absent':
+                failures.append('ingress-cleanup-failed')
+                failure_classes.append(cleanup_failure_class('ingress', 'absence', absence))
 
     lab_id = state.get('lab_id')
     vm_name = state.get('vm_name')
@@ -330,19 +369,29 @@ def cleanup(state_path: Path, cleanup_timeout: int = 10 * 60) -> int:
         deleted = rest_result('DELETE', vm_url, timeout=remaining_timeout(deadline))
         if deleted.returncode and not is_confirmed_not_found(deleted):
             failures.append('devtest-vm-delete-failed')
-        elif not wait_for_absence(lambda: observe_rest(vm_url, remaining_timeout(deadline)), deadline):
-            failures.append('devtest-vm-cleanup-failed')
+            failure_classes.append(cleanup_failure_class(
+                'devtest-vm', 'delete', classify_azure_failure(deleted)))
+        else:
+            absence = wait_for_absence(lambda: observe_rest(vm_url, remaining_timeout(deadline)), deadline)
+            if absence != 'absent':
+                failures.append('devtest-vm-cleanup-failed')
+                failure_classes.append(cleanup_failure_class('devtest-vm', 'absence', absence))
 
     for resource_id in state.get('resources', []):
-        if isinstance(resource_id, str) and delete_resource(resource_id, remaining_timeout(deadline)) == 'failed':
-            failures.append('backing-resource-delete-failed')
+        if isinstance(resource_id, str):
+            deleted = delete_resource(resource_id, remaining_timeout(deadline))
+            if deleted != 'requested':
+                failures.append('backing-resource-delete-failed')
+                failure_classes.append(cleanup_failure_class('backing-resource', 'delete', deleted))
 
     for resource_id in state.get('resources', []):
         if not isinstance(resource_id, str):
             continue
-        if not wait_for_absence(lambda resource_id=resource_id: observe_resource(
-                resource_id, remaining_timeout(deadline)), deadline):
+        absence = wait_for_absence(lambda resource_id=resource_id: observe_resource(
+            resource_id, remaining_timeout(deadline)), deadline)
+        if absence != 'absent':
             failures.append('backing-resource-remains')
+            failure_classes.append(cleanup_failure_class('backing-resource', 'absence', absence))
 
     try:
         remove_private(state_path)
@@ -355,6 +404,7 @@ def cleanup(state_path: Path, cleanup_timeout: int = 10 * 60) -> int:
             'lease_id': state['lease_id'],
             'phase': 'deletion',
             'failures': sorted(set(failures)),
+            'failure_classes': sorted(set(failure_classes)),
         }))
         return 1
     state_path.unlink(missing_ok=True)
