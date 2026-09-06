@@ -341,7 +341,12 @@ async fn connect_list_disconnect_e2e_against_a_real_target() {
 
     write_frame(&mut stream, &Request::WorldState {
         session: session.clone(),
-        options: WireWorldStateOptions { screenshot: true, window_list: true, uia: WireUiaMode::Foreground },
+        options: WireWorldStateOptions {
+            screenshot: true,
+            window_list: true,
+            uia: WireUiaMode::Foreground,
+            elevation_check: false,
+        },
     }).await.expect("write WorldState");
     assert!(matches!(read_frame::<WireResponse>(&mut stream).await.expect("read WorldState"), WireResponse::WorldState { screenshot: Some(_), window_list: Some(_), uia: Some(_), .. }));
 

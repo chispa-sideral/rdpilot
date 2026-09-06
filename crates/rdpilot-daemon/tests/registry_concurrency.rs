@@ -59,6 +59,7 @@ impl ManagedSession for FakeSession {
                 screenshot: None,
                 window_list: None,
                 uia: None,
+            elevation_active: None,
             })
         })
     }
@@ -110,6 +111,17 @@ impl ManagedSession for FakeSession {
     }
     fn deploy_and_launch(&self) -> OpFuture<'_, Result<std::time::Duration, DaemonError>> {
         Box::pin(async move { Ok(std::time::Duration::from_millis(0)) })
+    }
+    fn uac_respond(
+        &self,
+        decision: rdpilot::UacDecision,
+    ) -> OpFuture<'_, Result<rdpilot::UacResponseOutcome, DaemonError>> {
+        Box::pin(async move {
+            Ok(rdpilot::UacResponseOutcome {
+                decision,
+                confirmation: rdpilot::Screenshot { width: 1, height: 1, rgba: vec![0, 0, 0, 0] },
+            })
+        })
     }
 }
 

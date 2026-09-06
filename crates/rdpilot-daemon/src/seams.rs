@@ -218,6 +218,26 @@ pub trait ManagedSession: Send + 'static {
     fn bootstrap_stages(&self) -> Vec<rdpilot::BootstrapStage> {
         Vec::new()
     }
+
+    /// This session's own RDP session id, if resolved by a prior
+    /// `get_process_tree` round trip (mirrors
+    /// [`rdpilot::Session::own_session_id`], ticket BF8Q9K6FGZ2APN8F). A
+    /// plain synchronous getter, like `desktop_size` — never a `BoxFuture`.
+    /// The default (`None`) keeps existing fake sessions source-compatible.
+    fn own_session_id(&self) -> Option<u32> {
+        None
+    }
+
+    /// Respond to an active UAC/elevation consent prompt (mirrors
+    /// [`rdpilot::Session::uac_respond`], ticket BF8Q9K6FGZ2APN8F).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DaemonError::Sdk`] on any underlying SDK failure.
+    fn uac_respond(
+        &self,
+        decision: rdpilot::UacDecision,
+    ) -> BoxFuture<'_, Result<rdpilot::UacResponseOutcome, DaemonError>>;
 }
 
 impl ManagedSession for Session {
@@ -307,6 +327,17 @@ impl ManagedSession for Session {
 
     fn bootstrap_stages(&self) -> Vec<rdpilot::BootstrapStage> {
         self.bootstrap_stages()
+    }
+
+    fn own_session_id(&self) -> Option<u32> {
+        self.own_session_id()
+    }
+
+    fn uac_respond(
+        &self,
+        decision: rdpilot::UacDecision,
+    ) -> BoxFuture<'_, Result<rdpilot::UacResponseOutcome, DaemonError>> {
+        Box::pin(async move { self.uac_respond(decision).await.map_err(DaemonError::Sdk) })
     }
 }
 
