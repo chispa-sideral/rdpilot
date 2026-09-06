@@ -41,6 +41,7 @@ mod request;
 mod response;
 mod session_id;
 mod transfer;
+mod uac;
 // `transport`'s framing primitives (`read_frame`/`write_frame`/
 // `TransportError`) are cross-platform (Plan 15-05 fix: `rdpilot-daemon`'s
 // Windows IPC path needs them too, exercised via the generic
@@ -60,6 +61,7 @@ pub use request::{Request, SessionScoped};
 pub use response::{SessionLifecycle, SessionStatus, WireResponse};
 pub use session_id::SessionId;
 pub use transfer::TransferOutcome;
+pub use uac::WireUacDecision;
 pub use transport::{TransportError, read_frame, write_frame};
 #[cfg(unix)]
 pub use transport::{connect_or_spawn, socket_path};

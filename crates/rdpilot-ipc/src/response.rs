@@ -15,6 +15,7 @@ use crate::error::WireError;
 use crate::perception::{WireProcessInfo, WireUiaElement, WireWindowInfo};
 use crate::session_id::SessionId;
 use crate::transfer::TransferOutcome;
+use crate::uac::WireUacDecision;
 
 /// The D-30 session lifecycle vocabulary, derived from the SDK keepalive
 /// signal (Phase 12 populates it).
@@ -107,6 +108,10 @@ pub enum WireResponse {
     ProcessList {
         /// The current processes.
         processes: Vec<WireProcessInfo>,
+        /// Whether a UAC/elevation consent prompt is active in this
+        /// session (session-scoped, structural detection off the same
+        /// process tree — zero extra sensor cost, ticket BF8Q9K6FGZ2APN8F).
+        elevation_active: bool,
     },
     /// A UI Automation tree walk result (`Uia`).
     Uia {
@@ -130,6 +135,11 @@ pub enum WireResponse {
         window_list: Option<Vec<WireWindowInfo>>,
         /// UIA trees grouped by originating window handle, if requested.
         uia: Option<Vec<(u64, Vec<WireUiaElement>)>>,
+        /// Whether a UAC/elevation consent prompt is active in this
+        /// session (session-scoped, structural detection), if
+        /// `elevation_check` was requested — `None` otherwise, or on a
+        /// fail-open sensor degrade (ticket BF8Q9K6FGZ2APN8F).
+        elevation_active: Option<bool>,
     },
     /// A session's native desktop dimensions (`DesktopSize`; mirrors
     /// `Session::desktop_size`). `u16` because RDP desktop dimensions never
@@ -140,6 +150,15 @@ pub enum WireResponse {
         width: u16,
         /// Native desktop height, in pixels.
         height: u16,
+    },
+    /// The confirmed outcome of a `UacRespond` request (ticket
+    /// BF8Q9K6FGZ2APN8F): responding to an active UAC/elevation consent
+    /// prompt via the proven native Tab-navigate + Unicode-Enter sequence.
+    UacRespond {
+        /// Which decision was requested.
+        decision: WireUacDecision,
+        /// Base64-encoded PNG of the confirming follow-up screenshot.
+        confirmation_png_base64: String,
     },
     /// A typed wire error (D-28).
     Error(WireError),
@@ -208,7 +227,9 @@ mod tests {
                     path: "C:\\Windows\\notepad.exe".to_owned(),
                     command_line: None,
                     owner: None,
+                    session_id: Some(1),
                 }],
+                elevation_active: false,
             },
             WireResponse::Uia {
                 elements: vec![WireUiaElement {
@@ -230,8 +251,13 @@ mod tests {
                 screenshot: Some("cGxhY2Vob2xkZXI=".to_owned()),
                 window_list: None,
                 uia: None,
+                elevation_active: Some(false),
             },
             WireResponse::DesktopSize { width: 1920, height: 1080 },
+            WireResponse::UacRespond {
+                decision: crate::uac::WireUacDecision::Approve,
+                confirmation_png_base64: "cGxhY2Vob2xkZXI=".to_owned(),
+            },
             WireResponse::Error(WireError {
                 code: WireErrorCode::SessionNotFound,
                 message: "not found".to_owned(),
@@ -251,6 +277,7 @@ mod tests {
                 | WireResponse::Uia { .. }
                 | WireResponse::WorldState { .. }
                 | WireResponse::DesktopSize { .. }
+                | WireResponse::UacRespond { .. }
                 | WireResponse::Error(_) => {}
             }
         }
