@@ -33,7 +33,7 @@ use std::str::FromStr;
 
 use rdpilot_config::ResolvedConfig;
 use rdpilot_ipc::{
-    Request, SessionId, SessionLifecycle, TransferOutcome, WireResponse, WireUiaMode, WireUiaScope,
+    Request, SessionId, SessionLifecycle, TransferOutcome, WireResponse, WireUacDecision, WireUiaMode, WireUiaScope,
     WireWorldStateOptions,
 };
 use rmcp::handler::server::wrapper::Parameters;
@@ -134,6 +134,10 @@ pub struct WorldStateArgs {
     /// Which UIA tree(s), if any, to fetch.
     #[serde(default)]
     pub uia: WorldStateUiaMode,
+    /// Whether to fetch and surface `elevation_active` (session-scoped
+    /// UAC/elevation consent-prompt detection, ticket BF8Q9K6FGZ2APN8F).
+    #[serde(default)]
+    pub elevation_check: bool,
 }
 
 /// Build the wire [`WireWorldStateOptions`] from [`WorldStateArgs`] — a
@@ -143,6 +147,7 @@ fn build_world_state_options(args: &WorldStateArgs) -> WireWorldStateOptions {
         screenshot: args.screenshot,
         window_list: args.window_list,
         uia: args.uia.clone().into(),
+        elevation_check: args.elevation_check,
     }
 }
 
@@ -151,13 +156,14 @@ fn build_world_state_options(args: &WorldStateArgs) -> WireWorldStateOptions {
 /// [`WireResponse`] fixture (no daemon needed).
 fn render_world_state(resp: WireResponse) -> Result<CallToolResult, McpError> {
     match resp {
-        WireResponse::WorldState { timestamp, capture_span_ms, screenshot, window_list, uia } => {
+        WireResponse::WorldState { timestamp, capture_span_ms, screenshot, window_list, uia, elevation_active } => {
             json_result(&serde_json::json!({
                 "timestamp": timestamp,
                 "capture_span_ms": capture_span_ms,
                 "screenshot": screenshot,
                 "window_list": window_list,
                 "uia": uia,
+                "elevation_active": elevation_active,
             }))
         }
         WireResponse::Error(err) => Err(McpError::from(err)),
@@ -235,7 +241,9 @@ pub struct ProcessListArgs {
 
 fn render_process_list(resp: WireResponse) -> Result<CallToolResult, McpError> {
     match resp {
-        WireResponse::ProcessList { processes } => json_result(&serde_json::json!({ "processes": processes })),
+        WireResponse::ProcessList { processes, elevation_active } => {
+            json_result(&serde_json::json!({ "processes": processes, "elevation_active": elevation_active }))
+        }
         WireResponse::Error(err) => Err(McpError::from(err)),
         other => Err(McpError::invalid_argument(format!("expected ProcessList, got {other:?}"))),
     }
@@ -282,6 +290,58 @@ fn render_ack(resp: WireResponse) -> Result<CallToolResult, McpError> {
         WireResponse::Ack => Ok(ack_result()),
         WireResponse::Error(err) => Err(McpError::from(err)),
         other => Err(McpError::invalid_argument(format!("expected Ack, got {other:?}"))),
+    }
+}
+
+// ---------------------------------------------------------------------
+// rdpilot_uac_respond (ticket BF8Q9K6FGZ2APN8F)
+// ---------------------------------------------------------------------
+
+/// A caller-facing mirror of [`WireUacDecision`], converted 1:1 via
+/// [`From`] — mirrors [`UiaScopeArg`]'s tagged-enum pattern.
+#[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
+#[serde(tag = "decision", rename_all = "snake_case")]
+pub enum McpUacDecision {
+    /// Approve the active UAC/elevation prompt.
+    Approve,
+    /// Reject the active UAC/elevation prompt.
+    Reject,
+}
+
+impl From<McpUacDecision> for WireUacDecision {
+    fn from(decision: McpUacDecision) -> Self {
+        match decision {
+            McpUacDecision::Approve => WireUacDecision::Approve,
+            McpUacDecision::Reject => WireUacDecision::Reject,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct UacRespondArgs {
+    /// The session to operate on (D-29).
+    pub session: String,
+    /// Which way to respond.
+    pub decision: McpUacDecision,
+}
+
+/// Render a `Request::UacRespond` round trip's response as
+/// `{decision, confirmation_screenshot_base64}` — mirrors
+/// [`render_world_state`]'s base64 convention.
+fn render_uac_respond(resp: WireResponse) -> Result<CallToolResult, McpError> {
+    match resp {
+        WireResponse::UacRespond { decision, confirmation_png_base64 } => {
+            let decision_str = match decision {
+                WireUacDecision::Approve => "approve",
+                WireUacDecision::Reject => "reject",
+            };
+            json_result(&serde_json::json!({
+                "decision": decision_str,
+                "confirmation_screenshot_base64": confirmation_png_base64,
+            }))
+        }
+        WireResponse::Error(err) => Err(McpError::from(err)),
+        other => Err(McpError::invalid_argument(format!("expected UacRespond, got {other:?}"))),
     }
 }
 
@@ -455,6 +515,13 @@ impl RdpilotMcpHandler {
         render_ack(resp)
     }
 
+    async fn uac_respond_impl(&self, args: UacRespondArgs) -> Result<CallToolResult, McpError> {
+        let session = parse_session(&args.session)?;
+        let resp =
+            round_trip_bounded(Request::UacRespond { session, decision: args.decision.into() }, timeouts::FAST).await?;
+        render_uac_respond(resp)
+    }
+
     async fn connect_impl(&self, args: ConnectArgs) -> Result<CallToolResult, McpError> {
         let resolved =
             rdpilot_config::resolve(args.params.into_overrides()).map_err(|e| McpError::invalid_argument(e.to_string()))?;
@@ -516,7 +583,7 @@ impl RdpilotMcpHandler {
 impl RdpilotMcpHandler {
     #[tool(
         name = "rdpilot_world_state",
-        description = "Correlated desktop snapshot: screenshot + window list + optional UIA tree(s), one batch timestamp (D-8.1). Requires session (D-29)."
+        description = "Correlated desktop snapshot: screenshot + window list + optional UIA tree(s), one batch timestamp (D-8.1). Set elevation_check to also surface elevation_active: whether a UAC/elevation consent prompt is active in this session -- if true, use rdpilot_uac_respond instead of clicks/keys. Requires session (D-29)."
     )]
     pub async fn rdpilot_world_state(
         &self,
@@ -546,13 +613,24 @@ impl RdpilotMcpHandler {
 
     #[tool(
         name = "rdpilot_process_list",
-        description = "List the remote machine's process tree (pid, parent pid, image name/path, best-effort command line/owner). Requires session (D-29)."
+        description = "List the remote machine's process tree (pid, parent pid, image name/path, best-effort command line/owner/session id) alongside elevation_active: whether a UAC/elevation consent prompt is active in this session -- if true, use rdpilot_uac_respond instead of clicks/keys. Requires session (D-29)."
     )]
     pub async fn rdpilot_process_list(
         &self,
         Parameters(args): Parameters<ProcessListArgs>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         self.process_list_impl(args).await.map_err(Into::into)
+    }
+
+    #[tool(
+        name = "rdpilot_uac_respond",
+        description = "Respond to an active Windows UAC/elevation consent prompt (approve or reject), including when it is on the protected secure desktop. Use this INSTEAD OF rdpilot_click-style clicks or the computer tool's left_click/scancode key actions whenever rdpilot_process_list or rdpilot_world_state reports elevation_active: true, or after a click/key call itself failed with a secure-desktop-active error -- raw clicks and scancode key combos are silently ignored by an active UAC prompt even though they report success. RDPilot performs the correct Tab-navigate + Unicode-keyboard-event sequence internally and confirms the outcome with a follow-up screenshot. Only the plain admin-consent Yes/No dialog is supported; a credential-entry UAC prompt (asking a non-admin user for a password) returns a uac-response-unconfirmed error naming this limitation -- escalate to a human instead of retrying. Requires session (D-29)."
+    )]
+    pub async fn rdpilot_uac_respond(
+        &self,
+        Parameters(args): Parameters<UacRespondArgs>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        self.uac_respond_impl(args).await.map_err(Into::into)
     }
 
     #[tool(
@@ -664,10 +742,12 @@ mod tests {
             screenshot: true,
             window_list: true,
             uia: WorldStateUiaMode::Hwnd { hwnds: vec![1, 2] },
+            elevation_check: true,
         };
         let options = build_world_state_options(&args);
         assert!(options.screenshot);
         assert!(options.window_list);
+        assert!(options.elevation_check);
         assert!(matches!(options.uia, WireUiaMode::Hwnd(hwnds) if hwnds == vec![1, 2]));
     }
 
@@ -679,11 +759,13 @@ mod tests {
             screenshot: Some("cGxhY2Vob2xkZXI=".to_owned()),
             window_list: None,
             uia: None,
+            elevation_active: Some(true),
         };
         let result = render_world_state(resp).expect("success must render");
         let text = text_of(&result);
         assert!(text.contains("capture_span_ms"), "missing capture_span_ms: {text}");
         assert!(text.contains("2026-07-11T00:00:00Z"), "missing timestamp: {text}");
+        assert!(text.contains("\"elevation_active\":true"), "missing elevation_active: {text}");
     }
 
     #[test]
@@ -762,10 +844,56 @@ mod tests {
                 path: "C:\\Windows\\notepad.exe".to_owned(),
                 command_line: None,
                 owner: None,
+                session_id: Some(1),
             }],
+            elevation_active: false,
         };
         let result = render_process_list(resp).expect("success must render");
-        assert!(text_of(&result).contains("notepad.exe"));
+        let text = text_of(&result);
+        assert!(text.contains("notepad.exe"));
+        assert!(text.contains("\"elevation_active\":false"), "missing elevation_active: {text}");
+    }
+
+    // -- uac_respond (ticket BF8Q9K6FGZ2APN8F) --
+
+    #[test]
+    fn mcp_uac_decision_approve_maps_to_wire_approve() {
+        let wire: WireUacDecision = McpUacDecision::Approve.into();
+        assert!(matches!(wire, WireUacDecision::Approve));
+    }
+
+    #[test]
+    fn mcp_uac_decision_reject_maps_to_wire_reject() {
+        let wire: WireUacDecision = McpUacDecision::Reject.into();
+        assert!(matches!(wire, WireUacDecision::Reject));
+    }
+
+    #[test]
+    fn render_uac_respond_renders_the_decision_and_confirmation() {
+        let resp = WireResponse::UacRespond {
+            decision: WireUacDecision::Approve,
+            confirmation_png_base64: "cGxhY2Vob2xkZXI=".to_owned(),
+        };
+        let result = render_uac_respond(resp).expect("success must render");
+        let text = text_of(&result);
+        assert!(text.contains("\"decision\":\"approve\""), "missing decision: {text}");
+        assert!(text.contains("confirmation_screenshot_base64"), "missing confirmation: {text}");
+    }
+
+    #[test]
+    fn render_uac_respond_surfaces_a_wire_error_by_code_and_message() {
+        let resp = WireResponse::Error(WireError {
+            code: WireErrorCode::UacResponseUnconfirmed,
+            message: "the prompt is still present".to_owned(),
+        });
+        let err = render_uac_respond(resp).expect_err("wire error must surface as an Err");
+        assert!(err.to_string().contains("the prompt is still present"));
+    }
+
+    #[test]
+    fn render_uac_respond_surfaces_wrong_variant_as_an_explicit_error() {
+        let err = render_uac_respond(WireResponse::Ack).expect_err("Ack is the wrong variant for UacRespond");
+        assert!(err.to_string().to_lowercase().contains("uacrespond"));
     }
 
     // -- launch / foreground --

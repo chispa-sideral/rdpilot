@@ -66,7 +66,7 @@ impl RdpilotMcpHandler {
     /// vertical-only).
     #[tool(
         name = "computer",
-        description = "Anthropic computer_20250124-compatible remote-desktop control: screenshot, mouse, keyboard, and scroll actions against a connected rdpilot session, with coordinates in a fixed 1280x800 space. Requires a session id. Does NOT support left_mouse_down/left_mouse_up, cursor_position, or horizontal scroll (left/right) — these return an explicit error."
+        description = "Anthropic computer_20250124-compatible remote-desktop control: screenshot, mouse, keyboard, and scroll actions against a connected rdpilot session, with coordinates in a fixed 1280x800 space. Requires a session id. Does NOT support left_mouse_down/left_mouse_up, cursor_position, or horizontal scroll (left/right) — these return an explicit error. left_click/right_click/middle_click/double_click/triple_click/left_click_drag/key/hold_key return a secure-desktop-active error instead of silently no-op'ing when a UAC/elevation consent prompt is active in this session — use rdpilot_uac_respond instead."
     )]
     pub async fn computer(
         &self,
