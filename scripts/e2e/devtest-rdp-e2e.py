@@ -30,6 +30,7 @@ LAB_ID = re.compile(r'^/subscriptions/[^/]+/resourceGroups/[^/]+/providers/Micro
 NOT_FOUND = re.compile(r'(?:\bResourceNotFound\b|\bHTTP\s*404\b|\bStatus\s*Code:\s*404\b)', re.I)
 BACKING_VM_VISIBILITY_TIMEOUT = 120
 BACKING_VM_VISIBILITY_POLL_INTERVAL = 5
+PHASES = frozenset(('provisioning', 'resource-discovery', 'nsg', 'rdp', 'deletion'))
 
 
 class LeaseError(RuntimeError):
@@ -38,6 +39,13 @@ class LeaseError(RuntimeError):
 
 def fail(message: str) -> None:
     raise LeaseError(message)
+
+
+def emit_phase_failure(lease_id: str, phase: str, reason: str) -> None:
+    """Emit one fixed, redacted phase label with an existing safe failure reason."""
+    if phase not in PHASES:
+        raise AssertionError('invalid phase')
+    print(json.dumps({'event': 'failed', 'lease_id': lease_id, 'phase': phase, 'reason': reason}), file=sys.stderr)
 
 
 def duration(value: str) -> int:
@@ -311,7 +319,12 @@ def cleanup(state_path: Path, cleanup_timeout: int = 10 * 60) -> int:
         failures.append('private-state-remove-failed')
 
     if failures:
-        print(json.dumps({'event': 'cleanup-failed', 'lease_id': state['lease_id'], 'failures': sorted(set(failures))}))
+        print(json.dumps({
+            'event': 'cleanup-failed',
+            'lease_id': state['lease_id'],
+            'phase': 'deletion',
+            'failures': sorted(set(failures)),
+        }))
         return 1
     state_path.unlink(missing_ok=True)
     print(json.dumps({'event': 'down', 'lease_id': state['lease_id']}))
@@ -338,6 +351,7 @@ def run(args: argparse.Namespace) -> int:
     signal.signal(signal.SIGTERM, on_signal)
 
     result = 1
+    phase = 'provisioning'
     try:
         formula = rest('GET', f'https://management.azure.com{lab_id}/formulas/{formula_name}?api-version={API_VERSION}')
         content = formula.get('properties', {}).get('formulaContent')
@@ -364,10 +378,12 @@ def run(args: argparse.Namespace) -> int:
         if not isinstance(compute_id, str) or not isinstance(host, str):
             fail('devtest-connection-coordinates-missing')
 
+        phase = 'resource-discovery'
         resources, subnet_id, private_ip = resource_ids(compute_id, args.provision_timeout)
         # Persist all backing resources before source-IP discovery or NSG mutation.
         state['resources'] = resources
         save_state(state_path, state)
+        phase = 'nsg'
         if not nsg_bound_to_subnet(nsg_id, subnet_id):
             fail('configured-nsg-not-bound-to-lease-subnet')
 
@@ -384,6 +400,7 @@ def run(args: argparse.Namespace) -> int:
         save_state(state_path, state)
         rest('PUT', f'https://management.azure.com{nsg_id}/securityRules/{rule}?api-version={NETWORK_API_VERSION}', rule_body)
 
+        phase = 'rdp'
         connection = private / 'connection.json'
         write_json(connection, {'host': host, 'user': payload['properties']['userName'], 'password': password, 'rdpPort': 3389})
         command = ['bash', str(Path(__file__).with_name('run-rdp-e2e.sh')), str(connection)]
@@ -393,7 +410,7 @@ def run(args: argparse.Namespace) -> int:
         print(json.dumps({'event': 'interrupted', 'lease_id': lease_id}))
         result = 130 if interrupted else 1
     except LeaseError as error:
-        print(json.dumps({'event': 'failed', 'lease_id': lease_id, 'reason': str(error)}), file=sys.stderr)
+        emit_phase_failure(lease_id, phase, str(error))
         result = 1
     finally:
         cleanup_result = cleanup(state_path, args.cleanup_timeout)

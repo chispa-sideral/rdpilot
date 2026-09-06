@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import importlib.util
 import io
+import json
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 
 RUNNER_PATH = Path(__file__).with_name('devtest-rdp-e2e.py')
 SPEC = importlib.util.spec_from_file_location('devtest_rdp_e2e', RUNNER_PATH)
@@ -192,6 +193,105 @@ class BackingVmVisibilityTests(unittest.TestCase):
              self.assertRaisesRegex(RUNNER.LeaseError, 'devtest-backing-resource-invalid'):
             RUNNER.resource_ids(self.compute_id, 15 * 60)
         az_mock.assert_called_once()
+
+
+class PhaseDiagnosticsTests(unittest.TestCase):
+    protected_values = ('/subscriptions/mock/resourceGroups/secret-rg', 'host.internal', 'secret-user', 'private-password')
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.state_path = Path(self.temporary.name) / 'lease.json'
+        self.config = (
+            '/subscriptions/s/resourceGroups/rg/providers/Microsoft.DevTestLab/labs/lab',
+            '/subscriptions/s/resourceGroups/rg/providers/Microsoft.Network/networkSecurityGroups/nsg',
+            'formula',
+        )
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def args(self):
+        return argparse_namespace(self.state_path)
+
+    def run_failure(self, phase: str, action, reason: str = 'safe-failure') -> tuple[int, str, str]:
+        output, errors = io.StringIO(), io.StringIO()
+        with patch.object(RUNNER, 'required_config', return_value=self.config), \
+             patch.object(RUNNER, 'cleanup', return_value=0), \
+             patch.object(RUNNER, 'rest', side_effect=action), \
+             redirect_stdout(output), redirect_stderr(errors):
+            status = RUNNER.run(self.args())
+        event = json.loads(errors.getvalue())
+        self.assertEqual(event['event'], 'failed')
+        self.assertEqual(event['phase'], phase)
+        self.assertEqual(event['reason'], reason)
+        self.assertEqual(errors.getvalue().count('"phase"'), 1)
+        for value in self.protected_values:
+            self.assertNotIn(value, output.getvalue() + errors.getvalue())
+        return status, output.getvalue(), errors.getvalue()
+
+    def test_provisioning_failure_has_one_fixed_phase_label(self) -> None:
+        status, _output, _errors = self.run_failure('provisioning', lambda *_args, **_kwargs: (_ for _ in ()).throw(RUNNER.LeaseError('safe-failure')))
+        self.assertEqual(status, 1)
+
+    def test_resource_discovery_failure_has_one_fixed_phase_label(self) -> None:
+        def action(*_args, **_kwargs):
+            return {'properties': {'formulaContent': {'properties': {}}}}
+
+        with patch.object(RUNNER, 'wait_vm', return_value={'properties': {'computeId': 'compute', 'fqdn': 'host.internal'}}), \
+             patch.object(RUNNER, 'resource_ids', side_effect=RUNNER.LeaseError('safe-failure')):
+            status, _output, _errors = self.run_failure('resource-discovery', action)
+        self.assertEqual(status, 1)
+
+    def test_nsg_failure_has_one_fixed_phase_label(self) -> None:
+        def action(*_args, **_kwargs):
+            return {'properties': {'formulaContent': {'properties': {}}}}
+
+        with patch.object(RUNNER, 'wait_vm', return_value={'properties': {'computeId': 'compute', 'fqdn': 'host.internal'}}), \
+             patch.object(RUNNER, 'resource_ids', return_value=([], 'subnet', '10.0.0.4')), \
+             patch.object(RUNNER, 'nsg_bound_to_subnet', return_value=False):
+            status, _output, _errors = self.run_failure(
+                'nsg', action, 'configured-nsg-not-bound-to-lease-subnet')
+        self.assertEqual(status, 1)
+
+    def test_rdp_failure_has_one_fixed_phase_label(self) -> None:
+        def action(*_args, **_kwargs):
+            return {'properties': {'formulaContent': {'properties': {}}}}
+
+        with patch.object(RUNNER, 'wait_vm', return_value={'properties': {'computeId': 'compute', 'fqdn': 'host.internal'}}), \
+             patch.object(RUNNER, 'resource_ids', return_value=([], 'subnet', '10.0.0.4')), \
+             patch.object(RUNNER, 'nsg_bound_to_subnet', return_value=True), \
+             patch.object(RUNNER, 'source_cidr', return_value='198.51.100.1/32'), \
+             patch.object(RUNNER.subprocess, 'run', side_effect=RUNNER.LeaseError('safe-failure')):
+            status, _output, _errors = self.run_failure('rdp', action)
+        self.assertEqual(status, 1)
+
+    def test_cleanup_failure_has_only_deletion_phase_marker(self) -> None:
+        state = {
+            'lease_id': '00000000-0000-0000-0000-000000000001',
+            'vm_name': 'lease-vm',
+            'lab_id': '/subscriptions/s/resourceGroups/rg/providers/Microsoft.DevTestLab/labs/lab',
+            'resources': [],
+        }
+        RUNNER.save_state(self.state_path, state)
+        output = io.StringIO()
+        with patch.object(RUNNER, 'rest_result', return_value=result(1, 'AuthorizationFailed')), \
+             redirect_stdout(output):
+            self.assertEqual(RUNNER.cleanup(self.state_path, cleanup_timeout=1), 1)
+        event = json.loads(output.getvalue())
+        self.assertEqual(event['event'], 'cleanup-failed')
+        self.assertEqual(event['phase'], 'deletion')
+        self.assertEqual(output.getvalue().count('"phase"'), 1)
+        for value in self.protected_values:
+            self.assertNotIn(value, output.getvalue())
+
+
+def argparse_namespace(state_path: Path):
+    return type('Args', (), {
+        'state': state_path,
+        'lease_expiry': 60,
+        'provision_timeout': 60,
+        'cleanup_timeout': 60,
+    })()
 
 
 if __name__ == '__main__':
