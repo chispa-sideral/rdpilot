@@ -29,7 +29,7 @@ PY
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 timeout_limit="${RDPILOT_E2E_TIMEOUT:-20m}"
-connect_timeout="$($repo_root/scripts/e2e/validate-connect-timeout.sh "${RDPILOT_CONNECT_TIMEOUT:-}")"
+connect_timeout="$(bash "$repo_root/scripts/e2e/validate-connect-timeout.sh" "${RDPILOT_CONNECT_TIMEOUT:-}")"
 
 cd "$repo_root"
 RDPILOT_LIVE=1 RDPILOT_CONNECTION_FILE="$connection_file" \
