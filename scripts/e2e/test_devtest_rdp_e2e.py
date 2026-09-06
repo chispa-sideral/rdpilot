@@ -194,6 +194,27 @@ class BackingVmVisibilityTests(unittest.TestCase):
             RUNNER.resource_ids(self.compute_id, 15 * 60)
         az_mock.assert_called_once()
 
+    def test_non404_failure_classification_is_fixed_and_redacted(self) -> None:
+        cases = (
+            (result(1, 'AuthorizationFailed mocked-secret'), 'authorization'),
+            (result(1, 'connection reset from host.internal'), 'transport'),
+            (result(124, 'azure-command-timeout private-password'), 'timeout'),
+            (result(1, 'ServiceUnavailable /subscriptions/mock'), 'other'),
+        )
+        for completed, expected in cases:
+            self.assertEqual(RUNNER.classify_backing_vm_failure(completed), expected)
+
+    def test_non404_failure_retains_generic_reason_and_fixed_class(self) -> None:
+        with patch.object(RUNNER, 'az', return_value=result(1, 'AuthorizationFailed secret-user')) as az_mock, \
+             patch.object(RUNNER.time, 'monotonic', side_effect=(0, 0)), \
+             patch.object(RUNNER.time, 'sleep') as sleep, \
+             self.assertRaises(RUNNER.BackingVmReadError) as raised:
+            RUNNER.resource_ids(self.compute_id, 15 * 60)
+        self.assertEqual(str(raised.exception), 'azure-command-failed:vm')
+        self.assertEqual(raised.exception.failure_class, 'authorization')
+        az_mock.assert_called_once()
+        sleep.assert_not_called()
+
 
 class PhaseDiagnosticsTests(unittest.TestCase):
     protected_values = ('/subscriptions/mock/resourceGroups/secret-rg', 'host.internal', 'secret-user', 'private-password')
@@ -213,7 +234,8 @@ class PhaseDiagnosticsTests(unittest.TestCase):
     def args(self):
         return argparse_namespace(self.state_path)
 
-    def run_failure(self, phase: str, action, reason: str = 'safe-failure') -> tuple[int, str, str]:
+    def run_failure(self, phase: str, action, reason: str = 'safe-failure',
+                    failure_class: str | None = None) -> tuple[int, str, str]:
         output, errors = io.StringIO(), io.StringIO()
         with patch.object(RUNNER, 'required_config', return_value=self.config), \
              patch.object(RUNNER, 'cleanup', return_value=0), \
@@ -224,6 +246,7 @@ class PhaseDiagnosticsTests(unittest.TestCase):
         self.assertEqual(event['event'], 'failed')
         self.assertEqual(event['phase'], phase)
         self.assertEqual(event['reason'], reason)
+        self.assertEqual(event.get('failure_class'), failure_class)
         self.assertEqual(errors.getvalue().count('"phase"'), 1)
         for value in self.protected_values:
             self.assertNotIn(value, output.getvalue() + errors.getvalue())
@@ -241,6 +264,19 @@ class PhaseDiagnosticsTests(unittest.TestCase):
              patch.object(RUNNER, 'resource_ids', side_effect=RUNNER.LeaseError('safe-failure')):
             status, _output, _errors = self.run_failure('resource-discovery', action)
         self.assertEqual(status, 1)
+
+    def test_backing_vm_class_is_emitted_only_with_resource_discovery_failure(self) -> None:
+        def action(*_args, **_kwargs):
+            return {'properties': {'formulaContent': {'properties': {}}}}
+
+        with patch.object(RUNNER, 'wait_vm', return_value={'properties': {'computeId': 'compute', 'fqdn': 'host.internal'}}), \
+             patch.object(RUNNER, 'resource_ids', side_effect=RUNNER.BackingVmReadError('transport')):
+            status, _output, errors = self.run_failure(
+                'resource-discovery', action, 'azure-command-failed:vm', 'transport')
+        self.assertEqual(status, 1)
+        self.assertNotIn('host.internal', errors)
+        self.assertNotIn('secret-user', errors)
+        self.assertNotIn('private-password', errors)
 
     def test_nsg_failure_has_one_fixed_phase_label(self) -> None:
         def action(*_args, **_kwargs):

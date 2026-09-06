@@ -31,21 +31,41 @@ NOT_FOUND = re.compile(r'(?:\bResourceNotFound\b|\bHTTP\s*404\b|\bStatus\s*Code:
 BACKING_VM_VISIBILITY_TIMEOUT = 120
 BACKING_VM_VISIBILITY_POLL_INTERVAL = 5
 PHASES = frozenset(('provisioning', 'resource-discovery', 'nsg', 'rdp', 'deletion'))
+BACKING_VM_FAILURE_CLASSES = frozenset(('authorization', 'transport', 'timeout', 'other'))
+AUTHORIZATION_FAILURE = re.compile(r'\b(?:authorization\w*|forbidden|unauthorized)\b', re.I)
+TIMEOUT_FAILURE = re.compile(r'\b(?:timeout|timed out|deadline exceeded)\b', re.I)
+TRANSPORT_FAILURE = re.compile(r'\b(?:connection|connect|network|dns|socket|tls|proxy|reset|unreachable)\b', re.I)
 
 
 class LeaseError(RuntimeError):
     """A deliberately non-secret operational failure."""
 
 
+class BackingVmReadError(LeaseError):
+    """A fail-closed backing-VM read error with a fixed redacted class."""
+
+    def __init__(self, failure_class: str) -> None:
+        if failure_class not in BACKING_VM_FAILURE_CLASSES:
+            raise ValueError('invalid backing VM failure class')
+        super().__init__('azure-command-failed:vm')
+        self.failure_class = failure_class
+
+
 def fail(message: str) -> None:
     raise LeaseError(message)
 
 
-def emit_phase_failure(lease_id: str, phase: str, reason: str) -> None:
+def emit_phase_failure(lease_id: str, phase: str, reason: str,
+                       failure_class: str | None = None) -> None:
     """Emit one fixed, redacted phase label with an existing safe failure reason."""
     if phase not in PHASES:
         raise AssertionError('invalid phase')
-    print(json.dumps({'event': 'failed', 'lease_id': lease_id, 'phase': phase, 'reason': reason}), file=sys.stderr)
+    if failure_class is not None and failure_class not in BACKING_VM_FAILURE_CLASSES:
+        raise AssertionError('invalid backing VM failure class')
+    event: dict[str, str] = {'event': 'failed', 'lease_id': lease_id, 'phase': phase, 'reason': reason}
+    if failure_class is not None:
+        event['failure_class'] = failure_class
+    print(json.dumps(event), file=sys.stderr)
 
 
 def duration(value: str) -> int:
@@ -81,6 +101,17 @@ def rest_result(method: str, url: str, body: Path | None = None,
 def is_confirmed_not_found(result: subprocess.CompletedProcess[str]) -> bool:
     """Only an explicit Azure 404 is safe to treat as an absent owned resource."""
     return result.returncode != 0 and bool(NOT_FOUND.search(result.stderr))
+
+
+def classify_backing_vm_failure(result: subprocess.CompletedProcess[str]) -> str:
+    """Classify only a non-404 exact Compute VM read without retaining Azure output."""
+    if result.returncode == 124 or TIMEOUT_FAILURE.search(result.stderr):
+        return 'timeout'
+    if AUTHORIZATION_FAILURE.search(result.stderr):
+        return 'authorization'
+    if TRANSPORT_FAILURE.search(result.stderr):
+        return 'transport'
+    return 'other'
 
 
 def rest(method: str, url: str, body: Path | None = None) -> Any:
@@ -180,7 +211,7 @@ def visible_backing_vm(compute_id: str, provision_timeout: int) -> subprocess.Co
         if vm.returncode == 0:
             return vm
         if not is_confirmed_not_found(vm):
-            fail('azure-command-failed:vm')
+            raise BackingVmReadError(classify_backing_vm_failure(vm))
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             fail('devtest-backing-vm-not-ready')
@@ -410,7 +441,8 @@ def run(args: argparse.Namespace) -> int:
         print(json.dumps({'event': 'interrupted', 'lease_id': lease_id}))
         result = 130 if interrupted else 1
     except LeaseError as error:
-        emit_phase_failure(lease_id, phase, str(error))
+        failure_class = error.failure_class if isinstance(error, BackingVmReadError) else None
+        emit_phase_failure(lease_id, phase, str(error), failure_class)
         result = 1
     finally:
         cleanup_result = cleanup(state_path, args.cleanup_timeout)
