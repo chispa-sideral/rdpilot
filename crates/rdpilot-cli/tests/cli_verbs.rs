@@ -176,9 +176,15 @@ fn every_cli_02_verb_round_trips_against_the_canned_fake_session() {
         process_list_run.stdout,
         process_list_run.stderr
     );
-    let processes: serde_json::Value =
+    let process_list_response: serde_json::Value =
         serde_json::from_str(process_list_run.stdout.trim()).expect("process list --json must be valid JSON");
-    let processes = processes.as_array().expect("process list --json must be a JSON array");
+    assert!(
+        process_list_response["elevation_active"].is_boolean(),
+        "process list --json must surface elevation_active (ticket BF8Q9K6FGZ2APN8F): {process_list_response:?}"
+    );
+    let processes = process_list_response["processes"]
+        .as_array()
+        .expect("process list --json must carry a processes array");
     assert!(
         processes.iter().any(|p| p["pid"].as_u64() == Some(1234) && p["name"].as_str() == Some("notepad.exe")),
         "expected the fake's canned process (pid=1234, name=notepad.exe) in {processes:?}"

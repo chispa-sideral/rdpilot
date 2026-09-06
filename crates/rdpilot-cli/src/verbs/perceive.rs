@@ -56,9 +56,10 @@ pub async fn world_state(args: WorldStateArgs, json: bool) -> Result<(), CliErro
         UiaModeArg::All => WireUiaMode::AllTopLevel,
         UiaModeArg::Hwnd => WireUiaMode::Hwnd(args.hwnd.clone()),
     };
-    let options = WireWorldStateOptions { screenshot: args.screenshot, window_list: args.window_list, uia };
+    let options =
+        WireWorldStateOptions { screenshot: args.screenshot, window_list: args.window_list, uia, elevation_check: args.elevation_check };
     match round_trip(Request::WorldState { session, options }).await? {
-        WireResponse::WorldState { timestamp, capture_span_ms, screenshot, window_list, uia } => {
+        WireResponse::WorldState { timestamp, capture_span_ms, screenshot, window_list, uia, elevation_active } => {
             let mut written_bytes: Option<usize> = None;
             if let (Some(png_base64), Some(output)) = (&screenshot, &args.output) {
                 let bytes = decode_png(png_base64)?;
@@ -73,6 +74,7 @@ pub async fn world_state(args: WorldStateArgs, json: bool) -> Result<(), CliErro
                     "screenshot_written_bytes": written_bytes,
                     "window_list": window_list,
                     "uia": uia,
+                    "elevation_active": elevation_active,
                 }))
             } else {
                 println!("timestamp: {timestamp}");
@@ -84,6 +86,9 @@ pub async fn world_state(args: WorldStateArgs, json: bool) -> Result<(), CliErro
                     }
                 } else if screenshot.is_some() {
                     println!("screenshot captured (pass --output to write it)");
+                }
+                if let Some(active) = elevation_active {
+                    println!("elevation_active: {active}");
                 }
                 if let Some(windows) = window_list {
                     print!("{}", render_window_table(&windows));
@@ -159,10 +164,11 @@ pub async fn window_list(args: SessionArg, json: bool) -> Result<(), CliError> {
 pub async fn process_list(args: SessionArg, json: bool) -> Result<(), CliError> {
     let session = args.session.parse().map_err(CliError::Internal)?;
     match round_trip(Request::ProcessList { session }).await? {
-        WireResponse::ProcessList { processes } => {
+        WireResponse::ProcessList { processes, elevation_active } => {
             if json {
-                print_json(&processes)
+                print_json(&serde_json::json!({ "processes": processes, "elevation_active": elevation_active }))
             } else {
+                println!("elevation_active: {elevation_active}");
                 print!("{}", render_process_table(&processes));
                 Ok(())
             }
@@ -173,12 +179,19 @@ pub async fn process_list(args: SessionArg, json: bool) -> Result<(), CliError> 
 }
 
 /// Base64-decode a wire `png_base64` field.
-fn decode_png(png_base64: &str) -> Result<Vec<u8>, CliError> {
+///
+/// `pub(crate)`: also reused by `verbs::input::uac_respond` for its own
+/// confirming-screenshot decode (ticket BF8Q9K6FGZ2APN8F) — the one
+/// canonical base64-decode helper, not a duplicated copy.
+pub(crate) fn decode_png(png_base64: &str) -> Result<Vec<u8>, CliError> {
     STANDARD.decode(png_base64).map_err(|e| CliError::Internal(format!("invalid base64 screenshot data: {e}")))
 }
 
 /// Write decoded PNG bytes to `output` — never to stdout (D-13.1).
-fn write_output(output: &std::path::Path, bytes: &[u8]) -> Result<(), CliError> {
+///
+/// `pub(crate)`: see [`decode_png`]'s doc comment for why this is shared
+/// with `verbs::input::uac_respond`.
+pub(crate) fn write_output(output: &std::path::Path, bytes: &[u8]) -> Result<(), CliError> {
     std::fs::write(output, bytes)
         .map_err(|e| CliError::Internal(format!("failed to write {}: {e}", output.display())))
 }

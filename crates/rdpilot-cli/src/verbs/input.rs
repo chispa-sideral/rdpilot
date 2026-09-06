@@ -5,12 +5,13 @@
 //! `--session` (D-29), and render the SPECIFIC response variant it expects
 //! (table by default, `--json` opt-in).
 
-use rdpilot_ipc::{Request, WireButton, WireKey, WireKeyAction, WireMouseAction, WireResponse};
+use rdpilot_ipc::{Request, WireButton, WireKey, WireKeyAction, WireMouseAction, WireResponse, WireUacDecision};
 
-use crate::cli::{ButtonArg, ClickArgs, DragArgs, ForegroundArgs, KeyArgs, LaunchArgs, ScrollArgs, TypeArgs};
+use crate::cli::{ButtonArg, ClickArgs, DragArgs, ForegroundArgs, KeyArgs, LaunchArgs, ScrollArgs, TypeArgs, UacRespondArgs};
 use crate::connect::round_trip;
 use crate::exit_codes::CliError;
 use crate::render::print_json;
+use crate::verbs::perceive::{decode_png, write_output};
 
 /// `input click --session <id> --x <n> --y <n> [--button <button>] [--double]`.
 ///
@@ -112,6 +113,53 @@ pub async fn launch(args: LaunchArgs, json: bool) -> Result<(), CliError> {
 pub async fn foreground(args: ForegroundArgs, json: bool) -> Result<(), CliError> {
     let session = args.session.parse().map_err(CliError::Internal)?;
     expect_ack(round_trip(Request::SetForeground { session, hwnd: args.hwnd }).await?, json)
+}
+
+/// `input uac respond --session <id> [--approve|--reject] [--output <path>]`
+/// (ticket BF8Q9K6FGZ2APN8F): responds to an active UAC/elevation consent
+/// prompt via the proven native Tab-navigate + Unicode-Enter sequence,
+/// confirmed via a follow-up screenshot. `--approve`/`--reject` are a
+/// clap-enforced exactly-one-of group (`UacRespondArgs`'s `ArgGroup`).
+///
+/// # Errors
+///
+/// [`CliError::Internal`] for an empty `--session`, a base64 decode
+/// failure, or a failure writing `--output`; the daemon's own error
+/// otherwise (including the new `secure-desktop-active`/
+/// `uac-prompt-not-active`/`uac-response-unconfirmed` wire codes, which
+/// render exactly like every existing `WireError` — no special handling
+/// needed here); or a transport/auto-start failure.
+pub async fn uac_respond(args: UacRespondArgs, json: bool) -> Result<(), CliError> {
+    let session = args.session.parse().map_err(CliError::Internal)?;
+    // clap's `ArgGroup` (required, exactly one of approve/reject) already
+    // guarantees exactly one of these is `true` -- never a manual runtime
+    // check standing in for that enforcement.
+    let decision = if args.approve { WireUacDecision::Approve } else { WireUacDecision::Reject };
+    match round_trip(Request::UacRespond { session, decision }).await? {
+        WireResponse::UacRespond { decision, confirmation_png_base64 } => {
+            let mut written_bytes: Option<usize> = None;
+            if let Some(output) = &args.output {
+                let bytes = decode_png(&confirmation_png_base64)?;
+                write_output(output, &bytes)?;
+                written_bytes = Some(bytes.len());
+            }
+            let decision_str = match decision {
+                WireUacDecision::Approve => "approve",
+                WireUacDecision::Reject => "reject",
+            };
+            if json {
+                print_json(&serde_json::json!({ "decision": decision_str, "written_bytes": written_bytes }))
+            } else {
+                println!("{decision_str}");
+                if let (Some(n), Some(output)) = (written_bytes, &args.output) {
+                    println!("wrote {} ({n} bytes)", output.display());
+                }
+                Ok(())
+            }
+        }
+        WireResponse::Error(err) => Err(CliError::from(err)),
+        other => Err(CliError::Internal(format!("unexpected response to UacRespond: {other:?}"))),
+    }
 }
 
 /// The CLI spelling of `rdpilot_ipc::WireButton` -> the wire type itself.

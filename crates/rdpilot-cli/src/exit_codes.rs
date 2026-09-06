@@ -64,6 +64,9 @@ fn code_for(err: &CliError) -> u8 {
             WireErrorCode::PathTraversal => 5,
             WireErrorCode::ChecksumMismatch => 6,
             WireErrorCode::DuplicateSession => 7,
+            WireErrorCode::SecureDesktopActive => 9,
+            WireErrorCode::UacPromptNotActive => 10,
+            WireErrorCode::UacResponseUnconfirmed => 11,
             // `Internal`, the client-only `DaemonUnreachable` wire variant
             // (never actually produced by the daemon — see
             // `CliError::DaemonUnreachable` for the real client-side path),
@@ -121,7 +124,31 @@ mod tests {
         assert_eq!(code_for(&wire(WireErrorCode::PathTraversal)), 5);
         assert_eq!(code_for(&wire(WireErrorCode::ChecksumMismatch)), 6);
         assert_eq!(code_for(&wire(WireErrorCode::DuplicateSession)), 7);
+        assert_eq!(code_for(&wire(WireErrorCode::SecureDesktopActive)), 9);
+        assert_eq!(code_for(&wire(WireErrorCode::UacPromptNotActive)), 10);
+        assert_eq!(code_for(&wire(WireErrorCode::UacResponseUnconfirmed)), 11);
         assert_eq!(code_for(&wire(WireErrorCode::Internal)), 1);
+    }
+
+    /// Every wire error class maps to a DISTINCT exit code (D-28) — a
+    /// regression guard specifically for the three codes this ticket adds
+    /// (9/10/11), proving they do not collide with any of the 1-8 codes
+    /// already taken.
+    #[test]
+    fn distinct_codes_for_every_wire_error_class_are_pairwise_unique() {
+        let codes = [
+            WireErrorCode::SessionNotFound,
+            WireErrorCode::TransferFailed,
+            WireErrorCode::PathTraversal,
+            WireErrorCode::ChecksumMismatch,
+            WireErrorCode::DuplicateSession,
+            WireErrorCode::SecureDesktopActive,
+            WireErrorCode::UacPromptNotActive,
+            WireErrorCode::UacResponseUnconfirmed,
+        ]
+        .map(|code| code_for(&wire(code)));
+        let unique: std::collections::HashSet<u8> = codes.iter().copied().collect();
+        assert_eq!(unique.len(), codes.len(), "expected every wire error class to map to a distinct exit code: {codes:?}");
     }
 
     #[test]
@@ -146,6 +173,9 @@ mod tests {
         assert_eq!(code_str_for(&wire(WireErrorCode::PathTraversal)), "path-traversal");
         assert_eq!(code_str_for(&wire(WireErrorCode::ChecksumMismatch)), "checksum-mismatch");
         assert_eq!(code_str_for(&wire(WireErrorCode::DuplicateSession)), "duplicate-session");
+        assert_eq!(code_str_for(&wire(WireErrorCode::SecureDesktopActive)), "secure-desktop-active");
+        assert_eq!(code_str_for(&wire(WireErrorCode::UacPromptNotActive)), "uac-prompt-not-active");
+        assert_eq!(code_str_for(&wire(WireErrorCode::UacResponseUnconfirmed)), "uac-response-unconfirmed");
         assert_eq!(code_str_for(&wire(WireErrorCode::Internal)), "internal");
     }
 
