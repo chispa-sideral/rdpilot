@@ -77,6 +77,13 @@ pub struct ProcessInfo {
     /// The process's owning user account, if the sensor could retrieve it
     /// (best-effort extra, D-6.3).
     pub owner: Option<String>,
+    /// The Terminal Services session id hosting this process, if the
+    /// sensor could resolve it (best-effort extra — `None` on an older
+    /// sensor build mid-rollout, or a per-record `ProcessIdToSessionId`
+    /// failure). Used to scope elevation-prompt detection
+    /// ([`crate::perception::elevation_prompt_active`]) to the caller's own
+    /// RDP session rather than matching a whole-system process snapshot.
+    pub session_id: Option<u32>,
 }
 
 /// Crate-internal wire shape for [`crate::Rect`] (the Phase 6 wire contract's
@@ -168,6 +175,13 @@ pub(crate) struct ProcessInfoWire {
     path: String,
     command_line: Option<String>,
     owner: Option<String>,
+    /// Wire field added alongside section 0's sensor-side
+    /// `ProcessIdToSessionId` fix (session-scoped elevation detection).
+    /// `#[serde(default)]` so a reply from an older sensor build that has
+    /// not yet shipped this field degrades to `None` (session-scoping's own
+    /// degrade rule) rather than a hard deserialize error.
+    #[serde(default)]
+    session_id: Option<u32>,
 }
 
 impl ProcessInfoWire {
@@ -180,6 +194,7 @@ impl ProcessInfoWire {
             path: self.path,
             command_line: self.command_line,
             owner: self.owner,
+            session_id: self.session_id,
         }
     }
 }
@@ -363,9 +378,99 @@ impl UiaElementWire {
     }
 }
 
+/// Process image names Windows uses to host a UAC consent/elevation prompt
+/// (`consent.exe`, spawned by the Application Information service).
+const ELEVATION_PROCESS_NAMES: &[&str] = &["consent.exe"];
+
+/// Whether `processes` contains a live UAC/elevation consent prompt
+/// (structural, sensor-backed detection — never visual/pixel guesswork),
+/// scoped to `own_session_id` when both it and a candidate record's own
+/// `session_id` are known (section 0's required session-scoping safeguard).
+///
+/// `own_session_id` is this `Session`'s own RDP session id (from
+/// `Session::own_session_id()`, `None` if not yet resolved by a prior
+/// `get_process_tree()` round trip). A candidate match is accepted UNSCOPED
+/// (the pre-existing, whole-system behavior — no worse than before this
+/// safeguard existed) whenever either `own_session_id` or the candidate
+/// record's own `session_id` is unknown, and session-verified otherwise —
+/// the explicit, honest degrade rule required by the amended acceptance.
+#[must_use]
+pub fn elevation_prompt_active(processes: &[ProcessInfo], own_session_id: Option<u32>) -> bool {
+    processes.iter().any(|p| {
+        let name_matches = ELEVATION_PROCESS_NAMES.iter().any(|n| p.name.eq_ignore_ascii_case(n));
+        name_matches
+            && match (own_session_id, p.session_id) {
+                (Some(mine), Some(theirs)) => mine == theirs,
+                _ => true,
+            }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn process(name: &str, session_id: Option<u32>) -> ProcessInfo {
+        ProcessInfo {
+            pid: 4242,
+            parent_pid: 4,
+            name: name.to_owned(),
+            path: format!("C:\\Windows\\System32\\{name}"),
+            command_line: None,
+            owner: None,
+            session_id,
+        }
+    }
+
+    /// A `consent.exe` record with no session id on either side (the
+    /// pre-existing, whole-system behavior) is detected unscoped.
+    #[test]
+    fn elevation_prompt_active_detects_consent_exe_case_insensitively() {
+        let processes = vec![process("CONSENT.EXE", None)];
+        assert!(elevation_prompt_active(&processes, None));
+    }
+
+    /// No `consent.exe` anywhere in the snapshot: never active.
+    #[test]
+    fn elevation_prompt_active_is_false_when_no_consent_exe_present() {
+        let processes = vec![process("notepad.exe", None)];
+        assert!(!elevation_prompt_active(&processes, None));
+    }
+
+    /// Section 0's degrade rule, case 1: `own_session_id` is unknown (an
+    /// older sensor build mid-rollout) — falls back to the unscoped
+    /// whole-system match rather than failing to detect at all.
+    #[test]
+    fn elevation_prompt_active_falls_back_unscoped_when_own_session_id_is_unknown() {
+        let processes = vec![process("consent.exe", Some(2))];
+        assert!(elevation_prompt_active(&processes, None));
+    }
+
+    /// Section 0's degrade rule, case 2: the candidate record's own
+    /// `session_id` is unknown (a per-record `ProcessIdToSessionId`
+    /// failure) — also falls back to the unscoped match.
+    #[test]
+    fn elevation_prompt_active_falls_back_unscoped_when_record_session_id_is_unknown() {
+        let processes = vec![process("consent.exe", None)];
+        assert!(elevation_prompt_active(&processes, Some(1)));
+    }
+
+    /// Section 0's core safeguard: a `consent.exe` in a DIFFERENT session
+    /// than the caller's own must NOT false-positive this session's
+    /// detection, once both session ids are known.
+    #[test]
+    fn elevation_prompt_active_does_not_match_a_different_sessions_consent_exe() {
+        let processes = vec![process("consent.exe", Some(2))];
+        assert!(!elevation_prompt_active(&processes, Some(1)));
+    }
+
+    /// The positive session-scoped case: a `consent.exe` in the SAME
+    /// session as the caller matches.
+    #[test]
+    fn elevation_prompt_active_matches_the_same_sessions_consent_exe() {
+        let processes = vec![process("consent.exe", Some(1))];
+        assert!(elevation_prompt_active(&processes, Some(1)));
+    }
 
     /// A canned `WindowList` `data` JSON array (per the wire_contract)
     /// deserializes into `Vec<WindowInfo>` with correct
@@ -411,7 +516,9 @@ mod tests {
     /// A canned `ProcessTree` `data` JSON array deserializes into
     /// `Vec<ProcessInfo>`; a record with `command_line:null` and
     /// `owner:null` yields `None` for both (graceful-degradation fields,
-    /// D-6.3).
+    /// D-6.3), and a record with NO `session_id` field at all (an older
+    /// sensor build mid-rollout, section 0's degrade rule) also degrades to
+    /// `None` rather than a hard deserialize error.
     #[test]
     fn process_tree_data_deserializes_and_degrades_optional_fields() {
         let data = serde_json::json!([
@@ -437,6 +544,31 @@ mod tests {
         assert_eq!(p.path, "C:\\Windows\\System32\\notepad.exe");
         assert_eq!(p.command_line, None);
         assert_eq!(p.owner, None);
+        assert_eq!(p.session_id, None, "a missing session_id field must degrade to None, not a deserialize error");
+    }
+
+    /// A `ProcessTree` record carrying a present `session_id` round-trips
+    /// through `ProcessInfoWire`/`into_owned` (section 0's new field).
+    #[test]
+    fn process_tree_data_round_trips_a_present_session_id() {
+        let data = serde_json::json!([
+            {
+                "pid": 4242,
+                "parent_pid": 4,
+                "name": "consent.exe",
+                "path": "C:\\Windows\\System32\\consent.exe",
+                "command_line": null,
+                "owner": null,
+                "session_id": 2
+            }
+        ]);
+
+        let wires: Vec<ProcessInfoWire> =
+            serde_json::from_value(data).expect("canned ProcessTree data with session_id deserializes");
+        let processes: Vec<ProcessInfo> = wires.into_iter().map(ProcessInfoWire::into_owned).collect();
+
+        assert_eq!(processes.len(), 1);
+        assert_eq!(processes[0].session_id, Some(2));
     }
 
     /// A canned `Uia` `data` JSON array (per the wire contract, raw
@@ -564,12 +696,14 @@ mod tests {
             path: "C:\\Windows\\System32\\notepad.exe".to_string(),
             command_line: None,
             owner: Some("SYSTEM".to_string()),
+            session_id: Some(1),
         };
         let value = serde_json::to_value(&process).expect("ProcessInfo serializes");
         let obj = value.as_object().expect("ProcessInfo serializes as a JSON object");
         assert_eq!(obj.get("pid").and_then(|v| v.as_u64()), Some(4242));
         assert_eq!(obj.get("name").and_then(|v| v.as_str()), Some("notepad.exe"));
         assert_eq!(obj.get("owner").and_then(|v| v.as_str()), Some("SYSTEM"));
+        assert_eq!(obj.get("session_id").and_then(serde_json::Value::as_u64), Some(1));
     }
 
     /// A fully-populated `UiaElement` serializes without error and exposes
