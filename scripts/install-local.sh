@@ -42,14 +42,28 @@ CONFIG_JUST_SEEDED=0
 # `~/.cargo/env` (e.g. non-login/non-interactive shells).
 export PATH="$CARGO_ROOT/bin:$PATH"
 
-echo "==> [1/5] Using the workspace-selected stable host toolchain"
+echo "==> [1/6] Using the workspace-selected stable host toolchain"
 cargo --version
 
-echo "==> [2/5] Building + installing rdpilot and rdpilot-daemon to $CARGO_ROOT/bin"
+# rdpilot's daemon is a long-lived, auto-started, SHARED process that never
+# restarts itself just because a newer CLI/daemon got installed alongside it
+# — reinstalling the binaries below is not enough on its own. Kill any
+# already-running daemon FIRST, before reinstalling, so the next command
+# always spawns fresh from whatever ends up on disk. This also bounds the
+# damage if this script itself is interrupted partway through the two
+# `cargo install` calls below: worst case is no daemon running (auto-spawned
+# fresh on next connect), never a silently stale live process serving a
+# newer CLI over a wire protocol it never learned (see ticket
+# B86MSH43DXV6AR6N — a stale daemon left running exactly this way caused
+# `rdpilot-operation-failed` for a caller whose CLI had moved on).
+echo "==> [2/6] Stopping any already-running rdpilot-daemon"
+pkill -x rdpilot-daemon 2>/dev/null || true
+
+echo "==> [3/6] Building + installing rdpilot and rdpilot-daemon to $CARGO_ROOT/bin"
 cargo install --path "$REPO_ROOT/crates/rdpilot-cli" --root "$CARGO_ROOT"
 cargo install --path "$REPO_ROOT/crates/rdpilot-daemon" --root "$CARGO_ROOT"
 
-echo "==> [3/5] Staging local sensor binary (local-only, never committed to git)"
+echo "==> [4/6] Staging local sensor binary (local-only, never committed to git)"
 if [ -f "$SENSOR_SRC" ]; then
   mkdir -p "$SENSOR_DATA_DIR"
   cp "$SENSOR_SRC" "$SENSOR_DEST"
@@ -59,7 +73,7 @@ else
   echo "    no local sensor binary found at $SENSOR_SRC — skipping (session-management-only install)"
 fi
 
-echo "==> [4/5] Seeding config (idempotent — never overwrites an existing file)"
+echo "==> [5/6] Seeding config (idempotent — never overwrites an existing file)"
 mkdir -p "$CONFIG_DIR"
 chmod 700 "$CONFIG_DIR"
 if [ ! -f "$CONFIG_FILE" ]; then
@@ -86,7 +100,7 @@ else
   fi
 fi
 
-echo "==> [5/5] Smoke test (D-8): confirming the CLI -> daemon IPC path works"
+echo "==> [6/6] Smoke test (D-8): confirming the CLI -> daemon IPC path works"
 if ! rdpilot --version; then
   echo "FAILED: 'rdpilot --version' did not exit 0" >&2
   exit 1
