@@ -131,6 +131,21 @@ class CleanupTests(unittest.TestCase):
         with self.assertRaises(AssertionError):
             RUNNER.cleanup_failure_class('ingress', 'absence', 'absent')
 
+    def test_cleanup_diagnostic_vocabulary_is_complete_and_closed(self) -> None:
+        expected = {
+            'backing-resource-delete-conflict', 'backing-resource-delete-other',
+            'backing-resource-delete-transport',
+            *(f'{scope}-absence-{cause}'
+              for scope in ('ingress', 'devtest-vm')
+              for cause in ('authorization', 'transport', 'timeout', 'conflict', 'other')),
+        }
+        self.assertEqual(RUNNER.CLEANUP_DIAGNOSTIC_CLASSES, expected)
+        for diagnostic_class in expected:
+            scope, operation, cause = diagnostic_class.rsplit('-', 2)
+            self.assertEqual(RUNNER.cleanup_diagnostic_class(scope, operation, cause), diagnostic_class)
+        with self.assertRaises(AssertionError):
+            RUNNER.cleanup_diagnostic_class('ingress', 'delete', 'authorization')
+
     def test_cleanup_failure_event_is_sorted_deduplicated_and_redacted(self) -> None:
         self.state(resources=(
             '/subscriptions/s/resourceGroups/rg/providers/Microsoft.Compute/virtualMachines/owned',
@@ -148,6 +163,7 @@ class CleanupTests(unittest.TestCase):
             'devtest-vm-delete-authorization',
             'backing-resource-delete-transport',
         }))
+        self.assertEqual(event['diagnostic_classes'], ['backing-resource-delete-transport'])
         self.assertEqual(event['failures'], sorted({
             'ingress-rule-delete-failed',
             'devtest-vm-delete-failed',
@@ -178,6 +194,57 @@ class CleanupTests(unittest.TestCase):
             'devtest-vm-cleanup-failed',
             'ingress-cleanup-failed',
         ])
+        self.assertEqual(event['diagnostic_classes'], [])
+
+    def test_unknown_absence_emits_each_static_secondary_cause_without_output(self) -> None:
+        errors = {
+            'authorization': 'AuthorizationFailed secret-user',
+            'transport': 'connection reset host.internal',
+            'timeout': 'deadline exceeded private-password',
+            'conflict': 'HTTP 409 /subscriptions/mock',
+            'other': 'ServiceUnavailable secret-user',
+        }
+        for cause, error in errors.items():
+            with self.subTest(cause=cause):
+                self.state()
+                output = io.StringIO()
+                with patch.object(RUNNER, 'rest_result', side_effect=lambda method, *_args, **_kwargs:
+                                  result(0) if method == 'DELETE' else result(1, error)), \
+                     redirect_stdout(output):
+                    self.assertEqual(RUNNER.cleanup(self.state_path, cleanup_timeout=1), 1)
+                event = json.loads(output.getvalue())
+                self.assertEqual(event['failure_classes'], [
+                    'devtest-vm-absence-unknown', 'ingress-absence-unknown',
+                ])
+                self.assertEqual(event['diagnostic_classes'], [
+                    f'devtest-vm-absence-{cause}', f'ingress-absence-{cause}',
+                ])
+                for protected in ('secret-user', 'host.internal', 'private-password', '/subscriptions/mock'):
+                    self.assertNotIn(protected, output.getvalue())
+
+    def test_backing_delete_emits_only_observed_static_secondary_cause(self) -> None:
+        resource_id = '/subscriptions/s/resourceGroups/rg/providers/Microsoft.Compute/virtualMachines/owned'
+        errors = {
+            'transport': 'connection reset private-password',
+            'conflict': 'Status Code: 409 secret-user',
+            'other': 'ServiceUnavailable host.internal',
+        }
+        for cause, error in errors.items():
+            with self.subTest(cause=cause):
+                self.state(rule=False, resources=(resource_id,))
+                output = io.StringIO()
+                def az_responder(*args, **_kwargs):
+                    return result(1, error) if args[1] == 'delete' else result(1, 'ResourceNotFound')
+                with patch.object(RUNNER, 'rest_result', return_value=result(1, 'ResourceNotFound')), \
+                     patch.object(RUNNER, 'az', side_effect=az_responder), \
+                     redirect_stdout(output):
+                    self.assertEqual(RUNNER.cleanup(self.state_path, cleanup_timeout=1), 1)
+                event = json.loads(output.getvalue())
+                self.assertEqual(event['diagnostic_classes'], [f'backing-resource-delete-{cause}'])
+                self.assertIn('backing-resource-delete-other' if cause == 'conflict'
+                              else f'backing-resource-delete-{cause}', event['failure_classes'])
+                for protected in ('secret-user', 'host.internal', 'private-password'):
+                    self.assertNotIn(protected, output.getvalue())
 
     def test_successful_explicit_404_cleanup_has_no_failure_classes(self) -> None:
         self.state()

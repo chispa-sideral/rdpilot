@@ -52,9 +52,25 @@ CLEANUP_FAILURE_CLASSES = frozenset((
     'ingress-delete-timeout',
     'ingress-delete-transport',
 ))
+CLEANUP_DIAGNOSTIC_CLASSES = frozenset((
+    'backing-resource-delete-conflict',
+    'backing-resource-delete-other',
+    'backing-resource-delete-transport',
+    'devtest-vm-absence-authorization',
+    'devtest-vm-absence-conflict',
+    'devtest-vm-absence-other',
+    'devtest-vm-absence-timeout',
+    'devtest-vm-absence-transport',
+    'ingress-absence-authorization',
+    'ingress-absence-conflict',
+    'ingress-absence-other',
+    'ingress-absence-timeout',
+    'ingress-absence-transport',
+))
 AUTHORIZATION_FAILURE = re.compile(r'\b(?:authorization\w*|forbidden|unauthorized)\b', re.I)
 TIMEOUT_FAILURE = re.compile(r'\b(?:timeout|timed out|deadline exceeded)\b', re.I)
 TRANSPORT_FAILURE = re.compile(r'\b(?:connection|connect|network|dns|socket|tls|proxy|reset|unreachable)\b', re.I)
+CONFLICT_FAILURE = re.compile(r'\b(?:conflict|HTTP\s*409|Status\s*Code:\s*409)\b', re.I)
 
 
 class LeaseError(RuntimeError):
@@ -136,6 +152,16 @@ def classify_azure_failure(result: subprocess.CompletedProcess[str]) -> str:
         return 'authorization'
     if TRANSPORT_FAILURE.search(result.stderr):
         return 'transport'
+    return 'other'
+
+
+def classify_cleanup_diagnostic_cause(result: subprocess.CompletedProcess[str]) -> str:
+    """Classify one observed cleanup failure without retaining its Azure output."""
+    failure_class = classify_azure_failure(result)
+    if failure_class != 'other':
+        return failure_class
+    if CONFLICT_FAILURE.search(result.stderr):
+        return 'conflict'
     return 'other'
 
 
@@ -292,29 +318,39 @@ def wait_vm(lab_id: str, vm_name: str, timeout: int) -> dict[str, Any]:
     raise AssertionError
 
 
-def delete_resource(resource_id: str, timeout: float) -> str:
+def delete_resource(resource_id: str, timeout: float,
+                    diagnostic_causes: list[str] | None = None) -> str:
     result = az('resource', 'delete', '--ids', resource_id, check=False, timeout=timeout)
     if result.returncode == 0 or is_confirmed_not_found(result):
         return 'requested'
-    return classify_azure_failure(result)
+    failure_class = classify_azure_failure(result)
+    if diagnostic_causes is not None and failure_class in ('transport', 'other'):
+        diagnostic_causes.append(classify_cleanup_diagnostic_cause(result))
+    return failure_class
 
 
-def observe_resource(resource_id: str, timeout: float) -> str:
+def observe_resource(resource_id: str, timeout: float,
+                     diagnostic_causes: list[str] | None = None) -> str:
     result = az('resource', 'show', '--ids', resource_id, '--output', 'none', check=False,
                 timeout=timeout)
     if result.returncode == 0:
         return 'present'
     if is_confirmed_not_found(result):
         return 'absent'
+    if diagnostic_causes is not None:
+        diagnostic_causes.append(classify_cleanup_diagnostic_cause(result))
     return 'failed'
 
 
-def observe_rest(url: str, timeout: float) -> str:
+def observe_rest(url: str, timeout: float,
+                 diagnostic_causes: list[str] | None = None) -> str:
     result = rest_result('GET', url, timeout=timeout)
     if result.returncode == 0:
         return 'present'
     if is_confirmed_not_found(result):
         return 'absent'
+    if diagnostic_causes is not None:
+        diagnostic_causes.append(classify_cleanup_diagnostic_cause(result))
     return 'failed'
 
 
@@ -342,11 +378,20 @@ def cleanup_failure_class(scope: str, operation: str, outcome: str) -> str:
     return failure_class
 
 
+def cleanup_diagnostic_class(scope: str, operation: str, cause: str) -> str:
+    """Build one closed secondary cleanup cause label from code-selected values."""
+    diagnostic_class = f'{scope}-{operation}-{cause}'
+    if diagnostic_class not in CLEANUP_DIAGNOSTIC_CLASSES:
+        raise AssertionError('invalid cleanup diagnostic class')
+    return diagnostic_class
+
+
 def cleanup(state_path: Path, cleanup_timeout: int = 10 * 60) -> int:
     state = load_state(state_path)
     deadline = time.monotonic() + cleanup_timeout
     failures: list[str] = []
     failure_classes: list[str] = []
+    diagnostic_classes: list[str] = []
     nsg_id = state.get('nsg_id')
     rule = state.get('ingress_rule')
     if isinstance(nsg_id, str) and isinstance(rule, str):
@@ -357,10 +402,15 @@ def cleanup(state_path: Path, cleanup_timeout: int = 10 * 60) -> int:
             failure_classes.append(cleanup_failure_class(
                 'ingress', 'delete', classify_azure_failure(deleted)))
         else:
-            absence = wait_for_absence(lambda: observe_rest(rule_url, remaining_timeout(deadline)), deadline)
+            absence_causes: list[str] = []
+            absence = wait_for_absence(lambda: observe_rest(
+                rule_url, remaining_timeout(deadline), absence_causes), deadline)
             if absence != 'absent':
                 failures.append('ingress-cleanup-failed')
                 failure_classes.append(cleanup_failure_class('ingress', 'absence', absence))
+                if absence == 'unknown' and absence_causes:
+                    diagnostic_classes.append(cleanup_diagnostic_class(
+                        'ingress', 'absence', absence_causes[-1]))
 
     lab_id = state.get('lab_id')
     vm_name = state.get('vm_name')
@@ -372,17 +422,26 @@ def cleanup(state_path: Path, cleanup_timeout: int = 10 * 60) -> int:
             failure_classes.append(cleanup_failure_class(
                 'devtest-vm', 'delete', classify_azure_failure(deleted)))
         else:
-            absence = wait_for_absence(lambda: observe_rest(vm_url, remaining_timeout(deadline)), deadline)
+            absence_causes = []
+            absence = wait_for_absence(lambda: observe_rest(
+                vm_url, remaining_timeout(deadline), absence_causes), deadline)
             if absence != 'absent':
                 failures.append('devtest-vm-cleanup-failed')
                 failure_classes.append(cleanup_failure_class('devtest-vm', 'absence', absence))
+                if absence == 'unknown' and absence_causes:
+                    diagnostic_classes.append(cleanup_diagnostic_class(
+                        'devtest-vm', 'absence', absence_causes[-1]))
 
     for resource_id in state.get('resources', []):
         if isinstance(resource_id, str):
-            deleted = delete_resource(resource_id, remaining_timeout(deadline))
+            delete_causes: list[str] = []
+            deleted = delete_resource(resource_id, remaining_timeout(deadline), delete_causes)
             if deleted != 'requested':
                 failures.append('backing-resource-delete-failed')
                 failure_classes.append(cleanup_failure_class('backing-resource', 'delete', deleted))
+                if delete_causes:
+                    diagnostic_classes.append(cleanup_diagnostic_class(
+                        'backing-resource', 'delete', delete_causes[-1]))
 
     for resource_id in state.get('resources', []):
         if not isinstance(resource_id, str):
@@ -405,6 +464,7 @@ def cleanup(state_path: Path, cleanup_timeout: int = 10 * 60) -> int:
             'phase': 'deletion',
             'failures': sorted(set(failures)),
             'failure_classes': sorted(set(failure_classes)),
+            'diagnostic_classes': sorted(set(diagnostic_classes)),
         }))
         return 1
     state_path.unlink(missing_ok=True)
