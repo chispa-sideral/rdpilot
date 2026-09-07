@@ -208,7 +208,7 @@ pub enum Request {
         session: SessionId,
     },
     /// Respond to an active UAC/elevation consent prompt (mirrors
-    /// `Session::uac_respond`, ticket BF8Q9K6FGZ2APN8F).
+    /// `Session::uac_respond`).
     UacRespond {
         /// The session to operate on.
         session: SessionId,

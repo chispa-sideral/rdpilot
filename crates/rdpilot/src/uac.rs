@@ -1,5 +1,5 @@
 //! Owned SDK types for [`crate::Session::uac_respond`] (UAC/elevation
-//! consent-prompt response, ticket BF8Q9K6FGZ2APN8F).
+//! consent-prompt response).
 //!
 //! Only these owned types leave this crate's public API (D-09) — the
 //! Tab-navigate + Unicode-Enter sequence and the decision-specific

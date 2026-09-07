@@ -152,10 +152,10 @@ internal static partial class ProcessEnumeration
     /// Resolves the Terminal Services session id hosting a process, given
     /// its pid — used both per-record (`ProcessRecord.SessionId`) and once
     /// for the sensor's own session (`ProcessTreeResponse.OwnSessionId`),
-    /// closing plan-review gap 2 (session-scoped elevation detection). No
-    /// handle/privilege dependency — unlike `OpenProcess` above, this needs
-    /// only a pid, so it succeeds even for a process this sensor could not
-    /// otherwise open.
+    /// enabling session-scoped elevation detection. No handle/privilege
+    /// dependency — unlike `OpenProcess` above, this needs only a pid, so
+    /// it succeeds even for a process this sensor could not otherwise
+    /// open.
     [LibraryImport("kernel32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static partial bool ProcessIdToSessionId(uint dwProcessId, out uint pSessionId);

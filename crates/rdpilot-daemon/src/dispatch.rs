@@ -225,10 +225,10 @@ pub(crate) async fn dispatch_for_ipc(
             Err(e) => WireResponse::Error(e.into()),
         },
         Request::ProcessList { session } => {
-            // Session-scoped elevation detection (ticket BF8Q9K6FGZ2APN8F,
-            // section 1) piggybacks on the same process-tree fetch every
-            // `ProcessList` request already makes -- zero extra sensor
-            // cost. `own_session_id()` must be read from the SAME
+            // Session-scoped elevation detection piggybacks on the same
+            // process-tree fetch every `ProcessList` request already
+            // makes -- zero extra sensor cost. `own_session_id()` must be
+            // read from the SAME
             // `ManagedSession` inside the SAME `registry.call` closure as
             // `get_process_tree()`, since it is only ever populated as a
             // side effect of that exact round trip.
@@ -637,7 +637,7 @@ mod tests {
                     screenshot: None,
                     window_list: None,
                     uia: None,
-                elevation_active: None,
+                    elevation_active: None,
                 })
             })
         }
@@ -877,7 +877,7 @@ mod tests {
                     screenshot: None,
                     window_list: None,
                     uia: None,
-                elevation_active: None,
+                    elevation_active: None,
                 })
             })
         }
@@ -1074,7 +1074,7 @@ mod tests {
                         screenshot: Some(rdpilot::Screenshot { width: 1, height: 1, rgba: vec![0, 0, 0, 0] }),
                         window_list: None,
                         uia: None,
-                    elevation_active: None,
+                        elevation_active: None,
                     })
                 })
             }
@@ -1263,8 +1263,8 @@ mod tests {
         }
     }
 
-    // --- Section 0/1/2/5 (ticket BF8Q9K6FGZ2APN8F): UacRespond dispatch,
-    // and session-scoped elevation_active on ProcessList ---
+    // --- UacRespond dispatch, and session-scoped elevation_active on
+    // ProcessList ---
 
     #[tokio::test]
     async fn uac_respond_returns_the_fakes_confirmation() {
@@ -1294,9 +1294,9 @@ mod tests {
 
     /// A `ManagedSession` fake whose `get_process_tree` reports a single
     /// `consent.exe` record at a caller-fixed `session_id`, and whose
-    /// `own_session_id()` is separately caller-fixed -- the same-session
-    /// vs. different-session `consent.exe` fixture pair section 0/5 calls
-    /// for, exercised end-to-end through `dispatch`'s `ProcessList` arm.
+    /// `own_session_id()` is separately caller-fixed -- a same-session vs.
+    /// different-session `consent.exe` fixture pair, exercised end-to-end
+    /// through `dispatch`'s `ProcessList` arm.
     struct SessionScopedConsentSession {
         own_session_id: Option<u32>,
         consent_session_id: Option<u32>,
@@ -1415,8 +1415,8 @@ mod tests {
         }
     }
 
-    /// The core session-scoping safeguard (section 0/5): a `consent.exe` in
-    /// THIS session reports `elevation_active: true` on `ProcessList`.
+    /// The core session-scoping safeguard: a `consent.exe` in THIS session
+    /// reports `elevation_active: true` on `ProcessList`.
     #[tokio::test]
     async fn process_list_reports_elevation_active_true_for_a_same_session_consent_exe() {
         let registry = Registry::new(
@@ -1431,9 +1431,9 @@ mod tests {
         assert!(elevation_active, "a consent.exe in THIS session must report elevation_active: true");
     }
 
-    /// The core session-scoping safeguard (section 0/5): a `consent.exe` in
-    /// a DIFFERENT session must never false-positive `elevation_active` for
-    /// this session's `ProcessList`.
+    /// The core session-scoping safeguard: a `consent.exe` in a DIFFERENT
+    /// session must never false-positive `elevation_active` for this
+    /// session's `ProcessList`.
     #[tokio::test]
     async fn process_list_reports_elevation_active_false_for_a_different_session_consent_exe() {
         let registry = Registry::new(

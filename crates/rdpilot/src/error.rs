@@ -126,10 +126,9 @@ pub enum Error {
 
     /// A raw `send_mouse`/`send_key(Combo)` call was rejected because a
     /// UAC/elevation prompt is active in this session (the safety-net
-    /// check, section 3): scancode key combos and mouse clicks are silently
-    /// ignored by the secure desktop even though the transport reports
-    /// success — use [`Session::uac_respond`](crate::Session::uac_respond)
-    /// instead.
+    /// check): scancode key combos and mouse clicks are silently ignored by
+    /// the secure desktop even though the transport reports success — use
+    /// [`Session::uac_respond`](crate::Session::uac_respond) instead.
     #[error(
         "a UAC/elevation prompt is active in this session -- raw clicks and scancode key combos have no effect \
          on the secure desktop; use Session::uac_respond (input uac respond) instead"
@@ -138,7 +137,7 @@ pub enum Error {
 
     /// [`Session::uac_respond`](crate::Session::uac_respond) was called but
     /// no elevation prompt is active in this session (the session-scoped
-    /// check from sections 0/1).
+    /// precondition check).
     #[error("uac_respond was called but no UAC/elevation prompt is active in this session")]
     UacPromptNotActive,
 
@@ -340,7 +339,7 @@ mod tests {
 
     /// `Error::SecureDesktopActive` reports the `"secure_desktop_active"`
     /// category and names the working alternative (`uac_respond`) in its
-    /// message -- the safety-net rejection (section 3).
+    /// message -- the safety-net rejection.
     #[test]
     fn secure_desktop_active_category_and_message_render() {
         let err = Error::SecureDesktopActive;
@@ -351,7 +350,7 @@ mod tests {
     }
 
     /// `Error::UacPromptNotActive` reports the `"uac_prompt_not_active"`
-    /// category (section 2's precondition check).
+    /// category (the precondition check).
     #[test]
     fn uac_prompt_not_active_category_and_message_render() {
         let err = Error::UacPromptNotActive;

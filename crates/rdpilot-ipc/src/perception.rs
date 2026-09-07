@@ -77,7 +77,7 @@ pub struct WireProcessInfo {
     /// (best-effort extra).
     pub owner: Option<String>,
     /// The Terminal Services session id hosting this process, if the
-    /// sensor could resolve it (best-effort extra, ticket BF8Q9K6FGZ2APN8F).
+    /// sensor could resolve it (best-effort extra).
     pub session_id: Option<u32>,
 }
 
@@ -150,10 +150,9 @@ pub struct WireWorldStateOptions {
     /// Which UIA tree(s), if any, to fetch.
     pub uia: WireUiaMode,
     /// Whether to fetch and surface `elevation_active` (session-scoped
-    /// UAC/elevation consent-prompt detection, ticket BF8Q9K6FGZ2APN8F).
-    /// `#[serde(default)]` so an older client that predates this field
-    /// still deserializes cleanly, defaulting to `false` (no behavior
-    /// change for existing callers).
+    /// UAC/elevation consent-prompt detection). `#[serde(default)]` so an
+    /// older client that predates this field still deserializes cleanly,
+    /// defaulting to `false` (no behavior change for existing callers).
     #[serde(default)]
     pub elevation_check: bool,
 }
@@ -314,9 +313,8 @@ mod tests {
     }
 
     /// A `WireWorldStateOptions` JSON payload with NO `elevation_check`
-    /// field at all (an older client that predates this ticket) still
-    /// deserializes, defaulting to `false` -- no behavior change for
-    /// existing callers.
+    /// field at all (an older client) still deserializes, defaulting to
+    /// `false` -- no behavior change for existing callers.
     #[test]
     fn wire_world_state_options_defaults_elevation_check_when_absent() -> Result<(), Box<dyn std::error::Error>> {
         let json = r#"{"screenshot":true,"window_list":true,"uia":"None"}"#;

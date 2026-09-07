@@ -110,7 +110,7 @@ pub enum WireResponse {
         processes: Vec<WireProcessInfo>,
         /// Whether a UAC/elevation consent prompt is active in this
         /// session (session-scoped, structural detection off the same
-        /// process tree — zero extra sensor cost, ticket BF8Q9K6FGZ2APN8F).
+        /// process tree — zero extra sensor cost).
         elevation_active: bool,
     },
     /// A UI Automation tree walk result (`Uia`).
@@ -138,7 +138,7 @@ pub enum WireResponse {
         /// Whether a UAC/elevation consent prompt is active in this
         /// session (session-scoped, structural detection), if
         /// `elevation_check` was requested — `None` otherwise, or on a
-        /// fail-open sensor degrade (ticket BF8Q9K6FGZ2APN8F).
+        /// fail-open sensor degrade.
         elevation_active: Option<bool>,
     },
     /// A session's native desktop dimensions (`DesktopSize`; mirrors
@@ -151,9 +151,9 @@ pub enum WireResponse {
         /// Native desktop height, in pixels.
         height: u16,
     },
-    /// The confirmed outcome of a `UacRespond` request (ticket
-    /// BF8Q9K6FGZ2APN8F): responding to an active UAC/elevation consent
-    /// prompt via the proven native Tab-navigate + Unicode-Enter sequence.
+    /// The confirmed outcome of a `UacRespond` request: responding to an
+    /// active UAC/elevation consent prompt via the proven native
+    /// Tab-navigate + Unicode-Enter sequence.
     UacRespond {
         /// Which decision was requested.
         decision: WireUacDecision,

@@ -81,7 +81,7 @@ impl ManagedSession for ThreadOwningFakeSession {
                 screenshot: None,
                 window_list: None,
                 uia: None,
-            elevation_active: None,
+                elevation_active: None,
             })
         })
     }

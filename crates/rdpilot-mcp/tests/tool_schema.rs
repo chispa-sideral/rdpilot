@@ -35,8 +35,7 @@ mod timeouts;
 use handler::RdpilotMcpHandler;
 
 /// The full advertised dual surface: `computer` plus the twelve `rdpilot_*`
-/// native tools (MCP-01/MCP-03; `rdpilot_uac_respond` added by ticket
-/// BF8Q9K6FGZ2APN8F).
+/// native tools (MCP-01/MCP-03), including `rdpilot_uac_respond`.
 const EXPECTED_TOOL_NAMES: [&str; 13] = [
     "computer",
     "rdpilot_world_state",
@@ -157,10 +156,9 @@ fn the_two_structurally_session_less_tools_declare_no_session_property_at_all() 
     assert_eq!(checked, SESSION_LESS_TOOLS.len());
 }
 
-/// `rdpilot_uac_respond` (ticket BF8Q9K6FGZ2APN8F) requires BOTH `session`
-/// (already covered generically above) AND `decision` — the dedicated
-/// per-tool coverage the plan calls out beyond the generic session-only
-/// sweep.
+/// `rdpilot_uac_respond` requires BOTH `session` (already covered
+/// generically above) AND `decision` — dedicated per-tool coverage beyond
+/// the generic session-only sweep.
 #[test]
 fn rdpilot_uac_respond_requires_session_and_decision() {
     let tools = all_tools();

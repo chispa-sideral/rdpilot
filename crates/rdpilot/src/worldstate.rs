@@ -70,8 +70,8 @@ pub struct WorldStateOptions {
     /// Which UIA tree(s), if any, to fetch.
     pub uia: UiaMode,
     /// Whether to fetch and surface `elevation_active` (a session-scoped
-    /// UAC/elevation consent-prompt detection, ticket BF8Q9K6FGZ2APN8F) —
-    /// opt-in, a-la-carte: `world_state()` does not fetch the process tree
+    /// UAC/elevation consent-prompt detection) — opt-in, a-la-carte:
+    /// `world_state()` does not fetch the process tree
     /// at all unless this is `true`, preserving the existing SC#2 default
     /// cheapness for every caller that does not ask for it.
     pub elevation_check: bool,
@@ -149,9 +149,8 @@ pub struct WorldState {
     /// not requested, OR when the underlying `get_process_tree()` fetch
     /// itself failed with [`crate::Error::Dvc`] — a stuck sensor degrades
     /// this one field rather than failing an otherwise-successful
-    /// screenshot/window-list/UIA snapshot (fail-open, matching this
-    /// ticket's safety-net principle applied to `world_state` too). Any
-    /// OTHER error from that fetch still propagates via `?` like every
-    /// other component.
+    /// screenshot/window-list/UIA snapshot (fail-open, the same safety-net
+    /// principle applied to `world_state` too). Any OTHER error from that
+    /// fetch still propagates via `?` like every other component.
     pub elevation_active: Option<bool>,
 }

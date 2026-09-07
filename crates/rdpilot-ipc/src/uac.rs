@@ -1,7 +1,7 @@
 //! Wire mirror of `rdpilot::UacDecision` (UAC/elevation consent-prompt
-//! response, ticket BF8Q9K6FGZ2APN8F) — deliberately duplicates the SDK
-//! type's field shape rather than importing it (the `transfer.rs`
-//! convention, Decision 1): `rdpilot-ipc` must never depend on `rdpilot`.
+//! response) — deliberately duplicates the SDK type's field shape rather
+//! than importing it (the `transfer.rs` convention, Decision 1):
+//! `rdpilot-ipc` must never depend on `rdpilot`.
 
 use serde::{Deserialize, Serialize};
 
@@ -13,6 +13,17 @@ pub enum WireUacDecision {
     Approve,
     /// Reject the prompt.
     Reject,
+}
+
+impl WireUacDecision {
+    /// The decision's string form.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            WireUacDecision::Approve => "approve",
+            WireUacDecision::Reject => "reject",
+        }
+    }
 }
 
 #[cfg(test)]

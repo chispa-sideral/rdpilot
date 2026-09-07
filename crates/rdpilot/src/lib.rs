@@ -37,11 +37,11 @@ mod framebuffer;
 mod input;
 mod keepalive;
 // `pub` (unlike every other internal module here): the daemon crate calls
-// `rdpilot::perception::elevation_prompt_active` directly (section 0/1/5 of
-// the UAC-detection plan) rather than through a crate-root re-export, since
-// it is a free function alongside the module's owned types, not a type
-// itself. The module's `*Wire` structs stay `pub(crate)` (D-09) and are
-// therefore still invisible outside this crate despite the module itself
+// `rdpilot::perception::elevation_prompt_active` directly rather than
+// through a crate-root re-export, since it is a free function alongside
+// the module's owned types, not a type itself. The module's `*Wire`
+// structs stay `pub(crate)` (D-09) and are therefore still invisible
+// outside this crate despite the module itself
 // being reachable.
 pub mod perception;
 mod rdpdr_backend;

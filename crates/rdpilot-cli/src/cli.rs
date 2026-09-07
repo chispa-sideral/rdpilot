@@ -174,9 +174,8 @@ pub struct WorldStateArgs {
     #[arg(long)]
     pub output: Option<PathBuf>,
     /// Also fetch and surface `elevation_active` (session-scoped UAC/
-    /// elevation consent-prompt detection, ticket BF8Q9K6FGZ2APN8F) — an
-    /// extra process-tree round trip, opt-in per D-8.1's a-la-carte
-    /// discipline.
+    /// elevation consent-prompt detection) — an extra process-tree round
+    /// trip, opt-in per D-8.1's a-la-carte discipline.
     #[arg(long = "elevation-check")]
     pub elevation_check: bool,
 }
@@ -246,7 +245,7 @@ pub enum InputCmd {
     Launch(LaunchArgs),
     /// Bring a remote window to the foreground.
     Foreground(ForegroundArgs),
-    /// The `input uac` noun group (ticket BF8Q9K6FGZ2APN8F).
+    /// The `input uac` noun group.
     #[command(subcommand)]
     Uac(UacCmd),
 }

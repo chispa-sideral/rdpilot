@@ -115,11 +115,11 @@ pub async fn foreground(args: ForegroundArgs, json: bool) -> Result<(), CliError
     expect_ack(round_trip(Request::SetForeground { session, hwnd: args.hwnd }).await?, json)
 }
 
-/// `input uac respond --session <id> [--approve|--reject] [--output <path>]`
-/// (ticket BF8Q9K6FGZ2APN8F): responds to an active UAC/elevation consent
-/// prompt via the proven native Tab-navigate + Unicode-Enter sequence,
-/// confirmed via a follow-up screenshot. `--approve`/`--reject` are a
-/// clap-enforced exactly-one-of group (`UacRespondArgs`'s `ArgGroup`).
+/// `input uac respond --session <id> [--approve|--reject] [--output <path>]`:
+/// responds to an active UAC/elevation consent prompt via the proven native
+/// Tab-navigate + Unicode-Enter sequence, confirmed via a follow-up
+/// screenshot. `--approve`/`--reject` are a clap-enforced exactly-one-of
+/// group (`UacRespondArgs`'s `ArgGroup`).
 ///
 /// # Errors
 ///
@@ -143,10 +143,7 @@ pub async fn uac_respond(args: UacRespondArgs, json: bool) -> Result<(), CliErro
                 write_output(output, &bytes)?;
                 written_bytes = Some(bytes.len());
             }
-            let decision_str = match decision {
-                WireUacDecision::Approve => "approve",
-                WireUacDecision::Reject => "reject",
-            };
+            let decision_str = decision.as_str();
             if json {
                 print_json(&serde_json::json!({ "decision": decision_str, "written_bytes": written_bytes }))
             } else {

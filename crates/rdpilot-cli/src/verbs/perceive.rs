@@ -181,8 +181,8 @@ pub async fn process_list(args: SessionArg, json: bool) -> Result<(), CliError> 
 /// Base64-decode a wire `png_base64` field.
 ///
 /// `pub(crate)`: also reused by `verbs::input::uac_respond` for its own
-/// confirming-screenshot decode (ticket BF8Q9K6FGZ2APN8F) — the one
-/// canonical base64-decode helper, not a duplicated copy.
+/// confirming-screenshot decode — the one canonical base64-decode helper,
+/// not a duplicated copy.
 pub(crate) fn decode_png(png_base64: &str) -> Result<Vec<u8>, CliError> {
     STANDARD.decode(png_base64).map_err(|e| CliError::Internal(format!("invalid base64 screenshot data: {e}")))
 }

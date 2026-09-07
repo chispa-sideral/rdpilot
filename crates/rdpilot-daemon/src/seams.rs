@@ -221,15 +221,15 @@ pub trait ManagedSession: Send + 'static {
 
     /// This session's own RDP session id, if resolved by a prior
     /// `get_process_tree` round trip (mirrors
-    /// [`rdpilot::Session::own_session_id`], ticket BF8Q9K6FGZ2APN8F). A
-    /// plain synchronous getter, like `desktop_size` — never a `BoxFuture`.
-    /// The default (`None`) keeps existing fake sessions source-compatible.
+    /// [`rdpilot::Session::own_session_id`]). A plain synchronous getter,
+    /// like `desktop_size` — never a `BoxFuture`. The default (`None`)
+    /// keeps existing fake sessions source-compatible.
     fn own_session_id(&self) -> Option<u32> {
         None
     }
 
     /// Respond to an active UAC/elevation consent prompt (mirrors
-    /// [`rdpilot::Session::uac_respond`], ticket BF8Q9K6FGZ2APN8F).
+    /// [`rdpilot::Session::uac_respond`]).
     ///
     /// # Errors
     ///

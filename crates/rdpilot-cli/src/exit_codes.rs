@@ -131,9 +131,8 @@ mod tests {
     }
 
     /// Every wire error class maps to a DISTINCT exit code (D-28) — a
-    /// regression guard specifically for the three codes this ticket adds
-    /// (9/10/11), proving they do not collide with any of the 1-8 codes
-    /// already taken.
+    /// regression guard specifically for the UAC-related codes (9/10/11),
+    /// proving they do not collide with any of the 1-8 codes already taken.
     #[test]
     fn distinct_codes_for_every_wire_error_class_are_pairwise_unique() {
         let codes = [

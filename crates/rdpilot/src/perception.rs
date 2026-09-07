@@ -175,11 +175,11 @@ pub(crate) struct ProcessInfoWire {
     path: String,
     command_line: Option<String>,
     owner: Option<String>,
-    /// Wire field added alongside section 0's sensor-side
-    /// `ProcessIdToSessionId` fix (session-scoped elevation detection).
-    /// `#[serde(default)]` so a reply from an older sensor build that has
-    /// not yet shipped this field degrades to `None` (session-scoping's own
-    /// degrade rule) rather than a hard deserialize error.
+    /// Wire field carrying the sensor's `ProcessIdToSessionId` result
+    /// (session-scoped elevation detection). `#[serde(default)]` so a
+    /// reply from an older sensor build that has not yet shipped this
+    /// field degrades to `None` (session-scoping's own degrade rule)
+    /// rather than a hard deserialize error.
     #[serde(default)]
     session_id: Option<u32>,
 }
@@ -385,25 +385,35 @@ const ELEVATION_PROCESS_NAMES: &[&str] = &["consent.exe"];
 /// Whether `processes` contains a live UAC/elevation consent prompt
 /// (structural, sensor-backed detection — never visual/pixel guesswork),
 /// scoped to `own_session_id` when both it and a candidate record's own
-/// `session_id` are known (section 0's required session-scoping safeguard).
+/// `session_id` are known.
 ///
 /// `own_session_id` is this `Session`'s own RDP session id (from
 /// `Session::own_session_id()`, `None` if not yet resolved by a prior
-/// `get_process_tree()` round trip). A candidate match is accepted UNSCOPED
-/// (the pre-existing, whole-system behavior — no worse than before this
-/// safeguard existed) whenever either `own_session_id` or the candidate
-/// record's own `session_id` is unknown, and session-verified otherwise —
-/// the explicit, honest degrade rule required by the amended acceptance.
+/// `get_process_tree()` round trip). A candidate match is accepted unscoped
+/// whenever either `own_session_id` or the candidate record's own
+/// `session_id` is unknown, and session-verified otherwise. See
+/// [`session_scope_matches`] for the shared degrade rule.
 #[must_use]
 pub fn elevation_prompt_active(processes: &[ProcessInfo], own_session_id: Option<u32>) -> bool {
     processes.iter().any(|p| {
         let name_matches = ELEVATION_PROCESS_NAMES.iter().any(|n| p.name.eq_ignore_ascii_case(n));
-        name_matches
-            && match (own_session_id, p.session_id) {
-                (Some(mine), Some(theirs)) => mine == theirs,
-                _ => true,
-            }
+        name_matches && session_scope_matches(own_session_id, p.session_id)
     })
+}
+
+/// Whether `theirs` is in the same session-scoping bucket as `mine`.
+///
+/// A match is accepted unscoped whenever either side's session id is
+/// unknown, and session-verified otherwise. Shared by
+/// [`elevation_prompt_active`]'s process-name matching and
+/// `session::in_session`'s baseline/confirmation pid-diffing, so both stay
+/// consistent about what "in this session" means.
+#[must_use]
+pub(crate) fn session_scope_matches(mine: Option<u32>, theirs: Option<u32>) -> bool {
+    match (mine, theirs) {
+        (Some(mine), Some(theirs)) => mine == theirs,
+        _ => true,
+    }
 }
 
 #[cfg(test)]
@@ -517,8 +527,8 @@ mod tests {
     /// `Vec<ProcessInfo>`; a record with `command_line:null` and
     /// `owner:null` yields `None` for both (graceful-degradation fields,
     /// D-6.3), and a record with NO `session_id` field at all (an older
-    /// sensor build mid-rollout, section 0's degrade rule) also degrades to
-    /// `None` rather than a hard deserialize error.
+    /// sensor build mid-rollout) also degrades to `None` rather than a hard
+    /// deserialize error.
     #[test]
     fn process_tree_data_deserializes_and_degrades_optional_fields() {
         let data = serde_json::json!([
@@ -548,7 +558,7 @@ mod tests {
     }
 
     /// A `ProcessTree` record carrying a present `session_id` round-trips
-    /// through `ProcessInfoWire`/`into_owned` (section 0's new field).
+    /// through `ProcessInfoWire`/`into_owned`.
     #[test]
     fn process_tree_data_round_trips_a_present_session_id() {
         let data = serde_json::json!([

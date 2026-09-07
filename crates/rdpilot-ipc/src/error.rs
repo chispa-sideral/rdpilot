@@ -65,10 +65,9 @@ pub enum WireErrorCode {
     /// SESSION-04). Produced by the registry's atomic-insert collision path
     /// (Plan 12-03). Wire string: `duplicate-session`.
     DuplicateSession,
-    /// Maps 1:1 from `rdpilot::Error::SecureDesktopActive` (ticket
-    /// BF8Q9K6FGZ2APN8F, section 3's safety net): a raw `Mouse`/`Key`
-    /// (`Combo`) request was rejected because a UAC/elevation prompt is
-    /// active in this session. Wire string: `secure-desktop-active`.
+    /// Maps 1:1 from `rdpilot::Error::SecureDesktopActive`: a raw
+    /// `Mouse`/`Key` (`Combo`) request was rejected because a UAC/elevation
+    /// prompt is active in this session. Wire string: `secure-desktop-active`.
     SecureDesktopActive,
     /// Maps 1:1 from `rdpilot::Error::UacPromptNotActive`: `UacRespond` was
     /// called but no elevation prompt is active in this session. Wire

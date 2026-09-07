@@ -180,7 +180,7 @@ fn every_cli_02_verb_round_trips_against_the_canned_fake_session() {
         serde_json::from_str(process_list_run.stdout.trim()).expect("process list --json must be valid JSON");
     assert!(
         process_list_response["elevation_active"].is_boolean(),
-        "process list --json must surface elevation_active (ticket BF8Q9K6FGZ2APN8F): {process_list_response:?}"
+        "process list --json must surface elevation_active: {process_list_response:?}"
     );
     let processes = process_list_response["processes"]
         .as_array()

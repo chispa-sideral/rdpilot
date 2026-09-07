@@ -135,7 +135,7 @@ pub struct WorldStateArgs {
     #[serde(default)]
     pub uia: WorldStateUiaMode,
     /// Whether to fetch and surface `elevation_active` (session-scoped
-    /// UAC/elevation consent-prompt detection, ticket BF8Q9K6FGZ2APN8F).
+    /// UAC/elevation consent-prompt detection).
     #[serde(default)]
     pub elevation_check: bool,
 }
@@ -294,7 +294,7 @@ fn render_ack(resp: WireResponse) -> Result<CallToolResult, McpError> {
 }
 
 // ---------------------------------------------------------------------
-// rdpilot_uac_respond (ticket BF8Q9K6FGZ2APN8F)
+// rdpilot_uac_respond
 // ---------------------------------------------------------------------
 
 /// A caller-facing mirror of [`WireUacDecision`], converted 1:1 via
@@ -331,10 +331,7 @@ pub struct UacRespondArgs {
 fn render_uac_respond(resp: WireResponse) -> Result<CallToolResult, McpError> {
     match resp {
         WireResponse::UacRespond { decision, confirmation_png_base64 } => {
-            let decision_str = match decision {
-                WireUacDecision::Approve => "approve",
-                WireUacDecision::Reject => "reject",
-            };
+            let decision_str = decision.as_str();
             json_result(&serde_json::json!({
                 "decision": decision_str,
                 "confirmation_screenshot_base64": confirmation_png_base64,
@@ -854,7 +851,7 @@ mod tests {
         assert!(text.contains("\"elevation_active\":false"), "missing elevation_active: {text}");
     }
 
-    // -- uac_respond (ticket BF8Q9K6FGZ2APN8F) --
+    // -- uac_respond --
 
     #[test]
     fn mcp_uac_decision_approve_maps_to_wire_approve() {
