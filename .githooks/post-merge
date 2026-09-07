@@ -7,5 +7,16 @@ set -euo pipefail
 [ "${RDPILOT_SKIP_HOOKS:-}" = "1" ] && exit 0
 [ "$(git symbolic-ref --quiet --short HEAD 2>/dev/null || true)" = "develop" ] || exit 0
 
+# Kill any already-running rdpilot-daemon FIRST, before reinstalling.
+# rdpilot's daemon is a long-lived, auto-started, SHARED process that never
+# restarts itself on a fresh install -- reinstalling the binaries alone
+# leaves a stale daemon live and reused by every subsequent command. Killing
+# it here also bounds the damage if this hook itself gets interrupted
+# partway through install-local.sh's two `cargo install` calls: worst case
+# is no daemon running (auto-spawned fresh on next connect from whatever is
+# currently on disk), never a silently stale live process serving a newer
+# CLI (see ticket B86MSH43DXV6AR6N).
+pkill -x rdpilot-daemon 2>/dev/null || true
+
 root=$(git rev-parse --show-toplevel)
 "$root/scripts/install-local.sh"
