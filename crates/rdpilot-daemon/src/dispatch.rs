@@ -26,8 +26,8 @@ use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use rdpilot::ConnectionConfig;
 use rdpilot_ipc::{
     Request, TransferOutcome as WireTransferOutcome, WireButton, WireKey, WireKeyAction, WireMouseAction,
-    WireProcessInfo, WireRect, WireResponse, WireUiaElement, WireUiaMode, WireUiaScope, WireWindowInfo,
-    WireWindowState, WireWorldStateOptions,
+    WireProcessInfo, WireRect, WireResponse, WireUacDecision, WireUiaElement, WireUiaMode, WireUiaScope,
+    WireWindowInfo, WireWindowState, WireWorldStateOptions,
 };
 
 use crate::diagnostics::{Diagnostics, Stage};
@@ -53,9 +53,10 @@ pub(crate) struct DispatchOutcome {
 /// - `Disconnect` calls `registry.close`.
 /// - Every operational verb (`Ping`/`Screenshot`/`WindowList`/
 ///   `ProcessList`/`Uia`/`WorldState`/`Mouse`/`Key`/`LaunchProcess`/
-///   `SetForeground`/`Put`/`Get`) routes through `registry.call` to the live
-///   session via the `ManagedSession` seam (Plan 13-03), converting wire
-///   DTOs (Plan 13-02) to/from the corresponding SDK types (Plan 13-04).
+///   `SetForeground`/`Put`/`Get`/`UacRespond`) routes through `registry.call`
+///   to the live session via the `ManagedSession` seam (Plan 13-03),
+///   converting wire DTOs (Plan 13-02) to/from the corresponding SDK types
+///   (Plan 13-04).
 pub async fn dispatch(registry: &Registry, req: Request) -> WireResponse {
     dispatch_for_ipc(registry, req, None).await.response
 }
@@ -223,12 +224,34 @@ pub(crate) async fn dispatch_for_ipc(
             Ok(windows) => WireResponse::WindowList { windows: windows.into_iter().map(wire_window_info).collect() },
             Err(e) => WireResponse::Error(e.into()),
         },
-        Request::ProcessList { session } => match registry.call(&session, |s| s.get_process_tree()).await {
-            Ok(processes) => {
-                WireResponse::ProcessList { processes: processes.into_iter().map(wire_process_info).collect() }
+        Request::ProcessList { session } => {
+            // Session-scoped elevation detection piggybacks on the same
+            // process-tree fetch every `ProcessList` request already
+            // makes -- zero extra sensor cost. `own_session_id()` must be
+            // read from the SAME
+            // `ManagedSession` inside the SAME `registry.call` closure as
+            // `get_process_tree()`, since it is only ever populated as a
+            // side effect of that exact round trip.
+            match registry
+                .call(&session, |s| {
+                    Box::pin(async move {
+                        let processes = s.get_process_tree().await?;
+                        let own_session_id = s.own_session_id();
+                        Ok((processes, own_session_id))
+                    })
+                })
+                .await
+            {
+                Ok((processes, own_session_id)) => {
+                    let elevation_active = rdpilot::perception::elevation_prompt_active(&processes, own_session_id);
+                    WireResponse::ProcessList {
+                        processes: processes.into_iter().map(wire_process_info).collect(),
+                        elevation_active,
+                    }
+                }
+                Err(e) => WireResponse::Error(e.into()),
             }
-            Err(e) => WireResponse::Error(e.into()),
-        },
+        }
         Request::Uia { session, hwnd, scope } => {
             let scope = sdk_uia_scope(scope);
             match registry.call(&session, move |s| s.get_uia_tree(hwnd, scope)).await {
@@ -263,6 +286,18 @@ pub(crate) async fn dispatch_for_ipc(
         Request::DesktopSize { session } => {
             match registry.call(&session, |s| Box::pin(async move { Ok(s.desktop_size()) })).await {
                 Ok((w, h)) => WireResponse::DesktopSize { width: w as u16, height: h as u16 },
+                Err(e) => WireResponse::Error(e.into()),
+            }
+        }
+        Request::UacRespond { session, decision } => {
+            let decision = sdk_uac_decision(decision);
+            match registry.call(&session, move |s| s.uac_respond(decision)).await {
+                Ok(outcome) => match screenshot_to_base64(&outcome.confirmation) {
+                    Ok(confirmation_png_base64) => {
+                        WireResponse::UacRespond { decision: wire_uac_decision(outcome.decision), confirmation_png_base64 }
+                    }
+                    Err(e) => WireResponse::Error(e.into()),
+                },
                 Err(e) => WireResponse::Error(e.into()),
             }
         }
@@ -335,7 +370,7 @@ fn wire_world_state(state: rdpilot::WorldState) -> Result<WireResponse, DaemonEr
             .map(|(hwnd, elements)| (hwnd, elements.into_iter().map(wire_uia_element).collect()))
             .collect()
     });
-    Ok(WireResponse::WorldState { timestamp, capture_span_ms, screenshot, window_list, uia })
+    Ok(WireResponse::WorldState { timestamp, capture_span_ms, screenshot, window_list, uia, elevation_active: state.elevation_active })
 }
 
 /// `Duration::as_millis()` returns `u128`; the wire shape is `u64`
@@ -384,6 +419,23 @@ fn wire_process_info(p: rdpilot::ProcessInfo) -> WireProcessInfo {
         path: p.path,
         command_line: p.command_line,
         owner: p.owner,
+        session_id: p.session_id,
+    }
+}
+
+/// Wire `WireUacDecision` -> SDK `rdpilot::UacDecision`.
+fn sdk_uac_decision(d: WireUacDecision) -> rdpilot::UacDecision {
+    match d {
+        WireUacDecision::Approve => rdpilot::UacDecision::Approve,
+        WireUacDecision::Reject => rdpilot::UacDecision::Reject,
+    }
+}
+
+/// SDK `rdpilot::UacDecision` -> wire `WireUacDecision`.
+fn wire_uac_decision(d: rdpilot::UacDecision) -> WireUacDecision {
+    match d {
+        rdpilot::UacDecision::Approve => WireUacDecision::Approve,
+        rdpilot::UacDecision::Reject => WireUacDecision::Reject,
     }
 }
 
@@ -423,7 +475,12 @@ fn sdk_uia_mode(m: WireUiaMode) -> rdpilot::UiaMode {
 
 /// Wire `WireWorldStateOptions` -> SDK `rdpilot::WorldStateOptions`.
 fn sdk_world_state_options(o: WireWorldStateOptions) -> rdpilot::WorldStateOptions {
-    rdpilot::WorldStateOptions { screenshot: o.screenshot, window_list: o.window_list, uia: sdk_uia_mode(o.uia) }
+    rdpilot::WorldStateOptions {
+        screenshot: o.screenshot,
+        window_list: o.window_list,
+        uia: sdk_uia_mode(o.uia),
+        elevation_check: o.elevation_check,
+    }
 }
 
 /// Wire `WireButton` -> SDK `rdpilot::Button`.
@@ -580,6 +637,7 @@ mod tests {
                     screenshot: None,
                     window_list: None,
                     uia: None,
+                    elevation_active: None,
                 })
             })
         }
@@ -631,6 +689,17 @@ mod tests {
         }
         fn deploy_and_launch(&self) -> BoxFuture<'_, Result<std::time::Duration, DaemonError>> {
             Box::pin(async move { Ok(std::time::Duration::from_millis(0)) })
+        }
+        fn uac_respond(
+            &self,
+            decision: rdpilot::UacDecision,
+        ) -> BoxFuture<'_, Result<rdpilot::UacResponseOutcome, DaemonError>> {
+            Box::pin(async move {
+                Ok(rdpilot::UacResponseOutcome {
+                    decision,
+                    confirmation: rdpilot::Screenshot { width: 1, height: 1, rgba: vec![0, 0, 0, 0] },
+                })
+            })
         }
     }
 
@@ -808,6 +877,7 @@ mod tests {
                     screenshot: None,
                     window_list: None,
                     uia: None,
+                    elevation_active: None,
                 })
             })
         }
@@ -833,6 +903,7 @@ mod tests {
                     path: "C:\\Windows\\notepad.exe".to_owned(),
                     command_line: None,
                     owner: None,
+                    session_id: None,
                 }])
             })
         }
@@ -892,6 +963,17 @@ mod tests {
         fn deploy_and_launch(&self) -> BoxFuture<'_, Result<std::time::Duration, DaemonError>> {
             Box::pin(async move { Ok(std::time::Duration::from_millis(0)) })
         }
+        fn uac_respond(
+            &self,
+            decision: rdpilot::UacDecision,
+        ) -> BoxFuture<'_, Result<rdpilot::UacResponseOutcome, DaemonError>> {
+            Box::pin(async move {
+                Ok(rdpilot::UacResponseOutcome {
+                    decision,
+                    confirmation: rdpilot::Screenshot { width: 1, height: 1, rgba: vec![0, 0, 0, 0] },
+                })
+            })
+        }
     }
 
     struct RichPerceptionConnector;
@@ -926,12 +1008,13 @@ mod tests {
         let registry = rich_perception_registry();
         let session = connected_session(&registry).await;
         let response = dispatch(&registry, Request::ProcessList { session }).await;
-        let WireResponse::ProcessList { processes } = response else {
+        let WireResponse::ProcessList { processes, elevation_active } = response else {
             panic!("expected ProcessList, got {response:?}");
         };
         assert_eq!(processes.len(), 1);
         assert_eq!(processes[0].pid, 4242);
         assert_eq!(processes[0].name, "notepad.exe");
+        assert!(!elevation_active, "the fake's single notepad.exe record is not an elevation prompt");
     }
 
     #[tokio::test]
@@ -951,9 +1034,11 @@ mod tests {
     async fn world_state_converts_timestamp_and_capture_span_and_returns_the_fakes_data() {
         let registry = test_registry();
         let session = connected_session(&registry).await;
-        let options = WireWorldStateOptions { screenshot: false, window_list: false, uia: WireUiaMode::None };
+        let options = WireWorldStateOptions { screenshot: false, window_list: false, uia: WireUiaMode::None, elevation_check: false };
         let response = dispatch(&registry, Request::WorldState { session, options }).await;
-        let WireResponse::WorldState { timestamp, capture_span_ms, screenshot, window_list, uia } = response else {
+        let WireResponse::WorldState { timestamp, capture_span_ms, screenshot, window_list, uia, elevation_active } =
+            response
+        else {
             panic!("expected WorldState, got {response:?}");
         };
         assert!(!timestamp.is_empty(), "timestamp must be a non-empty ISO-8601 string");
@@ -961,6 +1046,7 @@ mod tests {
         assert!(screenshot.is_none(), "the fake's world_state screenshot is None");
         assert!(window_list.is_none(), "the fake's world_state window_list is None");
         assert!(uia.is_none(), "the fake's world_state uia is None");
+        assert!(elevation_active.is_none(), "elevation_check was not requested");
     }
 
     #[tokio::test]
@@ -988,6 +1074,7 @@ mod tests {
                         screenshot: Some(rdpilot::Screenshot { width: 1, height: 1, rgba: vec![0, 0, 0, 0] }),
                         window_list: None,
                         uia: None,
+                        elevation_active: None,
                     })
                 })
             }
@@ -1040,6 +1127,17 @@ mod tests {
             fn deploy_and_launch(&self) -> BoxFuture<'_, Result<std::time::Duration, DaemonError>> {
                 Box::pin(async move { Ok(std::time::Duration::from_millis(0)) })
             }
+            fn uac_respond(
+                &self,
+                decision: rdpilot::UacDecision,
+            ) -> BoxFuture<'_, Result<rdpilot::UacResponseOutcome, DaemonError>> {
+                Box::pin(async move {
+                    Ok(rdpilot::UacResponseOutcome {
+                        decision,
+                        confirmation: rdpilot::Screenshot { width: 1, height: 1, rgba: vec![0, 0, 0, 0] },
+                    })
+                })
+            }
         }
         struct WithScreenshotConnector;
         impl SessionConnector for WithScreenshotConnector {
@@ -1050,7 +1148,7 @@ mod tests {
 
         let registry = Registry::new(Arc::new(WithScreenshotConnector), Arc::new(NoopReconciliationSink));
         let session = connected_session(&registry).await;
-        let options = WireWorldStateOptions { screenshot: true, window_list: false, uia: WireUiaMode::None };
+        let options = WireWorldStateOptions { screenshot: true, window_list: false, uia: WireUiaMode::None, elevation_check: false };
         let response = dispatch(&registry, Request::WorldState { session, options }).await;
         let WireResponse::WorldState { timestamp, capture_span_ms, screenshot, .. } = response else {
             panic!("expected WorldState, got {response:?}");
@@ -1163,5 +1261,193 @@ mod tests {
             WireResponse::Error(WireError { code: WireErrorCode::SessionNotFound, .. }) => {}
             other => panic!("expected Error(SessionNotFound), got {other:?}"),
         }
+    }
+
+    // --- UacRespond dispatch, and session-scoped elevation_active on
+    // ProcessList ---
+
+    #[tokio::test]
+    async fn uac_respond_returns_the_fakes_confirmation() {
+        let registry = test_registry();
+        let session = connected_session(&registry).await;
+        let response = dispatch(&registry, Request::UacRespond { session, decision: WireUacDecision::Approve }).await;
+        match response {
+            WireResponse::UacRespond { decision, confirmation_png_base64 } => {
+                assert!(matches!(decision, WireUacDecision::Approve));
+                let bytes = BASE64_STANDARD.decode(confirmation_png_base64).expect("valid base64");
+                assert_eq!(&bytes[0..4], &[0x89, b'P', b'N', b'G'], "decoded bytes must be a PNG");
+            }
+            other => panic!("expected UacRespond, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn uac_respond_for_an_unknown_session_returns_session_not_found() {
+        let registry = test_registry();
+        let session: SessionId = "ghost".parse().expect("non-empty literal");
+        let response = dispatch(&registry, Request::UacRespond { session, decision: WireUacDecision::Reject }).await;
+        match response {
+            WireResponse::Error(WireError { code: WireErrorCode::SessionNotFound, .. }) => {}
+            other => panic!("expected Error(SessionNotFound), got {other:?}"),
+        }
+    }
+
+    /// A `ManagedSession` fake whose `get_process_tree` reports a single
+    /// `consent.exe` record at a caller-fixed `session_id`, and whose
+    /// `own_session_id()` is separately caller-fixed -- a same-session vs.
+    /// different-session `consent.exe` fixture pair, exercised end-to-end
+    /// through `dispatch`'s `ProcessList` arm.
+    struct SessionScopedConsentSession {
+        own_session_id: Option<u32>,
+        consent_session_id: Option<u32>,
+    }
+
+    impl ManagedSession for SessionScopedConsentSession {
+        fn close(self: Box<Self>) -> TestFuture<Result<(), DaemonError>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn describe(&self) -> SessionLifecycle {
+            SessionLifecycle::Live
+        }
+        fn screenshot(&self) -> BoxFuture<'_, Result<rdpilot::Screenshot, DaemonError>> {
+            Box::pin(async { Ok(rdpilot::Screenshot { width: 1, height: 1, rgba: vec![0, 0, 0, 0] }) })
+        }
+        fn world_state(&self, _opts: rdpilot::WorldStateOptions) -> BoxFuture<'_, Result<rdpilot::WorldState, DaemonError>> {
+            Box::pin(async {
+                Ok(rdpilot::WorldState {
+                    timestamp: std::time::SystemTime::now(),
+                    capture_span: std::time::Duration::from_millis(0),
+                    screenshot: None,
+                    window_list: None,
+                    uia: None,
+                    elevation_active: None,
+                })
+            })
+        }
+        fn get_window_list(&self) -> BoxFuture<'_, Result<Vec<rdpilot::WindowInfo>, DaemonError>> {
+            Box::pin(async { Ok(vec![]) })
+        }
+        fn get_process_tree(&self) -> BoxFuture<'_, Result<Vec<rdpilot::ProcessInfo>, DaemonError>> {
+            let consent_session_id = self.consent_session_id;
+            Box::pin(async move {
+                Ok(vec![rdpilot::ProcessInfo {
+                    pid: 100,
+                    parent_pid: 4,
+                    name: "consent.exe".to_owned(),
+                    path: "C:\\Windows\\System32\\consent.exe".to_owned(),
+                    command_line: None,
+                    owner: None,
+                    session_id: consent_session_id,
+                }])
+            })
+        }
+        fn get_uia_tree(&self, _hwnd: u64, _scope: rdpilot::UiaScope) -> BoxFuture<'_, Result<Vec<rdpilot::UiaElement>, DaemonError>> {
+            Box::pin(async { Ok(vec![]) })
+        }
+        fn send_mouse(&self, _action: rdpilot::MouseAction) -> BoxFuture<'_, Result<(), DaemonError>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn send_key(&self, _action: rdpilot::KeyAction) -> BoxFuture<'_, Result<(), DaemonError>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn set_foreground_window(&self, _hwnd: u64) -> BoxFuture<'_, Result<(), DaemonError>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn launch_process(
+            &self,
+            _exe: String,
+            _args: Option<String>,
+            _cwd: Option<String>,
+        ) -> BoxFuture<'_, Result<u32, DaemonError>> {
+            Box::pin(async { Ok(0) })
+        }
+        fn upload_file(
+            &self,
+            _local: std::path::PathBuf,
+            _remote_name: String,
+        ) -> BoxFuture<'_, Result<rdpilot::TransferOutcome, DaemonError>> {
+            Box::pin(async { Ok(rdpilot::TransferOutcome { bytes_transferred: 0, checksum: String::new() }) })
+        }
+        fn download_file(
+            &self,
+            _remote_name: String,
+            _local: std::path::PathBuf,
+        ) -> BoxFuture<'_, Result<rdpilot::TransferOutcome, DaemonError>> {
+            Box::pin(async { Ok(rdpilot::TransferOutcome { bytes_transferred: 0, checksum: String::new() }) })
+        }
+        fn ping(&self) -> BoxFuture<'_, Result<std::time::Duration, DaemonError>> {
+            Box::pin(async { Ok(std::time::Duration::from_millis(0)) })
+        }
+        fn desktop_size(&self) -> (u32, u32) {
+            (1920, 1080)
+        }
+        fn deploy_and_launch(&self) -> BoxFuture<'_, Result<std::time::Duration, DaemonError>> {
+            Box::pin(async move { Ok(std::time::Duration::from_millis(0)) })
+        }
+        fn own_session_id(&self) -> Option<u32> {
+            self.own_session_id
+        }
+        fn uac_respond(
+            &self,
+            decision: rdpilot::UacDecision,
+        ) -> BoxFuture<'_, Result<rdpilot::UacResponseOutcome, DaemonError>> {
+            Box::pin(async move {
+                Ok(rdpilot::UacResponseOutcome {
+                    decision,
+                    confirmation: rdpilot::Screenshot { width: 1, height: 1, rgba: vec![0, 0, 0, 0] },
+                })
+            })
+        }
+    }
+
+    struct SessionScopedConsentConnector {
+        own_session_id: Option<u32>,
+        consent_session_id: Option<u32>,
+    }
+
+    impl SessionConnector for SessionScopedConsentConnector {
+        fn connect(&self, _cfg: ConnectionConfig) -> TestFuture<Result<Box<dyn ManagedSession>, DaemonError>> {
+            let own_session_id = self.own_session_id;
+            let consent_session_id = self.consent_session_id;
+            Box::pin(async move {
+                Ok(Box::new(SessionScopedConsentSession { own_session_id, consent_session_id }) as Box<dyn ManagedSession>)
+            })
+        }
+    }
+
+    /// The core session-scoping safeguard: a `consent.exe` in THIS session
+    /// reports `elevation_active: true` on `ProcessList`.
+    #[tokio::test]
+    async fn process_list_reports_elevation_active_true_for_a_same_session_consent_exe() {
+        let registry = Registry::new(
+            Arc::new(SessionScopedConsentConnector { own_session_id: Some(1), consent_session_id: Some(1) }),
+            Arc::new(NoopReconciliationSink),
+        );
+        let session = connected_session(&registry).await;
+        let response = dispatch(&registry, Request::ProcessList { session }).await;
+        let WireResponse::ProcessList { elevation_active, .. } = response else {
+            panic!("expected ProcessList, got {response:?}");
+        };
+        assert!(elevation_active, "a consent.exe in THIS session must report elevation_active: true");
+    }
+
+    /// The core session-scoping safeguard: a `consent.exe` in a DIFFERENT
+    /// session must never false-positive `elevation_active` for this
+    /// session's `ProcessList`.
+    #[tokio::test]
+    async fn process_list_reports_elevation_active_false_for_a_different_session_consent_exe() {
+        let registry = Registry::new(
+            Arc::new(SessionScopedConsentConnector { own_session_id: Some(1), consent_session_id: Some(2) }),
+            Arc::new(NoopReconciliationSink),
+        );
+        let session = connected_session(&registry).await;
+        let response = dispatch(&registry, Request::ProcessList { session }).await;
+        let WireResponse::ProcessList { elevation_active, .. } = response else {
+            panic!("expected ProcessList, got {response:?}");
+        };
+        assert!(
+            !elevation_active,
+            "a consent.exe in a DIFFERENT session must never false-positive this session's detection"
+        );
     }
 }

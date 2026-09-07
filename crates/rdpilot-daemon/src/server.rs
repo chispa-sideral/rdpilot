@@ -279,6 +279,7 @@ impl ManagedSession for FakeTestSession {
                 screenshot,
                 window_list,
                 uia,
+                elevation_active: None,
             })
         })
     }
@@ -296,6 +297,7 @@ impl ManagedSession for FakeTestSession {
                 path: r"C:\Windows\notepad.exe".to_owned(),
                 command_line: None,
                 owner: None,
+                session_id: None,
             }])
         })
     }
@@ -379,6 +381,17 @@ impl ManagedSession for FakeTestSession {
                 tokio::time::sleep(Duration::from_millis(bootstrap_delay_ms)).await;
             }
             Ok(std::time::Duration::from_millis(0))
+        })
+    }
+    fn uac_respond(
+        &self,
+        decision: rdpilot::UacDecision,
+    ) -> BoxFuture<'_, Result<rdpilot::UacResponseOutcome, DaemonError>> {
+        Box::pin(async move {
+            Ok(rdpilot::UacResponseOutcome {
+                decision,
+                confirmation: rdpilot::Screenshot { width: 1, height: 1, rgba: vec![0, 0, 0, 0] },
+            })
         })
     }
 }

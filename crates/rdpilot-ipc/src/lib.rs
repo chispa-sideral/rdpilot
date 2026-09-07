@@ -49,6 +49,7 @@ mod transfer;
 // The module itself is therefore unconditional; the Unix-only items inside
 // it carry their own `#[cfg(unix)]`.
 pub mod transport;
+mod uac;
 
 pub use error::{WireError, WireErrorCode};
 pub use input::{WireButton, WireKey, WireKeyAction, WireMouseAction, parse_wire_key};
@@ -63,3 +64,4 @@ pub use transfer::TransferOutcome;
 pub use transport::{TransportError, read_frame, write_frame};
 #[cfg(unix)]
 pub use transport::{connect_or_spawn, socket_path};
+pub use uac::WireUacDecision;

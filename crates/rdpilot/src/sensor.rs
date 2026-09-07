@@ -217,16 +217,24 @@ pub(crate) struct SensorShared {
     pub(crate) pending: Mutex<HashMap<u64, oneshot::Sender<serde_json::Value>>>,
     pub(crate) handshake: Mutex<HandshakeState>,
     pub(crate) bootstrap: BootstrapProgress,
+    /// Cache of this session's own RDP session id, populated as a side
+    /// effect of a `Session::get_process_tree()` round trip whose reply
+    /// carries `own_session_id` — read cheaply and non-async by
+    /// `Session::own_session_id()` without a second round trip. `None`
+    /// until the first such round trip completes, or against an older
+    /// sensor build that never reports the field.
+    pub(crate) own_session_id: Mutex<Option<u32>>,
 }
 
 impl SensorShared {
     /// A fresh, unstarted correlation state: no pending requests, handshake
-    /// not yet completed.
+    /// not yet completed, no cached own-session-id.
     pub(crate) fn new() -> Self {
         Self {
             pending: Mutex::new(HashMap::new()),
             handshake: Mutex::new(HandshakeState::Pending),
             bootstrap: BootstrapProgress::new(),
+            own_session_id: Mutex::new(None),
         }
     }
 }

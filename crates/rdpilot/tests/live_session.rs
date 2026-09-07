@@ -1638,6 +1638,7 @@ fn world_state_foreground_uia_matches_focused_window() {
             screenshot: true,
             window_list: true,
             uia: UiaMode::Foreground,
+            elevation_check: false,
         };
         let world: WorldState = session
             .world_state(opts)

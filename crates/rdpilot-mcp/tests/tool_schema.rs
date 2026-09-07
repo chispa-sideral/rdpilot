@@ -34,9 +34,9 @@ mod timeouts;
 
 use handler::RdpilotMcpHandler;
 
-/// The full advertised dual surface: `computer` plus the eleven `rdpilot_*`
-/// native tools (MCP-01/MCP-03).
-const EXPECTED_TOOL_NAMES: [&str; 12] = [
+/// The full advertised dual surface: `computer` plus the twelve `rdpilot_*`
+/// native tools (MCP-01/MCP-03), including `rdpilot_uac_respond`.
+const EXPECTED_TOOL_NAMES: [&str; 13] = [
     "computer",
     "rdpilot_world_state",
     "rdpilot_uia",
@@ -44,6 +44,7 @@ const EXPECTED_TOOL_NAMES: [&str; 12] = [
     "rdpilot_process_list",
     "rdpilot_launch",
     "rdpilot_foreground",
+    "rdpilot_uac_respond",
     "rdpilot_connect",
     "rdpilot_list",
     "rdpilot_disconnect",
@@ -153,6 +154,18 @@ fn the_two_structurally_session_less_tools_declare_no_session_property_at_all() 
         checked += 1;
     }
     assert_eq!(checked, SESSION_LESS_TOOLS.len());
+}
+
+/// `rdpilot_uac_respond` requires BOTH `session` (already covered
+/// generically above) AND `decision` — dedicated per-tool coverage beyond
+/// the generic session-only sweep.
+#[test]
+fn rdpilot_uac_respond_requires_session_and_decision() {
+    let tools = all_tools();
+    let tool = tools.iter().find(|t| t.name == "rdpilot_uac_respond").expect("rdpilot_uac_respond must be advertised");
+    let schema = tool.schema_as_json_value();
+    assert!(schema_requires_field(&schema, "session"), "rdpilot_uac_respond must require session: {schema:#?}");
+    assert!(schema_requires_field(&schema, "decision"), "rdpilot_uac_respond must require decision: {schema:#?}");
 }
 
 #[test]

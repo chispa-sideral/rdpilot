@@ -36,13 +36,21 @@ mod error;
 mod framebuffer;
 mod input;
 mod keepalive;
-mod perception;
+// `pub` (unlike every other internal module here): the daemon crate calls
+// `rdpilot::perception::elevation_prompt_active` directly rather than
+// through a crate-root re-export, since it is a free function alongside
+// the module's owned types, not a type itself. The module's `*Wire`
+// structs stay `pub(crate)` (D-09) and are therefore still invisible
+// outside this crate despite the module itself
+// being reachable.
+pub mod perception;
 mod rdpdr_backend;
 mod rdpsnd_stub;
 mod screenshot;
 mod sensor;
 mod session;
 mod session_loop;
+mod uac;
 mod worldstate;
 
 pub use config::ConnectionConfig;
@@ -52,6 +60,7 @@ pub use input::{Button, Key, KeyAction, MouseAction};
 pub use perception::{ProcessInfo, UiaElement, UiaScope, WindowInfo, WindowState};
 pub use screenshot::{Rect, Screenshot};
 pub use session::{Session, TransferOutcome};
+pub use uac::{UacDecision, UacResponseOutcome};
 pub use worldstate::{UiaMode, WorldState, WorldStateOptions};
 
 // `connect`, `framebuffer`, `keepalive`, and `session_loop` are internal — they
@@ -59,7 +68,10 @@ pub use worldstate::{UiaMode, WorldState, WorldStateOptions};
 // surface. The public API is exactly: `Session`, `ConnectionConfig`,
 // `Screenshot`, `Rect`, `Error`, `Result`, `MouseAction`, `KeyAction`,
 // `Button`, `Key`, `WindowInfo`, `WindowState`, `ProcessInfo`, `UiaElement`,
-// `UiaScope`, `WorldStateOptions`, `UiaMode`, `WorldState`, `TransferOutcome`
-// (owned SDK types only, D-09). `UiaElementWire` stays crate-internal and is
-// never re-exported (D-09). `worldstate` stays a private `mod` — only its
-// three named types are `pub use`-re-exported, matching `screenshot`.
+// `UiaScope`, `WorldStateOptions`, `UiaMode`, `WorldState`, `TransferOutcome`,
+// `UacDecision`, `UacResponseOutcome` (owned SDK types only, D-09), plus
+// `perception::elevation_prompt_active` (a free function reached via the
+// `pub mod perception` path rather than a crate-root re-export). The
+// module's `*Wire` structs stay crate-internal and are never reachable
+// outside this crate (D-09). `worldstate`/`uac` stay private `mod`s — only
+// their named types are `pub use`-re-exported, matching `screenshot`.

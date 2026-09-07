@@ -123,6 +123,33 @@ pub enum Error {
         /// The actual computed SHA-256 digest, hex-encoded.
         actual: String,
     },
+
+    /// A raw `send_mouse`/`send_key(Combo)` call was rejected because a
+    /// UAC/elevation prompt is active in this session (the safety-net
+    /// check): scancode key combos and mouse clicks are silently ignored by
+    /// the secure desktop even though the transport reports success — use
+    /// [`Session::uac_respond`](crate::Session::uac_respond) instead.
+    #[error(
+        "a UAC/elevation prompt is active in this session -- raw clicks and scancode key combos have no effect \
+         on the secure desktop; use Session::uac_respond (input uac respond) instead"
+    )]
+    SecureDesktopActive,
+
+    /// [`Session::uac_respond`](crate::Session::uac_respond) was called but
+    /// no elevation prompt is active in this session (the session-scoped
+    /// precondition check).
+    #[error("uac_respond was called but no UAC/elevation prompt is active in this session")]
+    UacPromptNotActive,
+
+    /// [`Session::uac_respond`](crate::Session::uac_respond) sent its
+    /// Tab-navigate + Unicode-Enter sequence, but the follow-up
+    /// session-scoped structural recheck does not match the requested
+    /// decision's postcondition. Covers three distinct cases (the message
+    /// names which applies): a genuine response failure, a UAC credential
+    /// prompt (whose extra controls this fixed sequence does not support),
+    /// or an unexpected process-tree change during the settle window.
+    #[error("UAC response unconfirmed: {0}")]
+    UacResponseUnconfirmed(String),
 }
 
 /// Convenience alias for results returned by the `rdpilot` public API.
@@ -207,6 +234,13 @@ impl Error {
             actual: actual.into(),
         }
     }
+
+    /// Construct a [`Error::UacResponseUnconfirmed`] from any message
+    /// displayable as a string — mirrors [`Error::checksum_mismatch`]'s
+    /// role as the single call-site-friendly constructor for its variant.
+    pub(crate) fn uac_response_unconfirmed(msg: impl Into<String>) -> Self {
+        Error::UacResponseUnconfirmed(msg.into())
+    }
 }
 
 /// Ensure the error renders without leaking any internal/third-party detail
@@ -229,6 +263,9 @@ impl Error {
             Error::SensorRejected(_) => "sensor_rejected",
             Error::PathTraversal(_) => "path_traversal",
             Error::ChecksumMismatch { .. } => "checksum_mismatch",
+            Error::SecureDesktopActive => "secure_desktop_active",
+            Error::UacPromptNotActive => "uac_prompt_not_active",
+            Error::UacResponseUnconfirmed(_) => "uac_response_unconfirmed",
         }
     }
 }
@@ -298,5 +335,42 @@ mod tests {
         assert!(rendered.contains("checksum mismatch"));
         assert!(rendered.contains("aaaa"));
         assert!(rendered.contains("bbbb"));
+    }
+
+    /// `Error::SecureDesktopActive` reports the `"secure_desktop_active"`
+    /// category and names the working alternative (`uac_respond`) in its
+    /// message -- the safety-net rejection.
+    #[test]
+    fn secure_desktop_active_category_and_message_render() {
+        let err = Error::SecureDesktopActive;
+        assert_eq!(err.category(), "secure_desktop_active");
+        let rendered = format!("{err}");
+        assert!(rendered.contains("secure desktop"));
+        assert!(rendered.contains("uac_respond"));
+    }
+
+    /// `Error::UacPromptNotActive` reports the `"uac_prompt_not_active"`
+    /// category (the precondition check).
+    #[test]
+    fn uac_prompt_not_active_category_and_message_render() {
+        let err = Error::UacPromptNotActive;
+        assert_eq!(err.category(), "uac_prompt_not_active");
+        let rendered = format!("{err}");
+        assert!(rendered.contains("no UAC/elevation prompt is active"));
+    }
+
+    /// `Error::uac_response_unconfirmed` reports the
+    /// `"uac_response_unconfirmed"` category, matches
+    /// `Error::UacResponseUnconfirmed(_)`, and its `Display` contains the
+    /// caller-supplied reason -- mirrors
+    /// `checksum_mismatch_category_and_message_render`.
+    #[test]
+    fn uac_response_unconfirmed_category_and_message_render() {
+        let err = Error::uac_response_unconfirmed("the prompt is still present");
+        assert_eq!(err.category(), "uac_response_unconfirmed");
+        assert!(matches!(err, Error::UacResponseUnconfirmed(_)));
+        let rendered = format!("{err}");
+        assert!(rendered.contains("UAC response unconfirmed"));
+        assert!(rendered.contains("the prompt is still present"));
     }
 }

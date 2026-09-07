@@ -28,6 +28,7 @@ use serde::{Deserialize, Serialize};
 use crate::input::{WireKeyAction, WireMouseAction};
 use crate::perception::{WireUiaScope, WireWorldStateOptions};
 use crate::session_id::SessionId;
+use crate::uac::WireUacDecision;
 
 /// A daemon-bound wire request.
 ///
@@ -206,6 +207,14 @@ pub enum Request {
         /// The session to operate on.
         session: SessionId,
     },
+    /// Respond to an active UAC/elevation consent prompt (mirrors
+    /// `Session::uac_respond`).
+    UacRespond {
+        /// The session to operate on.
+        session: SessionId,
+        /// Which way to respond.
+        decision: WireUacDecision,
+    },
 }
 
 /// Compile-time forcing function (SESSION-02): a future `Request` variant
@@ -235,7 +244,8 @@ impl SessionScoped for Request {
             | Request::WorldState { session, .. }
             | Request::Mouse { session, .. }
             | Request::Key { session, .. }
-            | Request::DesktopSize { session } => Some(session),
+            | Request::DesktopSize { session }
+            | Request::UacRespond { session, .. } => Some(session),
         }
     }
 }
@@ -260,6 +270,7 @@ mod tests {
             r#"{"op":"Mouse","action":{"Move":{"x":1,"y":2}}}"#,
             r#"{"op":"Key","action":{"Type":"hi"}}"#,
             r#"{"op":"DesktopSize"}"#,
+            r#"{"op":"UacRespond","decision":"Approve"}"#,
         ];
         for json in cases {
             let result: Result<Request, _> = serde_json::from_str(json);
@@ -283,6 +294,7 @@ mod tests {
             r#"{"op":"Mouse","session":"s","action":{"Move":{"x":1,"y":2}}}"#,
             r#"{"op":"Key","session":"s","action":{"Type":"hi"}}"#,
             r#"{"op":"DesktopSize","session":"s"}"#,
+            r#"{"op":"UacRespond","session":"s","decision":"Approve"}"#,
         ];
         for json in cases {
             let result: Request = serde_json::from_str(json)?;
@@ -310,6 +322,7 @@ mod tests {
             serde_json::from_str(r#"{"op":"Mouse","session":"a","action":{"Move":{"x":1,"y":2}}}"#)?,
             serde_json::from_str(r#"{"op":"Key","session":"a","action":{"Type":"hi"}}"#)?,
             serde_json::from_str(r#"{"op":"DesktopSize","session":"a"}"#)?,
+            serde_json::from_str(r#"{"op":"UacRespond","session":"a","decision":"Approve"}"#)?,
         ];
         for req in &requests {
             assert_eq!(req.session().map(SessionId::as_str), Some("a"));

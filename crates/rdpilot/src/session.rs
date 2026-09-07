@@ -17,6 +17,7 @@
 //! Only owned SDK types appear in the public signatures — no `ironrdp`, `image`,
 //! `rustls`, or `tokio` type leaks (D-09). No `unwrap`/`expect`/`panic` (API-01).
 
+use std::collections::HashSet;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -39,6 +40,7 @@ use crate::perception::{ProcessInfo, UiaElement, UiaScope, WindowInfo};
 use crate::screenshot::Screenshot;
 use crate::sensor::SensorShared;
 use crate::session_loop::{self, RdpInputEvent};
+use crate::uac::{UacDecision, UacResponseOutcome};
 use crate::worldstate::{UiaMode, WorldState, WorldStateOptions};
 
 /// Inter-click delay for [`MouseAction::DoubleClick`] (D-3.7). RDP has no
@@ -157,6 +159,42 @@ const ACTION_TIMEOUT_MS: u64 = 500;
 /// themselves flagged as LIVE-VERIFY tuning targets.
 const TRANSFER_TIMEOUT_MS: u64 = 30_000;
 
+/// The proven-live Unicode key sequence that rejects an active UAC/
+/// elevation consent prompt: one Unicode Enter activates the
+/// default-focused "No" button. Delivered via `KeyAction::Type`
+/// (`Operation::UnicodeKeyPressed`/`Released`) — NEVER a scancode combo,
+/// which has zero effect on the secure desktop despite reporting success.
+const UAC_REJECT_SEQUENCE: &str = "\n";
+
+/// The proven-live Unicode key sequence that approves an active UAC/
+/// elevation consent prompt: Tab, Tab, Unicode Enter moves focus No ->
+/// "Show more details" -> Yes, then activates it. Same `KeyAction::Type`
+/// delivery discipline as [`UAC_REJECT_SEQUENCE`].
+const UAC_APPROVE_SEQUENCE: &str = "\t\t\n";
+
+/// Settle delay after [`Session::uac_respond`] sends its response sequence,
+/// before the FIRST confirmation snapshot. Live testing paced each
+/// confirmation screenshot 1.5-2s after its input call against the real
+/// secure desktop; this constant takes the low end of that proven window,
+/// relying on [`UAC_CONFIRM_RETRY_ATTEMPTS`]/[`UAC_CONFIRM_RETRY_INTERVAL`]
+/// (a bounded retry, not a single longer sleep) to absorb a genuine
+/// Approve's elevated child process being slower to become enumerable —
+/// LIVE-VERIFY tuning target, mirrors this file's other empirically-tuned
+/// constants (e.g. [`RUN_DIALOG_SETTLE`]).
+const UAC_RESPOND_SETTLE: Duration = Duration::from_millis(1500);
+
+/// Bounded retry count for [`Session::uac_respond`]'s confirmation
+/// structural recheck — closes the settle-timing race where a single fixed
+/// sleep + single snapshot could false-negative a genuine Approve whose
+/// elevated child process is slow to become enumerable past
+/// [`UAC_RESPOND_SETTLE`]. A concrete, bounded count (10x250ms in the
+/// verification discipline this mirrors) — never an open-ended "poll until
+/// it works" loop.
+const UAC_CONFIRM_RETRY_ATTEMPTS: u32 = 3;
+
+/// Interval between [`Session::uac_respond`] confirmation retry attempts.
+const UAC_CONFIRM_RETRY_INTERVAL: Duration = Duration::from_millis(500);
+
 /// Split `s` into `max_len`-character (not byte) chunks, preserving order.
 /// Pure and offline-testable. Never panics on empty input, non-ASCII input,
 /// or `max_len == 0` (treated as "one char per chunk" to avoid an infinite
@@ -239,6 +277,16 @@ fn sensor_open_error(log: &str) -> Option<u32> {
 /// site.
 fn crop_to_window(shot: Screenshot, window: &WindowInfo) -> Result<Screenshot> {
     shot.crop(window.rect)
+}
+
+/// Whether `p` counts as "in this session" for [`Session::uac_respond`]'s
+/// baseline/confirmation pid-diffing — the same degrade rule
+/// [`crate::perception::elevation_prompt_active`] applies to its own name
+/// match, applied here to session membership instead: unscoped (included)
+/// whenever either `my_session` or `p.session_id` is unknown, and
+/// session-verified otherwise. Pure and offline-testable.
+fn in_session(p: &ProcessInfo, my_session: Option<u32>) -> bool {
+    crate::perception::session_scope_matches(my_session, p.session_id)
 }
 
 /// A live, managed RDP session.
@@ -462,11 +510,15 @@ impl Session {
     ///
     /// Returns [`Error::CoordinateOutOfBounds`] if any coordinate `action`
     /// touches falls outside the negotiated desktop size (nothing is sent in
-    /// that case), or [`Error::Session`] if the input channel is closed
-    /// (the session loop already exited) or the internal input-state lock is
-    /// poisoned.
+    /// that case), [`Error::SecureDesktopActive`] if a UAC/elevation prompt
+    /// is active in this session (the safety net — raw clicks are
+    /// silently ignored by the secure desktop even though the transport
+    /// reports success; use [`Session::uac_respond`] instead), or
+    /// [`Error::Session`] if the input channel is closed (the session loop
+    /// already exited) or the internal input-state lock is poisoned.
     pub async fn send_mouse(&self, action: MouseAction) -> Result<()> {
         self.check_bounds(&action)?;
+        self.reject_if_elevation_active().await?;
 
         // Only DoubleClick/Drag need an inter-batch delay (D-3.7/D-3.8); all
         // other actions translate to exactly one batch, so no gap is used.
@@ -524,9 +576,20 @@ impl Session {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Session`] if the input channel is closed (the session
-    /// loop already exited) or the internal input-state lock is poisoned.
+    /// Returns [`Error::SecureDesktopActive`] if `action` is a
+    /// [`KeyAction::Combo`] and a UAC/elevation prompt is active in this
+    /// session (the safety net — scancode combos have zero effect
+    /// on the secure desktop even though the transport reports success;
+    /// use [`Session::uac_respond`] instead). Never checked for
+    /// [`KeyAction::Type`] — Unicode key events are the one mechanism
+    /// proven to work on the secure desktop. Returns [`Error::Session`] if
+    /// the input channel is closed (the session loop already exited) or the
+    /// internal input-state lock is poisoned.
     pub async fn send_key(&self, action: KeyAction) -> Result<()> {
+        if matches!(action, KeyAction::Combo(_)) {
+            self.reject_if_elevation_active().await?;
+        }
+
         let ops = crate::input::key_operations(&action);
 
         let events: Vec<FastPathInputEvent> = {
@@ -621,6 +684,33 @@ impl Session {
     /// [`Session::set_foreground_window`], and [`Session::launch_process`]
     /// (RESEARCH Pattern 3).
     ///
+    /// A two-line wrapper around [`Session::sensor_request_full`] that
+    /// discards every envelope field but `data` — the historical contract
+    /// every existing caller relies on. [`Session::get_process_tree`] alone
+    /// calls [`Session::sensor_request_full`] directly so it can also read
+    /// `own_session_id` off the same round trip, with no extra sensor call.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Dvc`] for a handshake mismatch, a closed
+    /// input/reply channel, or a timeout (transport failures), and
+    /// [`Error::SensorRejected`] when the sensor answered but its reply's
+    /// `success` field was `false` (D-6.4).
+    async fn sensor_request(
+        &self,
+        msg_type: crate::sensor::MsgType,
+        payload: Option<serde_json::Value>,
+        timeout_ms: u64,
+    ) -> Result<serde_json::Value> {
+        let value = self.sensor_request_full(msg_type, payload, timeout_ms).await?;
+        Ok(value.get("data").cloned().unwrap_or(serde_json::Value::Null))
+    }
+
+    /// Round-trip a generic sensor request, returning the WHOLE successful
+    /// reply envelope value (not merely its `data` field) — the primitive
+    /// [`Session::get_process_tree`] uses so it can also read
+    /// `own_session_id` off the same round trip.
+    ///
     /// Mirrors [`Session::ping`]'s five-step shape exactly (handshake
     /// fast-fail check, allocate a `req_id`, register a `oneshot` reply slot
     /// in [`SensorShared::pending`], send [`RdpInputEvent::Request`], await
@@ -635,7 +725,7 @@ impl Session {
     /// input/reply channel, or a timeout (transport failures), and
     /// [`Error::SensorRejected`] when the sensor answered but its reply's
     /// `success` field was `false` (D-6.4).
-    async fn sensor_request(
+    async fn sensor_request_full(
         &self,
         msg_type: crate::sensor::MsgType,
         payload: Option<serde_json::Value>,
@@ -677,10 +767,7 @@ impl Session {
                     .and_then(serde_json::Value::as_bool)
                     .unwrap_or(false);
                 if success {
-                    Ok(value
-                        .get("data")
-                        .cloned()
-                        .unwrap_or(serde_json::Value::Null))
+                    Ok(value)
                 } else {
                     let reason = value
                         .get("error")
@@ -763,19 +850,215 @@ impl Session {
     /// the request (D-6.4), or [`Error::Dvc`] for a handshake mismatch, a
     /// closed channel, a malformed reply, or a timeout.
     pub async fn get_process_tree(&self) -> Result<Vec<ProcessInfo>> {
-        let data = self
-            .sensor_request(
+        let envelope = self
+            .sensor_request_full(
                 crate::sensor::MsgType::ProcessTree,
                 None,
                 ENUMERATION_TIMEOUT_MS,
             )
             .await?;
+
+        // Cache the sensor's own session id off the SAME round trip (no
+        // extra sensor call) so `Session::own_session_id()` can answer
+        // cheaply and non-async afterward. A reply from an older sensor
+        // build with no `own_session_id` field simply leaves the cache
+        // unpopulated (`None`) — the fail-open degrade rule.
+        if let Some(id) = envelope
+            .get("own_session_id")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|v| u32::try_from(v).ok())
+        {
+            let mut cache = match self.sensor.own_session_id.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            *cache = Some(id);
+        }
+
+        let data = envelope.get("data").cloned().unwrap_or(serde_json::Value::Null);
         let wires: Vec<crate::perception::ProcessInfoWire> = serde_json::from_value(data)
             .map_err(|e| Error::dvc(format!("malformed ProcessTree reply: {e}")))?;
         Ok(wires
             .into_iter()
             .map(crate::perception::ProcessInfoWire::into_owned)
             .collect())
+    }
+
+    /// This session's own RDP session id, as resolved by a prior
+    /// [`Session::get_process_tree`] round trip — `None` if no such round
+    /// trip has completed yet (e.g. before the first
+    /// `get_process_tree`/`elevation_status`/`world_state` call, or against
+    /// an older sensor build that does not report `own_session_id`).
+    ///
+    /// Cheap, non-async, in-memory read — never itself triggers a sensor
+    /// round trip.
+    #[must_use]
+    pub fn own_session_id(&self) -> Option<u32> {
+        match self.sensor.own_session_id.lock() {
+            Ok(g) => *g,
+            Err(poisoned) => *poisoned.into_inner(),
+        }
+    }
+
+    /// Whether a UAC/elevation consent prompt is currently active in THIS
+    /// session (structural, sensor-backed detection via
+    /// [`crate::perception::elevation_prompt_active`] — never visual/pixel
+    /// guesswork), session-scoped per its degrade rule.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`Session::get_process_tree`]'s own errors
+    /// ([`Error::SensorRejected`]/[`Error::Dvc`]) — this method itself adds
+    /// no new timeout/error class.
+    pub async fn elevation_status(&self) -> Result<bool> {
+        let processes = self.get_process_tree().await?;
+        Ok(crate::perception::elevation_prompt_active(&processes, self.own_session_id()))
+    }
+
+    /// The safety-net check behind [`Session::send_mouse`]/
+    /// [`Session::send_key`]'s `KeyAction::Combo` arm: rejects raw input
+    /// with [`Error::SecureDesktopActive`] whenever a UAC/elevation prompt
+    /// is active in this session.
+    ///
+    /// Fails OPEN on any detection failure (no sensor configured, a sensor
+    /// timeout/hang) — a raw click silently eaten by an active prompt is
+    /// the PRE-EXISTING behavior this check improves on; it must never
+    /// make an unrelated sensor hiccup newly block ordinary input that
+    /// would otherwise have worked.
+    async fn reject_if_elevation_active(&self) -> Result<()> {
+        match self.elevation_status().await {
+            Ok(true) => Err(Error::SecureDesktopActive),
+            Ok(false) | Err(_) => Ok(()),
+        }
+    }
+
+    /// Respond to an active UAC/elevation consent prompt in this session
+    /// (approve or reject) via the proven native Tab-navigate +
+    /// Unicode-Enter sequence, confirmed via a decision-specific,
+    /// session-scoped structural recheck (never a bare screenshot pixel
+    /// diff — see this method's confirmation step below).
+    ///
+    /// The ONLY sensor round trips in this method are the precondition/
+    /// baseline check and the confirmation recheck — sending the response
+    /// sequence and taking the confirming screenshot are both 100% native
+    /// RDP, matching the proven mechanism: only `KeyAction::Type` (Unicode
+    /// key events) reaches the secure desktop;
+    /// mouse clicks and scancode combos have zero effect despite reporting
+    /// success.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::UacPromptNotActive`] if no elevation prompt is
+    /// active in this session before the sequence is sent (nothing is sent
+    /// in that case); [`Error::UacResponseUnconfirmed`] if the sequence was
+    /// sent but the follow-up structural recheck does not match the
+    /// requested decision's postcondition — this covers a genuine failure,
+    /// a UAC credential prompt (extra controls this fixed sequence does not
+    /// support), or an unexpected process-tree change during the settle
+    /// window; or propagates [`Error::SensorRejected`]/[`Error::Dvc`] from
+    /// the underlying `get_process_tree`/`send_key`/`screenshot` calls —
+    /// this method never reports a decision succeeded on a sensor hiccup
+    /// any more than on a mismatched outcome (deliberately NOT fail-open,
+    /// unlike the raw-input safety net).
+    pub async fn uac_respond(&self, decision: UacDecision) -> Result<UacResponseOutcome> {
+        // 1. Precondition + baseline (session-scoped, sensor-backed):
+        //    refuse to fire a fixed sequence at nothing, and remember which
+        //    pids already existed in this session before acting.
+        let before_processes = self.get_process_tree().await?;
+        let my_session = self.own_session_id();
+        if !crate::perception::elevation_prompt_active(&before_processes, my_session) {
+            return Err(Error::UacPromptNotActive);
+        }
+        let baseline_pids: HashSet<u32> = before_processes
+            .iter()
+            .filter(|p| in_session(p, my_session))
+            .map(|p| p.pid)
+            .collect();
+
+        // 2. Action: fully native RDP (Unicode Type, never a click/combo).
+        let sequence = match decision {
+            UacDecision::Approve => UAC_APPROVE_SEQUENCE,
+            UacDecision::Reject => UAC_REJECT_SEQUENCE,
+        };
+        self.send_key(KeyAction::Type(sequence.to_owned())).await?;
+        tokio::time::sleep(UAC_RESPOND_SETTLE).await;
+        let confirmation = self.screenshot().await?; // artifact only, not the pass/fail signal
+
+        // 3. Confirmation: decision-specific, session-scoped structural
+        //    recheck (never a pixel diff), with a short bounded retry to
+        //    absorb a slow-to-enumerate elevated child process.
+        let (still_active, new_session_pid_appeared, confirmed) =
+            self.uac_confirmation_check(decision, my_session, &baseline_pids).await?;
+        if !confirmed {
+            let reason = if still_active {
+                "the elevation prompt is still present after the Tab-navigate plus Unicode-Enter sequence -- \
+                 this may be a UAC credential prompt (extra controls for a non-admin user), which this fixed \
+                 sequence does not support, or the response otherwise failed"
+            } else if decision == UacDecision::Approve {
+                "the prompt cleared but no new process appeared in this session -- the approval did not produce \
+                 the expected elevated child process"
+            } else {
+                "the prompt cleared but an unexpected new process appeared in this session -- the rejection may \
+                 not have taken effect as expected"
+            };
+            return Err(Error::uac_response_unconfirmed(format!(
+                "{reason} (new_process_appeared={new_session_pid_appeared})"
+            )));
+        }
+        Ok(UacResponseOutcome { decision, confirmation })
+    }
+
+    /// [`Session::uac_respond`]'s confirmation structural recheck, run up
+    /// to [`UAC_CONFIRM_RETRY_ATTEMPTS`] times, [`UAC_CONFIRM_RETRY_INTERVAL`]
+    /// apart — closes the settle-timing race in a single
+    /// fixed-sleep-then-one-snapshot design.
+    ///
+    /// A still-active prompt (the credential-prompt exclusion) never
+    /// benefits from a retry — the dialog will not spontaneously clear on
+    /// its own — so the retry budget is spent only on the genuine race this
+    /// closes: the dialog HAS cleared but the pid-appearance signal has not
+    /// yet caught up. Returns the LAST attempt's
+    /// `(still_active, new_session_pid_appeared, confirmed)` triple.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`Session::get_process_tree`]'s own errors — a
+    /// `get_process_tree` failure during confirmation is a genuine error
+    /// (never silently treated as success, matching [`Session::uac_respond`]'s
+    /// own non-fail-open discipline for its outcome confirmation).
+    async fn uac_confirmation_check(
+        &self,
+        decision: UacDecision,
+        my_session: Option<u32>,
+        baseline_pids: &HashSet<u32>,
+    ) -> Result<(bool, bool, bool)> {
+        let mut still_active = true;
+        let mut new_session_pid_appeared = false;
+        let mut confirmed = false;
+        for attempt in 0..UAC_CONFIRM_RETRY_ATTEMPTS {
+            let after_processes = self.get_process_tree().await?;
+            still_active = crate::perception::elevation_prompt_active(&after_processes, my_session);
+            new_session_pid_appeared = after_processes
+                .iter()
+                .any(|p| in_session(p, my_session) && !baseline_pids.contains(&p.pid));
+            confirmed = match decision {
+                // Approve: the prompt must be gone AND a new process must
+                // have appeared in this session (the elevated child process
+                // spawns).
+                UacDecision::Approve => !still_active && new_session_pid_appeared,
+                // Reject: the prompt must be gone AND no new process
+                // appeared (matches the observed "Run box retained"
+                // outcome).
+                UacDecision::Reject => !still_active && !new_session_pid_appeared,
+            };
+
+            let is_last_attempt = attempt + 1 == UAC_CONFIRM_RETRY_ATTEMPTS;
+            if confirmed || still_active || is_last_attempt {
+                break;
+            }
+            tokio::time::sleep(UAC_CONFIRM_RETRY_INTERVAL).await;
+        }
+        Ok((still_active, new_session_pid_appeared, confirmed))
     }
 
     /// Retrieve a flat UI Automation tree for the given window, at a
@@ -927,6 +1210,23 @@ impl Session {
             },
         };
 
+        // Opt-in, a-la-carte: only fetches the process tree when
+        // requested, so the SC#2 default stays cheap. Degrades to `None`
+        // on `Error::Dvc` specifically (a stuck sensor) rather than
+        // failing the whole `world_state()` call -- fail-open applied to
+        // `world_state` too, matching the safety-net principle used
+        // elsewhere for elevation detection. Any OTHER error still
+        // propagates via `?`.
+        let elevation_active = if opts.elevation_check {
+            match self.get_process_tree().await {
+                Ok(processes) => Some(crate::perception::elevation_prompt_active(&processes, self.own_session_id())),
+                Err(Error::Dvc(_)) => None,
+                Err(other) => return Err(other),
+            }
+        } else {
+            None
+        };
+
         Ok(WorldState {
             timestamp: std::time::SystemTime::now(),
             capture_span: started.elapsed(),
@@ -935,6 +1235,7 @@ impl Session {
             // `windows` may have been fetched internally above (Pitfall 3).
             window_list: if opts.window_list { windows } else { None },
             uia,
+            elevation_active,
         })
     }
 
@@ -1608,51 +1909,84 @@ mod tests {
         (session, input_rx)
     }
 
+    /// Drain and answer the safety-net elevation-check `ProcessTree` round
+    /// trip that `send_mouse`/`send_key(Combo)` issue FIRST with "no
+    /// elevation prompt active" (`data: []`), then return so the
+    /// caller can go on to assert against the actual mouse/key `FastPath`
+    /// event that follows. Mirrors this module's existing
+    /// request-then-reply test pattern (e.g.
+    /// `get_window_list_success_returns_owned_windows`).
+    async fn respond_not_elevated(sensor: &Arc<SensorShared>, input_rx: &mut mpsc::Receiver<RdpInputEvent>) {
+        let RdpInputEvent::Request(msg_type, req_id, _payload) =
+            input_rx.recv().await.expect("the safety-net elevation-check Request was sent")
+        else {
+            panic!("expected a Request event (the safety-net elevation check)");
+        };
+        assert!(matches!(msg_type, crate::sensor::MsgType::ProcessTree));
+        let tx = {
+            let mut pending = sensor.pending.lock().expect("lock");
+            pending.remove(&req_id).expect("req_id registered in pending map")
+        };
+        tx.send(serde_json::json!({ "success": true, "data": [] }))
+            .expect("reply delivered before the receiver was dropped");
+    }
+
     /// An in-range `Click` sends exactly one non-empty `FastPath` batch
-    /// (SC#2).
+    /// (SC#2), after the safety-net elevation check clears.
     #[tokio::test]
     async fn send_mouse_click_sends_one_nonempty_fastpath_batch() {
-        let (session, mut input_rx) = test_session_with_channel((1920, 1080));
+        let sensor = Arc::new(SensorShared::new());
+        let (session, mut input_rx) = test_session_with_sensor(sensor.clone());
 
-        session
-            .send_mouse(MouseAction::Click {
-                x: 100,
-                y: 100,
-                button: Button::Left,
-            })
-            .await
-            .expect("in-range click succeeds");
+        let handle = tokio::spawn(async move {
+            session
+                .send_mouse(MouseAction::Click {
+                    x: 100,
+                    y: 100,
+                    button: Button::Left,
+                })
+                .await
+        });
+
+        respond_not_elevated(&sensor, &mut input_rx).await;
+        handle.await.expect("task did not panic").expect("in-range click succeeds");
 
         let RdpInputEvent::FastPath(events) =
-            input_rx.try_recv().expect("a FastPath message was sent")
+            input_rx.recv().await.expect("a FastPath message was sent")
         else {
             panic!("expected a FastPath event");
         };
         assert!(!events.is_empty());
         assert!(
             input_rx.try_recv().is_err(),
-            "Click must send exactly one batch"
+            "Click must send exactly one batch (beyond the elevation-check Request)"
         );
     }
 
-    /// `Scroll` sends a `FastPath` batch containing a wheel event (D-3.3).
+    /// `Scroll` sends a `FastPath` batch containing a wheel event (D-3.3),
+    /// after the safety-net elevation check clears.
     #[tokio::test]
     async fn send_mouse_scroll_sends_wheel_event() {
         use ironrdp::pdu::input::mouse::PointerFlags;
 
-        let (session, mut input_rx) = test_session_with_channel((1920, 1080));
+        let sensor = Arc::new(SensorShared::new());
+        let (session, mut input_rx) = test_session_with_sensor(sensor.clone());
 
-        session
-            .send_mouse(MouseAction::Scroll {
-                x: 100,
-                y: 100,
-                dy: 120,
-            })
-            .await
-            .expect("in-range scroll succeeds");
+        let handle = tokio::spawn(async move {
+            session
+                .send_mouse(MouseAction::Scroll {
+                    x: 100,
+                    y: 100,
+                    dy: 120,
+                })
+                .await
+        });
+
+        respond_not_elevated(&sensor, &mut input_rx).await;
+        handle.await.expect("task did not panic").expect("in-range scroll succeeds");
 
         let RdpInputEvent::FastPath(events) =
-            input_rx.try_recv().expect("a FastPath message was sent")
+            input_rx.recv().await.expect("a FastPath message was sent")
         else {
             panic!("expected a FastPath event");
         };
@@ -1663,7 +1997,9 @@ mod tests {
     }
 
     /// An out-of-bounds coordinate is rejected before anything is sent on
-    /// the channel (D-3.2, SC#4 — "enforced").
+    /// the channel (D-3.2, SC#4 — "enforced") — `check_bounds` runs BEFORE
+    /// the elevation check, so this stays a zero-channel-activity rejection
+    /// exactly as before.
     #[tokio::test]
     async fn send_mouse_rejects_out_of_range_coordinate_before_sending() {
         let (session, mut input_rx) = test_session_with_channel((1920, 1080));
@@ -1683,19 +2019,25 @@ mod tests {
     }
 
     /// `DoubleClick` synthesizes two single-click sequences, sent as two
-    /// separate `FastPath` messages (D-3.7).
+    /// separate `FastPath` messages (D-3.7) — the elevation check runs
+    /// exactly ONCE per `send_mouse` call, not once per batch.
     #[tokio::test]
     async fn send_mouse_double_click_emits_two_fastpath_messages() {
-        let (session, mut input_rx) = test_session_with_channel((1920, 1080));
+        let sensor = Arc::new(SensorShared::new());
+        let (session, mut input_rx) = test_session_with_sensor(sensor.clone());
 
-        session
-            .send_mouse(MouseAction::DoubleClick {
-                x: 100,
-                y: 100,
-                button: Button::Left,
-            })
-            .await
-            .expect("in-range double-click succeeds");
+        let handle = tokio::spawn(async move {
+            session
+                .send_mouse(MouseAction::DoubleClick {
+                    x: 100,
+                    y: 100,
+                    button: Button::Left,
+                })
+                .await
+        });
+
+        respond_not_elevated(&sensor, &mut input_rx).await;
+        handle.await.expect("task did not panic").expect("in-range double-click succeeds");
 
         let mut count = 0;
         while input_rx.try_recv().is_ok() {
@@ -1707,7 +2049,10 @@ mod tests {
     // --- Task 1: send_key -- Type (Unicode) + Combo (scancode) wiring (INPUT-02, SC#3) ---
 
     /// `send_key(KeyAction::Type(..))` sends a single non-empty `FastPath`
-    /// batch carrying the per-character Unicode operations (D-3.5).
+    /// batch carrying the per-character Unicode operations (D-3.5). `Type`
+    /// is never gated by the safety net (Unicode key events are the one
+    /// mechanism proven to work on the secure desktop), so no
+    /// elevation-check Request precedes it.
     #[tokio::test]
     async fn send_key_type_sends_nonempty_fastpath_batch() {
         let (session, mut input_rx) = test_session_with_channel((1920, 1080));
@@ -1730,18 +2075,20 @@ mod tests {
     }
 
     /// `send_key(KeyAction::Combo([Ctrl, A]))` sends a single non-empty
-    /// `FastPath` batch (scancode down/up, modifier ordering -- D-3.5).
+    /// `FastPath` batch (scancode down/up, modifier ordering -- D-3.5),
+    /// after the safety-net elevation check clears.
     #[tokio::test]
     async fn send_key_combo_ctrl_a_sends_nonempty_fastpath_batch() {
-        let (session, mut input_rx) = test_session_with_channel((1920, 1080));
+        let sensor = Arc::new(SensorShared::new());
+        let (session, mut input_rx) = test_session_with_sensor(sensor.clone());
 
-        session
-            .send_key(KeyAction::Combo(vec![Key::Ctrl, Key::A]))
-            .await
-            .expect("Ctrl+A combo send succeeds");
+        let handle = tokio::spawn(async move { session.send_key(KeyAction::Combo(vec![Key::Ctrl, Key::A])).await });
+
+        respond_not_elevated(&sensor, &mut input_rx).await;
+        handle.await.expect("task did not panic").expect("Ctrl+A combo send succeeds");
 
         let RdpInputEvent::FastPath(events) =
-            input_rx.try_recv().expect("a FastPath message was sent")
+            input_rx.recv().await.expect("a FastPath message was sent")
         else {
             panic!("expected a FastPath event");
         };
@@ -1749,18 +2096,20 @@ mod tests {
     }
 
     /// `send_key(KeyAction::Combo([Alt, F4]))` likewise sends a non-empty
-    /// `FastPath` batch (SC#3 -- Alt+F4 expressible).
+    /// `FastPath` batch (SC#3 -- Alt+F4 expressible), after the safety-net
+    /// elevation check clears.
     #[tokio::test]
     async fn send_key_combo_alt_f4_sends_nonempty_fastpath_batch() {
-        let (session, mut input_rx) = test_session_with_channel((1920, 1080));
+        let sensor = Arc::new(SensorShared::new());
+        let (session, mut input_rx) = test_session_with_sensor(sensor.clone());
 
-        session
-            .send_key(KeyAction::Combo(vec![Key::Alt, Key::F4]))
-            .await
-            .expect("Alt+F4 combo send succeeds");
+        let handle = tokio::spawn(async move { session.send_key(KeyAction::Combo(vec![Key::Alt, Key::F4])).await });
+
+        respond_not_elevated(&sensor, &mut input_rx).await;
+        handle.await.expect("task did not panic").expect("Alt+F4 combo send succeeds");
 
         let RdpInputEvent::FastPath(events) =
-            input_rx.try_recv().expect("a FastPath message was sent")
+            input_rx.recv().await.expect("a FastPath message was sent")
         else {
             panic!("expected a FastPath event");
         };
@@ -1768,15 +2117,330 @@ mod tests {
     }
 
     /// A degenerate empty `Combo` returns `Ok` without panicking (API-01,
-    /// T-03-11); it may send an empty/no-op batch.
+    /// T-03-11); it may send an empty/no-op batch. An empty `Combo` still
+    /// matches `KeyAction::Combo(_)`, so the safety net still runs first.
     #[tokio::test]
     async fn send_key_empty_combo_returns_ok_without_panic() {
-        let (session, _input_rx) = test_session_with_channel((1920, 1080));
+        let sensor = Arc::new(SensorShared::new());
+        let (session, mut input_rx) = test_session_with_sensor(sensor.clone());
+
+        let handle = tokio::spawn(async move { session.send_key(KeyAction::Combo(vec![])).await });
+
+        respond_not_elevated(&sensor, &mut input_rx).await;
+        handle.await.expect("task did not panic").expect("empty combo must not error");
+    }
+
+    /// The safety net: `send_mouse` is rejected with
+    /// `Error::SecureDesktopActive` when the elevation check reports an
+    /// active prompt in this session, and nothing further is sent (no
+    /// `FastPath` event follows the elevation-check Request).
+    #[tokio::test]
+    async fn send_mouse_is_rejected_while_elevation_is_active_in_this_session() {
+        let sensor = Arc::new(SensorShared::new());
+        let (session, mut input_rx) = test_session_with_sensor(sensor.clone());
+
+        let handle = tokio::spawn(async move {
+            session
+                .send_mouse(MouseAction::Click {
+                    x: 100,
+                    y: 100,
+                    button: Button::Left,
+                })
+                .await
+        });
+
+        let RdpInputEvent::Request(msg_type, req_id, _payload) =
+            input_rx.recv().await.expect("the elevation-check Request was sent")
+        else {
+            panic!("expected a Request event");
+        };
+        assert!(matches!(msg_type, crate::sensor::MsgType::ProcessTree));
+        let tx = {
+            let mut pending = sensor.pending.lock().expect("lock");
+            pending.remove(&req_id).expect("req_id registered in pending map")
+        };
+        tx.send(serde_json::json!({
+            "success": true,
+            "data": [{
+                "pid": 4242,
+                "parent_pid": 4,
+                "name": "consent.exe",
+                "path": "C:\\Windows\\System32\\consent.exe",
+                "command_line": null,
+                "owner": null,
+                "session_id": null
+            }],
+            "own_session_id": null
+        }))
+        .expect("reply delivered before the receiver was dropped");
+
+        let err = handle.await.expect("task did not panic");
+        assert!(matches!(err, Err(Error::SecureDesktopActive)));
+        assert!(
+            input_rx.try_recv().is_err(),
+            "no FastPath event should follow a rejected send_mouse"
+        );
+    }
+
+    /// The safety net fails OPEN: a sensor timeout during the elevation
+    /// check must never newly block ordinary `send_key(Combo)` input that
+    /// would otherwise have worked (a stuck sensor is the PRE-EXISTING
+    /// behavior this check improves on elsewhere, never a regression
+    /// here).
+    #[tokio::test(start_paused = true)]
+    async fn send_key_combo_fails_open_when_the_elevation_check_times_out() {
+        // A `SensorShared` with nothing ever fulfilling the pending oneshot
+        // reproduces a stuck/unresponsive sensor deterministically. Tokio's
+        // paused/mocked clock (`start_paused = true`, mirrors
+        // `upload_file_times_out_after_transfer_timeout_and_removes_pending_entry`)
+        // auto-advances past the real `ENUMERATION_TIMEOUT_MS` wait once
+        // nothing else can make progress, so this offline test stays fast.
+        let sensor = Arc::new(SensorShared::new());
+        let (session, _input_rx) = test_session_with_sensor(sensor);
 
         session
-            .send_key(KeyAction::Combo(vec![]))
+            .send_key(KeyAction::Combo(vec![Key::Ctrl, Key::A]))
             .await
-            .expect("empty combo must not error");
+            .expect("a stuck elevation check must fail OPEN, never newly block ordinary input");
+    }
+
+    // --- own_session_id/elevation_status caching and Session::uac_respond ---
+
+    /// Build a `Session` wired to a real (undrained) channel with a
+    /// caller-supplied `SensorShared` AND a pre-seeded framebuffer, so
+    /// `uac_respond` tests (which also call `Session::screenshot`) do not
+    /// fail on "no framebuffer captured yet".
+    fn test_session_with_sensor_and_frame(sensor: Arc<SensorShared>) -> (Session, mpsc::Receiver<RdpInputEvent>) {
+        let (input_tx, input_rx) = mpsc::channel(INPUT_CHANNEL_CAPACITY);
+        let frame = SharedFrame::new();
+        frame.write(1, 1, vec![0u8; 4]);
+        let session = Session {
+            thread: None,
+            input_tx,
+            frame,
+            input_db: test_input_db(),
+            desktop_size: TEST_DESKTOP_SIZE,
+            sensor,
+            next_req_id: AtomicU64::new(1),
+            share_root: None,
+        };
+        (session, input_rx)
+    }
+
+    /// Drain and answer one `ProcessTree` round trip with `reply` -- the
+    /// shared helper behind the tests below (mirrors this module's other
+    /// request-then-reply test helpers).
+    async fn respond_process_tree(
+        sensor: &Arc<SensorShared>,
+        input_rx: &mut mpsc::Receiver<RdpInputEvent>,
+        reply: serde_json::Value,
+    ) {
+        let RdpInputEvent::Request(msg_type, req_id, _payload) =
+            input_rx.recv().await.expect("a ProcessTree Request was sent")
+        else {
+            panic!("expected a Request event");
+        };
+        assert!(matches!(msg_type, crate::sensor::MsgType::ProcessTree));
+        let tx = {
+            let mut pending = sensor.pending.lock().expect("lock");
+            pending.remove(&req_id).expect("req_id registered in pending map")
+        };
+        tx.send(reply).expect("reply delivered before the receiver was dropped");
+    }
+
+    /// A `{"success":true,"data":[...],"own_session_id":1}` envelope --
+    /// every fixture record below also carries `session_id: Some(1)` so the
+    /// happy-path tests exercise the SESSION-SCOPED match, not the unscoped
+    /// degrade fallback (already covered in `perception.rs`'s own tests).
+    fn process_tree_reply(processes: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({ "success": true, "data": processes, "own_session_id": 1 })
+    }
+
+    fn consent_record(session_id: Option<u32>) -> serde_json::Value {
+        serde_json::json!({
+            "pid": 100, "parent_pid": 4, "name": "consent.exe",
+            "path": "C:\\Windows\\System32\\consent.exe",
+            "command_line": null, "owner": null, "session_id": session_id
+        })
+    }
+
+    fn process_record(pid: u32, name: &str, session_id: Option<u32>) -> serde_json::Value {
+        serde_json::json!({
+            "pid": pid, "parent_pid": 4, "name": name,
+            "path": format!("C:\\Windows\\System32\\{name}"),
+            "command_line": null, "owner": null, "session_id": session_id
+        })
+    }
+
+    /// `get_process_tree()` caches `own_session_id` off the reply envelope,
+    /// readable afterward via `Session::own_session_id()` without a second
+    /// round trip.
+    #[tokio::test]
+    async fn get_process_tree_caches_own_session_id_for_later_reads() {
+        let sensor = Arc::new(SensorShared::new());
+        let (session, mut input_rx) = test_session_with_sensor(sensor.clone());
+
+        assert_eq!(session.own_session_id(), None, "unpopulated before any round trip");
+
+        let handle = tokio::spawn(async move {
+            let processes = session.get_process_tree().await.expect("succeeds");
+            (session, processes)
+        });
+        respond_process_tree(&sensor, &mut input_rx, process_tree_reply(serde_json::json!([]))).await;
+        let (session, _processes) = handle.await.expect("task did not panic");
+
+        assert_eq!(session.own_session_id(), Some(1));
+    }
+
+    /// `elevation_status()` reports `true` when a session-scoped
+    /// `consent.exe` is present, and `false` otherwise -- the same
+    /// `get_process_tree` + `elevation_prompt_active` composition
+    /// `send_mouse`/`send_key`'s safety net relies on.
+    #[tokio::test]
+    async fn elevation_status_reflects_a_session_scoped_consent_exe() {
+        let sensor = Arc::new(SensorShared::new());
+        let (session, mut input_rx) = test_session_with_sensor(sensor.clone());
+
+        let handle = tokio::spawn(async move { session.elevation_status().await });
+        respond_process_tree(&sensor, &mut input_rx, process_tree_reply(serde_json::json!([consent_record(Some(1))])))
+            .await;
+        assert!(matches!(handle.await.expect("task did not panic"), Ok(true)));
+    }
+
+    /// `uac_respond` refuses to fire its fixed sequence when no elevation
+    /// prompt is detected in this session -- nothing beyond the baseline
+    /// `ProcessTree` check is ever sent (the precondition check).
+    #[tokio::test]
+    async fn uac_respond_fails_when_no_prompt_is_active() {
+        let sensor = Arc::new(SensorShared::new());
+        let (session, mut input_rx) = test_session_with_sensor_and_frame(sensor.clone());
+
+        let handle = tokio::spawn(async move { session.uac_respond(UacDecision::Reject).await });
+        respond_process_tree(
+            &sensor,
+            &mut input_rx,
+            process_tree_reply(serde_json::json!([process_record(4242, "notepad.exe", Some(1))])),
+        )
+        .await;
+
+        let err = handle.await.expect("task did not panic");
+        assert!(matches!(err, Err(Error::UacPromptNotActive)));
+        assert!(input_rx.try_recv().is_err(), "nothing beyond the baseline check should have been sent");
+    }
+
+    /// `uac_respond(Reject)`'s happy path: baseline detects `consent.exe`
+    /// in-session, the Unicode Enter sequence is sent, and the confirmation
+    /// recheck (no longer active, no new in-session pid) confirms on the
+    /// FIRST attempt -- matching the observed "Run box retained, no new
+    /// process" outcome.
+    #[tokio::test(start_paused = true)]
+    async fn uac_respond_reject_confirms_on_first_attempt() {
+        let sensor = Arc::new(SensorShared::new());
+        let (session, mut input_rx) = test_session_with_sensor_and_frame(sensor.clone());
+
+        let handle = tokio::spawn(async move { session.uac_respond(UacDecision::Reject).await });
+
+        respond_process_tree(&sensor, &mut input_rx, process_tree_reply(serde_json::json!([consent_record(Some(1))])))
+            .await;
+        let RdpInputEvent::FastPath(_) = input_rx.recv().await.expect("a FastPath event was sent") else {
+            panic!("expected a FastPath event");
+        };
+        respond_process_tree(&sensor, &mut input_rx, process_tree_reply(serde_json::json!([]))).await;
+
+        let outcome = handle.await.expect("task did not panic").expect("reject must confirm");
+        assert_eq!(outcome.decision, UacDecision::Reject);
+        assert!(input_rx.try_recv().is_err(), "exactly one confirmation attempt should have been made");
+    }
+
+    /// `uac_respond(Approve)`'s happy path: the confirmation recheck sees
+    /// the prompt cleared AND a new in-session pid (the elevated child
+    /// process) on the FIRST attempt.
+    #[tokio::test(start_paused = true)]
+    async fn uac_respond_approve_confirms_when_a_new_session_pid_appears() {
+        let sensor = Arc::new(SensorShared::new());
+        let (session, mut input_rx) = test_session_with_sensor_and_frame(sensor.clone());
+
+        let handle = tokio::spawn(async move { session.uac_respond(UacDecision::Approve).await });
+
+        respond_process_tree(&sensor, &mut input_rx, process_tree_reply(serde_json::json!([consent_record(Some(1))])))
+            .await;
+        let RdpInputEvent::FastPath(_) = input_rx.recv().await.expect("a FastPath event was sent") else {
+            panic!("expected a FastPath event");
+        };
+        respond_process_tree(
+            &sensor,
+            &mut input_rx,
+            process_tree_reply(serde_json::json!([process_record(500, "cmd.exe", Some(1))])),
+        )
+        .await;
+
+        let outcome = handle.await.expect("task did not panic").expect("approve must confirm");
+        assert_eq!(outcome.decision, UacDecision::Approve);
+    }
+
+    /// `uac_respond` returns `Error::UacResponseUnconfirmed` when the
+    /// prompt is STILL active after the sequence -- the credential-prompt
+    /// exclusion (acceptance exclusion #2), confirmed on the FIRST attempt
+    /// WITHOUT spending the retry budget (a still-active prompt never
+    /// spontaneously clears on retry, so retrying it would only waste
+    /// time).
+    #[tokio::test(start_paused = true)]
+    async fn uac_respond_reports_unconfirmed_when_the_prompt_is_still_present() {
+        let sensor = Arc::new(SensorShared::new());
+        let (session, mut input_rx) = test_session_with_sensor_and_frame(sensor.clone());
+
+        let handle = tokio::spawn(async move { session.uac_respond(UacDecision::Approve).await });
+
+        respond_process_tree(&sensor, &mut input_rx, process_tree_reply(serde_json::json!([consent_record(Some(1))])))
+            .await;
+        let RdpInputEvent::FastPath(_) = input_rx.recv().await.expect("a FastPath event was sent") else {
+            panic!("expected a FastPath event");
+        };
+        // Still active -- e.g. a credential prompt this fixed sequence does
+        // not support.
+        respond_process_tree(&sensor, &mut input_rx, process_tree_reply(serde_json::json!([consent_record(Some(1))])))
+            .await;
+
+        let err = handle.await.expect("task did not panic");
+        match err {
+            Err(Error::UacResponseUnconfirmed(msg)) => assert!(msg.contains("still present")),
+            other => panic!("expected Err(Error::UacResponseUnconfirmed(_)), got {other:?}"),
+        }
+        assert!(input_rx.try_recv().is_err(), "a still-active prompt must not spend the retry budget");
+    }
+
+    /// Closes the settle-timing-race gap: the FIRST confirmation attempt
+    /// sees the prompt cleared but the elevated child process has not YET
+    /// become enumerable (a genuine race, not a failure); the bounded
+    /// retry's SECOND attempt sees it and confirms -- proving the retry
+    /// actually closes the false-negative, rather than merely adding
+    /// unused retry code.
+    #[tokio::test(start_paused = true)]
+    async fn uac_respond_approve_confirms_on_a_later_retry_attempt() {
+        let sensor = Arc::new(SensorShared::new());
+        let (session, mut input_rx) = test_session_with_sensor_and_frame(sensor.clone());
+
+        let handle = tokio::spawn(async move { session.uac_respond(UacDecision::Approve).await });
+
+        respond_process_tree(&sensor, &mut input_rx, process_tree_reply(serde_json::json!([consent_record(Some(1))])))
+            .await;
+        let RdpInputEvent::FastPath(_) = input_rx.recv().await.expect("a FastPath event was sent") else {
+            panic!("expected a FastPath event");
+        };
+        // Attempt 1: prompt cleared, but the elevated child has not yet
+        // become enumerable -- inconclusive, not a failure.
+        respond_process_tree(&sensor, &mut input_rx, process_tree_reply(serde_json::json!([]))).await;
+        // Attempt 2 (after UAC_CONFIRM_RETRY_INTERVAL, auto-advanced by
+        // Tokio's paused clock): the elevated child is now visible.
+        respond_process_tree(
+            &sensor,
+            &mut input_rx,
+            process_tree_reply(serde_json::json!([process_record(500, "cmd.exe", Some(1))])),
+        )
+        .await;
+
+        let outcome = handle.await.expect("task did not panic").expect("the second retry attempt must confirm");
+        assert_eq!(outcome.decision, UacDecision::Approve);
     }
 
     // --- Task 2: Session::ping() -- handshake fast-fail + 500ms timeout (SC#2/SC#3) ---
@@ -2702,6 +3366,7 @@ mod tests {
             screenshot: false,
             window_list: false,
             uia: UiaMode::Foreground,
+            elevation_check: false,
         };
         let handle = tokio::spawn(async move { session.world_state(opts).await });
 
@@ -2757,6 +3422,7 @@ mod tests {
             screenshot: false,
             window_list: true,
             uia: UiaMode::AllTopLevel,
+            elevation_check: false,
         };
         let handle = tokio::spawn(async move { session.world_state(opts).await });
 
@@ -2815,6 +3481,7 @@ mod tests {
             screenshot: false,
             window_list: false,
             uia: UiaMode::Hwnd(vec![111, 222]),
+            elevation_check: false,
         };
         let handle = tokio::spawn(async move { session.world_state(opts).await });
 

@@ -76,6 +76,9 @@ pub struct WireProcessInfo {
     /// The process's owning user account, if the sensor could retrieve it
     /// (best-effort extra).
     pub owner: Option<String>,
+    /// The Terminal Services session id hosting this process, if the
+    /// sensor could resolve it (best-effort extra).
+    pub session_id: Option<u32>,
 }
 
 /// Wire mirror of `rdpilot::UiaScope` — how deep a UIA tree walk should go.
@@ -146,6 +149,12 @@ pub struct WireWorldStateOptions {
     pub window_list: bool,
     /// Which UIA tree(s), if any, to fetch.
     pub uia: WireUiaMode,
+    /// Whether to fetch and surface `elevation_active` (session-scoped
+    /// UAC/elevation consent-prompt detection). `#[serde(default)]` so an
+    /// older client that predates this field still deserializes cleanly,
+    /// defaulting to `false` (no behavior change for existing callers).
+    #[serde(default)]
+    pub elevation_check: bool,
 }
 
 #[cfg(test)]
@@ -221,6 +230,7 @@ mod tests {
             path: "C:\\Windows\\notepad.exe".to_owned(),
             command_line: Some("notepad.exe file.txt".to_owned()),
             owner: None,
+            session_id: Some(1),
         };
         let json = serde_json::to_string(&info)?;
         let parsed: WireProcessInfo = serde_json::from_str(&json)?;
@@ -230,6 +240,7 @@ mod tests {
         assert_eq!(parsed.path, info.path);
         assert_eq!(parsed.command_line, info.command_line);
         assert_eq!(parsed.owner, info.owner);
+        assert_eq!(parsed.session_id, info.session_id);
         Ok(())
     }
 
@@ -291,11 +302,24 @@ mod tests {
             screenshot: true,
             window_list: true,
             uia: WireUiaMode::Foreground,
+            elevation_check: true,
         };
         let json = serde_json::to_string(&options)?;
         let parsed: WireWorldStateOptions = serde_json::from_str(&json)?;
         assert_eq!(parsed.screenshot, options.screenshot);
+        assert_eq!(parsed.elevation_check, options.elevation_check);
         assert_eq!(parsed.window_list, options.window_list);
+        Ok(())
+    }
+
+    /// A `WireWorldStateOptions` JSON payload with NO `elevation_check`
+    /// field at all (an older client) still deserializes, defaulting to
+    /// `false` -- no behavior change for existing callers.
+    #[test]
+    fn wire_world_state_options_defaults_elevation_check_when_absent() -> Result<(), Box<dyn std::error::Error>> {
+        let json = r#"{"screenshot":true,"window_list":true,"uia":"None"}"#;
+        let parsed: WireWorldStateOptions = serde_json::from_str(json)?;
+        assert!(!parsed.elevation_check);
         Ok(())
     }
 }

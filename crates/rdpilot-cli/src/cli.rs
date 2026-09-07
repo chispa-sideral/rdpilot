@@ -173,6 +173,11 @@ pub struct WorldStateArgs {
     /// on-disk write.
     #[arg(long)]
     pub output: Option<PathBuf>,
+    /// Also fetch and surface `elevation_active` (session-scoped UAC/
+    /// elevation consent-prompt detection) — an extra process-tree round
+    /// trip, opt-in per D-8.1's a-la-carte discipline.
+    #[arg(long = "elevation-check")]
+    pub elevation_check: bool,
 }
 
 /// How deep a `uia` tree walk should go — the CLI spelling of
@@ -240,6 +245,37 @@ pub enum InputCmd {
     Launch(LaunchArgs),
     /// Bring a remote window to the foreground.
     Foreground(ForegroundArgs),
+    /// The `input uac` noun group.
+    #[command(subcommand)]
+    Uac(UacCmd),
+}
+
+/// The `input uac` noun group.
+#[derive(Debug, Subcommand)]
+pub enum UacCmd {
+    /// Respond to an active UAC/elevation prompt via the proven native
+    /// Tab-navigate + Unicode-Enter sequence, confirmed via a follow-up
+    /// screenshot.
+    Respond(UacRespondArgs),
+}
+
+/// `input uac respond --session <id> [--approve|--reject] [--output <path>]`.
+#[derive(Debug, Args)]
+#[command(group(clap::ArgGroup::new("decision").required(true).multiple(false)))]
+pub struct UacRespondArgs {
+    /// The session to target.
+    #[arg(long)]
+    pub session: String,
+    /// Approve the active prompt.
+    #[arg(long, group = "decision")]
+    pub approve: bool,
+    /// Reject the active prompt.
+    #[arg(long, group = "decision")]
+    pub reject: bool,
+    /// Where to write the confirming follow-up screenshot's decoded PNG
+    /// bytes. Optional — same convention as `WorldStateArgs::output`.
+    #[arg(long)]
+    pub output: Option<PathBuf>,
 }
 
 /// A mouse button — the CLI spelling of `rdpilot_ipc::WireButton`.

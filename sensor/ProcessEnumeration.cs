@@ -49,6 +49,16 @@ internal sealed record ProcessRecord
 
     [JsonPropertyName("owner")]
     public string? Owner { get; init; }
+
+    /// The Terminal Services session id hosting this process, resolved via
+    /// `ProcessIdToSessionId` — null on any resolution failure (process
+    /// exited between the snapshot and this call, access denied, etc.),
+    /// mirroring `Owner`/`CommandLine`'s existing best-effort degrade
+    /// discipline. Added so RDPilot's Rust side can scope elevation-prompt
+    /// detection (`consent.exe`) to the caller's own RDP session instead of
+    /// matching a whole-system process snapshot.
+    [JsonPropertyName("session_id")]
+    public uint? SessionId { get; init; }
 }
 
 /// The ProcessTree response payload (D-6.4 success/failure envelope shape):
@@ -63,6 +73,16 @@ internal sealed record ProcessTreeResponse
 
     [JsonPropertyName("error")]
     public string? Error { get; init; }
+
+    /// This sensor process's OWN Terminal Services session id, resolved
+    /// once per call via `ProcessIdToSessionId` against
+    /// `Environment.ProcessId` — null on any resolution failure. Program.cs's
+    /// own invariant ("must run inside the interactive RDP session,
+    /// Session > 0") means this IS the RDP session the caller's request
+    /// arrived over, by construction — no separate session-discovery
+    /// mechanism is needed.
+    [JsonPropertyName("own_session_id")]
+    public uint? OwnSessionId { get; init; }
 }
 
 // ---------------------------------------------------------------------------
@@ -129,6 +149,17 @@ internal static partial class ProcessEnumeration
     [LibraryImport("kernel32.dll", SetLastError = true)]
     private static partial nint OpenProcess(uint dwDesiredAccess, [MarshalAs(UnmanagedType.Bool)] bool bInheritHandle, uint dwProcessId);
 
+    /// Resolves the Terminal Services session id hosting a process, given
+    /// its pid — used both per-record (`ProcessRecord.SessionId`) and once
+    /// for the sensor's own session (`ProcessTreeResponse.OwnSessionId`),
+    /// enabling session-scoped elevation detection. No handle/privilege
+    /// dependency — unlike `OpenProcess` above, this needs only a pid, so
+    /// it succeeds even for a process this sensor could not otherwise
+    /// open.
+    [LibraryImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static partial bool ProcessIdToSessionId(uint dwProcessId, out uint pSessionId);
+
     [LibraryImport("kernel32.dll", EntryPoint = "QueryFullProcessImageNameW", StringMarshalling = StringMarshalling.Utf16, SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static partial bool QueryFullProcessImageNameW(nint hProcess, uint dwFlags, Span<char> lpExeName, ref uint lpdwSize);
@@ -159,6 +190,13 @@ internal static partial class ProcessEnumeration
             return new string(buffer, 0, length);
         }
     }
+
+    /// Best-effort Terminal Services session id for one pid via
+    /// `ProcessIdToSessionId` — on ANY failure (process exited between the
+    /// snapshot and this call, an invalid pid, etc.) returns null rather
+    /// than failing the whole ProcessTree call, mirroring
+    /// `ResolveProcessPath`'s degrade discipline.
+    private static uint? ResolveSessionId(uint pid) => ProcessIdToSessionId(pid, out uint sessionId) ? sessionId : null;
 
     /// Best-effort full image path for one pid via
     /// `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)` +
@@ -210,6 +248,12 @@ internal static partial class ProcessEnumeration
 
         try
         {
+            // Resolved once per call, not once per record: this sensor
+            // process's own session id, per Program.cs's own "must run
+            // inside the interactive RDP session" invariant -- this IS the
+            // RDP session the caller's request arrived over.
+            uint? ownSessionId = ResolveSessionId((uint)Environment.ProcessId);
+
             List<ProcessRecord> records = [];
             PROCESSENTRY32W entry = default;
             entry.dwSize = (uint)Marshal.SizeOf<PROCESSENTRY32W>();
@@ -218,7 +262,7 @@ internal static partial class ProcessEnumeration
             {
                 // An empty/failed first entry is not itself an error condition
                 // worth failing the whole call over -- report an empty tree.
-                return new ProcessTreeResponse { Success = true, Data = [], Error = null };
+                return new ProcessTreeResponse { Success = true, Data = [], Error = null, OwnSessionId = ownSessionId };
             }
 
             do
@@ -231,10 +275,11 @@ internal static partial class ProcessEnumeration
                     Path = ResolveProcessPath(entry.th32ProcessID),
                     CommandLine = null,
                     Owner = null,
+                    SessionId = ResolveSessionId(entry.th32ProcessID),
                 });
             } while (Process32NextW(snapshot, ref entry));
 
-            return new ProcessTreeResponse { Success = true, Data = [.. records], Error = null };
+            return new ProcessTreeResponse { Success = true, Data = [.. records], Error = null, OwnSessionId = ownSessionId };
         }
         finally
         {
