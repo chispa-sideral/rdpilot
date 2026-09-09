@@ -28,8 +28,8 @@ mod common;
 mod proof_harness;
 
 use rdpilot::{
-    Button, Key, KeyAction, MouseAction, ProcessInfo, Rect, Screenshot, TransferOutcome, UiaElement, UiaMode,
-    UiaScope, WindowInfo, WindowState, WorldState, WorldStateOptions,
+    Button, Key, KeyAction, MouseAction, ProcessInfo, Rect, Screenshot, TransferOutcome,
+    UiaElement, UiaMode, UiaScope, WindowInfo, WindowState, WorldState, WorldStateOptions,
 };
 
 // Phase 10 (FILE-01/02/03/04) live-gate additions: local std::fs staging
@@ -42,6 +42,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 use sha2::{Digest, Sha256};
+
+#[cfg(feature = "live-dvc-diagnostics")]
+use rdpilot::LiveDvcDeadlineOutcome;
 
 /// Skip helper: returns the live config or prints a skip note and returns `None`.
 /// Each test uses `let Some(cfg) = require_target!() else { return };`.
@@ -86,9 +89,8 @@ fn is_uniform_grey(shot: &Screenshot) -> bool {
             let b = i32::from(shot.rgba[idx + 2]);
             // If any sampled pixel is clearly NOT neutral grey, it is a real
             // colored desktop, not the YUV-grey failure.
-            let near_grey = (r - GREY).abs() <= TOL
-                && (g - GREY).abs() <= TOL
-                && (b - GREY).abs() <= TOL;
+            let near_grey =
+                (r - GREY).abs() <= TOL && (g - GREY).abs() <= TOL && (b - GREY).abs() <= TOL;
             if !near_grey {
                 return false;
             }
@@ -156,8 +158,14 @@ fn screenshot_is_rgb_correct() {
         session.close().await.expect("close");
 
         // Dimensions match the requested desktop size.
-        assert_eq!(shot.width, want_w, "screenshot width matches requested desktop");
-        assert_eq!(shot.height, want_h, "screenshot height matches requested desktop");
+        assert_eq!(
+            shot.width, want_w,
+            "screenshot width matches requested desktop"
+        );
+        assert_eq!(
+            shot.height, want_h,
+            "screenshot height matches requested desktop"
+        );
         assert_eq!(
             shot.rgba.len(),
             (want_w * want_h * 4) as usize,
@@ -171,7 +179,10 @@ fn screenshot_is_rgb_correct() {
         // uniform mid-grey. (Content-richness / non-blank after settle is the
         // domain of `stays_rendered_while_idle`; a uniform solid desktop background
         // is still correct RGB, so it is NOT asserted blank here.)
-        assert_eq!(shot.rgba[3], 255, "top-left pixel alpha is opaque (0xFF), proving RGBA32 layout");
+        assert_eq!(
+            shot.rgba[3], 255,
+            "top-left pixel alpha is opaque (0xFF), proving RGBA32 layout"
+        );
         assert!(
             !is_uniform_grey(&shot),
             "screenshot is uniform mid-grey — the YUV-grey decode pitfall (criterion #2 fails)"
@@ -194,8 +205,15 @@ fn screenshot_crop() {
         session.close().await.expect("close");
 
         // Crop a 100x80 region at (10, 20) — well within any real desktop size.
-        let rect = Rect { x: 10, y: 20, w: 100, h: 80 };
-        let cropped = shot.crop(rect).expect("in-bounds crop succeeds on a live frame");
+        let rect = Rect {
+            x: 10,
+            y: 20,
+            w: 100,
+            h: 80,
+        };
+        let cropped = shot
+            .crop(rect)
+            .expect("in-bounds crop succeeds on a live frame");
 
         assert_eq!(cropped.width, 100, "crop width matches the requested rect");
         assert_eq!(cropped.height, 80, "crop height matches the requested rect");
@@ -235,13 +253,28 @@ fn stays_rendered_while_idle() {
         tokio::time::sleep(idle).await;
 
         // After idle, the framebuffer must still be full-resolution and non-blank.
-        let after = session.screenshot().await.expect("framebuffer still available after idle");
+        let after = session
+            .screenshot()
+            .await
+            .expect("framebuffer still available after idle");
         session.close().await.expect("close");
 
-        assert_eq!(after.width, want_w, "still full-resolution width after idle");
-        assert_eq!(after.height, want_h, "still full-resolution height after idle");
-        assert!(!is_blank(&after), "windowless session is non-blank after idle (criterion #4)");
-        assert!(!is_uniform_grey(&after), "windowless session is not grey after idle");
+        assert_eq!(
+            after.width, want_w,
+            "still full-resolution width after idle"
+        );
+        assert_eq!(
+            after.height, want_h,
+            "still full-resolution height after idle"
+        );
+        assert!(
+            !is_blank(&after),
+            "windowless session is non-blank after idle (criterion #4)"
+        );
+        assert!(
+            !is_uniform_grey(&after),
+            "windowless session is not grey after idle"
+        );
     });
 }
 
@@ -431,32 +464,59 @@ fn mouse_action_types_all_work() {
             .send_mouse(MouseAction::Move { x: cx, y: cy })
             .await
             .expect("Move round-trips");
-        assert!(session.screenshot().await.is_ok(), "session alive after Move");
+        assert!(
+            session.screenshot().await.is_ok(),
+            "session alive after Move"
+        );
 
         // Left click: assert Ok + alive. Left-clicking empty desktop
         // typically has no visible effect worth screenshot-diffing.
         session
-            .send_mouse(MouseAction::Click { x: cx, y: cy, button: Button::Left })
+            .send_mouse(MouseAction::Click {
+                x: cx,
+                y: cy,
+                button: Button::Left,
+            })
             .await
             .expect("left Click round-trips");
-        assert!(session.screenshot().await.is_ok(), "session alive after left Click");
+        assert!(
+            session.screenshot().await.is_ok(),
+            "session alive after left Click"
+        );
 
         // Middle click: assert Ok + alive (no default OS-level visible
         // effect on an empty desktop area).
         session
-            .send_mouse(MouseAction::Click { x: cx, y: cy, button: Button::Middle })
+            .send_mouse(MouseAction::Click {
+                x: cx,
+                y: cy,
+                button: Button::Middle,
+            })
             .await
             .expect("middle Click round-trips");
-        assert!(session.screenshot().await.is_ok(), "session alive after middle Click");
+        assert!(
+            session.screenshot().await.is_ok(),
+            "session alive after middle Click"
+        );
 
         // Right click IS observable: the desktop context menu opens.
-        let before_right = session.screenshot().await.expect("screenshot before right click");
+        let before_right = session
+            .screenshot()
+            .await
+            .expect("screenshot before right click");
         session
-            .send_mouse(MouseAction::Click { x: cx, y: cy, button: Button::Right })
+            .send_mouse(MouseAction::Click {
+                x: cx,
+                y: cy,
+                button: Button::Right,
+            })
             .await
             .expect("right Click round-trips");
         settle().await;
-        let after_right = session.screenshot().await.expect("screenshot after right click");
+        let after_right = session
+            .screenshot()
+            .await
+            .expect("screenshot after right click");
         let menu_rect = clamped_rect(u32::from(cx), u32::from(cy), 400, 500, w, h);
         assert!(
             region_changed(&before_right, &after_right, menu_rect),
@@ -479,10 +539,17 @@ fn mouse_action_types_all_work() {
         // (`DOUBLE_CLICK_GAP` in session.rs) does not reliably register,
         // increase it here at the checkpoint (RESEARCH §4).
         session
-            .send_mouse(MouseAction::DoubleClick { x: cx, y: cy, button: Button::Left })
+            .send_mouse(MouseAction::DoubleClick {
+                x: cx,
+                y: cy,
+                button: Button::Left,
+            })
             .await
             .expect("DoubleClick round-trips");
-        assert!(session.screenshot().await.is_ok(), "session alive after DoubleClick");
+        assert!(
+            session.screenshot().await.is_ok(),
+            "session alive after DoubleClick"
+        );
 
         // Scroll: open the Start menu (a reversible, standard-integrity,
         // app-independent surface, Pitfall 4) and scroll its app list.
@@ -509,17 +576,31 @@ fn mouse_action_types_all_work() {
             .expect("Ctrl+Esc opens Start");
         settle().await;
         session
-            .send_mouse(MouseAction::Scroll { x: cx, y: cy, dy: -120 })
+            .send_mouse(MouseAction::Scroll {
+                x: cx,
+                y: cy,
+                dy: -120,
+            })
             .await
             .expect("Scroll(dy:-120) round-trips");
         settle().await;
-        assert!(session.screenshot().await.is_ok(), "session alive after Scroll(dy:-120)");
+        assert!(
+            session.screenshot().await.is_ok(),
+            "session alive after Scroll(dy:-120)"
+        );
         session
-            .send_mouse(MouseAction::Scroll { x: cx, y: cy, dy: 120 })
+            .send_mouse(MouseAction::Scroll {
+                x: cx,
+                y: cy,
+                dy: 120,
+            })
             .await
             .expect("Scroll(dy:120) round-trips");
         settle().await;
-        assert!(session.screenshot().await.is_ok(), "session alive after Scroll(dy:120)");
+        assert!(
+            session.screenshot().await.is_ok(),
+            "session alive after Scroll(dy:120)"
+        );
 
         session
             .send_key(KeyAction::Combo(vec![Key::Esc]))
@@ -551,7 +632,10 @@ fn mouse_action_types_all_work() {
             })
             .await
             .expect("Drag round-trips");
-        assert!(session.screenshot().await.is_ok(), "session alive after Drag");
+        assert!(
+            session.screenshot().await.is_ok(),
+            "session alive after Drag"
+        );
 
         session.close().await.expect("close");
     });
@@ -576,14 +660,24 @@ fn coordinate_contract_enforced() {
         let _ = capture_when_ready(&session).await;
 
         let (w, h) = session.desktop_size();
-        assert_eq!(w, want_w, "desktop_size() reports the requested physical width");
-        assert_eq!(h, want_h, "desktop_size() reports the requested physical height");
+        assert_eq!(
+            w, want_w,
+            "desktop_size() reports the requested physical width"
+        );
+        assert_eq!(
+            h, want_h,
+            "desktop_size() reports the requested physical height"
+        );
 
         // Out-of-bounds: exactly at the width bound (the bounds check is
         // `>=`, so `x == w` is the smallest rejected value).
         let oob_x = u16::try_from(w).expect("desktop width fits u16");
         let err = session
-            .send_mouse(MouseAction::Click { x: oob_x, y: 0, button: Button::Left })
+            .send_mouse(MouseAction::Click {
+                x: oob_x,
+                y: 0,
+                button: Button::Left,
+            })
             .await
             .expect_err("an out-of-bounds coordinate must be rejected, not silently sent");
         assert!(
@@ -595,7 +689,11 @@ fn coordinate_contract_enforced() {
         // proves the rejection is a per-call bounds check, not a
         // session-level failure state.
         session
-            .send_mouse(MouseAction::Click { x: 10, y: 10, button: Button::Left })
+            .send_mouse(MouseAction::Click {
+                x: 10,
+                y: 10,
+                button: Button::Left,
+            })
             .await
             .expect("an in-bounds click still succeeds after a prior rejection");
 
@@ -633,7 +731,10 @@ fn keyboard_typed_text_is_received() {
             .expect("Ctrl+Esc opens Start");
         settle().await;
 
-        let before_type = session.screenshot().await.expect("screenshot before typing");
+        let before_type = session
+            .screenshot()
+            .await
+            .expect("screenshot before typing");
 
         session
             .send_key(KeyAction::Type("rdpilot".into()))
@@ -688,13 +789,19 @@ fn keyboard_combos_are_received() {
 
         // --- Ctrl+Esc opens Start: screenshot-diff observable. ---
         const COMBO_CHANGE_THRESHOLD: f32 = 0.001;
-        let before_start = session.screenshot().await.expect("screenshot before Ctrl+Esc");
+        let before_start = session
+            .screenshot()
+            .await
+            .expect("screenshot before Ctrl+Esc");
         session
             .send_key(KeyAction::Combo(vec![Key::Ctrl, Key::Esc]))
             .await
             .expect("Ctrl+Esc round-trips");
         settle().await;
-        let after_start = session.screenshot().await.expect("screenshot after Ctrl+Esc");
+        let after_start = session
+            .screenshot()
+            .await
+            .expect("screenshot after Ctrl+Esc");
         assert!(
             changed_fraction(&before_start, &after_start) > COMBO_CHANGE_THRESHOLD,
             "Ctrl+Esc did not visibly open the Start menu (SC#3)"
@@ -709,7 +816,10 @@ fn keyboard_combos_are_received() {
             .send_key(KeyAction::Combo(vec![Key::Ctrl, Key::A]))
             .await
             .expect("Ctrl+A round-trips");
-        assert!(session.screenshot().await.is_ok(), "session alive after Ctrl+A");
+        assert!(
+            session.screenshot().await.is_ok(),
+            "session alive after Ctrl+A"
+        );
 
         // Close Start before moving to the desktop-focused Alt+F4 case.
         session
@@ -730,12 +840,19 @@ fn keyboard_combos_are_received() {
         // Click an empty desktop area first to give the desktop shell input
         // focus (Alt+F4 targets whatever currently has focus).
         session
-            .send_mouse(MouseAction::Click { x: cx, y: cy, button: Button::Left })
+            .send_mouse(MouseAction::Click {
+                x: cx,
+                y: cy,
+                button: Button::Left,
+            })
             .await
             .expect("focusing click round-trips");
         settle().await;
 
-        let before_altf4 = session.screenshot().await.expect("screenshot before Alt+F4");
+        let before_altf4 = session
+            .screenshot()
+            .await
+            .expect("screenshot before Alt+F4");
         session
             .send_key(KeyAction::Combo(vec![Key::Alt, Key::F4]))
             .await
@@ -939,7 +1056,10 @@ fn window_list_returns_visible_windows() {
             .get_window_list()
             .await
             .expect("get_window_list should round-trip successfully (SC#1)");
-        assert!(!windows.is_empty(), "expected at least one visible window on the live desktop");
+        assert!(
+            !windows.is_empty(),
+            "expected at least one visible window on the live desktop"
+        );
 
         let in_bounds = |w: &WindowInfo| {
             w.rect.x.saturating_add(w.rect.w) <= desktop_w
@@ -1020,9 +1140,14 @@ fn process_tree_returns_pid_parent_name_path() {
             .get_process_tree()
             .await
             .expect("get_process_tree should round-trip successfully (SC#2)");
-        assert!(!processes.is_empty(), "expected at least one process on the live desktop");
+        assert!(
+            !processes.is_empty(),
+            "expected at least one process on the live desktop"
+        );
 
-        let has_pid_and_name = processes.iter().any(|p: &ProcessInfo| p.pid != 0 && !p.name.is_empty());
+        let has_pid_and_name = processes
+            .iter()
+            .any(|p: &ProcessInfo| p.pid != 0 && !p.name.is_empty());
         assert!(
             has_pid_and_name,
             "expected at least one process record with a nonzero pid and non-empty name"
@@ -1213,16 +1338,18 @@ fn launch_process_appears_in_followup_process_tree() {
             .expect("launch_process(notepad.exe) should return a PID (SC#4)");
         settle().await;
 
-        let processes = session
-            .get_process_tree()
-            .await
-            .expect("get_process_tree (follow-up, SC#4 confirmation) should round-trip successfully");
-        let launched = processes.iter().find(|p: &&ProcessInfo| p.pid == pid).unwrap_or_else(|| {
-            panic!(
-                "launched pid {pid} not found in the follow-up process tree — \
+        let processes = session.get_process_tree().await.expect(
+            "get_process_tree (follow-up, SC#4 confirmation) should round-trip successfully",
+        );
+        let launched = processes
+            .iter()
+            .find(|p: &&ProcessInfo| p.pid == pid)
+            .unwrap_or_else(|| {
+                panic!(
+                    "launched pid {pid} not found in the follow-up process tree — \
                  processes seen: {processes:?}"
-            )
-        });
+                )
+            });
         assert!(
             launched.name.to_ascii_lowercase().contains("notepad"),
             "expected the launched process's name to look like notepad.exe, got {:?}",
@@ -1252,7 +1379,8 @@ async fn launch_notepad_and_find_window(session: &rdpilot::Session) -> WindowInf
             .await
             .expect("get_window_list should round-trip successfully while polling for Notepad");
         if let Some(w) = windows.iter().find(|w| {
-            w.class_name.eq_ignore_ascii_case("Notepad") || w.title.to_ascii_lowercase().contains("notepad")
+            w.class_name.eq_ignore_ascii_case("Notepad")
+                || w.title.to_ascii_lowercase().contains("notepad")
         }) {
             return w.clone();
         }
@@ -1285,10 +1413,9 @@ fn uia_tree_returns_populated_elements() {
         let session = rdpilot::Session::connect(&cfg)
             .await
             .expect("connect (RDPDR channel registers when sensor_binary_path is set)");
-        session
-            .deploy_and_launch()
-            .await
-            .expect("deploy_and_launch: sensor must be answering before window/process/UIA requests");
+        session.deploy_and_launch().await.expect(
+            "deploy_and_launch: sensor must be answering before window/process/UIA requests",
+        );
 
         let notepad = launch_notepad_and_find_window(&session).await;
 
@@ -1296,11 +1423,14 @@ fn uia_tree_returns_populated_elements() {
             .get_uia_tree(notepad.hwnd, UiaScope::Children)
             .await
             .expect("get_uia_tree(notepad.hwnd) should round-trip successfully (SC#1)");
-        assert!(!elements.is_empty(), "expected a non-empty UIA element tree for Notepad's hwnd");
+        assert!(
+            !elements.is_empty(),
+            "expected a non-empty UIA element tree for Notepad's hwnd"
+        );
 
-        let has_populated = elements.iter().any(|e| {
-            !e.id.is_empty() && e.role != "Unknown" && e.bbox.w > 0 && e.bbox.h > 0
-        });
+        let has_populated = elements
+            .iter()
+            .any(|e| !e.id.is_empty() && e.role != "Unknown" && e.bbox.w > 0 && e.bbox.h > 0);
         assert!(
             has_populated,
             "expected at least one element with a non-empty id, a mapped role, and a nonzero bbox — \
@@ -1341,10 +1471,9 @@ fn uia_bbox_shares_window_pixel_space() {
         let session = rdpilot::Session::connect(&cfg)
             .await
             .expect("connect (RDPDR channel registers when sensor_binary_path is set)");
-        session
-            .deploy_and_launch()
-            .await
-            .expect("deploy_and_launch: sensor must be answering before window/process/UIA requests");
+        session.deploy_and_launch().await.expect(
+            "deploy_and_launch: sensor must be answering before window/process/UIA requests",
+        );
 
         let (desktop_w, desktop_h) = session.desktop_size();
         let notepad = launch_notepad_and_find_window(&session).await;
@@ -1353,7 +1482,10 @@ fn uia_bbox_shares_window_pixel_space() {
             .get_uia_tree(notepad.hwnd, UiaScope::Children)
             .await
             .expect("get_uia_tree(notepad.hwnd) should round-trip successfully (SC#2)");
-        assert!(!elements.is_empty(), "expected a non-empty UIA element tree for Notepad's hwnd");
+        assert!(
+            !elements.is_empty(),
+            "expected a non-empty UIA element tree for Notepad's hwnd"
+        );
 
         // Every bbox must land within the desktop bounds (no coordinate-space
         // mismatch/remap) — this is the SC#2 assertion, not a tight window-
@@ -1409,10 +1541,9 @@ fn uia_tree_walk_within_500ms() {
         let session = rdpilot::Session::connect(&cfg)
             .await
             .expect("connect (RDPDR channel registers when sensor_binary_path is set)");
-        session
-            .deploy_and_launch()
-            .await
-            .expect("deploy_and_launch: sensor must be answering before window/process/UIA requests");
+        session.deploy_and_launch().await.expect(
+            "deploy_and_launch: sensor must be answering before window/process/UIA requests",
+        );
 
         let notepad = launch_notepad_and_find_window(&session).await;
 
@@ -1434,7 +1565,10 @@ fn uia_tree_walk_within_500ms() {
 
         // Surfaced for the end-of-phase human-check record (SC#3
         // measurement) and for the D-7.7 CreateCacheRequest decision gate.
-        println!("uia_tree_walk_within_500ms: measured elapsed = {elapsed:?}, elements = {}", elements.len());
+        println!(
+            "uia_tree_walk_within_500ms: measured elapsed = {elapsed:?}, elements = {}",
+            elements.len()
+        );
 
         assert!(
             elapsed < std::time::Duration::from_millis(500),
@@ -1469,18 +1603,22 @@ fn uia_tree_round_trips_live() {
         let session = rdpilot::Session::connect(&cfg)
             .await
             .expect("connect (RDPDR channel registers when sensor_binary_path is set)");
-        session
-            .deploy_and_launch()
-            .await
-            .expect("deploy_and_launch: sensor must be answering before window/process/UIA requests");
+        session.deploy_and_launch().await.expect(
+            "deploy_and_launch: sensor must be answering before window/process/UIA requests",
+        );
 
         let notepad = launch_notepad_and_find_window(&session).await;
 
         let elements: Vec<UiaElement> = session
             .get_uia_tree(notepad.hwnd, UiaScope::Children)
             .await
-            .expect("get_uia_tree(notepad.hwnd) should round-trip successfully (SC#4 precondition)");
-        assert!(!elements.is_empty(), "expected a non-empty UIA element tree for Notepad's hwnd");
+            .expect(
+                "get_uia_tree(notepad.hwnd) should round-trip successfully (SC#4 precondition)",
+            );
+        assert!(
+            !elements.is_empty(),
+            "expected a non-empty UIA element tree for Notepad's hwnd"
+        );
 
         // UiaElement itself is not (De)Serialize (D-09 owned-SDK-types-only
         // public API keeps the wire-shape Serialize/Deserialize impls
@@ -1553,9 +1691,18 @@ fn world_state_default_options_reports_capture_span() {
             .await
             .expect("world_state(default) should round-trip successfully (SC#2)");
 
-        assert!(world.screenshot.is_some(), "default options request a screenshot (SC#2 default shape)");
-        assert!(world.window_list.is_some(), "default options request a window list (SC#2 default shape)");
-        assert!(world.uia.is_none(), "default options request no UIA tree (SC#2 default shape)");
+        assert!(
+            world.screenshot.is_some(),
+            "default options request a screenshot (SC#2 default shape)"
+        );
+        assert!(
+            world.window_list.is_some(),
+            "default options request a window list (SC#2 default shape)"
+        );
+        assert!(
+            world.uia.is_none(),
+            "default options request no UIA tree (SC#2 default shape)"
+        );
 
         // Best-effort per D-8.2: record the measured span for the SC#2
         // record. NEVER assert a hard `< 500ms` bound here — only that the
@@ -1647,14 +1794,21 @@ fn world_state_foreground_uia_matches_focused_window() {
         assert!(world.screenshot.is_some(), "screenshot was requested");
         assert!(world.window_list.is_some(), "window_list was requested");
         let uia = world.uia.expect("Foreground mode requests a UIA group");
-        assert_eq!(uia.len(), 1, "Foreground mode yields exactly one (hwnd, elements) group");
+        assert_eq!(
+            uia.len(),
+            1,
+            "Foreground mode yields exactly one (hwnd, elements) group"
+        );
         assert_eq!(
             uia[0].0, expected_hwnd,
             "Foreground group's hwnd should match the titled window with the minimum z_order \
              (expected {expected_hwnd}, notepad hwnd was {}) — windows seen: {windows_before:?}",
             notepad.hwnd
         );
-        assert!(!uia[0].1.is_empty(), "Foreground UIA element list should be non-empty");
+        assert!(
+            !uia[0].1.is_empty(),
+            "Foreground UIA element list should be non-empty"
+        );
 
         eprintln!(
             "world_state_foreground_uia_matches_focused_window: measured capture_span = {:?} ({} ms)",
@@ -1692,12 +1846,13 @@ fn proof_harness_end_to_end() {
         let session = rdpilot::Session::connect(&cfg)
             .await
             .expect("connect (RDPDR channel registers when sensor_binary_path is set)");
-        session
-            .deploy_and_launch()
-            .await
-            .expect("deploy_and_launch: sensor must be answering before window/process/UIA requests");
+        session.deploy_and_launch().await.expect(
+            "deploy_and_launch: sensor must be answering before window/process/UIA requests",
+        );
 
-        let report = proof_harness::run_proof_harness(&session).await.expect("harness");
+        let report = proof_harness::run_proof_harness(&session)
+            .await
+            .expect("harness");
         assert!(report.passed, "proof harness failed: {:?}", report.steps);
 
         session.close().await.expect("close");
@@ -1738,7 +1893,11 @@ fn deterministic_bytes(len: usize) -> Vec<u8> {
 fn sha256_hex(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
-    hasher.finalize().iter().map(|b| format!("{b:02x}")).collect()
+    hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 /// Shared preamble for every Phase 10 file-transfer live test: requires the
@@ -1753,7 +1912,9 @@ async fn connect_with_transfer(cfg: rdpilot::ConnectionConfig) -> rdpilot::Sessi
          (`dotnet publish -r win-x64 -p:PublishAot=true --self-contained` on a Windows host \
          with the .NET 8 SDK)"
     );
-    let cfg = cfg.sensor_binary_path(sensor_exe).share_root(common::share_root_dir());
+    let cfg = cfg
+        .sensor_binary_path(sensor_exe)
+        .share_root(common::share_root_dir());
 
     let session = rdpilot::Session::connect(&cfg)
         .await
@@ -1763,6 +1924,107 @@ async fn connect_with_transfer(cfg: rdpilot::ConnectionConfig) -> rdpilot::Sessi
         .await
         .expect("deploy_and_launch: sensor must be answering before file-transfer requests");
     session
+}
+
+/// The real dispatcher adversary is deliberately feature-gated in addition
+/// to being ignored: it launches the sensor's sole fixed-root diagnostic mode
+/// and uses FileTransfer itself for both marker directions.
+#[cfg(feature = "live-dvc-diagnostics")]
+#[test]
+#[ignore = "live: requires provisioned RDP target, published NativeAOT sensor, private share root (RDPILOT_LIVE=1)"]
+fn live_dvc_blocked_windowlist_keeps_dispatcher_serviceable() {
+    let Some(cfg) = require_target!("live_dvc_blocked_windowlist_keeps_dispatcher_serviceable")
+    else {
+        return;
+    };
+    let token = format!("{:032x}", ((std::process::id() as u128) << 64) | 1);
+    let entered_remote = format!("live-dvc-{token}.entered");
+    let release_remote = format!("live-dvc-{token}.release");
+    let sensor_exe = common::sensor_exe_path();
+    assert!(
+        sensor_exe.exists(),
+        "published NativeAOT sensor must exist before the live DVC gate"
+    );
+    let cfg = cfg
+        .sensor_binary_path(sensor_exe)
+        .share_root(common::share_root_dir())
+        .live_dvc_blocked_handler(&token)
+        .expect("validated fixed-shape live DVC token");
+
+    block_on(async {
+        let session = rdpilot::Session::connect(&cfg)
+            .await
+            .expect("connect with private sensor handoff");
+        session
+            .deploy_and_launch()
+            .await
+            .expect("launch diagnostic-only sensor mode");
+
+        let local_dir = scratch_dir("live-dvc-blocked-handler");
+        let entered_local = local_dir.join("entered.marker");
+        let deadline = {
+            let blocked = session.get_window_list();
+            tokio::pin!(blocked);
+            let wait_entered = async {
+                loop {
+                    if session.download_file(&entered_remote, &entered_local).await.is_ok() {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                }
+            };
+            tokio::pin!(wait_entered);
+            tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                tokio::select! {
+                    result = &mut blocked => panic!("WindowList completed before entered marker: {result:?}"),
+                    _ = &mut wait_entered => {},
+                }
+            }).await.expect("WindowList handler must enter through real DVC before its deadline");
+            blocked.as_mut().await.expect_err("sensor dispatcher must emit its deadline failure, not a caller timeout")
+        };
+        assert!(
+            matches!(deadline, rdpilot::Error::SensorRejected(_)),
+            "expected correlated sensor deadline failure: {deadline:?}"
+        );
+        let ping = session
+            .ping()
+            .await
+            .expect("Ping remains serviceable while WindowList handler blocks");
+        assert!(
+            ping < std::time::Duration::from_millis(500),
+            "Ping/Pong exceeded 500ms: {ping:?}"
+        );
+        session
+            .get_process_tree()
+            .await
+            .expect("unrelated ProcessTree remains serviceable while WindowList blocks");
+
+        let release_local = local_dir.join("release.marker");
+        std::fs::write(&release_local, b"release").expect("write local release marker");
+        session
+            .upload_file(&release_local, &release_remote)
+            .await
+            .expect("upload release through FileTransfer");
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        let diagnostic = session.live_dvc_diagnostic_snapshot();
+        assert!(diagnostic.receipts.iter().any(|receipt| receipt.deadline_outcome == LiveDvcDeadlineOutcome::DeadlineExceeded),
+            "diagnostic must record the correlated deadline outcome: {diagnostic:?}");
+        assert_eq!(diagnostic.unmatched_late_replies, 0,
+            "a released late WindowList handler must not emit an unmatched late DVC envelope: {diagnostic:?}");
+        let final_ping = session
+            .ping()
+            .await
+            .expect("final Ping preserves the v1 DVC framing/session handshake");
+        assert!(
+            final_ping < std::time::Duration::from_millis(500),
+            "final Ping/Pong exceeded 500ms: {final_ping:?}"
+        );
+        eprintln!("live DVC blocked-handler proof: token_shape=32-lowerhex deadline=recorded ping_ms={} final_ping_ms={} process_tree=ok unmatched_late_replies={}",
+            ping.as_millis(), final_ping.as_millis(), diagnostic.unmatched_late_replies);
+        session.close().await.expect("close");
+        let _ = std::fs::remove_dir_all(local_dir);
+    });
 }
 
 /// A fresh per-call local scratch directory under the system temp dir for a
@@ -1858,12 +2120,17 @@ impl tracing::Subscriber for ChunkCapture {
     fn event(&self, event: &tracing::Event<'_>) {
         let mut visitor = ChunkVisitor::default();
         event.record(&mut visitor);
-        let Some(message) = &visitor.message else { return };
+        let Some(message) = &visitor.message else {
+            return;
+        };
         if message != "rdpdr_read_irp" && message != "rdpdr_write_irp" {
             return;
         }
         if let (Some(offset), Some(len)) = (visitor.offset, visitor.len) {
-            self.0.lock().expect("chunk capture mutex").push((offset, len, message.clone()));
+            self.0
+                .lock()
+                .expect("chunk capture mutex")
+                .push((offset, len, message.clone()));
         }
     }
 
@@ -2059,7 +2326,8 @@ fn large_file_transfers_chunked() {
             .expect("download_file(large) should round-trip successfully (FILE-04)");
         assert_eq!(download_outcome.bytes_transferred, LARGE_FILE_BYTES as u64);
 
-        let downloaded = std::fs::read(&dest_path).expect("downloaded large file should exist locally");
+        let downloaded =
+            std::fs::read(&dest_path).expect("downloaded large file should exist locally");
         assert_eq!(
             downloaded, content,
             "large-file round trip is byte-identical (FILE-04 correctness, the loop reassembled correctly)"
@@ -2073,8 +2341,14 @@ fn large_file_transfers_chunked() {
     // per-IRP offset/length progression instead of asserting an assumed
     // byte constant (10-RESEARCH Open Question 1).
     let events = capture.snapshot();
-    let reads: Vec<_> = events.iter().filter(|(_, _, msg)| msg == "rdpdr_read_irp").collect();
-    let writes: Vec<_> = events.iter().filter(|(_, _, msg)| msg == "rdpdr_write_irp").collect();
+    let reads: Vec<_> = events
+        .iter()
+        .filter(|(_, _, msg)| msg == "rdpdr_read_irp")
+        .collect();
+    let writes: Vec<_> = events
+        .iter()
+        .filter(|(_, _, msg)| msg == "rdpdr_write_irp")
+        .collect();
     eprintln!(
         "large_file_transfers_chunked: {} read IRPs (upload direction), {} write IRPs (download \
          direction) observed for a {LARGE_FILE_BYTES}-byte file",
@@ -2142,7 +2416,8 @@ fn interrupted_transfer_is_detectable() {
         let local_dir = scratch_dir("interrupted-transfer");
         let source_path = local_dir.join("interrupt-source.bin");
         let content = deterministic_bytes(INTERRUPTED_TRANSFER_FILE_BYTES);
-        std::fs::write(&source_path, &content).expect("write local fixture for interrupted-transfer setup");
+        std::fs::write(&source_path, &content)
+            .expect("write local fixture for interrupted-transfer setup");
 
         let remote_name = format!("rdpilot-live-interrupt-{}.bin", std::process::id());
         session
@@ -2162,7 +2437,11 @@ fn interrupted_transfer_is_detectable() {
         let download_fut = session.download_file(&remote_name, &dest_path);
         let wait_for_first_write = async {
             loop {
-                if capture.snapshot().iter().any(|(_, _, msg)| msg == "rdpdr_write_irp") {
+                if capture
+                    .snapshot()
+                    .iter()
+                    .any(|(_, _, msg)| msg == "rdpdr_write_irp")
+                {
                     return;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(5)).await;
@@ -2262,7 +2541,8 @@ fn traversal_rejected_live() {
 
         let local_dir = scratch_dir("traversal");
         let harmless_source = local_dir.join("harmless.bin");
-        std::fs::write(&harmless_source, b"not a real payload").expect("write harmless local fixture");
+        std::fs::write(&harmless_source, b"not a real payload")
+            .expect("write harmless local fixture");
         let harmless_dest = local_dir.join("harmless-download.bin");
 
         for adversarial in [MIXED_SEPARATOR_ESCAPE, WINDOWS_DRIVE_ABSOLUTE] {
@@ -2276,8 +2556,10 @@ fn traversal_rejected_live() {
                  SensorRejected)"
             );
 
-            let download_err =
-                session.download_file(adversarial, &harmless_dest).await.expect_err(&format!(
+            let download_err = session
+                .download_file(adversarial, &harmless_dest)
+                .await
+                .expect_err(&format!(
                     "download_file({adversarial:?}) must be rejected live, not silently accepted \
                      (FILE-03 BLOCKING)"
                 ));

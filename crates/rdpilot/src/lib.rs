@@ -29,8 +29,8 @@
 #![deny(clippy::unwrap_used)]
 #![deny(clippy::expect_used)]
 
-mod config;
 mod bootstrap;
+mod config;
 mod connect;
 mod error;
 mod framebuffer;
@@ -45,12 +45,16 @@ mod session;
 mod session_loop;
 mod worldstate;
 
-pub use config::ConnectionConfig;
 pub use bootstrap::BootstrapStage;
+pub use config::ConnectionConfig;
 pub use error::{Error, Result};
 pub use input::{Button, Key, KeyAction, MouseAction};
 pub use perception::{ProcessInfo, UiaElement, UiaScope, WindowInfo, WindowState};
 pub use screenshot::{Rect, Screenshot};
+#[cfg(feature = "live-dvc-diagnostics")]
+pub use sensor::{
+    LiveDvcDeadlineOutcome, LiveDvcDiagnosticSnapshot, LiveDvcReceipt, LiveDvcResponseType,
+};
 pub use session::{Session, TransferOutcome};
 pub use worldstate::{UiaMode, WorldState, WorldStateOptions};
 

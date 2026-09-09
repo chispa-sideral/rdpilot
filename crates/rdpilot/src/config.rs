@@ -67,6 +67,8 @@ pub struct ConnectionConfig {
     /// byte-for-byte. Owned `PathBuf` (D-09 — no third-party type in the
     /// public signature).
     share_root: Option<PathBuf>,
+    #[cfg(feature = "live-dvc-diagnostics")]
+    live_dvc_blocked_handler_token: Option<String>,
 }
 
 impl ConnectionConfig {
@@ -91,6 +93,8 @@ impl ConnectionConfig {
             accept_invalid_certs: false,
             sensor_binary_path: None,
             share_root: None,
+            #[cfg(feature = "live-dvc-diagnostics")]
+            live_dvc_blocked_handler_token: None,
         }
     }
 
@@ -138,6 +142,23 @@ impl ConnectionConfig {
     pub fn sensor_binary_path(mut self, path: impl Into<PathBuf>) -> Self {
         self.sensor_binary_path = Some(path.into());
         self
+    }
+
+    /// Select the sole diagnostic sensor command surface, with a capability
+    /// token rather than a caller-provided path or arbitrary arguments.
+    #[cfg(feature = "live-dvc-diagnostics")]
+    pub fn live_dvc_blocked_handler(mut self, token: &str) -> crate::Result<Self> {
+        if token.len() != 32
+            || !token
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Err(crate::Error::dvc(
+                "live DVC token must be 32 lowercase hexadecimal characters",
+            ));
+        }
+        self.live_dvc_blocked_handler_token = Some(token.to_owned());
+        Ok(self)
     }
 
     /// Set the local filesystem path of the share root the RDPDR drive
@@ -207,6 +228,11 @@ impl ConnectionConfig {
         self.sensor_binary_path.as_deref()
     }
 
+    #[cfg(feature = "live-dvc-diagnostics")]
+    pub(crate) fn get_live_dvc_blocked_handler_token(&self) -> Option<&str> {
+        self.live_dvc_blocked_handler_token.as_deref()
+    }
+
     /// Local filesystem path of the share root the RDPDR drive backend
     /// serves in addition to the sensor exe, if configured (D-10.1,
     /// FILE-01/FILE-02).
@@ -256,7 +282,8 @@ mod tests {
 
     #[test]
     fn sensor_binary_path_builder_and_getter_roundtrip() {
-        let cfg = ConnectionConfig::new("h", "u", "p").sensor_binary_path("/tmp/rdpilot-sensor.exe");
+        let cfg =
+            ConnectionConfig::new("h", "u", "p").sensor_binary_path("/tmp/rdpilot-sensor.exe");
         assert_eq!(
             cfg.get_sensor_binary_path(),
             Some(std::path::Path::new("/tmp/rdpilot-sensor.exe"))
@@ -266,7 +293,10 @@ mod tests {
     #[test]
     fn share_root_builder_and_getter_roundtrip() {
         let cfg = ConnectionConfig::new("h", "u", "p").share_root("/tmp/rdpilot-share");
-        assert_eq!(cfg.get_share_root(), Some(std::path::Path::new("/tmp/rdpilot-share")));
+        assert_eq!(
+            cfg.get_share_root(),
+            Some(std::path::Path::new("/tmp/rdpilot-share"))
+        );
     }
 
     #[test]

@@ -147,6 +147,65 @@ use ironrdp::dvc::{DvcEncode, DvcMessage, DvcProcessor};
 use ironrdp::pdu::PduResult;
 use tokio::sync::oneshot;
 
+/// Feature-gated, bounded evidence from the real-DVC blocked-handler proof.
+/// It is deliberately correlation-only: no payloads, hosts, credentials, or
+/// transport bytes are retained.
+#[cfg(feature = "live-dvc-diagnostics")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LiveDvcDiagnosticSnapshot {
+    pub receipts: Vec<LiveDvcReceipt>,
+    pub unmatched_late_replies: u64,
+}
+
+#[cfg(feature = "live-dvc-diagnostics")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LiveDvcReceipt {
+    pub req_id: u64,
+    pub response_type: LiveDvcResponseType,
+    pub deadline_outcome: LiveDvcDeadlineOutcome,
+}
+
+#[cfg(feature = "live-dvc-diagnostics")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LiveDvcResponseType {
+    Pong,
+    WindowList,
+    ProcessTree,
+    Other,
+}
+
+#[cfg(feature = "live-dvc-diagnostics")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LiveDvcDeadlineOutcome {
+    Responded,
+    DeadlineExceeded,
+}
+
+#[cfg(feature = "live-dvc-diagnostics")]
+#[derive(Debug, Default)]
+pub(crate) struct LiveDvcDiagnostics {
+    receipts: Vec<LiveDvcReceipt>,
+    unmatched_late_replies: u64,
+}
+
+#[cfg(feature = "live-dvc-diagnostics")]
+impl LiveDvcDiagnostics {
+    const MAX_RECEIPTS: usize = 32;
+
+    pub(crate) fn record(&mut self, receipt: LiveDvcReceipt) {
+        if self.receipts.len() < Self::MAX_RECEIPTS {
+            self.receipts.push(receipt);
+        }
+    }
+
+    pub(crate) fn snapshot(&self) -> LiveDvcDiagnosticSnapshot {
+        LiveDvcDiagnosticSnapshot {
+            receipts: self.receipts.clone(),
+            unmatched_late_replies: self.unmatched_late_replies,
+        }
+    }
+}
+
 /// An outbound envelope wrapped for the `ironrdp-dvc` wire (`Encode` +
 /// `DvcEncode`).
 ///
@@ -217,6 +276,10 @@ pub(crate) struct SensorShared {
     pub(crate) pending: Mutex<HashMap<u64, oneshot::Sender<serde_json::Value>>>,
     pub(crate) handshake: Mutex<HandshakeState>,
     pub(crate) bootstrap: BootstrapProgress,
+    #[cfg(feature = "live-dvc-diagnostics")]
+    pub(crate) live_dvc_diagnostics: Mutex<LiveDvcDiagnostics>,
+    #[cfg(feature = "live-dvc-diagnostics")]
+    pub(crate) live_dvc_token: Mutex<Option<String>>,
 }
 
 impl SensorShared {
@@ -227,6 +290,10 @@ impl SensorShared {
             pending: Mutex::new(HashMap::new()),
             handshake: Mutex::new(HandshakeState::Pending),
             bootstrap: BootstrapProgress::new(),
+            #[cfg(feature = "live-dvc-diagnostics")]
+            live_dvc_diagnostics: Mutex::new(LiveDvcDiagnostics::default()),
+            #[cfg(feature = "live-dvc-diagnostics")]
+            live_dvc_token: Mutex::new(None),
         }
     }
 }
@@ -301,7 +368,9 @@ impl DvcProcessor for RdpilotSensorProcessor {
         let msg = JsonDvcMessage::new(&envelope).map_err(|e| {
             ironrdp::pdu::pdu_other_err!("rdpilot-sensor: version envelope encode failed", source: e)
         })?;
-        self.shared.bootstrap.record(BootstrapStage::DvcChannelCreated);
+        self.shared
+            .bootstrap
+            .record(BootstrapStage::DvcChannelCreated);
         Ok(vec![Box::new(msg)])
     }
 
@@ -327,7 +396,9 @@ impl DvcProcessor for RdpilotSensorProcessor {
                         remote: envelope.version,
                     }
                 };
-                self.shared.bootstrap.record(BootstrapStage::VersionReceived);
+                self.shared
+                    .bootstrap
+                    .record(BootstrapStage::VersionReceived);
                 // The handshake is a terminal two-message exchange; no reply.
                 Ok(Vec::new())
             }
@@ -345,12 +416,42 @@ impl DvcProcessor for RdpilotSensorProcessor {
                     Err(poisoned) => poisoned.into_inner(),
                 };
                 if let Some(sender) = pending.remove(&envelope.req_id) {
+                    #[cfg(feature = "live-dvc-diagnostics")]
+                    {
+                        let response_type = match envelope.msg_type {
+                            MsgType::Pong => LiveDvcResponseType::Pong,
+                            MsgType::WindowList => LiveDvcResponseType::WindowList,
+                            MsgType::ProcessTree => LiveDvcResponseType::ProcessTree,
+                            _ => LiveDvcResponseType::Other,
+                        };
+                        let mut diagnostics = self
+                            .shared
+                            .live_dvc_diagnostics
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner());
+                        diagnostics.record(LiveDvcReceipt {
+                            req_id: envelope.req_id,
+                            response_type,
+                            deadline_outcome: LiveDvcDeadlineOutcome::Responded,
+                        });
+                    }
                     if envelope.msg_type == MsgType::Pong {
                         self.shared.bootstrap.record(BootstrapStage::PongReceived);
                     }
                     // Ignore the Result: the receiver may already be gone if
                     // a caller-side timeout fired first.
                     let _ = sender.send(envelope.payload.unwrap_or(serde_json::Value::Null));
+                } else {
+                    #[cfg(feature = "live-dvc-diagnostics")]
+                    {
+                        let mut diagnostics = self
+                            .shared
+                            .live_dvc_diagnostics
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner());
+                        diagnostics.unmatched_late_replies =
+                            diagnostics.unmatched_late_replies.saturating_add(1);
+                    }
                 }
                 Ok(Vec::new())
             }
@@ -387,7 +488,10 @@ mod processor_tests {
         assert_eq!(decoded.req_id, 0);
         assert_eq!(decoded.version, PROTOCOL_VERSION);
         assert_eq!(decoded.msg_type, MsgType::Version);
-        assert_eq!(shared.bootstrap.snapshot(), vec![BootstrapStage::DvcChannelCreated]);
+        assert_eq!(
+            shared.bootstrap.snapshot(),
+            vec![BootstrapStage::DvcChannelCreated]
+        );
     }
 
     /// `channel_name()` returns the same reserved constant `connect.rs` uses
@@ -416,14 +520,20 @@ mod processor_tests {
         let out = processor
             .process(0, &encode_envelope(&reply))
             .expect("process() succeeds");
-        assert!(out.is_empty(), "handshake reply produces no outbound message");
+        assert!(
+            out.is_empty(),
+            "handshake reply produces no outbound message"
+        );
 
         let handshake = match shared.handshake.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
         assert!(matches!(*handshake, HandshakeState::Ok));
-        assert_eq!(shared.bootstrap.snapshot(), vec![BootstrapStage::VersionReceived]);
+        assert_eq!(
+            shared.bootstrap.snapshot(),
+            vec![BootstrapStage::VersionReceived]
+        );
     }
 
     /// A mismatched-version `Version` reply sets `HandshakeState::Mismatched`
@@ -493,8 +603,14 @@ mod processor_tests {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
-        assert!(!pending.contains_key(&7), "entry must be removed after fulfilling");
-        assert_eq!(shared.bootstrap.snapshot(), vec![BootstrapStage::PongReceived]);
+        assert!(
+            !pending.contains_key(&7),
+            "entry must be removed after fulfilling"
+        );
+        assert_eq!(
+            shared.bootstrap.snapshot(),
+            vec![BootstrapStage::PongReceived]
+        );
     }
 
     /// A `Version` reply (req_id 0) still drives the handshake state machine
@@ -576,7 +692,10 @@ mod processor_tests {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
-        assert!(!pending.contains_key(&42), "entry must be removed after fulfilling");
+        assert!(
+            !pending.contains_key(&42),
+            "entry must be removed after fulfilling"
+        );
     }
 
     /// A reply whose `req_id` is NOT in the pending map is dropped
@@ -610,7 +729,10 @@ mod processor_tests {
             Err(poisoned) => poisoned.into_inner(),
         };
         assert_eq!(pending.len(), 1, "map must be unchanged");
-        assert!(pending.contains_key(&1), "the unrelated pending entry must survive untouched");
+        assert!(
+            pending.contains_key(&1),
+            "the unrelated pending entry must survive untouched"
+        );
     }
 
     /// Malformed/truncated inbound bytes are dropped (`Ok(empty)`), never a
@@ -618,7 +740,9 @@ mod processor_tests {
     #[test]
     fn malformed_payload_is_dropped_without_panic() {
         let (mut processor, _shared) = fresh_processor();
-        let out = processor.process(0, b"{not valid json").expect("never returns Err, never panics");
+        let out = processor
+            .process(0, b"{not valid json")
+            .expect("never returns Err, never panics");
         assert!(out.is_empty());
     }
 }

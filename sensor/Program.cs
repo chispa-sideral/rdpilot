@@ -20,7 +20,9 @@
 //     Rust processor's drop-never-panic discipline (T-05-01, ASVS V5).
 
 using System.Runtime.InteropServices;
+using System.Diagnostics;
 using System.Text.Json;
+using System.Collections.Concurrent;
 
 namespace RdpilotSensor;
 
@@ -32,7 +34,7 @@ internal static class Program
 
     private const int OpenRetries = 20;
     private const int OpenRetryDelayMs = 500;
-    private const uint ReadTimeoutMs = 5000;
+    private const uint ReadTimeoutMs = 50;
     private const int ReadBufferSize = 8192;
 
     /// Argument that selects the AOT source-gen risk-gate smoke test
@@ -56,8 +58,24 @@ internal static class Program
     /// no NativeAOT publish), see <see cref="RunFileTraversalSelfTest"/>.
     private const string FileTraversalSelfTestArg = "--file-traversal-selftest";
 
+    private const string DispatchSelfTestArg = "--dispatch-selftest";
+    private const string DispatchSelfTestUiaArg = "--dispatch-selftest-uia";
+    /// Default-off, fixed-root diagnostic used only by the ignored real-DVC
+    /// adversarial proof. It accepts a capability token, never a path.
+    private const string LiveDvcBlockedHandlerArg = "--live-dvc-blocked-handler";
+
     private static int Main(string[] args)
     {
+        LiveDvcBlockedHandler? liveBlockedHandler = null;
+        if (args.Length > 0 && args[0] == LiveDvcBlockedHandlerArg)
+        {
+            if (args.Length != 2 || !LiveDvcBlockedHandler.TryCreate(args[1], out liveBlockedHandler))
+            {
+                Console.Error.WriteLine("[live-dvc-blocked-handler] FAIL: expected one 32-character lowercase hexadecimal token");
+                return 2;
+            }
+        }
+
         if (args.Length > 0 && args[0] == SmokeTestArg)
         {
             return RunAotSmokeTest();
@@ -73,6 +91,16 @@ internal static class Program
             return RunFileTraversalSelfTest();
         }
 
+        if (args.Length > 0 && args[0] == DispatchSelfTestArg)
+        {
+            return RunDispatchSelfTest();
+        }
+
+        if (args.Length > 0 && args[0] == DispatchSelfTestUiaArg)
+        {
+            return RunDispatchSelfTestUia();
+        }
+
         nint handle = OpenChannelWithRetry();
         if (handle == 0)
         {
@@ -80,16 +108,17 @@ internal static class Program
             return 1;
         }
 
+        int exitCode = 1;
         try
         {
-            RunHandshakeAndPingPongLoop(handle);
+            exitCode = RunSensorLoop(new WtsEnvelopeReader(handle), new WtsEnvelopeWriter(handle), liveBlockedHandler) ? 0 : 1;
         }
         finally
         {
             Wts.WTSVirtualChannelClose(handle);
         }
 
-        return 0;
+        return exitCode;
     }
 
     /// The single highest-risk unknown of Phase 6 (RESEARCH A1 / Pitfall 1 /
@@ -391,82 +420,42 @@ internal static class Program
         return handle;
     }
 
-    /// Read the SDK's Version handshake (always the FIRST message on the
-    /// wire — RdpilotSensorProcessor::start() fires unconditionally the
-    /// instant the channel is created), echo this sensor's own version back
-    /// in the identical envelope shape, then loop answering every Ping with
-    /// a same-req_id Pong until the channel closes.
-    private static void RunHandshakeAndPingPongLoop(nint handle)
+    private static bool RunSensorLoop(IEnvelopeReader reader, IEnvelopeWriter writer, LiveDvcBlockedHandler? liveBlockedHandler = null)
     {
-        Envelope? version = null;
-        while (version is null)
-        {
-            Envelope? candidate = ReadEnvelope(handle);
-            if (candidate is { Type: MsgType.Version })
-            {
-                version = candidate;
-            }
-            // Anything read before the handshake (malformed bytes, or a
-            // non-Version message) is dropped and we keep waiting — the
-            // protocol guarantees Version is first, but never trust the
-            // wire over that guarantee (T-05-01).
-        }
-
-        WriteEnvelope(handle, new Envelope
-        {
-            Version = ProtocolVersion.Value,
-            ReqId = 0,
-            Type = MsgType.Version,
-            Payload = null,
-        });
-
-        while (true)
-        {
-            Envelope? msg = ReadEnvelope(handle);
-            if (msg is null)
-            {
-                continue;
-            }
-
-            if (msg.Type == MsgType.Ping)
-            {
-                WriteEnvelope(handle, new Envelope
-                {
-                    Version = ProtocolVersion.Value,
-                    ReqId = msg.ReqId,
-                    Type = MsgType.Pong,
-                    Payload = null,
-                });
-            }
-            else if (msg.Type == MsgType.WindowList)
-            {
-                WriteEnvelope(handle, BuildWindowListReplyEnvelope(msg.ReqId));
-            }
-            else if (msg.Type == MsgType.ProcessTree)
-            {
-                WriteEnvelope(handle, BuildProcessTreeReplyEnvelope(msg.ReqId));
-            }
-            else if (msg.Type == MsgType.SetForegroundWindow)
-            {
-                WriteEnvelope(handle, BuildSetForegroundWindowReplyEnvelope(msg.ReqId, msg.Payload));
-            }
-            else if (msg.Type == MsgType.LaunchProcess)
-            {
-                WriteEnvelope(handle, BuildLaunchProcessReplyEnvelope(msg.ReqId, msg.Payload));
-            }
-            else if (msg.Type == MsgType.Uia)
-            {
-                WriteEnvelope(handle, BuildUiaTreeReplyEnvelope(msg.ReqId, msg.Payload));
-            }
-            else if (msg.Type == MsgType.FileTransfer)
-            {
-                WriteEnvelope(handle, BuildFileTransferReplyEnvelope(msg.ReqId, msg.Payload));
-            }
-            // Any other message type this v1 protocol doesn't define is
-            // silently ignored — never crashes the loop (T-05-01, mirrors
-            // the Rust processor's own unknown-type handling).
-        }
+        RequestDispatcher dispatcher = new(message => BuildReplyEnvelope(message, liveBlockedHandler), BuildFailureReplyEnvelope);
+        return new SensorOwnerLoop(reader, writer, dispatcher, IsSupportedRequest).Run();
     }
+
+    private static bool IsSupportedRequest(Envelope message) => message.Type is
+        MsgType.WindowList or MsgType.ProcessTree or MsgType.SetForegroundWindow or
+        MsgType.LaunchProcess or MsgType.Uia or MsgType.FileTransfer;
+
+    private static Envelope BuildReplyEnvelope(Envelope message, LiveDvcBlockedHandler? liveBlockedHandler = null) => message.Type switch
+    {
+        MsgType.WindowList => BuildWindowListReplyEnvelope(message.ReqId, liveBlockedHandler),
+        MsgType.ProcessTree => BuildProcessTreeReplyEnvelope(message.ReqId),
+        MsgType.SetForegroundWindow => BuildSetForegroundWindowReplyEnvelope(message.ReqId, message.Payload),
+        MsgType.LaunchProcess => BuildLaunchProcessReplyEnvelope(message.ReqId, message.Payload),
+        MsgType.Uia => BuildUiaTreeReplyEnvelope(message.ReqId, message.Payload),
+        MsgType.FileTransfer => BuildFileTransferReplyEnvelope(message.ReqId, message.Payload),
+        _ => throw new InvalidOperationException($"unsupported request type {message.Type}"),
+    };
+
+    /// Builds the normal, already source-generated response shape for every
+    /// request type. This lets timeout/overload retain wire compatibility.
+    private static Envelope BuildFailureReplyEnvelope(Envelope message, string error) => message.Type switch
+    {
+        MsgType.WindowList => EnvelopeWith(message, new WindowListResponse { Success = false, Data = null, Error = error }, EnvelopeJsonContext.Default.WindowListResponse),
+        MsgType.ProcessTree => EnvelopeWith(message, new ProcessTreeResponse { Success = false, Data = null, Error = error }, EnvelopeJsonContext.Default.ProcessTreeResponse),
+        MsgType.SetForegroundWindow => EnvelopeWith(message, new SetForegroundWindowResponse { Success = false, Data = null, Error = error }, EnvelopeJsonContext.Default.SetForegroundWindowResponse),
+        MsgType.LaunchProcess => EnvelopeWith(message, new LaunchProcessResponse { Success = false, Data = null, Error = error }, EnvelopeJsonContext.Default.LaunchProcessResponse),
+        MsgType.Uia => EnvelopeWith(message, new UiaTreeResponse { Success = false, Data = null, Error = error }, EnvelopeJsonContext.Default.UiaTreeResponse),
+        MsgType.FileTransfer => EnvelopeWith(message, new FileTransferResponse { Success = false, Data = null, Error = error, ErrorKind = "io" }, EnvelopeJsonContext.Default.FileTransferResponse),
+        _ => throw new InvalidOperationException($"unsupported request type {message.Type}"),
+    };
+
+    private static Envelope EnvelopeWith<T>(Envelope request, T response, System.Text.Json.Serialization.Metadata.JsonTypeInfo<T> typeInfo)
+        => new() { Version = ProtocolVersion.Value, ReqId = request.ReqId, Type = request.Type, Payload = JsonSerializer.SerializeToElement(response, typeInfo) };
 
     /// Build the WindowList reply envelope (T-06-01 / D-6.4): enumerates
     /// top-level windows via <see cref="WindowEnumeration.BuildWindowListResponse"/>
@@ -475,11 +464,12 @@ internal static class Program
     /// instead of throwing out of the dispatch loop (mirrors the
     /// ReadEnvelope/T-05-01 drop-never-crash discipline for the response
     /// side too).
-    private static Envelope BuildWindowListReplyEnvelope(ulong reqId)
+    private static Envelope BuildWindowListReplyEnvelope(ulong reqId, LiveDvcBlockedHandler? liveBlockedHandler = null)
     {
         WindowListResponse response;
         try
         {
+            liveBlockedHandler?.WaitForRelease();
             response = WindowEnumeration.BuildWindowListResponse();
         }
         catch (Exception ex)
@@ -668,44 +658,202 @@ internal static class Program
         };
     }
 
-    /// Read one WTS message, strip the leading binary DVC framing prefix by
-    /// scanning forward for the first '{' byte (D-5.7 constraint #3 — do NOT
-    /// assume the JSON body starts at offset 0), then parse it via the
-    /// AOT-safe source-generated context. Malformed/truncated JSON, or a
-    /// read with no '{' at all, is dropped (returns null) — never throws out
-    /// of this method (T-05-01, ASVS V5).
-    private static Envelope? ReadEnvelope(nint handle)
+    private sealed class WtsEnvelopeReader(nint handle) : IEnvelopeReader
     {
-        byte[] buf = new byte[ReadBufferSize];
-        bool ok = Wts.WTSVirtualChannelRead(handle, ReadTimeoutMs, buf, (uint)buf.Length, out uint bytesRead);
-        if (!ok || bytesRead == 0)
+        public EnvelopeReadResult Read(uint timeoutMs)
         {
-            return null;
-        }
-
-        int jsonStart = Array.IndexOf(buf, (byte)'{', 0, (int)bytesRead);
-        if (jsonStart < 0)
-        {
-            Console.Error.WriteLine($"[rdpilot-sensor] dropped malformed envelope: no '{{' found in {bytesRead} byte(s)");
-            return null;
-        }
-
-        ReadOnlySpan<byte> jsonSlice = buf.AsSpan(jsonStart, (int)bytesRead - jsonStart);
-        try
-        {
-            return JsonSerializer.Deserialize(jsonSlice, EnvelopeJsonContext.Default.Envelope);
-        }
-        catch (JsonException ex)
-        {
-            Console.Error.WriteLine($"[rdpilot-sensor] dropped malformed envelope: {ex.Message}");
-            return null;
+            byte[] buf = new byte[ReadBufferSize];
+            if (!Wts.WTSVirtualChannelRead(handle, timeoutMs, buf, (uint)buf.Length, out uint bytesRead))
+            {
+                int error = Marshal.GetLastPInvokeError();
+                return error == 0 || error == 1460
+                    ? new(EnvelopeReadKind.Timeout)
+                    : new(EnvelopeReadKind.Terminal, Error: error);
+            }
+            if (bytesRead == 0) return new(EnvelopeReadKind.Timeout);
+            int jsonStart = Array.IndexOf(buf, (byte)'{', 0, (int)bytesRead);
+            if (jsonStart < 0)
+            {
+                Console.Error.WriteLine($"[rdpilot-sensor] dropped malformed envelope: no '{{' found in {bytesRead} byte(s)");
+                return new(EnvelopeReadKind.Drop);
+            }
+            try
+            {
+                Envelope? envelope = JsonSerializer.Deserialize(buf.AsSpan(jsonStart, (int)bytesRead - jsonStart), EnvelopeJsonContext.Default.Envelope);
+                return envelope is null ? new(EnvelopeReadKind.Drop) : new(EnvelopeReadKind.Envelope, envelope);
+            }
+            catch (JsonException ex)
+            {
+                Console.Error.WriteLine($"[rdpilot-sensor] dropped malformed envelope: {ex.Message}");
+                return new(EnvelopeReadKind.Drop);
+            }
         }
     }
 
-    private static void WriteEnvelope(nint handle, Envelope envelope)
+    private sealed class WtsEnvelopeWriter(nint handle) : IEnvelopeWriter
     {
-        byte[] bytes = JsonSerializer.SerializeToUtf8Bytes(envelope, EnvelopeJsonContext.Default.Envelope);
-        Wts.WTSVirtualChannelWrite(handle, bytes, (uint)bytes.Length, out _);
+        public bool Write(Envelope envelope, out int error)
+        {
+            byte[] bytes = JsonSerializer.SerializeToUtf8Bytes(envelope, EnvelopeJsonContext.Default.Envelope);
+            bool ok = Wts.WTSVirtualChannelWrite(handle, bytes, (uint)bytes.Length, out _);
+            error = ok ? 0 : Marshal.GetLastPInvokeError();
+            return ok;
+        }
+    }
+
+    private static int RunDispatchSelfTest()
+    {
+        using ManualResetEventSlim releaseBlocked = new(false);
+        List<Envelope> written = [];
+        int ownerThread = 0;
+        Queue<EnvelopeReadResult> input = new([
+            new(EnvelopeReadKind.Envelope, new Envelope { Version = ProtocolVersion.Value, ReqId = 0, Type = MsgType.Version }),
+            new(EnvelopeReadKind.Envelope, new Envelope { Version = ProtocolVersion.Value, ReqId = 41, Type = MsgType.WindowList }),
+            new(EnvelopeReadKind.Envelope, new Envelope { Version = ProtocolVersion.Value, ReqId = 42, Type = MsgType.Ping }),
+            new(EnvelopeReadKind.Envelope, new Envelope { Version = ProtocolVersion.Value, ReqId = 43, Type = MsgType.ProcessTree }),
+        ]);
+        int timeoutCount = 0;
+        IEnvelopeReader reader = new SelfTestReader(input, () => ++timeoutCount > 180 ? new(EnvelopeReadKind.Terminal, Error: 995) : new(EnvelopeReadKind.Timeout));
+        Stopwatch pingTimer = Stopwatch.StartNew();
+        IEnvelopeWriter writer = new SelfTestWriter(written, () => ownerThread, pingTimer);
+        RequestDispatcher dispatcher = new(message =>
+        {
+            if (message.ReqId == 41) releaseBlocked.Wait();
+            return BuildFailureReplyEnvelope(message, "selftest handler completed");
+        }, BuildFailureReplyEnvelope, workerCount: 2, queueCapacity: 2);
+        SensorOwnerLoop loop = new(reader, writer, dispatcher, IsSupportedRequest);
+        Thread owner = new(() => { ownerThread = Environment.CurrentManagedThreadId; loop.Run(); }) { IsBackground = true };
+        owner.Start();
+        owner.Join(3000);
+        bool pingFast = ((SelfTestWriter)writer).PongLatencyMs is long latency && latency < 500;
+        bool deadlineOnce = written.Count(e => e.ReqId == 41) == 1 && written.Any(e => e.ReqId == 41 && e.Type == MsgType.WindowList);
+        bool unrelated = written.Count(e => e.ReqId == 43 && e.Type == MsgType.ProcessTree) == 1;
+        releaseBlocked.Set();
+        Thread.Sleep(50);
+        bool noLateDuplicate = written.Count(e => e.ReqId == 41) == 1;
+        bool ownerOnly = ((SelfTestWriter)writer).OwnerOnly;
+        Queue<EnvelopeReadResult> terminalInput = new([new(EnvelopeReadKind.Envelope, new Envelope { Version = ProtocolVersion.Value, ReqId = 0, Type = MsgType.Version })]);
+        RequestDispatcher terminalDispatcher = new(message => BuildReplyEnvelope(message), BuildFailureReplyEnvelope);
+        bool terminalWriterStops = !new SensorOwnerLoop(
+            new SelfTestReader(terminalInput, () => new(EnvelopeReadKind.Timeout)),
+            new SelfTestWriter([], () => Environment.CurrentManagedThreadId, pingTimer, failWrites: true),
+            terminalDispatcher, IsSupportedRequest).Run();
+        bool passed = !owner.IsAlive && pingFast && deadlineOnce && unrelated && noLateDuplicate && ownerOnly && terminalWriterStops;
+        Console.WriteLine($"[dispatch-selftest] {(passed ? "PASS" : "FAIL")}: deadlineOnce={deadlineOnce} pingFast={pingFast} unrelated={unrelated} noLateDuplicate={noLateDuplicate} ownerOnly={ownerOnly} terminalWriterStops={terminalWriterStops}");
+        return passed ? 0 : 1;
+    }
+
+    /// Windows-only integration gate for the actual UIA request handler. It
+    /// intentionally uses the normal dispatcher and owner-loop seams, rather
+    /// than the direct UIA smoke-test path, so the captured reply proves the
+    /// worker/owner handoff and correlation contract.
+    private static int RunDispatchSelfTestUia()
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            Console.Error.WriteLine("[dispatch-selftest-uia] FAIL: Windows is required for dispatcher-worker UIA evidence");
+            return 1;
+        }
+
+        ulong reqId = (ulong)Random.Shared.NextInt64(1, long.MaxValue);
+        JsonElement requestPayload = JsonSerializer.SerializeToElement(
+            new UiaTreeRequest { Hwnd = (ulong)User32Interop.GetDesktopWindow(), MaxDepth = 0 },
+            EnvelopeJsonContext.Default.UiaTreeRequest);
+        Envelope request = new()
+        {
+            Version = ProtocolVersion.Value,
+            ReqId = reqId,
+            Type = MsgType.Uia,
+            Payload = requestPayload,
+        };
+
+        ConcurrentQueue<WorkerStartupEvidence> workerStarts = new();
+        UiaSelfTestTransport transport = new(request);
+        RequestDispatcher dispatcher = new(
+            message => BuildReplyEnvelope(message),
+            BuildFailureReplyEnvelope,
+            workerCount: 1,
+            queueCapacity: 1,
+            workerStartupObserver: workerStarts.Enqueue);
+        SensorOwnerLoop loop = new(transport, transport, dispatcher, IsSupportedRequest);
+        Thread owner = new(() => { loop.Run(); }) { IsBackground = true, Name = "rdpilot-sensor-uia-selftest-owner" };
+        owner.Start();
+
+        bool replyWritten = transport.WaitForUiaReply(TimeSpan.FromSeconds(5));
+        owner.Join(1000);
+        dispatcher.StopAccepting();
+
+        WorkerStartupEvidence? startup = workerStarts.TryDequeue(out WorkerStartupEvidence? captured) ? captured : null;
+        Envelope[] replies = transport.Written;
+        Envelope[] uiaReplies = replies.Where(reply => reply.Type == MsgType.Uia).ToArray();
+        UiaTreeResponse? response = uiaReplies.Length == 1
+            ? uiaReplies[0].Payload?.Deserialize(EnvelopeJsonContext.Default.UiaTreeResponse)
+            : null;
+        bool correlated = uiaReplies.Length == 1 && uiaReplies[0].ReqId == reqId;
+        bool validResponse = response is not null;
+        bool workerMtaCom = startup is { ApartmentState: ApartmentState.MTA, ComInitializationSucceeded: true };
+        bool passed = replyWritten && !owner.IsAlive && correlated && validResponse && workerMtaCom;
+
+        string success = response is null ? "<malformed>" : response.Success.ToString().ToLowerInvariant();
+        Console.WriteLine(
+            $"[dispatch-selftest-uia] {(passed ? "PASS" : "FAIL")}: requestId={reqId} " +
+            $"replyId={(uiaReplies.Length == 1 ? uiaReplies[0].ReqId : 0)} responseSuccess={success} " +
+            $"workerName={startup?.ThreadName ?? "<missing>"} workerManagedId={startup?.ManagedThreadId} " +
+            $"apartment={startup?.ApartmentState} coInitializeEx=0x{startup?.CoInitializeExHResult:X8} " +
+            $"comInitialized={startup?.ComInitializationSucceeded} ownerWrites={replies.Length}");
+        return passed ? 0 : 1;
+    }
+
+    private sealed class SelfTestReader(Queue<EnvelopeReadResult> input, Func<EnvelopeReadResult> after) : IEnvelopeReader
+    {
+        public EnvelopeReadResult Read(uint _) { if (input.TryDequeue(out EnvelopeReadResult result)) return result; Thread.Sleep(10); return after(); }
+    }
+
+    private sealed class UiaSelfTestTransport(Envelope request) : IEnvelopeReader, IEnvelopeWriter
+    {
+        private readonly Queue<EnvelopeReadResult> _input = new([
+            new(EnvelopeReadKind.Envelope, new Envelope { Version = ProtocolVersion.Value, ReqId = 0, Type = MsgType.Version }),
+            new(EnvelopeReadKind.Envelope, request),
+        ]);
+        private readonly List<Envelope> _written = [];
+        private readonly ManualResetEventSlim _uiaReplyWritten = new(false);
+
+        internal Envelope[] Written { get { lock (_written) return _written.ToArray(); } }
+
+        public EnvelopeReadResult Read(uint _)
+        {
+            lock (_input)
+            {
+                if (_input.TryDequeue(out EnvelopeReadResult message)) return message;
+            }
+            if (_uiaReplyWritten.Wait(25)) return new(EnvelopeReadKind.Terminal, Error: 995);
+            return new(EnvelopeReadKind.Timeout);
+        }
+
+        public bool Write(Envelope envelope, out int error)
+        {
+            lock (_written) _written.Add(envelope);
+            if (envelope.Type == MsgType.Uia && envelope.ReqId == request.ReqId) _uiaReplyWritten.Set();
+            error = 0;
+            return true;
+        }
+
+        internal bool WaitForUiaReply(TimeSpan timeout) => _uiaReplyWritten.Wait(timeout);
+    }
+
+    private sealed class SelfTestWriter(List<Envelope> written, Func<int> ownerThread, Stopwatch pingTimer, bool failWrites = false) : IEnvelopeWriter
+    {
+        internal bool OwnerOnly { get; private set; } = true;
+        internal long? PongLatencyMs { get; private set; }
+        public bool Write(Envelope envelope, out int error)
+        {
+            OwnerOnly &= ownerThread() == Environment.CurrentManagedThreadId;
+            if (failWrites) { error = 123; return false; }
+            if (envelope is { Type: MsgType.Pong, ReqId: 42 }) PongLatencyMs = pingTimer.ElapsedMilliseconds;
+            lock (written) written.Add(envelope);
+            error = 0;
+            return true;
+        }
     }
 }
 
