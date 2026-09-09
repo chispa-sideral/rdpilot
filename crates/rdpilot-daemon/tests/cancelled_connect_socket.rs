@@ -119,7 +119,7 @@ async fn early_close_leaves_no_live_or_reconciliation_record_after_restart() {
     let mut observer = connect(&path).await;
     write_frame(&mut observer, &Request::List {}).await;
     assert!(
-        matches!(read_frame(&mut observer).await, WireResponse::SessionList { ref sessions } if sessions.is_empty())
+        matches!(read_frame(&mut observer).await, WireResponse::SessionList { ref sessions, .. } if sessions.is_empty())
     );
     assert!(rdpilot_daemon::scan_orphans(&root.join("sessions.json")).is_empty());
     drop(observer);
@@ -129,7 +129,7 @@ async fn early_close_leaves_no_live_or_reconciliation_record_after_restart() {
     let mut observer = connect(&path).await;
     write_frame(&mut observer, &Request::List {}).await;
     assert!(
-        matches!(read_frame(&mut observer).await, WireResponse::SessionList { ref sessions } if sessions.is_empty())
+        matches!(read_frame(&mut observer).await, WireResponse::SessionList { ref sessions, .. } if sessions.is_empty())
     );
     drop(observer);
     stop(&mut restarted);
@@ -166,7 +166,7 @@ async fn post_write_cancellation_preserves_an_independent_live_control_session()
     write_frame(&mut observer, &Request::List {}).await;
     assert!(matches!(
         read_frame(&mut observer).await,
-        WireResponse::SessionList { ref sessions }
+        WireResponse::SessionList { ref sessions, .. }
             if sessions.len() == 1
                 && sessions[0].id == control_id.as_str()
                 && sessions[0].status == SessionLifecycle::Live

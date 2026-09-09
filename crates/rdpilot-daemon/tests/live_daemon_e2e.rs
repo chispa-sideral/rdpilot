@@ -160,7 +160,7 @@ async fn read_connect_response_with_deadline(stream: &mut UnixStream, owned_name
                 .expect("bounded List response after Connect timeout")
                 .expect("read List response after Connect timeout");
             let owned = match listed {
-                WireResponse::SessionList { sessions } => sessions
+                WireResponse::SessionList { sessions, .. } => sessions
                     .into_iter()
                     .find(|session| session.id == owned_name)
                     .map(|session| session.id.parse().expect("daemon returned a valid owned session id")),
@@ -326,7 +326,7 @@ async fn connect_list_disconnect_e2e_against_a_real_target() {
     // --- List -> exactly one Live session with the right host/name ---
     write_frame(&mut stream, &Request::List {}).await.expect("write List frame");
     match read_frame::<WireResponse>(&mut stream).await.expect("read List response") {
-        WireResponse::SessionList { sessions } => {
+        WireResponse::SessionList { sessions, .. } => {
             assert_eq!(sessions.len(), 1, "[FAIL] {name}: exactly one session should be listed after Connect");
             let s = &sessions[0];
             assert_eq!(s.id, session.as_str());
@@ -431,7 +431,7 @@ async fn kill_minus_9_mid_session_then_restart_surfaces_the_orphan_which_is_then
     // surface the orphan, never silently forget it. ---
     write_frame(&mut stream_b, &Request::List {}).await.expect("write List frame");
     match read_frame::<WireResponse>(&mut stream_b).await.expect("read List response") {
-        WireResponse::SessionList { sessions } => {
+        WireResponse::SessionList { sessions, .. } => {
             assert!(!sessions.is_empty(), "[FAIL] {name}: the orphan must be surfaced after restart, never silently forgotten (DAEMON-04)");
             assert_eq!(sessions.len(), 1);
             let s = &sessions[0];
@@ -457,7 +457,7 @@ async fn kill_minus_9_mid_session_then_restart_surfaces_the_orphan_which_is_then
 
     write_frame(&mut stream_b, &Request::List {}).await.expect("write List frame");
     match read_frame::<WireResponse>(&mut stream_b).await.expect("read final List response") {
-        WireResponse::SessionList { sessions } => {
+        WireResponse::SessionList { sessions, .. } => {
             assert!(sessions.is_empty(), "[FAIL] {name}: the orphan must no longer be listed once explicitly reconciled");
             println!("[PASS] {name}: the orphan no longer appears in list after explicit reconciliation");
         }

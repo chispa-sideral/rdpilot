@@ -98,6 +98,10 @@ pub enum WireResponse {
     SessionList {
         /// The current sessions known to the daemon.
         sessions: Vec<SessionStatus>,
+        /// The daemon's IPC compatibility identity. Missing values decode as
+        /// `None` so current clients can identify legacy daemons.
+        #[serde(default)]
+        compatibility_version: Option<u32>,
     },
     /// The top-level window list (`WindowList`).
     WindowList {
@@ -207,6 +211,7 @@ mod tests {
                     connected_since: None,
                     last_activity: None,
                 }],
+                compatibility_version: Some(crate::IPC_COMPATIBILITY_VERSION),
             },
             WireResponse::WindowList {
                 windows: vec![WireWindowInfo {
@@ -309,6 +314,13 @@ mod tests {
             let json = serde_json::to_string(&response)?;
             let _: WireResponse = serde_json::from_str(&json)?;
         }
+        Ok(())
+    }
+
+    #[test]
+    fn session_list_without_compatibility_version_decodes_as_legacy() -> Result<(), Box<dyn std::error::Error>> {
+        let response: WireResponse = serde_json::from_str(r#"{"SessionList":{"sessions":[]}}"#)?;
+        assert!(matches!(response, WireResponse::SessionList { compatibility_version: None, .. }));
         Ok(())
     }
 

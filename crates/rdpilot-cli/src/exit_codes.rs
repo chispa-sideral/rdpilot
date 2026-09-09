@@ -4,7 +4,7 @@
 use std::fmt;
 use std::process::ExitCode;
 
-use rdpilot_ipc::{WireError, WireErrorCode};
+use rdpilot_ipc::{WireError, WireErrorCode, daemon_incompatible_message};
 
 /// The client-side error type every verb handler returns. Wraps either a
 /// typed daemon-side [`WireError`] (D-28) or a client-local failure class
@@ -18,6 +18,9 @@ pub enum CliError {
     /// is never actually wire-transmitted by the daemon (research CLI-03
     /// taxonomy).
     DaemonUnreachable(String),
+    /// The daemon completed the harmless List probe but reported a legacy or
+    /// incompatible wire identity. Raised before credentials or operations.
+    DaemonIncompatible(Option<u32>),
     /// A destination file already exists and `--force` was not supplied
     /// (CLI-local class; the check itself is wired in Plan 13-07).
     #[allow(dead_code)] // Declared now (D-28's full 8-code taxonomy), constructed by Plan 13-07's `put`/`get` --force check.
@@ -39,6 +42,7 @@ impl fmt::Display for CliError {
         match self {
             CliError::Wire(err) => write!(f, "{err}"),
             CliError::DaemonUnreachable(msg) => write!(f, "daemon unreachable: {msg}"),
+            CliError::DaemonIncompatible(observed) => write!(f, "{}", daemon_incompatible_message(*observed)),
             CliError::NoClobber(msg) => write!(f, "destination already exists (use --force to overwrite): {msg}"),
             CliError::MissingConfig(msg) => write!(f, "missing required configuration: {msg}"),
             CliError::Internal(msg) => write!(f, "unexpected daemon response: {msg}"),
@@ -74,6 +78,7 @@ fn code_for(err: &CliError) -> u8 {
             _ => 1,
         },
         CliError::DaemonUnreachable(_) => 3,
+        CliError::DaemonIncompatible(_) => 12,
         CliError::NoClobber(_) => 8,
         CliError::MissingConfig(_) | CliError::Internal(_) | CliError::Transport(_) => 1,
     }
@@ -102,6 +107,7 @@ pub fn code_str_for(err: &CliError) -> String {
             .map(|s| s.trim_matches('"').to_owned())
             .unwrap_or_else(|| "internal".to_owned()),
         CliError::DaemonUnreachable(_) => "daemon-unreachable".to_owned(),
+        CliError::DaemonIncompatible(_) => "daemon-incompatible".to_owned(),
         CliError::NoClobber(_) => "no-clobber".to_owned(),
         CliError::MissingConfig(_) => "missing-config".to_owned(),
         CliError::Internal(_) => "internal".to_owned(),
@@ -153,6 +159,7 @@ mod tests {
     #[test]
     fn distinct_codes_for_client_local_classes() {
         assert_eq!(code_for(&CliError::DaemonUnreachable("x".to_owned())), 3);
+        assert_eq!(code_for(&CliError::DaemonIncompatible(None)), 12);
         assert_eq!(code_for(&CliError::NoClobber("x".to_owned())), 8);
         assert_eq!(code_for(&CliError::MissingConfig("x".to_owned())), 1);
         assert_eq!(code_for(&CliError::Internal("x".to_owned())), 1);
@@ -181,6 +188,7 @@ mod tests {
     #[test]
     fn code_str_for_client_local_classes_is_distinct_and_stable() {
         assert_eq!(code_str_for(&CliError::DaemonUnreachable("x".to_owned())), "daemon-unreachable");
+        assert_eq!(code_str_for(&CliError::DaemonIncompatible(None)), "daemon-incompatible");
         assert_eq!(code_str_for(&CliError::NoClobber("x".to_owned())), "no-clobber");
         assert_eq!(code_str_for(&CliError::MissingConfig("x".to_owned())), "missing-config");
         assert_eq!(code_str_for(&CliError::Internal("x".to_owned())), "internal");

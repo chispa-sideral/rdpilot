@@ -80,7 +80,7 @@ fn connect_status_message(session: &str, sensor_live: bool) -> String {
 /// The daemon's own error, or a transport/auto-start failure.
 pub async fn list(json: bool) -> Result<(), CliError> {
     match round_trip(Request::List {}).await? {
-        WireResponse::SessionList { sessions } => {
+        WireResponse::SessionList { sessions, .. } => {
             if json {
                 print_json(&sessions)
             } else {

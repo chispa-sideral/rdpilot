@@ -25,7 +25,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use rdpilot::ConnectionConfig;
 use rdpilot_ipc::{
-    Request, TransferOutcome as WireTransferOutcome, WireButton, WireKey, WireKeyAction, WireMouseAction,
+    IPC_COMPATIBILITY_VERSION, Request, TransferOutcome as WireTransferOutcome, WireButton, WireKey, WireKeyAction, WireMouseAction,
     WireProcessInfo, WireRect, WireResponse, WireUacDecision, WireUiaElement, WireUiaMode, WireUiaScope,
     WireWindowInfo, WireWindowState, WireWorldStateOptions,
 };
@@ -174,7 +174,10 @@ pub(crate) async fn dispatch_for_ipc(
         Request::ConnectAck { .. } => WireResponse::Error(DaemonError::Connect(
             "ConnectAck is only valid immediately after Connect".to_owned(),
         ).into()),
-        Request::List {} => WireResponse::SessionList { sessions: registry.list() },
+        Request::List {} => WireResponse::SessionList {
+            sessions: registry.list(),
+            compatibility_version: Some(IPC_COMPATIBILITY_VERSION),
+        },
         Request::Disconnect { session } => match registry.close(&session).await {
             Ok(()) => WireResponse::Ack,
             Err(e) => WireResponse::Error(e.into()),
@@ -768,7 +771,8 @@ mod tests {
 
         let response = dispatch(&registry, Request::List {}).await;
         match response {
-            WireResponse::SessionList { sessions } => {
+            WireResponse::SessionList { sessions, compatibility_version } => {
+                assert_eq!(compatibility_version, Some(IPC_COMPATIBILITY_VERSION));
                 assert_eq!(sessions.len(), 1);
                 let s = &sessions[0];
                 assert_eq!(s.id, "web");

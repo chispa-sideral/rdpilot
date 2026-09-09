@@ -42,28 +42,95 @@ CONFIG_JUST_SEEDED=0
 # `~/.cargo/env` (e.g. non-login/non-interactive shells).
 export PATH="$CARGO_ROOT/bin:$PATH"
 
+# Stop only the invoking user's exact daemon process before replacing either
+# sibling binary. A partial paired install must leave no old live daemon that
+# can silently accept newer client frames. This is intentionally bounded:
+# TERM gets five seconds, KILL gets one further second, and a surviving
+# process is a visible installer failure rather than a best-effort warning.
+stop_rdpilot_daemon() {
+  local uid status
+  uid="$(id -u)"
+
+  if ! command -v pkill >/dev/null 2>&1 || ! command -v pgrep >/dev/null 2>&1; then
+    echo "FAILED: pkill and pgrep are required to stop rdpilot-daemon safely" >&2
+    return 1
+  fi
+
+  if pkill -TERM -u "$uid" -x rdpilot-daemon; then
+    :
+  else
+    status=$?
+    if [ "$status" -ne 1 ]; then
+      echo "FAILED: could not send TERM to this user's rdpilot-daemon (pkill exit $status)" >&2
+      return 1
+    fi
+  fi
+
+  if wait_for_rdpilot_daemon_exit 50; then
+    return 0
+  else
+    status=$?
+  fi
+  if [ "$status" -ne 1 ]; then
+    return "$status"
+  fi
+
+  echo "    rdpilot-daemon did not exit after TERM; sending KILL" >&2
+  if pkill -KILL -u "$uid" -x rdpilot-daemon; then
+    :
+  else
+    status=$?
+    if [ "$status" -ne 1 ]; then
+      echo "FAILED: could not send KILL to this user's rdpilot-daemon (pkill exit $status)" >&2
+      return 1
+    fi
+  fi
+  if wait_for_rdpilot_daemon_exit 10; then
+    return 0
+  else
+    status=$?
+  fi
+  if [ "$status" -eq 1 ]; then
+    echo "FAILED: this user's rdpilot-daemon survived TERM and KILL" >&2
+    return 1
+  fi
+  return "$status"
+}
+
+# Poll at 100ms intervals. Return 0 when absent, 1 when still present after
+# the requested number of attempts, and 2 for an unexpected pgrep failure.
+wait_for_rdpilot_daemon_exit() {
+  local attempts="$1" uid attempt status
+  uid="$(id -u)"
+  for ((attempt = 0; attempt < attempts; attempt += 1)); do
+    if pgrep -u "$uid" -x rdpilot-daemon >/dev/null; then
+      sleep 0.1
+    else
+      status=$?
+      if [ "$status" -eq 1 ]; then
+        return 0
+      fi
+      echo "FAILED: could not inspect this user's rdpilot-daemon (pgrep exit $status)" >&2
+      return 2
+    fi
+  done
+  return 1
+}
+
 echo "==> [1/6] Using the workspace-selected stable host toolchain"
 cargo --version
 
-# rdpilot's daemon is a long-lived, auto-started, SHARED process that never
-# restarts itself just because a newer CLI/daemon got installed alongside it
-# — reinstalling the binaries below is not enough on its own. Kill any
-# already-running daemon FIRST, before reinstalling, so the next command
-# always spawns fresh from whatever ends up on disk. This also bounds the
-# damage if this script itself is interrupted partway through the two
-# `cargo install` calls below: worst case is no daemon running (auto-spawned
-# fresh on next connect), never a silently stale live process serving a
-# newer CLI over a wire protocol it never learned (see ticket
-# B86MSH43DXV6AR6N — a stale daemon left running exactly this way caused
-# `rdpilot-operation-failed` for a caller whose CLI had moved on).
-echo "==> [2/6] Stopping any already-running rdpilot-daemon"
-pkill -x rdpilot-daemon 2>/dev/null || true
+echo "==> [2/6] Stopping this user's running rdpilot-daemon"
+stop_rdpilot_daemon
 
 echo "==> [3/6] Building + installing rdpilot and rdpilot-daemon to $CARGO_ROOT/bin"
 cargo install --path "$REPO_ROOT/crates/rdpilot-cli" --root "$CARGO_ROOT"
 cargo install --path "$REPO_ROOT/crates/rdpilot-daemon" --root "$CARGO_ROOT"
 
-echo "==> [4/6] Staging local sensor binary (local-only, never committed to git)"
+echo "==> [4/6] Stopping this user's daemon again after the paired install"
+stop_rdpilot_daemon
+
+echo "==> [5/6] Staging local sensor binary (local-only, never committed to git)"
 if [ -f "$SENSOR_SRC" ]; then
   mkdir -p "$SENSOR_DATA_DIR"
   cp "$SENSOR_SRC" "$SENSOR_DEST"
@@ -73,7 +140,7 @@ else
   echo "    no local sensor binary found at $SENSOR_SRC — skipping (session-management-only install)"
 fi
 
-echo "==> [5/6] Seeding config (idempotent — never overwrites an existing file)"
+echo "==> [6/6] Seeding config (idempotent — never overwrites an existing file)"
 mkdir -p "$CONFIG_DIR"
 chmod 700 "$CONFIG_DIR"
 if [ ! -f "$CONFIG_FILE" ]; then
@@ -100,7 +167,7 @@ else
   fi
 fi
 
-echo "==> [6/6] Smoke test (D-8): confirming the CLI -> daemon IPC path works"
+echo "==> Smoke test (D-8): confirming the CLI -> daemon IPC path works"
 if ! rdpilot --version; then
   echo "FAILED: 'rdpilot --version' did not exit 0" >&2
   exit 1
