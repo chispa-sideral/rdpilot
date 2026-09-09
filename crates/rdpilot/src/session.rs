@@ -30,7 +30,6 @@ use ironrdp::pdu::input::fast_path::FastPathInputEvent;
 use ironrdp_input::Database;
 use tokio::sync::mpsc;
 
-use crate::BootstrapStage;
 use crate::config::ConnectionConfig;
 use crate::connect;
 use crate::error::{Error, Result};
@@ -42,6 +41,7 @@ use crate::sensor::SensorShared;
 use crate::session_loop::{self, RdpInputEvent};
 use crate::uac::{UacDecision, UacResponseOutcome};
 use crate::worldstate::{UiaMode, WorldState, WorldStateOptions};
+use crate::BootstrapStage;
 
 /// Inter-click delay for [`MouseAction::DoubleClick`] (D-3.7). RDP has no
 /// native double-click PDU, so a double-click is synthesized as two single
@@ -240,7 +240,10 @@ const SENSOR_LAUNCH_LOG_FILE: &str = "s.log";
 const REMOTE_SENSOR_LAUNCH_LOG_PATH: &str = r#"\\tsclient\RDPILOT\s.log"#;
 
 fn remote_sensor_deployment_path() -> String {
-    format!(r#"{REMOTE_SENSOR_DEPLOYMENT_DIR}\{}"#, crate::connect::SENSOR_EXE_NAME)
+    format!(
+        r#"{REMOTE_SENSOR_DEPLOYMENT_DIR}\{}"#,
+        crate::connect::SENSOR_EXE_NAME
+    )
 }
 
 fn remote_sensor_deployment_diagnostic_path() -> String {
@@ -250,14 +253,23 @@ fn remote_sensor_deployment_diagnostic_path() -> String {
     )
 }
 
-fn launch_command() -> String {
+fn launch_command_with_args(extra_args: &str) -> String {
     let name = crate::connect::SENSOR_EXE_NAME;
     let deployment_path = remote_sensor_deployment_path();
     format!(
-        "cmd /c taskkill /f /im {name}>nul 2>&1&\
-         copy /y \"\\\\tsclient\\RDPILOT\\{name}\" \"{deployment_path}\">nul&&\
-         \"{deployment_path}\" > \"{REMOTE_SENSOR_LAUNCH_LOG_PATH}\" 2>&1"
+        "cmd /c (taskkill /f /im {name}>nul 2>&1&\
+         copy /y \"\\\\tsclient\\RDPILOT\\{name}\" \"{deployment_path}\"&&\
+         \"{deployment_path}\"{extra_args}) > \"{REMOTE_SENSOR_LAUNCH_LOG_PATH}\" 2>&1"
     )
+}
+
+fn launch_command() -> String {
+    launch_command_with_args("")
+}
+
+#[cfg(feature = "live-dvc-diagnostics")]
+fn launch_command_with_live_dvc_token(token: &str) -> String {
+    launch_command_with_args(&format!(" --live-dvc-blocked-handler {token}"))
 }
 
 fn sensor_open_error(log: &str) -> Option<u32> {
@@ -415,6 +427,11 @@ impl Session {
     /// authentication fails.
     pub async fn connect(cfg: &ConnectionConfig) -> Result<Session> {
         let (connection_result, framed, sensor) = connect::connect(cfg).await?;
+        #[cfg(feature = "live-dvc-diagnostics")]
+        {
+            let mut token = sensor.live_dvc_token.lock().unwrap_or_else(|p| p.into_inner());
+            *token = cfg.get_live_dvc_blocked_handler_token().map(str::to_owned);
+        }
 
         // Deliberate v1 static capture (D-3.2; RESEARCH Open Q1 / Assumption
         // A1): copy the negotiated desktop size out here, BEFORE
@@ -678,6 +695,19 @@ impl Session {
         }
     }
 
+    /// Snapshot correlation-only evidence for the default-off ignored
+    /// live-DVC blocked-handler proof. This method is absent from ordinary
+    /// builds, so normal `Session` consumers receive no diagnostic surface.
+    #[cfg(feature = "live-dvc-diagnostics")]
+    pub fn live_dvc_diagnostic_snapshot(&self) -> crate::LiveDvcDiagnosticSnapshot {
+        let diagnostics = self
+            .sensor
+            .live_dvc_diagnostics
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        diagnostics.snapshot()
+    }
+
     /// Round-trip a generic sensor request, returning the reply's `data` on
     /// `success:true` — the shared plumbing behind
     /// [`Session::get_window_list`], [`Session::get_process_tree`],
@@ -798,6 +828,19 @@ impl Session {
                     Err(poisoned) => poisoned.into_inner(),
                 };
                 pending.remove(&req_id);
+                #[cfg(feature = "live-dvc-diagnostics")]
+                {
+                    let mut diagnostics = self
+                        .sensor
+                        .live_dvc_diagnostics
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner());
+                    diagnostics.record(crate::sensor::LiveDvcReceipt {
+                        req_id,
+                        response_type: crate::sensor::LiveDvcResponseType::Other,
+                        deadline_outcome: crate::sensor::LiveDvcDeadlineOutcome::DeadlineExceeded,
+                    });
+                }
                 Err(Error::dvc(format!(
                     "request timed out after {timeout_ms}ms"
                 )))
@@ -1547,8 +1590,11 @@ impl Session {
         // injected input even though the first framebuffer already arrived).
         tokio::time::sleep(SESSION_SETTLE).await;
 
+        // Clear stale evidence once. Later retry attempts may receive no
+        // redirected-drive traffic at all; preserving an earlier launch log
+        // is the only way to diagnose that transition after the bounded loop.
+        self.clear_sensor_launch_log();
         for _attempt in 1..=LAUNCH_ATTEMPTS {
-            self.clear_sensor_launch_log();
             self.inject_launch_sequence().await?;
 
             for _poll in 0..PINGS_PER_LAUNCH_ATTEMPT {
@@ -1627,7 +1673,17 @@ impl Session {
         self.send_key(KeyAction::Combo(vec![Key::Win, Key::R]))
             .await?;
         tokio::time::sleep(RUN_DIALOG_SETTLE).await;
-        for chunk in chunk_str(&launch_command(), TYPE_CHUNK_LEN) {
+        #[cfg(feature = "live-dvc-diagnostics")]
+        let command = {
+            let token = self.sensor.live_dvc_token.lock().unwrap_or_else(|p| p.into_inner());
+            token
+                .as_deref()
+                .map(launch_command_with_live_dvc_token)
+                .unwrap_or_else(launch_command)
+        };
+        #[cfg(not(feature = "live-dvc-diagnostics"))]
+        let command = launch_command();
+        for chunk in chunk_str(&command, TYPE_CHUNK_LEN) {
             self.send_key(KeyAction::Type(chunk)).await?;
             tokio::time::sleep(TYPE_CHUNK_GAP).await;
         }
@@ -2784,8 +2840,8 @@ mod tests {
     /// (WindowList/Uia/LaunchProcess never set `error_kind` and must be
     /// completely unaffected).
     #[tokio::test]
-    async fn sensor_request_failure_without_path_traversal_error_kind_still_maps_to_sensor_rejected()
-     {
+    async fn sensor_request_failure_without_path_traversal_error_kind_still_maps_to_sensor_rejected(
+    ) {
         let sensor = Arc::new(SensorShared::new());
         let (session, mut input_rx) = test_session_with_sensor(sensor.clone());
 
@@ -3683,15 +3739,12 @@ mod tests {
             "redirected source and destination must be quoted: {cmd}"
         );
         assert!(
-            cmd.contains(&format!(
-                r#""{}" >"#,
-                remote_sensor_deployment_path()
-            )),
-            "executed sensor path must be quoted: {cmd}"
+            cmd.contains(&format!(r#""{}") >"#, remote_sensor_deployment_path())),
+            "executed sensor path must be quoted inside the logged command group: {cmd}"
         );
         assert!(
             cmd.contains(REMOTE_SENSOR_LAUNCH_LOG_PATH),
-            "sensor stderr must be captured through the RDPDR share: {cmd}"
+            "the full command must capture copy and sensor diagnostics through the RDPDR share: {cmd}"
         );
         assert!(
             cmd.contains(crate::connect::SENSOR_EXE_NAME),

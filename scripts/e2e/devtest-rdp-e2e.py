@@ -30,14 +30,62 @@ LAB_ID = re.compile(r'^/subscriptions/[^/]+/resourceGroups/[^/]+/providers/Micro
 NOT_FOUND = re.compile(r'(?:\bResourceNotFound\b|\bHTTP\s*404\b|\bStatus\s*Code:\s*404\b)', re.I)
 BACKING_VM_VISIBILITY_TIMEOUT = 120
 BACKING_VM_VISIBILITY_POLL_INTERVAL = 5
+PHASES = frozenset(('provisioning', 'resource-discovery', 'nsg', 'rdp', 'deletion'))
+BACKING_VM_FAILURE_CLASSES = frozenset(('authorization', 'transport', 'timeout', 'other'))
+CLEANUP_FAILURE_CLASSES = frozenset((
+    'backing-resource-absence-present-timeout',
+    'backing-resource-absence-unknown',
+    'backing-resource-delete-authorization',
+    'backing-resource-delete-other',
+    'backing-resource-delete-timeout',
+    'backing-resource-delete-transport',
+    'devtest-vm-absence-present-timeout',
+    'devtest-vm-absence-unknown',
+    'devtest-vm-delete-authorization',
+    'devtest-vm-delete-other',
+    'devtest-vm-delete-timeout',
+    'devtest-vm-delete-transport',
+    'ingress-absence-present-timeout',
+    'ingress-absence-unknown',
+    'ingress-delete-authorization',
+    'ingress-delete-other',
+    'ingress-delete-timeout',
+    'ingress-delete-transport',
+))
+AUTHORIZATION_FAILURE = re.compile(r'\b(?:authorization\w*|forbidden|unauthorized)\b', re.I)
+TIMEOUT_FAILURE = re.compile(r'\b(?:timeout|timed out|deadline exceeded)\b', re.I)
+TRANSPORT_FAILURE = re.compile(r'\b(?:connection|connect|network|dns|socket|tls|proxy|reset|unreachable)\b', re.I)
 
 
 class LeaseError(RuntimeError):
     """A deliberately non-secret operational failure."""
 
 
+class BackingVmReadError(LeaseError):
+    """A fail-closed backing-VM read error with a fixed redacted class."""
+
+    def __init__(self, failure_class: str) -> None:
+        if failure_class not in BACKING_VM_FAILURE_CLASSES:
+            raise ValueError('invalid backing VM failure class')
+        super().__init__('azure-command-failed:vm')
+        self.failure_class = failure_class
+
+
 def fail(message: str) -> None:
     raise LeaseError(message)
+
+
+def emit_phase_failure(lease_id: str, phase: str, reason: str,
+                       failure_class: str | None = None) -> None:
+    """Emit one fixed, redacted phase label with an existing safe failure reason."""
+    if phase not in PHASES:
+        raise AssertionError('invalid phase')
+    if failure_class is not None and failure_class not in BACKING_VM_FAILURE_CLASSES:
+        raise AssertionError('invalid backing VM failure class')
+    event: dict[str, str] = {'event': 'failed', 'lease_id': lease_id, 'phase': phase, 'reason': reason}
+    if failure_class is not None:
+        event['failure_class'] = failure_class
+    print(json.dumps(event), file=sys.stderr)
 
 
 def duration(value: str) -> int:
@@ -73,6 +121,22 @@ def rest_result(method: str, url: str, body: Path | None = None,
 def is_confirmed_not_found(result: subprocess.CompletedProcess[str]) -> bool:
     """Only an explicit Azure 404 is safe to treat as an absent owned resource."""
     return result.returncode != 0 and bool(NOT_FOUND.search(result.stderr))
+
+
+def classify_backing_vm_failure(result: subprocess.CompletedProcess[str]) -> str:
+    """Classify only a non-404 exact Compute VM read without retaining Azure output."""
+    return classify_azure_failure(result)
+
+
+def classify_azure_failure(result: subprocess.CompletedProcess[str]) -> str:
+    """Map an Azure result to one fixed class without exposing its contents."""
+    if result.returncode == 124 or TIMEOUT_FAILURE.search(result.stderr):
+        return 'timeout'
+    if AUTHORIZATION_FAILURE.search(result.stderr):
+        return 'authorization'
+    if TRANSPORT_FAILURE.search(result.stderr):
+        return 'transport'
+    return 'other'
 
 
 def rest(method: str, url: str, body: Path | None = None) -> Any:
@@ -172,7 +236,7 @@ def visible_backing_vm(compute_id: str, provision_timeout: int) -> subprocess.Co
         if vm.returncode == 0:
             return vm
         if not is_confirmed_not_found(vm):
-            fail('azure-command-failed:vm')
+            raise BackingVmReadError(classify_backing_vm_failure(vm))
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             fail('devtest-backing-vm-not-ready')
@@ -232,7 +296,7 @@ def delete_resource(resource_id: str, timeout: float) -> str:
     result = az('resource', 'delete', '--ids', resource_id, check=False, timeout=timeout)
     if result.returncode == 0 or is_confirmed_not_found(result):
         return 'requested'
-    return 'failed'
+    return classify_azure_failure(result)
 
 
 def observe_resource(resource_id: str, timeout: float) -> str:
@@ -254,26 +318,35 @@ def observe_rest(url: str, timeout: float) -> str:
     return 'failed'
 
 
-def wait_for_absence(observe: Any, deadline: float) -> bool:
-    """Poll one exact resource; unknown Azure results fail closed, never become absence."""
+def wait_for_absence(observe: Any, deadline: float) -> str:
+    """Return only absent, present-timeout, or unknown for one exact resource."""
     while time.monotonic() < deadline:
         state = observe()
         if state == 'absent':
-            return True
+            return 'absent'
         if state != 'present':
-            return False
+            return 'unknown'
         time.sleep(min(5, max(0, deadline - time.monotonic())))
-    return False
+    return 'present-timeout'
 
 
 def remaining_timeout(deadline: float) -> float:
     return max(1, deadline - time.monotonic())
 
 
+def cleanup_failure_class(scope: str, operation: str, outcome: str) -> str:
+    """Build one closed cleanup diagnostic label from code-selected values only."""
+    failure_class = f'{scope}-{operation}-{outcome}'
+    if failure_class not in CLEANUP_FAILURE_CLASSES:
+        raise AssertionError('invalid cleanup failure class')
+    return failure_class
+
+
 def cleanup(state_path: Path, cleanup_timeout: int = 10 * 60) -> int:
     state = load_state(state_path)
     deadline = time.monotonic() + cleanup_timeout
     failures: list[str] = []
+    failure_classes: list[str] = []
     nsg_id = state.get('nsg_id')
     rule = state.get('ingress_rule')
     if isinstance(nsg_id, str) and isinstance(rule, str):
@@ -281,8 +354,13 @@ def cleanup(state_path: Path, cleanup_timeout: int = 10 * 60) -> int:
         deleted = rest_result('DELETE', rule_url, timeout=remaining_timeout(deadline))
         if deleted.returncode and not is_confirmed_not_found(deleted):
             failures.append('ingress-rule-delete-failed')
-        elif not wait_for_absence(lambda: observe_rest(rule_url, remaining_timeout(deadline)), deadline):
-            failures.append('ingress-cleanup-failed')
+            failure_classes.append(cleanup_failure_class(
+                'ingress', 'delete', classify_azure_failure(deleted)))
+        else:
+            absence = wait_for_absence(lambda: observe_rest(rule_url, remaining_timeout(deadline)), deadline)
+            if absence != 'absent':
+                failures.append('ingress-cleanup-failed')
+                failure_classes.append(cleanup_failure_class('ingress', 'absence', absence))
 
     lab_id = state.get('lab_id')
     vm_name = state.get('vm_name')
@@ -291,19 +369,29 @@ def cleanup(state_path: Path, cleanup_timeout: int = 10 * 60) -> int:
         deleted = rest_result('DELETE', vm_url, timeout=remaining_timeout(deadline))
         if deleted.returncode and not is_confirmed_not_found(deleted):
             failures.append('devtest-vm-delete-failed')
-        elif not wait_for_absence(lambda: observe_rest(vm_url, remaining_timeout(deadline)), deadline):
-            failures.append('devtest-vm-cleanup-failed')
+            failure_classes.append(cleanup_failure_class(
+                'devtest-vm', 'delete', classify_azure_failure(deleted)))
+        else:
+            absence = wait_for_absence(lambda: observe_rest(vm_url, remaining_timeout(deadline)), deadline)
+            if absence != 'absent':
+                failures.append('devtest-vm-cleanup-failed')
+                failure_classes.append(cleanup_failure_class('devtest-vm', 'absence', absence))
 
     for resource_id in state.get('resources', []):
-        if isinstance(resource_id, str) and delete_resource(resource_id, remaining_timeout(deadline)) == 'failed':
-            failures.append('backing-resource-delete-failed')
+        if isinstance(resource_id, str):
+            deleted = delete_resource(resource_id, remaining_timeout(deadline))
+            if deleted != 'requested':
+                failures.append('backing-resource-delete-failed')
+                failure_classes.append(cleanup_failure_class('backing-resource', 'delete', deleted))
 
     for resource_id in state.get('resources', []):
         if not isinstance(resource_id, str):
             continue
-        if not wait_for_absence(lambda resource_id=resource_id: observe_resource(
-                resource_id, remaining_timeout(deadline)), deadline):
+        absence = wait_for_absence(lambda resource_id=resource_id: observe_resource(
+            resource_id, remaining_timeout(deadline)), deadline)
+        if absence != 'absent':
             failures.append('backing-resource-remains')
+            failure_classes.append(cleanup_failure_class('backing-resource', 'absence', absence))
 
     try:
         remove_private(state_path)
@@ -311,7 +399,13 @@ def cleanup(state_path: Path, cleanup_timeout: int = 10 * 60) -> int:
         failures.append('private-state-remove-failed')
 
     if failures:
-        print(json.dumps({'event': 'cleanup-failed', 'lease_id': state['lease_id'], 'failures': sorted(set(failures))}))
+        print(json.dumps({
+            'event': 'cleanup-failed',
+            'lease_id': state['lease_id'],
+            'phase': 'deletion',
+            'failures': sorted(set(failures)),
+            'failure_classes': sorted(set(failure_classes)),
+        }))
         return 1
     state_path.unlink(missing_ok=True)
     print(json.dumps({'event': 'down', 'lease_id': state['lease_id']}))
@@ -338,6 +432,7 @@ def run(args: argparse.Namespace) -> int:
     signal.signal(signal.SIGTERM, on_signal)
 
     result = 1
+    phase = 'provisioning'
     try:
         formula = rest('GET', f'https://management.azure.com{lab_id}/formulas/{formula_name}?api-version={API_VERSION}')
         content = formula.get('properties', {}).get('formulaContent')
@@ -364,10 +459,12 @@ def run(args: argparse.Namespace) -> int:
         if not isinstance(compute_id, str) or not isinstance(host, str):
             fail('devtest-connection-coordinates-missing')
 
+        phase = 'resource-discovery'
         resources, subnet_id, private_ip = resource_ids(compute_id, args.provision_timeout)
         # Persist all backing resources before source-IP discovery or NSG mutation.
         state['resources'] = resources
         save_state(state_path, state)
+        phase = 'nsg'
         if not nsg_bound_to_subnet(nsg_id, subnet_id):
             fail('configured-nsg-not-bound-to-lease-subnet')
 
@@ -384,6 +481,7 @@ def run(args: argparse.Namespace) -> int:
         save_state(state_path, state)
         rest('PUT', f'https://management.azure.com{nsg_id}/securityRules/{rule}?api-version={NETWORK_API_VERSION}', rule_body)
 
+        phase = 'rdp'
         connection = private / 'connection.json'
         write_json(connection, {'host': host, 'user': payload['properties']['userName'], 'password': password, 'rdpPort': 3389})
         command = ['bash', str(Path(__file__).with_name('run-rdp-e2e.sh')), str(connection)]
@@ -393,7 +491,8 @@ def run(args: argparse.Namespace) -> int:
         print(json.dumps({'event': 'interrupted', 'lease_id': lease_id}))
         result = 130 if interrupted else 1
     except LeaseError as error:
-        print(json.dumps({'event': 'failed', 'lease_id': lease_id, 'reason': str(error)}), file=sys.stderr)
+        failure_class = error.failure_class if isinstance(error, BackingVmReadError) else None
+        emit_phase_failure(lease_id, phase, str(error), failure_class)
         result = 1
     finally:
         cleanup_result = cleanup(state_path, args.cleanup_timeout)

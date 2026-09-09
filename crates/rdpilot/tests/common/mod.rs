@@ -1,4 +1,4 @@
-//! Shared test helper: load `.secrets/connection.json` into a
+//! Shared test helper: load a private connection JSON file into a
 //! [`ConnectionConfig`] and gate the live suite (D-18).
 //!
 //! The library itself is environment-agnostic (D-12): it never reads a secrets
@@ -9,7 +9,8 @@
 //! early-return cleanly — unless BOTH conditions hold:
 //!
 //! 1. `RDPILOT_LIVE` is set (the explicit opt-in), and
-//! 2. `.secrets/connection.json` exists and parses.
+//! 2. `.secrets/connection.json` (or an explicit private override) exists and
+//!    parses.
 //!
 //! # Security
 //!
@@ -26,6 +27,14 @@ use rdpilot::ConnectionConfig;
 /// Name of the opt-in env var that arms the live suite (D-18).
 pub const LIVE_ENV: &str = "RDPILOT_LIVE";
 
+/// Optional owner-private connection JSON path for a mediated live run.
+///
+/// When absent, live tests retain the longstanding workspace-local
+/// `.secrets/connection.json` convention. A runner may set this path to a
+/// mode-0600 file outside the worktree so it never materializes credentials
+/// in source control's directory tree.
+pub const CONNECTION_FILE_ENV: &str = "RDPILOT_CONNECTION_FILE";
+
 /// Name of the env var that parameterises the idle/keepalive duration, in
 /// seconds. Defaults to a short value in dev; the canonical run sets `600`.
 pub const IDLE_SECS_ENV: &str = "RDPILOT_IDLE_SECS";
@@ -35,12 +44,16 @@ pub const IDLE_SECS_ENV: &str = "RDPILOT_IDLE_SECS";
 /// this to the full 600s (10 min).
 pub const DEFAULT_IDLE_SECS: u64 = 5;
 
-/// Locate `.secrets/connection.json` relative to the workspace root.
+/// Locate the private connection JSON file.
 ///
 /// `CARGO_MANIFEST_DIR` points at `crates/rdpilot`; the secrets file lives at the
-/// workspace root, two levels up. Returns the candidate path regardless of whether
-/// it exists (existence is checked by [`load_config`]).
+/// workspace root, two levels up. `RDPILOT_CONNECTION_FILE`, when set,
+/// overrides that default. Returns the candidate path regardless of whether it
+/// exists (existence is checked by [`load_config`]).
 fn connection_file() -> PathBuf {
+    if let Some(path) = std::env::var_os(CONNECTION_FILE_ENV) {
+        return PathBuf::from(path);
+    }
     // crates/rdpilot -> crates -> <workspace root>
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
@@ -53,7 +66,7 @@ fn connection_file() -> PathBuf {
 ///
 /// Returns `None` (the test should skip) when either:
 /// - `RDPILOT_LIVE` is unset, or
-/// - `.secrets/connection.json` is absent.
+/// - the configured connection JSON file is absent.
 ///
 /// Returns `Some(cfg)` only when the suite is armed AND the file parses. A
 /// present-but-malformed file panics with a descriptive message (a deliberate
