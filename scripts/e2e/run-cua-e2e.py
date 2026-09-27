@@ -413,25 +413,57 @@ Start-Sleep -Seconds 10
         if kind == "kill":
             script = prelude + "@{pid=$id;session_id=$sid;fault='kill'}|ConvertTo-Json -Compress|Set-Content -Encoding UTF8 $marker; Stop-Process -Id $id -Force"
         else:
-            script = prelude + r"""
+            script = f"""
+$ErrorActionPreference='Stop';$id={int(meta['cua_pid'])};$sid={int(meta['session_id'])}
+$marker=Join-Path (Join-Path $env:TEMP 'rdpilot-transfer-root') {psquote(marker)}
+$result=$null;$handle=[IntPtr]::Zero;$stage='load_native_api'
+try {{
 Add-Type @'
 using System;using System.Runtime.InteropServices;
-public class FreezeCua {
- [DllImport("kernel32.dll")] public static extern IntPtr OpenThread(uint access,bool inherit,uint id);
- [DllImport("kernel32.dll")] public static extern uint SuspendThread(IntPtr thread);
+public class FreezeCua {{
+ [DllImport("kernel32.dll", SetLastError=true)] public static extern IntPtr OpenProcess(uint access,bool inherit,uint id);
+ [DllImport("kernel32.dll")] public static extern uint GetProcessId(IntPtr process);
+ [DllImport("ntdll.dll")] public static extern int NtSuspendProcess(IntPtr process);
  [DllImport("kernel32.dll")] public static extern bool CloseHandle(IntPtr handle);
-}
+}}
 '@
-$count=0
-foreach($t in $p.Threads){$h=[FreezeCua]::OpenThread(2,$false,$t.Id);if($h -eq [IntPtr]::Zero){throw 'OpenThread failed'};try{if([FreezeCua]::SuspendThread($h) -eq [uint32]::MaxValue){throw 'SuspendThread failed'};$count++}finally{[FreezeCua]::CloseHandle($h)|Out-Null}}
-@{pid=$id;session_id=$sid;fault='stall';suspended_threads=$count}|ConvertTo-Json -Compress|Set-Content -Encoding UTF8 $marker
+  $stage='revalidate_before_delay'
+  $p=Get-Process -Id $id -ErrorAction Stop
+  $p.Refresh()
+  if($p.ProcessName -ne 'cua-driver' -or $p.SessionId -ne $sid){{throw "exact Cua process identity changed before delay (pid=$id, session=$($p.SessionId), name=$($p.ProcessName))"}}
+  Start-Sleep -Seconds 10
+  $stage='revalidate_after_delay'
+  $p=Get-Process -Id $id -ErrorAction Stop
+  $p.Refresh()
+  if($p.ProcessName -ne 'cua-driver' -or $p.SessionId -ne $sid){{throw "exact Cua process identity changed after delay (pid=$id, session=$($p.SessionId), name=$($p.ProcessName))"}}
+  $stage='open_exact_process'
+  # PROCESS_SUSPEND_RESUME | PROCESS_QUERY_LIMITED_INFORMATION
+  $handle=[FreezeCua]::OpenProcess(0x0800 -bor 0x1000,$false,[uint32]$id)
+  if($handle -eq [IntPtr]::Zero){{$win32=[Runtime.InteropServices.Marshal]::GetLastWin32Error();throw "OpenProcess failed (win32=$win32)"}}
+  $openedPid=[FreezeCua]::GetProcessId($handle)
+  if($openedPid -ne $id){{throw "opened process PID mismatch (expected=$id, actual=$openedPid)"}}
+  $p=Get-Process -Id $openedPid -ErrorAction Stop
+  $p.Refresh()
+  if($p.ProcessName -ne 'cua-driver' -or $p.SessionId -ne $sid){{throw "opened Cua process identity mismatch (pid=$openedPid, session=$($p.SessionId), name=$($p.ProcessName))"}}
+  $stage='NtSuspendProcess'
+  $status=[FreezeCua]::NtSuspendProcess($handle)
+  if($status -ne 0){{throw ('NtSuspendProcess failed (NTSTATUS=0x{{0:X8}})' -f [uint32]$status)}}
+  $result=@{{success=$true;pid=$id;session_id=$sid;fault='stall';operation='NtSuspendProcess';ntstatus=('0x{{0:X8}}' -f [uint32]$status);diagnostic='target process suspended'}}
+}} catch {{
+  $result=@{{success=$false;pid=$id;session_id=$sid;fault='stall';operation=$stage;error=$_.Exception.Message;diagnostic='suspension was not proven'}}
+}} finally {{
+  if($handle -ne [IntPtr]::Zero){{[FreezeCua]::CloseHandle($handle)|Out-Null}}
+}}
+$result|ConvertTo-Json -Compress|Set-Content -Encoding UTF8 $marker
 """
         await endpoint.tool("launch_app", powershell(script))
         path = self.output / marker
         await self.download("a", marker, path, attempts=60)
         fault = json.loads(path.read_text(encoding="utf-8-sig"))
         if kind == "stall":
-            require(fault.get("suspended_threads", 0) > 0, "no Cua thread suspended")
+            require(fault.get("success") is True, f"stall injection failed: {fault}")
+            require(fault.get("fault") == "stall" and fault.get("pid") == meta["cua_pid"] and fault.get("session_id") == meta["session_id"], f"stall marker identity mismatch: {fault}")
+            require(fault.get("operation") == "NtSuspendProcess" and fault.get("ntstatus") == "0x00000000", f"stall suspension status was not confirmed: {fault}")
             pending = asyncio.create_task(endpoint.tool("list_windows"))
             await self.native_recovery("a", "while_stalled")
             try:
