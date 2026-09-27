@@ -40,7 +40,7 @@
 /// compatible. The workspace package version is deliberately not the
 /// protocol identity: a long-lived daemon and a newly installed client must
 /// detect different wire contracts.
-pub const IPC_COMPATIBILITY_VERSION: u32 = 1;
+pub const IPC_COMPATIBILITY_VERSION: u32 = 2;
 
 /// Sanitized recovery guidance for a client that reached an incompatible
 /// daemon. It contains no socket, connection, or credential details so the
@@ -55,7 +55,6 @@ pub fn daemon_incompatible_message(observed: Option<u32>) -> String {
 
 mod error;
 mod input;
-mod perception;
 mod request;
 mod response;
 mod session_id;
@@ -68,19 +67,15 @@ mod transfer;
 // The module itself is therefore unconditional; the Unix-only items inside
 // it carry their own `#[cfg(unix)]`.
 pub mod transport;
-mod uac;
 
 pub use error::{WireError, WireErrorCode};
-pub use input::{WireButton, WireKey, WireKeyAction, WireMouseAction, parse_wire_key};
-pub use perception::{
-    WireProcessInfo, WireRect, WireUiaElement, WireUiaMode, WireUiaScope, WireWindowInfo, WireWindowState,
-    WireWorldStateOptions,
-};
+pub use input::{parse_wire_key, WireButton, WireKey, WireKeyAction, WireMouseAction};
 pub use request::{Request, SessionScoped};
 pub use response::{SessionLifecycle, SessionStatus, WireResponse};
 pub use session_id::SessionId;
 pub use transfer::TransferOutcome;
-pub use transport::{TransportError, read_frame, write_frame};
-#[cfg(unix)]
 pub use transport::{connect_or_spawn, socket_path};
-pub use uac::WireUacDecision;
+pub use transport::{read_frame, write_frame, TransportError};
+
+mod cua;
+pub use cua::CuaStreamFrame;

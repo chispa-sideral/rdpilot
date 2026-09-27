@@ -12,12 +12,12 @@
 //! - **Cert policy is selected by `accept_invalid_certs`** — default path validates
 //!   against the platform roots; the risk-named opt-out installs a no-op verifier
 //!   for a self-signed lab target only (D-15, threat T-02-03).
-//! - **The `RDPILOT_SENSOR` DVC seam** is registered on the connector *before*
+//! - **The `RDPILOT_CUA_V1` DVC seam** is registered on the connector *before*
 //!   `connect_begin` (registration is impossible once the session is active — a hard
-//!   IronRDP constraint, SC#1). `RdpilotSensorProcessor` is registered here via
+//!   IronRDP constraint, SC#1). `BridgeProcessor` is registered here via
 //!   `DrdynvcClient::with_dynamic_channel`; `connect()` returns the shared
-//!   `Arc<SensorShared>` so `Session` can drive `Session::ping()` against it.
-//! - **The `RDPDR` static channel** (drive redirection, D-5.1, SENSOR-02) is
+//!   `Arc<BridgeShared>` so `Session` can drive `Session::ping()` against it.
+//! - **The `RDPDR` static channel** (drive redirection, D-5.1, BRIDGE-02) is
 //!   registered at the identical connect-time seam, as a SIBLING static channel
 //!   to `DrdynvcClient` — NOT routed through it. `ironrdp_rdpdr::Rdpdr` fully
 //!   implements `SvcProcessor`/`SvcClientProcessor` (verified in the pinned
@@ -25,14 +25,14 @@
 //!   registered [`crate::rdpdr_backend::RdpilotDriveBackend`] internally —
 //!   `ActiveStage::process` drives it automatically, exactly like the drdynvc
 //!   static channel; no `session_loop.rs` change is needed. Registered only
-//!   when [`ConnectionConfig::get_sensor_binary_path`] is `Some`; when `None`,
+//!   when [`ConnectionConfig::get_bundle_path`] is `Some`; when `None`,
 //!   the connect path is byte-for-byte the pre-Phase-5 behavior.
 //!
 //! Credentials and certificate material are never logged (Security V7, threat
 //! T-02-02). No `unwrap`/`expect`/`panic` in non-test code (API-01).
 
-use std::fs;
 use std::fmt::Write as _;
+use std::fs;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
@@ -40,13 +40,13 @@ use std::sync::Arc;
 use ironrdp::connector::{ClientConnector, Config, ConnectionResult, Credentials, DesktopSize};
 use ironrdp::dvc::DrdynvcClient;
 use ironrdp::pdu::gcc::KeyboardType;
-use ironrdp_rdpdr::Rdpdr;
 use ironrdp::pdu::rdp::capability_sets::MajorPlatformType;
 use ironrdp::pdu::rdp::client_info::{PerformanceFlags, TimezoneInfo};
+use ironrdp_rdpdr::Rdpdr;
+use ironrdp_tokio::reqwest::ReqwestNetworkClient;
 use ironrdp_tokio::TokioFramed;
 use rustls::client::Resumption;
 use rustls::ClientConfig;
-use ironrdp_tokio::reqwest::ReqwestNetworkClient;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
@@ -54,17 +54,11 @@ use tokio_rustls::TlsConnector;
 use crate::config::ConnectionConfig;
 use crate::error::{Error, Result};
 
-/// The dynamic virtual channel name for the Phase 4 perception sensor.
-///
-/// Registered via `RdpilotSensorProcessor::channel_name()` in [`connect`] before
-/// `connect_begin` (SC#1).
-pub(crate) const RDPILOT_SENSOR: &str = "RDPILOT_SENSOR";
-
-/// The filename the RDPDR drive backend serves the sensor exe under, and the
+/// The filename the RDPDR drive backend serves the bridge exe under, and the
 /// filename [`crate::session::Session::deploy_and_launch`]'s in-band copy
 /// command references (D-5.1). Defined once here so the announced name and
 /// the launch command can never drift apart.
-pub(crate) const SENSOR_EXE_NAME: &str = "rdpilot-sensor.exe";
+pub(crate) const BRIDGE_EXE_NAME: &str = "rdpilot-bridge.exe";
 
 /// The framed transport over the TLS-upgraded, type-erased async stream.
 ///
@@ -90,7 +84,11 @@ pub(crate) type ConnectedFramed = TokioFramed<UpgradedStream>;
 /// credential or certificate material is ever logged.
 pub(crate) async fn connect(
     cfg: &ConnectionConfig,
-) -> Result<(ConnectionResult, ConnectedFramed, std::sync::Arc<crate::sensor::SensorShared>)> {
+) -> Result<(
+    ConnectionResult,
+    ConnectedFramed,
+    std::sync::Arc<crate::bridge::BridgeShared>,
+)> {
     let server_name = cfg.host().to_owned();
     let addr = resolve_addr(&server_name, cfg.get_port())?;
 
@@ -108,26 +106,26 @@ pub(crate) async fn connect(
     let mut connector = ClientConnector::new(connector_config, client_addr);
 
     // ── Phase 4 DVC seam ──────────────────────────────────────────────────────
-    // Register the sensor's DvcProcessor on the DRDYNVC static channel BEFORE
-    // connect_begin. Dynamic virtual channels (including `RDPILOT_SENSOR`, the
-    // perception channel) can only be registered before the connection is
-    // finalized — this is a hard IronRDP constraint (SC#1). `sensor` is the
+    // Register the bridge's DvcProcessor on the DRDYNVC static channel BEFORE
+    // connect_begin. Dynamic virtual channels (including `RDPILOT_CUA_V1`, the
+    // native Cua carrier) can only be registered before the connection is
+    // finalized — this is a hard IronRDP constraint (SC#1). `bridge` is the
     // shared correlation state (pending oneshot map + handshake); one clone is
     // moved into the processor here, the other is returned below so
     // `Session::connect` can drive `Session::ping()` against the same state.
-    let sensor = std::sync::Arc::new(crate::sensor::SensorShared::new());
-    let drdynvc =
-        DrdynvcClient::new().with_dynamic_channel(crate::sensor::RdpilotSensorProcessor::new(sensor.clone()));
+    let bridge = std::sync::Arc::new(crate::bridge::BridgeShared::new());
+    let drdynvc = DrdynvcClient::new()
+        .with_dynamic_channel(crate::bridge::BridgeProcessor::new(bridge.clone()));
     connector = connector.with_static_channel(drdynvc);
 
-    // ── Phase 5 RDPDR seam (D-5.1, SENSOR-02) ───────────────────────────────
+    // ── Phase 5 RDPDR seam (D-5.1, BRIDGE-02) ───────────────────────────────
     // A SIBLING static channel to `drdynvc` above, registered at the identical
     // connect-time seam — NOT routed through `DrdynvcClient` (RDPDR is a
-    // static virtual channel per MS-RDPEFS, unlike the `RDPILOT_SENSOR` DVC).
-    // Only registered when a sensor exe path is configured; otherwise the
+    // static virtual channel per MS-RDPEFS, unlike the `RDPILOT_CUA_V1` DVC).
+    // Only registered when a bridge exe path is configured; otherwise the
     // connect path is byte-for-byte the pre-Phase-5 behavior (existing tests
     // stay green).
-    if let Some(sensor_path) = cfg.get_sensor_binary_path() {
+    if let Some(bridge_path) = cfg.get_bundle_path() {
         // File-transfer share root (D-10.1, 10-01): pre-create the root AND
         // its staging subdir (Plan 10-02's write path relies on the latter
         // existing) BEFORE constructing the backend, so
@@ -145,11 +143,11 @@ pub(crate) async fn connect(
             })?;
         }
 
-        let drive_backend = crate::rdpdr_backend::RdpilotDriveBackend::new_with_sensor(
-            sensor_path.to_path_buf(),
-            SENSOR_EXE_NAME,
+        let drive_backend = crate::rdpdr_backend::RdpilotDriveBackend::new_with_bridge(
+            bridge_path.to_path_buf(),
+            BRIDGE_EXE_NAME,
             share_root,
-            sensor.clone(),
+            bridge.clone(),
         );
         let rdpdr = Rdpdr::new(Box::new(drive_backend), "rdpilot".to_owned())
             .with_drives(Some(vec![(0, "RDPILOT".to_owned())]));
@@ -193,9 +191,14 @@ pub(crate) async fn connect(
         None,
     )
     .await
-    .map_err(|e| Error::Connect(format!("connect_finalize failed: {}", format_error_chain(&e))))?;
+    .map_err(|e| {
+        Error::Connect(format!(
+            "connect_finalize failed: {}",
+            format_error_chain(&e)
+        ))
+    })?;
 
-    Ok((connection_result, upgraded_framed, sensor))
+    Ok((connection_result, upgraded_framed, bridge))
 }
 
 /// Render an upstream error together with its retained source chain.
@@ -481,12 +484,5 @@ mod tests {
             Err(Error::Tls(_)) => {}
             Err(other) => panic!("unexpected error category from validating path: {other:?}"),
         }
-    }
-
-    /// The DVC seam name is the reserved Phase 4 channel and is referenced by the
-    /// connect path (regression guard so the seam is not accidentally dropped).
-    #[test]
-    fn dvc_seam_name_is_reserved() {
-        assert_eq!(RDPILOT_SENSOR, "RDPILOT_SENSOR");
     }
 }

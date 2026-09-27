@@ -16,9 +16,6 @@ pub fn wire_code_for_sdk_error(e: &rdpilot::Error) -> WireErrorCode {
     match e {
         rdpilot::Error::PathTraversal(_) => WireErrorCode::PathTraversal,
         rdpilot::Error::ChecksumMismatch { .. } => WireErrorCode::ChecksumMismatch,
-        rdpilot::Error::SecureDesktopActive => WireErrorCode::SecureDesktopActive,
-        rdpilot::Error::UacPromptNotActive => WireErrorCode::UacPromptNotActive,
-        rdpilot::Error::UacResponseUnconfirmed(_) => WireErrorCode::UacResponseUnconfirmed,
         // Every other named `rdpilot::Error` variant maps to the Decision-3
         // `Internal` catch-all. Each is listed EXPLICITLY (not folded into
         // the trailing wildcard below) so this match documents, arm by
@@ -46,7 +43,7 @@ pub fn wire_code_for_sdk_error(e: &rdpilot::Error) -> WireErrorCode {
         | rdpilot::Error::CoordinateOutOfBounds { .. }
         | rdpilot::Error::Dvc(_)
         | rdpilot::Error::Bootstrap(_)
-        | rdpilot::Error::SensorRejected(_) => WireErrorCode::Internal,
+        | rdpilot::Error::BridgeRejected(_) => WireErrorCode::Internal,
         _ => WireErrorCode::Internal,
     }
 }
@@ -56,7 +53,9 @@ impl From<DaemonError> for WireError {
         let message = err.to_string();
         let code = match &err {
             DaemonError::DuplicateSession(_) => WireErrorCode::DuplicateSession,
-            DaemonError::SessionNotFound(_) | DaemonError::StillConnecting(_) => WireErrorCode::SessionNotFound,
+            DaemonError::SessionNotFound(_) | DaemonError::StillConnecting(_) => {
+                WireErrorCode::SessionNotFound
+            }
             DaemonError::Sdk(e) => wire_code_for_sdk_error(e),
             DaemonError::Connect(_) => WireErrorCode::Internal,
             DaemonError::Io(_) => WireErrorCode::Internal,
@@ -93,7 +92,10 @@ mod tests {
             expected: "aaaa".to_owned(),
             actual: "bbbb".to_owned(),
         };
-        assert_eq!(wire_code_for_sdk_error(&err), WireErrorCode::ChecksumMismatch);
+        assert_eq!(
+            wire_code_for_sdk_error(&err),
+            WireErrorCode::ChecksumMismatch
+        );
     }
 
     #[test]
@@ -121,7 +123,7 @@ mod tests {
             },
             rdpilot::Error::Dvc("x".to_owned()),
             rdpilot::Error::Bootstrap("x".to_owned()),
-            rdpilot::Error::SensorRejected("x".to_owned()),
+            rdpilot::Error::BridgeRejected("x".to_owned()),
         ];
         for err in cases {
             assert_eq!(
@@ -130,22 +132,6 @@ mod tests {
                 "expected Internal for {err}"
             );
         }
-    }
-
-    #[test]
-    fn secure_desktop_active_maps_to_secure_desktop_active_code() {
-        assert_eq!(wire_code_for_sdk_error(&rdpilot::Error::SecureDesktopActive), WireErrorCode::SecureDesktopActive);
-    }
-
-    #[test]
-    fn uac_prompt_not_active_maps_to_uac_prompt_not_active_code() {
-        assert_eq!(wire_code_for_sdk_error(&rdpilot::Error::UacPromptNotActive), WireErrorCode::UacPromptNotActive);
-    }
-
-    #[test]
-    fn uac_response_unconfirmed_maps_to_uac_response_unconfirmed_code() {
-        let err = rdpilot::Error::UacResponseUnconfirmed("still present".to_owned());
-        assert_eq!(wire_code_for_sdk_error(&err), WireErrorCode::UacResponseUnconfirmed);
     }
 
     #[test]

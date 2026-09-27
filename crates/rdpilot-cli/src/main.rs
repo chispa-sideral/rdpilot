@@ -18,8 +18,8 @@ mod verbs;
 
 use clap::Parser;
 
-use cli::{Cli, Command, FileCmd, InputCmd, PerceiveCmd, ProcessCmd, SessionCmd, UacCmd, WindowCmd};
-use exit_codes::{CliError, code_str_for, exit_code_for};
+use cli::{Cli, Command, FileCmd, InputCmd, PerceiveCmd, SessionCmd};
+use exit_codes::{code_str_for, exit_code_for, CliError};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> std::process::ExitCode {
@@ -50,28 +50,30 @@ async fn main() -> std::process::ExitCode {
 /// verb call the exact same handler function.
 async fn dispatch(command: Command, json: bool) -> Result<(), CliError> {
     match command {
-        Command::Connect(args) | Command::Session(SessionCmd::Connect(args)) => verbs::session::connect(args, json).await,
+        Command::Connect(args) | Command::Session(SessionCmd::Connect(args)) => {
+            verbs::session::connect(args, json).await
+        }
+        Command::Ping(args) => verbs::session::ping(args, json).await,
         Command::List | Command::Session(SessionCmd::List) => verbs::session::list(json).await,
         Command::Disconnect(args) | Command::Session(SessionCmd::Disconnect(args)) => {
             verbs::session::disconnect(args, json).await
         }
 
-        Command::Perceive(PerceiveCmd::Screenshot(args)) => verbs::perceive::screenshot(args, json).await,
-        Command::Perceive(PerceiveCmd::WorldState(args)) => verbs::perceive::world_state(args, json).await,
-        Command::Perceive(PerceiveCmd::Uia(args)) => verbs::perceive::uia(args, json).await,
-        Command::Perceive(PerceiveCmd::Window(WindowCmd::List(args))) => verbs::perceive::window_list(args, json).await,
-        Command::Perceive(PerceiveCmd::Process(ProcessCmd::List(args))) => verbs::perceive::process_list(args, json).await,
+        Command::Screenshot(args) | Command::Perceive(PerceiveCmd::Screenshot(args)) => {
+            verbs::perceive::screenshot(args, json).await
+        }
 
         Command::Input(InputCmd::Click(args)) => verbs::input::click(args, json).await,
         Command::Input(InputCmd::Scroll(args)) => verbs::input::scroll(args, json).await,
         Command::Input(InputCmd::Drag(args)) => verbs::input::drag(args, json).await,
         Command::Input(InputCmd::Type(args)) => verbs::input::type_text(args, json).await,
         Command::Input(InputCmd::Key(args)) => verbs::input::key(args, json).await,
-        Command::Input(InputCmd::Launch(args)) => verbs::input::launch(args, json).await,
-        Command::Input(InputCmd::Foreground(args)) => verbs::input::foreground(args, json).await,
-        Command::Input(InputCmd::Uac(UacCmd::Respond(args))) => verbs::input::uac_respond(args, json).await,
 
-        Command::Put(args) | Command::File(FileCmd::Put(args)) => verbs::file::put(args, json).await,
-        Command::Get(args) | Command::File(FileCmd::Get(args)) => verbs::file::get(args, json).await,
+        Command::Put(args) | Command::File(FileCmd::Put(args)) => {
+            verbs::file::put(args, json).await
+        }
+        Command::Get(args) | Command::File(FileCmd::Get(args)) => {
+            verbs::file::get(args, json).await
+        }
     }
 }

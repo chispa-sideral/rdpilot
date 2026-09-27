@@ -70,7 +70,10 @@ mod tests {
     #[test]
     fn template_parses_into_resolved_config() -> Result<(), Box<dyn std::error::Error>> {
         let built = config::Config::builder()
-            .add_source(config::File::from_str(crate::CONFIG_TEMPLATE, config::FileFormat::Toml))
+            .add_source(config::File::from_str(
+                crate::CONFIG_TEMPLATE,
+                config::FileFormat::Toml,
+            ))
             .build()?;
         let resolved: crate::ResolvedConfig = built.try_deserialize()?;
 
@@ -81,12 +84,12 @@ mod tests {
         assert_eq!(resolved.domain, None);
         assert!(!resolved.accept_invalid_certs);
         assert_eq!(resolved.share_root, None);
-        assert_eq!(resolved.sensor_binary_path, None);
+        assert_eq!(resolved.bundle_path, None);
         Ok(())
     }
 
     /// CONFIG-02: the template documents every D-27 key by name, plus the
-    /// Phase-13-added `share_root` and Plan-15-06-added `sensor_binary_path`
+    /// Phase-13-added `share_root` and Plan-15-06-added `bundle_path`
     /// daemon-local operational keys.
     #[test]
     fn template_documents_every_d27_key() {
@@ -98,7 +101,7 @@ mod tests {
             "domain",
             "accept_invalid_certs",
             "share_root",
-            "sensor_binary_path",
+            "bundle_path",
         ] {
             assert!(
                 crate::CONFIG_TEMPLATE.contains(key),

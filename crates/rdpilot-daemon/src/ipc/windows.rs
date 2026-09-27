@@ -49,9 +49,9 @@ use std::ptr;
 use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
 use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ACCESS_DENIED, HANDLE};
 use windows_sys::Win32::Security::{
-    ACCESS_ALLOWED_ACE, ACL, ACL_REVISION, AddAccessAllowedAce, GetLengthSid, GetTokenInformation,
-    InitializeAcl, InitializeSecurityDescriptor, PSID, SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR,
-    SetSecurityDescriptorDacl, TOKEN_USER, TokenUser,
+    AddAccessAllowedAce, GetLengthSid, GetTokenInformation, InitializeAcl,
+    InitializeSecurityDescriptor, SetSecurityDescriptorDacl, TokenUser, ACCESS_ALLOWED_ACE, ACL,
+    ACL_REVISION, PSID, SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR, TOKEN_USER,
 };
 // `SECURITY_DESCRIPTOR_REVISION` lives in `Win32::System::SystemServices`, not
 // `Win32::Security`, in windows-sys 0.61.2 (confirmed against the real crate
@@ -146,9 +146,9 @@ pub async fn bind() -> io::Result<PipeListener> {
 pub async fn accept_and_authorize(listener: &PipeListener) -> io::Result<NamedPipeServer> {
     let server = {
         let mut guard = listener.pending.lock().await;
-        guard
-            .take()
-            .ok_or_else(|| io::Error::other("no pending pipe instance -- accept_and_authorize called concurrently"))?
+        guard.take().ok_or_else(|| {
+            io::Error::other("no pending pipe instance -- accept_and_authorize called concurrently")
+        })?
     };
     server.connect().await?;
 
@@ -203,7 +203,11 @@ fn create_secured_pipe_instance(first: bool) -> io::Result<NamedPipeServer> {
     // this module to `tokio::net::windows::named_pipe::ServerOptions::create_with_security_attributes_raw`,
     // itself an `unsafe fn` per tokio's own contract (the caller vouches
     // for `attrs`' validity, satisfied above).
-    unsafe { ServerOptions::new().first_pipe_instance(first).create_with_security_attributes_raw(PIPE_NAME, attrs) }
+    unsafe {
+        ServerOptions::new()
+            .first_pipe_instance(first)
+            .create_with_security_attributes_raw(PIPE_NAME, attrs)
+    }
 }
 
 /// Owns every buffer the owner-only protected DACL's pointers reference —
@@ -250,7 +254,8 @@ impl OwnerOnlyDacl {
         // ACCESS_ALLOWED_ACE + the SID's own bytes, minus the ACE
         // struct's built-in placeholder DWORD), rounded up to the DWORD
         // alignment `InitializeAcl` requires.
-        let acl_len = size_of::<ACL>() + size_of::<ACCESS_ALLOWED_ACE>() - size_of::<u32>() + sid_len;
+        let acl_len =
+            size_of::<ACL>() + size_of::<ACCESS_ALLOWED_ACE>() - size_of::<u32>() + sid_len;
         let acl_len = (acl_len + 3) & !3;
         let mut acl_buf = vec![0u8; acl_len];
         let acl_ptr = acl_buf.as_mut_ptr().cast::<ACL>();
@@ -307,7 +312,11 @@ impl OwnerOnlyDacl {
             return Err(io::Error::last_os_error());
         }
 
-        Ok(OwnerOnlyDacl { _sid_buf: sid_buf, _acl_buf: acl_buf, sd })
+        Ok(OwnerOnlyDacl {
+            _sid_buf: sid_buf,
+            _acl_buf: acl_buf,
+            sd,
+        })
     }
 
     /// A raw pointer at this DACL's `SECURITY_DESCRIPTOR`, suitable for
@@ -355,7 +364,9 @@ fn current_user_token_user_buffer() -> io::Result<Vec<u8>> {
         // SAFETY: `token` is the still-open, valid handle from above,
         // closed exactly once on this early-return path.
         unsafe { CloseHandle(token) };
-        return Err(io::Error::other("GetTokenInformation(TokenUser) reported a zero required buffer size"));
+        return Err(io::Error::other(
+            "GetTokenInformation(TokenUser) reported a zero required buffer size",
+        ));
     }
 
     let mut buf = vec![0u8; needed as usize];
@@ -363,7 +374,15 @@ fn current_user_token_user_buffer() -> io::Result<Vec<u8>> {
     // size the probe call above reported); `GetTokenInformation` writes
     // at most that many bytes into it (Win32 contract for a
     // correctly-sized buffer).
-    let ok = unsafe { GetTokenInformation(token, TokenUser, buf.as_mut_ptr().cast::<c_void>(), needed, &mut needed) };
+    let ok = unsafe {
+        GetTokenInformation(
+            token,
+            TokenUser,
+            buf.as_mut_ptr().cast::<c_void>(),
+            needed,
+            &mut needed,
+        )
+    };
 
     // SAFETY: `token` is the valid handle opened above, closed exactly
     // once here regardless of the read's success/failure.

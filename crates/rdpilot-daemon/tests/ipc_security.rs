@@ -49,7 +49,8 @@ fn our_uid() -> u32 {
 #[test]
 fn authorize_uid_rejects_a_different_uid() {
     let our = our_uid();
-    let err = authorize_uid(our.wrapping_add(1), our).expect_err("a mismatched uid must be rejected");
+    let err =
+        authorize_uid(our.wrapping_add(1), our).expect_err("a mismatched uid must be rejected");
     assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
 }
 
@@ -57,7 +58,10 @@ fn authorize_uid_rejects_a_different_uid() {
 #[test]
 fn authorize_uid_accepts_a_matching_uid() {
     let our = our_uid();
-    assert!(authorize_uid(our, our).is_ok(), "a matching uid must be authorized");
+    assert!(
+        authorize_uid(our, our).is_ok(),
+        "a matching uid must be authorized"
+    );
 }
 
 /// Accompanying (not sole) evidence, per research Pitfall 5: the real
@@ -69,9 +73,17 @@ fn authorize_uid_accepts_a_matching_uid() {
 #[test]
 fn the_socket_directory_is_mode_0700() {
     let path = rdpilot_daemon::socket_path().expect("socket_path should resolve on this host");
-    let dir = path.parent().expect("socket_path always has a parent directory");
-    let meta = std::fs::metadata(dir).expect("stat should succeed — bind()/socket_path() create the dir eagerly");
-    assert_eq!(meta.mode() & 0o777, 0o700, "expected the socket dir to be mode 0700, got {:o}", meta.mode() & 0o777);
+    let dir = path
+        .parent()
+        .expect("socket_path always has a parent directory");
+    let meta = std::fs::metadata(dir)
+        .expect("stat should succeed — bind()/socket_path() create the dir eagerly");
+    assert_eq!(
+        meta.mode() & 0o777,
+        0o700,
+        "expected the socket dir to be mode 0700, got {:o}",
+        meta.mode() & 0o777
+    );
 }
 
 /// Real cross-account proof (gated): a genuinely different local OS

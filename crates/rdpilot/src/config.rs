@@ -51,19 +51,19 @@ pub struct ConnectionConfig {
     /// Risk-named and **default `false`**. Intended only for self-signed
     /// workgroup lab targets (D-15). Thumbprint pinning is deferred.
     accept_invalid_certs: bool,
-    /// Local filesystem path of the sensor executable to serve over the
-    /// RDPDR redirected drive (D-5.1, SENSOR-02).
+    /// Local filesystem path of the Cua bundle directory to serve over the
+    /// RDPDR redirected drive (D-5.1, bundle deployment).
     ///
     /// `None` (the default) means no RDPDR static channel is registered at
     /// connect time — the connect path is byte-for-byte the pre-Phase-5
     /// behavior. Owned `PathBuf` (D-09 — no third-party type in the public
     /// signature).
-    sensor_binary_path: Option<PathBuf>,
+    bundle_path: Option<PathBuf>,
     /// Local filesystem path of the share root the RDPDR drive backend
-    /// serves in addition to the sensor exe (D-10.1, FILE-01/FILE-02).
+    /// serves in addition to the bundle (D-10.1, FILE-01/FILE-02).
     ///
     /// `None` (the default) means [`crate::rdpdr_backend::RdpilotDriveBackend`]
-    /// serves ONLY the sensor exe, preserving the pre-Phase-10 behavior
+    /// serves ONLY the bundle, preserving the pre-Phase-10 behavior
     /// byte-for-byte. Owned `PathBuf` (D-09 — no third-party type in the
     /// public signature).
     share_root: Option<PathBuf>,
@@ -89,7 +89,7 @@ impl ConnectionConfig {
             width: DEFAULT_WIDTH,
             height: DEFAULT_HEIGHT,
             accept_invalid_certs: false,
-            sensor_binary_path: None,
+            bundle_path: None,
             share_root: None,
         }
     }
@@ -126,8 +126,8 @@ impl ConnectionConfig {
         self
     }
 
-    /// Set the local filesystem path of the sensor executable to serve over
-    /// the RDPDR redirected drive (builder, D-5.1, SENSOR-02).
+    /// Set the local filesystem path of the Cua bundle directory to serve over
+    /// the RDPDR redirected drive (builder, D-5.1, bundle deployment).
     ///
     /// When set, `connect::connect` registers the RDPDR static channel
     /// (`RdpilotDriveBackend`) announcing a `RDPILOT` drive that serves this
@@ -135,19 +135,19 @@ impl ConnectionConfig {
     /// (the default), no RDPDR channel is registered and the connect path is
     /// unchanged from pre-Phase-5 behavior.
     #[must_use]
-    pub fn sensor_binary_path(mut self, path: impl Into<PathBuf>) -> Self {
-        self.sensor_binary_path = Some(path.into());
+    pub fn bundle_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.bundle_path = Some(path.into());
         self
     }
 
     /// Set the local filesystem path of the share root the RDPDR drive
-    /// backend serves in addition to the sensor exe (builder, D-10.1,
+    /// backend serves in addition to the bundle (builder, D-10.1,
     /// FILE-01/FILE-02).
     ///
-    /// When set, every RDPDR-supplied path other than the sensor exe name is
+    /// When set, every RDPDR-supplied path other than the bundle name is
     /// canonicalized and ancestry-checked under this root before any
     /// `std::fs` call (D-10.2/FILE-03). When unset (the default), the drive
-    /// backend continues serving ONLY the sensor exe, unchanged from
+    /// backend continues serving ONLY the bundle, unchanged from
     /// pre-Phase-10 behavior.
     #[must_use]
     pub fn share_root(mut self, path: impl Into<PathBuf>) -> Self {
@@ -198,20 +198,20 @@ impl ConnectionConfig {
         self.accept_invalid_certs
     }
 
-    /// Local filesystem path of the sensor executable served over the RDPDR
-    /// redirected drive, if configured (D-5.1, SENSOR-02).
+    /// Local filesystem path of the Cua bundle directory served over the RDPDR
+    /// redirected drive, if configured (D-5.1, bundle deployment).
     ///
     /// `None` means the RDPDR static channel is not registered at connect
     /// time.
-    pub fn get_sensor_binary_path(&self) -> Option<&Path> {
-        self.sensor_binary_path.as_deref()
+    pub fn get_bundle_path(&self) -> Option<&Path> {
+        self.bundle_path.as_deref()
     }
 
     /// Local filesystem path of the share root the RDPDR drive backend
-    /// serves in addition to the sensor exe, if configured (D-10.1,
+    /// serves in addition to the bundle, if configured (D-10.1,
     /// FILE-01/FILE-02).
     ///
-    /// `None` means the drive backend serves ONLY the sensor exe.
+    /// `None` means the drive backend serves ONLY the bundle.
     pub fn get_share_root(&self) -> Option<&Path> {
         self.share_root.as_deref()
     }
@@ -229,7 +229,7 @@ impl fmt::Debug for ConnectionConfig {
             .field("width", &self.width)
             .field("height", &self.height)
             .field("accept_invalid_certs", &self.accept_invalid_certs)
-            .field("sensor_binary_path", &self.sensor_binary_path)
+            .field("bundle_path", &self.bundle_path)
             .field("share_root", &self.share_root)
             .finish()
     }
@@ -248,25 +248,28 @@ mod tests {
         assert_eq!(cfg.get_domain(), None);
         // Cert validation must default ON.
         assert!(!cfg.get_accept_invalid_certs());
-        // No RDPDR channel is registered unless a sensor path is configured.
-        assert_eq!(cfg.get_sensor_binary_path(), None);
+        // No RDPDR channel is registered unless a bridge path is configured.
+        assert_eq!(cfg.get_bundle_path(), None);
         // No share root is served unless explicitly configured (D-10.1).
         assert_eq!(cfg.get_share_root(), None);
     }
 
     #[test]
-    fn sensor_binary_path_builder_and_getter_roundtrip() {
-        let cfg = ConnectionConfig::new("h", "u", "p").sensor_binary_path("/tmp/rdpilot-sensor.exe");
+    fn bundle_path_builder_and_getter_roundtrip() {
+        let cfg = ConnectionConfig::new("h", "u", "p").bundle_path("/tmp/rdpilot-bundle");
         assert_eq!(
-            cfg.get_sensor_binary_path(),
-            Some(std::path::Path::new("/tmp/rdpilot-sensor.exe"))
+            cfg.get_bundle_path(),
+            Some(std::path::Path::new("/tmp/rdpilot-bundle"))
         );
     }
 
     #[test]
     fn share_root_builder_and_getter_roundtrip() {
         let cfg = ConnectionConfig::new("h", "u", "p").share_root("/tmp/rdpilot-share");
-        assert_eq!(cfg.get_share_root(), Some(std::path::Path::new("/tmp/rdpilot-share")));
+        assert_eq!(
+            cfg.get_share_root(),
+            Some(std::path::Path::new("/tmp/rdpilot-share"))
+        );
     }
 
     #[test]

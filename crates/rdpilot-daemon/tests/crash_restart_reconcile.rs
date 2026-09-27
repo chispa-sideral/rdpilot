@@ -31,7 +31,8 @@ use std::pin::Pin;
 
 use rdpilot::ConnectionConfig;
 use rdpilot_daemon::{
-    DaemonError, JsonReconciliationSink, ManagedSession, ReconciliationRecord, Registry, SessionConnector,
+    DaemonError, JsonReconciliationSink, ManagedSession, ReconciliationRecord, Registry,
+    SessionConnector,
 };
 use rdpilot_ipc::SessionLifecycle;
 
@@ -56,59 +57,45 @@ impl ManagedSession for FakeSession {
     }
 
     fn screenshot(&self) -> OpFuture<'_, Result<rdpilot::Screenshot, DaemonError>> {
-        Box::pin(async { Ok(rdpilot::Screenshot { width: 1, height: 1, rgba: vec![0, 0, 0, 0] }) })
-    }
-    fn world_state(&self, _opts: rdpilot::WorldStateOptions) -> OpFuture<'_, Result<rdpilot::WorldState, DaemonError>> {
         Box::pin(async {
-            Ok(rdpilot::WorldState {
-                timestamp: std::time::SystemTime::now(),
-                capture_span: std::time::Duration::from_millis(0),
-                screenshot: None,
-                window_list: None,
-                uia: None,
-                elevation_active: None,
+            Ok(rdpilot::Screenshot {
+                width: 1,
+                height: 1,
+                rgba: vec![0, 0, 0, 0],
             })
         })
     }
-    fn get_window_list(&self) -> OpFuture<'_, Result<Vec<rdpilot::WindowInfo>, DaemonError>> {
-        Box::pin(async { Ok(vec![]) })
-    }
-    fn get_process_tree(&self) -> OpFuture<'_, Result<Vec<rdpilot::ProcessInfo>, DaemonError>> {
-        Box::pin(async { Ok(vec![]) })
-    }
-    fn get_uia_tree(&self, _hwnd: u64, _scope: rdpilot::UiaScope) -> OpFuture<'_, Result<Vec<rdpilot::UiaElement>, DaemonError>> {
-        Box::pin(async { Ok(vec![]) })
-    }
+
     fn send_mouse(&self, _action: rdpilot::MouseAction) -> OpFuture<'_, Result<(), DaemonError>> {
         Box::pin(async { Ok(()) })
     }
     fn send_key(&self, _action: rdpilot::KeyAction) -> OpFuture<'_, Result<(), DaemonError>> {
         Box::pin(async { Ok(()) })
     }
-    fn set_foreground_window(&self, _hwnd: u64) -> OpFuture<'_, Result<(), DaemonError>> {
-        Box::pin(async { Ok(()) })
-    }
-    fn launch_process(
-        &self,
-        _exe: String,
-        _args: Option<String>,
-        _cwd: Option<String>,
-    ) -> OpFuture<'_, Result<u32, DaemonError>> {
-        Box::pin(async { Ok(0) })
-    }
+
     fn upload_file(
         &self,
         _local: std::path::PathBuf,
         _remote_name: String,
     ) -> OpFuture<'_, Result<rdpilot::TransferOutcome, DaemonError>> {
-        Box::pin(async { Ok(rdpilot::TransferOutcome { bytes_transferred: 0, checksum: String::new() }) })
+        Box::pin(async {
+            Ok(rdpilot::TransferOutcome {
+                bytes_transferred: 0,
+                checksum: String::new(),
+            })
+        })
     }
     fn download_file(
         &self,
         _remote_name: String,
         _local: std::path::PathBuf,
     ) -> OpFuture<'_, Result<rdpilot::TransferOutcome, DaemonError>> {
-        Box::pin(async { Ok(rdpilot::TransferOutcome { bytes_transferred: 0, checksum: String::new() }) })
+        Box::pin(async {
+            Ok(rdpilot::TransferOutcome {
+                bytes_transferred: 0,
+                checksum: String::new(),
+            })
+        })
     }
     fn ping(&self) -> OpFuture<'_, Result<std::time::Duration, DaemonError>> {
         Box::pin(async { Ok(std::time::Duration::from_millis(0)) })
@@ -119,17 +106,6 @@ impl ManagedSession for FakeSession {
     fn deploy_and_launch(&self) -> OpFuture<'_, Result<std::time::Duration, DaemonError>> {
         Box::pin(async move { Ok(std::time::Duration::from_millis(0)) })
     }
-    fn uac_respond(
-        &self,
-        decision: rdpilot::UacDecision,
-    ) -> OpFuture<'_, Result<rdpilot::UacResponseOutcome, DaemonError>> {
-        Box::pin(async move {
-            Ok(rdpilot::UacResponseOutcome {
-                decision,
-                confirmation: rdpilot::Screenshot { width: 1, height: 1, rgba: vec![0, 0, 0, 0] },
-            })
-        })
-    }
 }
 
 /// A fake `SessionConnector` that always succeeds immediately, producing a
@@ -138,7 +114,10 @@ impl ManagedSession for FakeSession {
 struct FakeConnector;
 
 impl SessionConnector for FakeConnector {
-    fn connect(&self, _cfg: ConnectionConfig) -> TestFuture<Result<Box<dyn ManagedSession>, DaemonError>> {
+    fn connect(
+        &self,
+        _cfg: ConnectionConfig,
+    ) -> TestFuture<Result<Box<dyn ManagedSession>, DaemonError>> {
         Box::pin(async { Ok(Box::new(FakeSession) as Box<dyn ManagedSession>) })
     }
 }
@@ -156,7 +135,10 @@ fn unique_state_path() -> std::path::PathBuf {
         .duration_since(std::time::UNIX_EPOCH)
         .expect("clock should be after the Unix epoch")
         .as_nanos();
-    std::env::temp_dir().join(format!("rdpilot-daemon-crash-restart-reconcile-{}-{nanos}.json", std::process::id()))
+    std::env::temp_dir().join(format!(
+        "rdpilot-daemon-crash-restart-reconcile-{}-{nanos}.json",
+        std::process::id()
+    ))
 }
 
 #[tokio::test]
@@ -167,13 +149,21 @@ async fn kill_minus_9_then_restart_surfaces_the_orphan_which_is_then_explicitly_
     let sink_a = std::sync::Arc::new(JsonReconciliationSink::at(state_path.clone()));
     let registry_a = Registry::new(std::sync::Arc::new(FakeConnector), sink_a);
     let payroll_id = registry_a
-        .open(Some("payroll".to_owned()), "10.0.0.9".to_owned(), test_cfg())
+        .open(
+            Some("payroll".to_owned()),
+            "10.0.0.9".to_owned(),
+            test_cfg(),
+        )
         .await
         .expect("open should succeed against the fake connector");
     assert_eq!(payroll_id.as_str(), "payroll");
 
     let after_open: Vec<ReconciliationRecord> = rdpilot_daemon::scan_orphans(&state_path);
-    assert_eq!(after_open.len(), 1, "the disk record must exist immediately after a successful open");
+    assert_eq!(
+        after_open.len(),
+        1,
+        "the disk record must exist immediately after a successful open"
+    );
     assert_eq!(after_open[0].id, "payroll");
     assert_eq!(after_open[0].host, "10.0.0.9");
 

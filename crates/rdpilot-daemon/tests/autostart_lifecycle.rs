@@ -68,7 +68,10 @@ use tokio::net::UnixStream;
 /// implementation detail of `ipc::serve_connection`.
 const MAX_FRAME_LEN: u32 = 16 * 1024 * 1024;
 
-async fn write_frame<T: serde::Serialize>(stream: &mut UnixStream, value: &T) -> std::io::Result<()> {
+async fn write_frame<T: serde::Serialize>(
+    stream: &mut UnixStream,
+    value: &T,
+) -> std::io::Result<()> {
     let body = serde_json::to_vec(value).expect("test request/response must serialize");
     let len = u32::try_from(body.len()).expect("test frame body fits in u32");
     stream.write_all(&len.to_be_bytes()).await?;
@@ -80,7 +83,10 @@ async fn read_frame<T: serde::de::DeserializeOwned>(stream: &mut UnixStream) -> 
     let mut len_buf = [0_u8; 4];
     stream.read_exact(&mut len_buf).await?;
     let len = u32::from_be_bytes(len_buf);
-    assert!(len <= MAX_FRAME_LEN, "test frame length {len} exceeds the sanity cap");
+    assert!(
+        len <= MAX_FRAME_LEN,
+        "test frame length {len} exceeds the sanity cap"
+    );
     let mut body = vec![0_u8; len as usize];
     stream.read_exact(&mut body).await?;
     Ok(serde_json::from_slice(&body).expect("test response must deserialize"))
@@ -93,7 +99,10 @@ fn unique_temp_root() -> PathBuf {
         .duration_since(std::time::UNIX_EPOCH)
         .expect("clock should be after the Unix epoch")
         .as_nanos();
-    std::env::temp_dir().join(format!("rdpilot-daemon-autostart-lifecycle-{}-{nanos}", std::process::id()))
+    std::env::temp_dir().join(format!(
+        "rdpilot-daemon-autostart-lifecycle-{}-{nanos}",
+        std::process::id()
+    ))
 }
 
 #[tokio::test]
@@ -125,13 +134,19 @@ async fn daemon_auto_starts_on_first_connect_and_self_exits_once_the_registry_em
     let socket_path = xdg_runtime_dir.join("rdpilot").join("daemon.sock");
 
     // Precondition: nothing is running yet.
-    assert!(!socket_path.exists(), "no daemon should be listening before connect_or_spawn auto-starts one");
+    assert!(
+        !socket_path.exists(),
+        "no daemon should be listening before connect_or_spawn auto-starts one"
+    );
 
     // --- Auto-start (DAEMON-03) ---
-    let mut stream = tokio::time::timeout(Duration::from_secs(10), connect_or_spawn(&socket_path, &daemon_exe))
-        .await
-        .expect("connect_or_spawn must not time out spawning+reaching the real daemon binary")
-        .expect("connect_or_spawn must auto-start the daemon and return a connected stream");
+    let mut stream = tokio::time::timeout(
+        Duration::from_secs(10),
+        connect_or_spawn(&socket_path, &daemon_exe),
+    )
+    .await
+    .expect("connect_or_spawn must not time out spawning+reaching the real daemon binary")
+    .expect("connect_or_spawn must auto-start the daemon and return a connected stream");
 
     // --- Connect (fake session, no RDP target needed) -> Connected ---
     let connect_req = Request::Connect {
@@ -144,25 +159,44 @@ async fn daemon_auto_starts_on_first_connect_and_self_exits_once_the_registry_em
         accept_invalid_certs: false,
         connect_ack: false,
     };
-    write_frame(&mut stream, &connect_req).await.expect("write Connect frame");
-    let session = match read_frame::<WireResponse>(&mut stream).await.expect("read Connect response") {
+    write_frame(&mut stream, &connect_req)
+        .await
+        .expect("write Connect frame");
+    let session = match read_frame::<WireResponse>(&mut stream)
+        .await
+        .expect("read Connect response")
+    {
         WireResponse::Connected { session, .. } => session,
         other => panic!("expected WireResponse::Connected, got {other:?}"),
     };
 
     // --- List -> exactly one session ---
-    write_frame(&mut stream, &Request::List {}).await.expect("write List frame");
-    match read_frame::<WireResponse>(&mut stream).await.expect("read List response") {
+    write_frame(&mut stream, &Request::List {})
+        .await
+        .expect("write List frame");
+    match read_frame::<WireResponse>(&mut stream)
+        .await
+        .expect("read List response")
+    {
         WireResponse::SessionList { sessions, .. } => {
-            assert_eq!(sessions.len(), 1, "exactly one session should be listed after Connect");
+            assert_eq!(
+                sessions.len(),
+                1,
+                "exactly one session should be listed after Connect"
+            );
             assert_eq!(sessions[0].id, session.as_str());
         }
         other => panic!("expected WireResponse::SessionList, got {other:?}"),
     }
 
     // --- Disconnect -> Ack (the registry becomes empty here) ---
-    write_frame(&mut stream, &Request::Disconnect { session }).await.expect("write Disconnect frame");
-    match read_frame::<WireResponse>(&mut stream).await.expect("read Disconnect response") {
+    write_frame(&mut stream, &Request::Disconnect { session })
+        .await
+        .expect("write Disconnect frame");
+    match read_frame::<WireResponse>(&mut stream)
+        .await
+        .expect("read Disconnect response")
+    {
         WireResponse::Ack => {}
         other => panic!("expected WireResponse::Ack, got {other:?}"),
     }
@@ -190,7 +224,10 @@ async fn daemon_auto_starts_on_first_connect_and_self_exits_once_the_registry_em
 
     // Corroborating evidence: nothing is listening at the path any more.
     let reconnect_attempt = UnixStream::connect(&socket_path).await;
-    assert!(reconnect_attempt.is_err(), "no daemon should be reachable after self-shutdown");
+    assert!(
+        reconnect_attempt.is_err(),
+        "no daemon should be reachable after self-shutdown"
+    );
 
     let _ = std::fs::remove_dir_all(&root);
 }

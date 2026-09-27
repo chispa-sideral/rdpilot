@@ -22,11 +22,9 @@ infra/*.json
 Thumbs.db
 .DS_Store
 
-# .NET / C# sensor build output (Phase 5, SENSOR-01) — sensor/.gitignore also
-# covers this from inside sensor/; duplicated here per plan for a top-level
-# `git status` that never shows the NativeAOT publish artifacts as untracked.
-sensor/bin/
-sensor/obj/
+# Generated release payloads and Python caches
+/dist/
+__pycache__/
 
 # rdpilot-config (Phase 11, CONFIG-02, D-27): the REAL config.toml lives at
 # the platform config dir (~/.config/rdpilot/config.toml on Unix,

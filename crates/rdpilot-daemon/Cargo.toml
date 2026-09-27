@@ -60,5 +60,6 @@ windows-sys = { version = "0.61.2", features = [
 ] }
 
 [dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
 # DAEMON-01 soak-test RSS baseline/return-to-baseline assertion (Plan 12-03).
 sysinfo = "0.39.6"

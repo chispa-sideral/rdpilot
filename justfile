@@ -24,6 +24,10 @@ install-local:
 windows-dacl:
     pwsh -NoProfile -File ./scripts/ci/run-windows-dacl.ps1
 
-# Creates, uses, and removes a bounded DevTest Labs target using workflow env.
-rdp-e2e state_file:
-    python3 ./scripts/e2e/devtest-rdp-e2e.py run --state "{{state_file}}"
+# Build the Windows transport bridge (on Windows, or use cargo-xwin).
+windows-bridge:
+    cargo build -p rdpilot-bridge --target x86_64-pc-windows-msvc
+
+# No machine provisioning: run the native Cua probe against caller-supplied RDP env.
+cua-probe bundle requests output:
+    cargo run -p rdpilot --example cua_probe -- "{{bundle}}" "{{requests}}" "{{output}}"

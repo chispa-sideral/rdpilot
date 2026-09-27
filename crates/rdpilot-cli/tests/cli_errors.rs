@@ -49,9 +49,14 @@ use std::process::{Command, ExitStatus, Stdio};
 /// daemon's socket directory) so this test never collides with a real
 /// daemon or another concurrent test run.
 fn unique_temp_root(label: &str) -> PathBuf {
-    let nanos =
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or_default();
-    std::env::temp_dir().join(format!("rdpilot-cli-errors-{label}-{}-{nanos}", std::process::id()))
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    std::env::temp_dir().join(format!(
+        "rdpilot-cli-errors-{label}-{}-{nanos}",
+        std::process::id()
+    ))
 }
 
 /// One CLI subprocess invocation's captured result.
@@ -106,16 +111,33 @@ fn run_cli_bin(
 
 /// Run the compiled `rdpilot` CLI binary from its normal build location
 /// (sibling `rdpilot-daemon` present, auto-start works normally).
-fn run_cli(args: &[&str], xdg_runtime_dir: &Path, sink_path: &Path, capture_dir: &Path, call_index: usize) -> CliRun {
+fn run_cli(
+    args: &[&str],
+    xdg_runtime_dir: &Path,
+    sink_path: &Path,
+    capture_dir: &Path,
+    call_index: usize,
+) -> CliRun {
     let bin = PathBuf::from(env!("CARGO_BIN_EXE_rdpilot"));
-    let daemon_bin = bin.with_file_name(if cfg!(windows) { "rdpilot-daemon.exe" } else { "rdpilot-daemon" });
+    let daemon_bin = bin.with_file_name(if cfg!(windows) {
+        "rdpilot-daemon.exe"
+    } else {
+        "rdpilot-daemon"
+    });
     assert!(
         daemon_bin.exists(),
         "expected the rdpilot-daemon binary at {daemon_bin:?} — run `cargo build --workspace` \
          before this test (rdpilot-cli intentionally never depends on rdpilot-daemon, so \
          `cargo test -p rdpilot-cli` alone cannot build it)"
     );
-    run_cli_bin(&bin, args, xdg_runtime_dir, sink_path, capture_dir, call_index)
+    run_cli_bin(
+        &bin,
+        args,
+        xdg_runtime_dir,
+        sink_path,
+        capture_dir,
+        call_index,
+    )
 }
 
 /// Copy the compiled `rdpilot` binary into `dest_dir`, deliberately WITHOUT
@@ -125,20 +147,30 @@ fn run_cli(args: &[&str], xdg_runtime_dir: &Path, sink_path: &Path, capture_dir:
 /// attempt fails immediately (research Environment/Offline SC#3 row).
 fn copy_cli_binary_without_daemon_sibling(dest_dir: &Path) -> PathBuf {
     let src = PathBuf::from(env!("CARGO_BIN_EXE_rdpilot"));
-    let file_name = src.file_name().expect("CARGO_BIN_EXE_rdpilot must have a file name");
+    let file_name = src
+        .file_name()
+        .expect("CARGO_BIN_EXE_rdpilot must have a file name");
     let dest = dest_dir.join(file_name);
     std::fs::copy(&src, &dest).expect("copying the compiled rdpilot binary must succeed");
 
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(&dest).expect("stat the copied binary").permissions();
+        let mut perms = std::fs::metadata(&dest)
+            .expect("stat the copied binary")
+            .permissions();
         perms.set_mode(0o755);
         std::fs::set_permissions(&dest, perms).expect("mark the copied binary executable");
     }
 
     assert!(
-        !dest.with_file_name(if cfg!(windows) { "rdpilot-daemon.exe" } else { "rdpilot-daemon" }).exists(),
+        !dest
+            .with_file_name(if cfg!(windows) {
+                "rdpilot-daemon.exe"
+            } else {
+                "rdpilot-daemon"
+            })
+            .exists(),
         "test setup invariant: the copy destination must have NO sibling rdpilot-daemon binary"
     );
 
@@ -159,19 +191,39 @@ fn session_not_found_maps_to_exit_code_2_and_names_the_session() {
 
     // `disconnect` on a session id the daemon (freshly auto-started, empty
     // registry) has never heard of.
-    let run = run_cli(&["disconnect", "--session", "ghost-session", "--json"], &xdg_runtime_dir, &sink_path, &capture_dir, 1);
+    let run = run_cli(
+        &["disconnect", "--session", "ghost-session", "--json"],
+        &xdg_runtime_dir,
+        &sink_path,
+        &capture_dir,
+        1,
+    );
 
-    assert!(!run.status.success(), "disconnecting an unknown session must not exit 0");
-    assert_eq!(run.status.code(), Some(2), "SessionNotFound must map to exit code 2 (D-28); stderr={}", run.stderr);
+    assert!(
+        !run.status.success(),
+        "disconnecting an unknown session must not exit 0"
+    );
+    assert_eq!(
+        run.status.code(),
+        Some(2),
+        "SessionNotFound must map to exit code 2 (D-28); stderr={}",
+        run.stderr
+    );
 
-    let payload: serde_json::Value =
-        serde_json::from_str(run.stdout.trim()).unwrap_or_else(|e| panic!("--json error output must be valid JSON: {e}; stdout={}", run.stdout));
+    let payload: serde_json::Value = serde_json::from_str(run.stdout.trim()).unwrap_or_else(|e| {
+        panic!(
+            "--json error output must be valid JSON: {e}; stdout={}",
+            run.stdout
+        )
+    });
     assert_eq!(
         payload["error"]["code"].as_str(),
         Some("session-not-found"),
         "expected the wire kebab-case code in the --json error payload: {payload}"
     );
-    let message = payload["error"]["message"].as_str().expect("--json error payload must include a message string");
+    let message = payload["error"]["message"]
+        .as_str()
+        .expect("--json error payload must include a message string");
     assert!(
         message.contains("ghost-session") || message.to_lowercase().contains("session"),
         "the error message should be legible about the missing session, got: {message}"
@@ -200,9 +252,19 @@ fn daemon_unreachable_maps_to_exit_code_3() {
     // round trip attempt. No listener at xdg_runtime_dir's socket path, and
     // no sibling rdpilot-daemon binary to spawn -> connect_or_spawn's spawn
     // attempt fails immediately (never reaches its bounded backoff loop).
-    let run = run_cli_bin(&isolated_bin, &["list"], &xdg_runtime_dir, &sink_path, &capture_dir, 1);
+    let run = run_cli_bin(
+        &isolated_bin,
+        &["list"],
+        &xdg_runtime_dir,
+        &sink_path,
+        &capture_dir,
+        1,
+    );
 
-    assert!(!run.status.success(), "list against an unreachable, unspawnable daemon must not exit 0");
+    assert!(
+        !run.status.success(),
+        "list against an unreachable, unspawnable daemon must not exit 0"
+    );
     assert_eq!(
         run.status.code(),
         Some(3),
@@ -229,31 +291,64 @@ fn get_no_clobber_refuses_without_force_and_succeeds_with_force() {
     // A real, live session first — `--force` must reach the daemon and
     // succeed, not just skip the CLI-side check.
     let connect_run = run_cli(
-        &["connect", "--name", "xfer", "--host", "10.0.0.5", "--username", "u", "--password", "p", "--json"],
+        &[
+            "connect",
+            "--name",
+            "xfer",
+            "--host",
+            "10.0.0.5",
+            "--username",
+            "u",
+            "--password",
+            "p",
+            "--json",
+        ],
         &xdg_runtime_dir,
         &sink_path,
         &capture_dir,
         1,
     );
-    assert!(connect_run.status.success(), "connect must exit 0; stdout={} stderr={}", connect_run.stdout, connect_run.stderr);
-    let connect_json: serde_json::Value =
-        serde_json::from_str(connect_run.stdout.trim()).expect("connect --json must emit valid JSON");
-    let session_id = connect_json["session"].as_str().expect("connect --json must include a session id").to_owned();
+    assert!(
+        connect_run.status.success(),
+        "connect must exit 0; stdout={} stderr={}",
+        connect_run.stdout,
+        connect_run.stderr
+    );
+    let connect_json: serde_json::Value = serde_json::from_str(connect_run.stdout.trim())
+        .expect("connect --json must emit valid JSON");
+    let session_id = connect_json["session"]
+        .as_str()
+        .expect("connect --json must include a session id")
+        .to_owned();
 
     // A pre-existing local destination.
     let existing_dest = root.join("already-here.bin");
-    std::fs::write(&existing_dest, b"pre-existing local content").expect("seed the pre-existing local destination");
-    let existing_dest_str = existing_dest.to_str().expect("temp path must be valid UTF-8 on this platform");
+    std::fs::write(&existing_dest, b"pre-existing local content")
+        .expect("seed the pre-existing local destination");
+    let existing_dest_str = existing_dest
+        .to_str()
+        .expect("temp path must be valid UTF-8 on this platform");
 
     // --- without --force: refused before ever reaching the daemon ---
     let no_force_run = run_cli(
-        &["get", "--session", &session_id, "--remote-name", "r.bin", "--local", existing_dest_str],
+        &[
+            "get",
+            "--session",
+            &session_id,
+            "--remote-name",
+            "r.bin",
+            "--local",
+            existing_dest_str,
+        ],
         &xdg_runtime_dir,
         &sink_path,
         &capture_dir,
         2,
     );
-    assert!(!no_force_run.status.success(), "get against an existing local destination without --force must not exit 0");
+    assert!(
+        !no_force_run.status.success(),
+        "get against an existing local destination without --force must not exit 0"
+    );
     assert_eq!(
         no_force_run.status.code(),
         Some(8),
@@ -270,7 +365,16 @@ fn get_no_clobber_refuses_without_force_and_succeeds_with_force() {
 
     // --- with --force: proceeds and succeeds against the canned fake session ---
     let force_run = run_cli(
-        &["get", "--session", &session_id, "--remote-name", "r.bin", "--local", existing_dest_str, "--force"],
+        &[
+            "get",
+            "--session",
+            &session_id,
+            "--remote-name",
+            "r.bin",
+            "--local",
+            existing_dest_str,
+            "--force",
+        ],
         &xdg_runtime_dir,
         &sink_path,
         &capture_dir,
@@ -281,6 +385,20 @@ fn get_no_clobber_refuses_without_force_and_succeeds_with_force() {
         "get --force against an existing local destination must proceed and succeed; stdout={} stderr={}",
         force_run.stdout,
         force_run.stderr
+    );
+    assert_eq!(
+        std::fs::read(&existing_dest).expect("download replaces the original"),
+        vec![0_u8; 1024]
+    );
+    assert!(
+        !std::fs::read_dir(&root)
+            .expect("test directory")
+            .any(|entry| entry
+                .expect("directory entry")
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".rdpilot-download-")),
+        "download staging must be cleaned"
     );
 
     let _ = std::fs::remove_dir_all(&root);

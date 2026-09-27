@@ -221,7 +221,11 @@ pub async fn idle_reaper(registry: Arc<Registry>, cfg: LifecycleConfig, shutdown
 /// sleep `cfg.empty_grace` and re-check -- if a session appeared during the
 /// grace window, loop back (anti-thrash, D-31); if the registry is STILL
 /// empty after the grace, fire `shutdown` and return.
-pub async fn empty_watcher(registry: Arc<Registry>, cfg: LifecycleConfig, shutdown: ShutdownSignal) {
+pub async fn empty_watcher(
+    registry: Arc<Registry>,
+    cfg: LifecycleConfig,
+    shutdown: ShutdownSignal,
+) {
     let mut interval = tokio::time::interval(cfg.reap_interval);
     loop {
         tokio::select! {
@@ -251,7 +255,9 @@ mod tests {
     use rdpilot_ipc::SessionLifecycle;
 
     use super::*;
-    use crate::seams::{BoxFuture, DaemonError, ManagedSession, NoopReconciliationSink, SessionConnector};
+    use crate::seams::{
+        BoxFuture, DaemonError, ManagedSession, NoopReconciliationSink, SessionConnector,
+    };
 
     type TestFuture<T> = Pin<Box<dyn Future<Output = T>>>;
 
@@ -272,59 +278,48 @@ mod tests {
         }
 
         fn screenshot(&self) -> BoxFuture<'_, Result<rdpilot::Screenshot, DaemonError>> {
-            Box::pin(async { Ok(rdpilot::Screenshot { width: 1, height: 1, rgba: vec![0, 0, 0, 0] }) })
-        }
-        fn world_state(&self, _opts: rdpilot::WorldStateOptions) -> BoxFuture<'_, Result<rdpilot::WorldState, DaemonError>> {
             Box::pin(async {
-                Ok(rdpilot::WorldState {
-                    timestamp: std::time::SystemTime::now(),
-                    capture_span: std::time::Duration::from_millis(0),
-                    screenshot: None,
-                    window_list: None,
-                    uia: None,
-                    elevation_active: None,
+                Ok(rdpilot::Screenshot {
+                    width: 1,
+                    height: 1,
+                    rgba: vec![0, 0, 0, 0],
                 })
             })
         }
-        fn get_window_list(&self) -> BoxFuture<'_, Result<Vec<rdpilot::WindowInfo>, DaemonError>> {
-            Box::pin(async { Ok(vec![]) })
-        }
-        fn get_process_tree(&self) -> BoxFuture<'_, Result<Vec<rdpilot::ProcessInfo>, DaemonError>> {
-            Box::pin(async { Ok(vec![]) })
-        }
-        fn get_uia_tree(&self, _hwnd: u64, _scope: rdpilot::UiaScope) -> BoxFuture<'_, Result<Vec<rdpilot::UiaElement>, DaemonError>> {
-            Box::pin(async { Ok(vec![]) })
-        }
-        fn send_mouse(&self, _action: rdpilot::MouseAction) -> BoxFuture<'_, Result<(), DaemonError>> {
+
+        fn send_mouse(
+            &self,
+            _action: rdpilot::MouseAction,
+        ) -> BoxFuture<'_, Result<(), DaemonError>> {
             Box::pin(async { Ok(()) })
         }
         fn send_key(&self, _action: rdpilot::KeyAction) -> BoxFuture<'_, Result<(), DaemonError>> {
             Box::pin(async { Ok(()) })
         }
-        fn set_foreground_window(&self, _hwnd: u64) -> BoxFuture<'_, Result<(), DaemonError>> {
-            Box::pin(async { Ok(()) })
-        }
-        fn launch_process(
-            &self,
-            _exe: String,
-            _args: Option<String>,
-            _cwd: Option<String>,
-        ) -> BoxFuture<'_, Result<u32, DaemonError>> {
-            Box::pin(async { Ok(0) })
-        }
+
         fn upload_file(
             &self,
             _local: std::path::PathBuf,
             _remote_name: String,
         ) -> BoxFuture<'_, Result<rdpilot::TransferOutcome, DaemonError>> {
-            Box::pin(async { Ok(rdpilot::TransferOutcome { bytes_transferred: 0, checksum: String::new() }) })
+            Box::pin(async {
+                Ok(rdpilot::TransferOutcome {
+                    bytes_transferred: 0,
+                    checksum: String::new(),
+                })
+            })
         }
         fn download_file(
             &self,
             _remote_name: String,
             _local: std::path::PathBuf,
         ) -> BoxFuture<'_, Result<rdpilot::TransferOutcome, DaemonError>> {
-            Box::pin(async { Ok(rdpilot::TransferOutcome { bytes_transferred: 0, checksum: String::new() }) })
+            Box::pin(async {
+                Ok(rdpilot::TransferOutcome {
+                    bytes_transferred: 0,
+                    checksum: String::new(),
+                })
+            })
         }
         fn ping(&self) -> BoxFuture<'_, Result<std::time::Duration, DaemonError>> {
             Box::pin(async { Ok(std::time::Duration::from_millis(0)) })
@@ -335,24 +330,20 @@ mod tests {
         fn deploy_and_launch(&self) -> BoxFuture<'_, Result<std::time::Duration, DaemonError>> {
             Box::pin(async move { Ok(std::time::Duration::from_millis(0)) })
         }
-        fn uac_respond(
-            &self,
-            decision: rdpilot::UacDecision,
-        ) -> BoxFuture<'_, Result<rdpilot::UacResponseOutcome, DaemonError>> {
-            Box::pin(async move {
-                Ok(rdpilot::UacResponseOutcome {
-                    decision,
-                    confirmation: rdpilot::Screenshot { width: 1, height: 1, rgba: vec![0, 0, 0, 0] },
-                })
-            })
-        }
     }
 
     struct FakeConnector;
 
     impl SessionConnector for FakeConnector {
-        fn connect(&self, _cfg: ConnectionConfig) -> TestFuture<Result<Box<dyn ManagedSession>, DaemonError>> {
-            Box::pin(async { Ok(Box::new(FakeSession { closed: Arc::new(AtomicBool::new(false)) }) as Box<dyn ManagedSession>) })
+        fn connect(
+            &self,
+            _cfg: ConnectionConfig,
+        ) -> TestFuture<Result<Box<dyn ManagedSession>, DaemonError>> {
+            Box::pin(async {
+                Ok(Box::new(FakeSession {
+                    closed: Arc::new(AtomicBool::new(false)),
+                }) as Box<dyn ManagedSession>)
+            })
         }
     }
 
@@ -361,7 +352,10 @@ mod tests {
     }
 
     fn fake_registry() -> Arc<Registry> {
-        Arc::new(Registry::new(Arc::new(FakeConnector), Arc::new(NoopReconciliationSink)))
+        Arc::new(Registry::new(
+            Arc::new(FakeConnector),
+            Arc::new(NoopReconciliationSink),
+        ))
     }
 
     fn tiny_cfg() -> LifecycleConfig {
@@ -404,11 +398,18 @@ mod tests {
             // Give the session time to exceed idle_timeout and the reaper
             // at least one poll cycle to observe and close it.
             tokio::time::sleep(cfg.idle_timeout + cfg.reap_interval * 3).await;
-            assert_eq!(registry_for_driver.len(), 0, "the stale session must have been reaped via close()");
+            assert_eq!(
+                registry_for_driver.len(),
+                0,
+                "the stale session must have been reaped via close()"
+            );
             shutdown_for_driver.fire();
         };
 
-        tokio::join!(idle_reaper(Arc::clone(&registry), cfg, shutdown.clone()), driver);
+        tokio::join!(
+            idle_reaper(Arc::clone(&registry), cfg, shutdown.clone()),
+            driver
+        );
     }
 
     #[tokio::test]
@@ -433,11 +434,18 @@ mod tests {
         let shutdown_for_driver = shutdown.clone();
         let driver = async move {
             tokio::time::sleep(Duration::from_millis(50)).await;
-            assert_eq!(registry_for_driver.len(), 1, "a freshly active session must not be reaped");
+            assert_eq!(
+                registry_for_driver.len(),
+                1,
+                "a freshly active session must not be reaped"
+            );
             shutdown_for_driver.fire();
         };
 
-        tokio::join!(idle_reaper(Arc::clone(&registry), cfg, shutdown.clone()), driver);
+        tokio::join!(
+            idle_reaper(Arc::clone(&registry), cfg, shutdown.clone()),
+            driver
+        );
     }
 
     #[tokio::test]
@@ -449,7 +457,10 @@ mod tests {
         let shutdown = ShutdownSignal::new();
         empty_watcher(Arc::clone(&registry), cfg, shutdown.clone()).await;
 
-        assert!(shutdown.is_fired(), "empty_watcher must fire shutdown once the grace elapses while still empty");
+        assert!(
+            shutdown.is_fired(),
+            "empty_watcher must fire shutdown once the grace elapses while still empty"
+        );
     }
 
     #[tokio::test]
@@ -484,6 +495,8 @@ mod tests {
         );
 
         shutdown.fire(); // stop the watcher task so this test does not hang the runtime on drop
-        watcher.await.expect("empty_watcher task should join cleanly after shutdown fires");
+        watcher
+            .await
+            .expect("empty_watcher task should join cleanly after shutdown fires");
     }
 }

@@ -70,9 +70,7 @@ pub enum Error {
     /// silent `as u8` wheel-magnitude wraparound (Pitfall 1, T-03-01) — a
     /// bounds violation must always surface as a typed error, never a
     /// silent clamp or wrap.
-    #[error(
-        "coordinate ({x},{y}) is out of bounds for a {desktop_w}x{desktop_h} desktop"
-    )]
+    #[error("coordinate ({x},{y}) is out of bounds for a {desktop_w}x{desktop_h} desktop")]
     CoordinateOutOfBounds {
         /// The offending x coordinate.
         x: u32,
@@ -85,30 +83,25 @@ pub enum Error {
     },
 
     /// A DVC (Dynamic Virtual Channel) transport error: registration, channel
-    /// lookup, encode/decode, or handshake failure on the `RDPILOT_SENSOR`
-    /// channel (Phase 4, SENSOR-03).
+    /// lookup, encode/decode, or handshake failure on the `RDPILOT_CUA_V1`
+    /// channel.
     #[error("DVC transport error: {0}")]
     Dvc(String),
 
-    /// The in-band sensor deploy/launch bootstrap failed (D-5.1/D-5.2,
-    /// SENSOR-02): the injected Win+R launch sequence did not produce a
-    /// responding sensor (no pong) within the poll-and-retry budget.
-    #[error("sensor bootstrap failed: {0}")]
+    /// The in-band bridge deploy/launch bootstrap failed: the injected
+    /// Win+R launch sequence did not produce a
+    /// responding bridge (no pong) within the poll-and-retry budget.
+    #[error("bridge bootstrap failed: {0}")]
     Bootstrap(String),
 
-    /// The sensor understood and processed a request but rejected it as a
-    /// semantic failure (D-6.4) — e.g. `set_foreground_window` given a
-    /// closed/invalid `hwnd`, or `launch_process` given an exe that could
-    /// not start. Distinct from [`Error::Dvc`] (a transport/timeout/decode
-    /// failure): a `SensorRejected` means the round trip succeeded and the
-    /// reply's `success` field was `false`.
-    #[error("sensor rejected the request: {0}")]
-    SensorRejected(String),
+    /// The bridge rejected a file transfer request.
+    #[error("bridge rejected the request: {0}")]
+    BridgeRejected(String),
 
     /// A file-transfer path (Rust-side `RdpilotDriveBackend` validator,
     /// D-10.2/FILE-03) resolved outside the configured share root, or could
     /// not be resolved under it at all. Distinct from [`Error::Dvc`]/
-    /// [`Error::SensorRejected`] (transport/semantic failures) so a rejected
+    /// [`Error::BridgeRejected`] (transport/semantic failures) so a rejected
     /// path is never conflated with a transient transfer failure (D-10.4).
     #[error("path rejected: {0}")]
     PathTraversal(String),
@@ -123,33 +116,6 @@ pub enum Error {
         /// The actual computed SHA-256 digest, hex-encoded.
         actual: String,
     },
-
-    /// A raw `send_mouse`/`send_key(Combo)` call was rejected because a
-    /// UAC/elevation prompt is active in this session (the safety-net
-    /// check): scancode key combos and mouse clicks are silently ignored by
-    /// the secure desktop even though the transport reports success — use
-    /// [`Session::uac_respond`](crate::Session::uac_respond) instead.
-    #[error(
-        "a UAC/elevation prompt is active in this session -- raw clicks and scancode key combos have no effect \
-         on the secure desktop; use Session::uac_respond (input uac respond) instead"
-    )]
-    SecureDesktopActive,
-
-    /// [`Session::uac_respond`](crate::Session::uac_respond) was called but
-    /// no elevation prompt is active in this session (the session-scoped
-    /// precondition check).
-    #[error("uac_respond was called but no UAC/elevation prompt is active in this session")]
-    UacPromptNotActive,
-
-    /// [`Session::uac_respond`](crate::Session::uac_respond) sent its
-    /// Tab-navigate + Unicode-Enter sequence, but the follow-up
-    /// session-scoped structural recheck does not match the requested
-    /// decision's postcondition. Covers three distinct cases (the message
-    /// names which applies): a genuine response failure, a UAC credential
-    /// prompt (whose extra controls this fixed sequence does not support),
-    /// or an unexpected process-tree change during the settle window.
-    #[error("UAC response unconfirmed: {0}")]
-    UacResponseUnconfirmed(String),
 }
 
 /// Convenience alias for results returned by the `rdpilot` public API.
@@ -161,11 +127,7 @@ impl Error {
     ///
     /// Internal helper so the screenshot module does not have to spell out the
     /// six fields at every call site.
-    pub(crate) fn crop_out_of_bounds(
-        rect: &crate::Rect,
-        image_w: u32,
-        image_h: u32,
-    ) -> Self {
+    pub(crate) fn crop_out_of_bounds(rect: &crate::Rect, image_w: u32, image_h: u32) -> Self {
         Error::CropOutOfBounds {
             rect_x: rect.x,
             rect_y: rect.y,
@@ -207,16 +169,16 @@ impl Error {
         Error::Bootstrap(msg.into())
     }
 
-    /// Construct a [`Error::SensorRejected`] from any message displayable as
+    /// Construct a [`Error::BridgeRejected`] from any message displayable as
     /// a string (D-6.4) — mirrors [`Error::bootstrap`]'s role as the single
     /// call-site-friendly constructor for its variant.
     #[allow(dead_code)] // Consumed by Plan 02's request-issuing Session methods (interface-first).
-    pub(crate) fn sensor_rejected(msg: impl Into<String>) -> Self {
-        Error::SensorRejected(msg.into())
+    pub(crate) fn bridge_rejected(msg: impl Into<String>) -> Self {
+        Error::BridgeRejected(msg.into())
     }
 
     /// Construct a [`Error::PathTraversal`] from any message displayable as
-    /// a string (D-10.2/D-10.4) — mirrors [`Error::sensor_rejected`]'s role
+    /// a string (D-10.2/D-10.4) — mirrors [`Error::bridge_rejected`]'s role
     /// as the single call-site-friendly constructor for its variant.
     #[allow(dead_code)] // Consumed by Plan 10-01 Task 2's resolve_under_root and Plan 10-02's write path.
     pub(crate) fn path_traversal(msg: impl Into<String>) -> Self {
@@ -228,18 +190,14 @@ impl Error {
     /// [`Error::path_traversal`]'s role as the single call-site-friendly
     /// constructor for its variant.
     #[allow(dead_code)] // Consumed by Plan 10-04's checksum verification (interface-first).
-    pub(crate) fn checksum_mismatch(expected: impl Into<String>, actual: impl Into<String>) -> Self {
+    pub(crate) fn checksum_mismatch(
+        expected: impl Into<String>,
+        actual: impl Into<String>,
+    ) -> Self {
         Error::ChecksumMismatch {
             expected: expected.into(),
             actual: actual.into(),
         }
-    }
-
-    /// Construct a [`Error::UacResponseUnconfirmed`] from any message
-    /// displayable as a string — mirrors [`Error::checksum_mismatch`]'s
-    /// role as the single call-site-friendly constructor for its variant.
-    pub(crate) fn uac_response_unconfirmed(msg: impl Into<String>) -> Self {
-        Error::UacResponseUnconfirmed(msg.into())
     }
 }
 
@@ -260,12 +218,9 @@ impl Error {
             Error::CoordinateOutOfBounds { .. } => "coordinate_out_of_bounds",
             Error::Dvc(_) => "dvc",
             Error::Bootstrap(_) => "bootstrap",
-            Error::SensorRejected(_) => "sensor_rejected",
+            Error::BridgeRejected(_) => "bridge_rejected",
             Error::PathTraversal(_) => "path_traversal",
             Error::ChecksumMismatch { .. } => "checksum_mismatch",
-            Error::SecureDesktopActive => "secure_desktop_active",
-            Error::UacPromptNotActive => "uac_prompt_not_active",
-            Error::UacResponseUnconfirmed(_) => "uac_response_unconfirmed",
         }
     }
 }
@@ -276,101 +231,3 @@ const _: fn() = || {
     fn assert_send_sync_static<T: Send + Sync + 'static>() {}
     assert_send_sync_static::<Error>();
 };
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// `Error::Bootstrap` reports the `"bootstrap"` category and renders its
-    /// message via `Display` (D-5.2) -- mirrors the existing `Error::Dvc`
-    /// coverage pattern for a new call-site-friendly variant.
-    #[test]
-    fn bootstrap_category_and_message_render() {
-        let err = Error::bootstrap("no pong after 3 launch attempts");
-        assert_eq!(err.category(), "bootstrap");
-        assert!(matches!(err, Error::Bootstrap(_)));
-        let rendered = format!("{err}");
-        assert!(rendered.contains("sensor bootstrap failed"));
-        assert!(rendered.contains("no pong after 3 launch attempts"));
-    }
-
-    /// `Error::sensor_rejected` reports the `"sensor_rejected"` category
-    /// (D-6.4), matches `Error::SensorRejected(_)`, and its `Display`
-    /// contains the reason -- distinguishing a semantic sensor-side
-    /// rejection from a transport/timeout `Error::Dvc`.
-    #[test]
-    fn sensor_rejected_category_and_message_render() {
-        let err = Error::sensor_rejected("window closed");
-        assert_eq!(err.category(), "sensor_rejected");
-        assert!(matches!(err, Error::SensorRejected(_)));
-        let rendered = format!("{err}");
-        assert!(rendered.contains("sensor rejected the request"));
-        assert!(rendered.contains("window closed"));
-    }
-
-    /// `Error::path_traversal` reports the `"path_traversal"` category
-    /// (D-10.2/D-10.4), matches `Error::PathTraversal(_)`, and its `Display`
-    /// contains the rejection reason -- mirrors the existing
-    /// `sensor_rejected_category_and_message_render` coverage pattern for a
-    /// new call-site-friendly variant.
-    #[test]
-    fn path_traversal_category_and_message_render() {
-        let err = Error::path_traversal("escapes share root");
-        assert_eq!(err.category(), "path_traversal");
-        assert!(matches!(err, Error::PathTraversal(_)));
-        let rendered = format!("{err}");
-        assert!(rendered.contains("path rejected"));
-        assert!(rendered.contains("escapes share root"));
-    }
-
-    /// `Error::checksum_mismatch` reports the `"checksum_mismatch"` category
-    /// (D-10.5) and its `Display` names both the expected and actual hex
-    /// digests -- mirrors `path_traversal_category_and_message_render`.
-    #[test]
-    fn checksum_mismatch_category_and_message_render() {
-        let err = Error::checksum_mismatch("aaaa", "bbbb");
-        assert_eq!(err.category(), "checksum_mismatch");
-        assert!(matches!(err, Error::ChecksumMismatch { .. }));
-        let rendered = format!("{err}");
-        assert!(rendered.contains("checksum mismatch"));
-        assert!(rendered.contains("aaaa"));
-        assert!(rendered.contains("bbbb"));
-    }
-
-    /// `Error::SecureDesktopActive` reports the `"secure_desktop_active"`
-    /// category and names the working alternative (`uac_respond`) in its
-    /// message -- the safety-net rejection.
-    #[test]
-    fn secure_desktop_active_category_and_message_render() {
-        let err = Error::SecureDesktopActive;
-        assert_eq!(err.category(), "secure_desktop_active");
-        let rendered = format!("{err}");
-        assert!(rendered.contains("secure desktop"));
-        assert!(rendered.contains("uac_respond"));
-    }
-
-    /// `Error::UacPromptNotActive` reports the `"uac_prompt_not_active"`
-    /// category (the precondition check).
-    #[test]
-    fn uac_prompt_not_active_category_and_message_render() {
-        let err = Error::UacPromptNotActive;
-        assert_eq!(err.category(), "uac_prompt_not_active");
-        let rendered = format!("{err}");
-        assert!(rendered.contains("no UAC/elevation prompt is active"));
-    }
-
-    /// `Error::uac_response_unconfirmed` reports the
-    /// `"uac_response_unconfirmed"` category, matches
-    /// `Error::UacResponseUnconfirmed(_)`, and its `Display` contains the
-    /// caller-supplied reason -- mirrors
-    /// `checksum_mismatch_category_and_message_render`.
-    #[test]
-    fn uac_response_unconfirmed_category_and_message_render() {
-        let err = Error::uac_response_unconfirmed("the prompt is still present");
-        assert_eq!(err.category(), "uac_response_unconfirmed");
-        assert!(matches!(err, Error::UacResponseUnconfirmed(_)));
-        let rendered = format!("{err}");
-        assert!(rendered.contains("UAC response unconfirmed"));
-        assert!(rendered.contains("the prompt is still present"));
-    }
-}

@@ -48,9 +48,14 @@ use std::process::{Command, ExitStatus, Stdio};
 /// daemon's socket directory) so this test never collides with a real
 /// daemon or another concurrent test run.
 fn unique_temp_root() -> PathBuf {
-    let nanos =
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or_default();
-    std::env::temp_dir().join(format!("rdpilot-cli-lifecycle-{}-{nanos}", std::process::id()))
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    std::env::temp_dir().join(format!(
+        "rdpilot-cli-lifecycle-{}-{nanos}",
+        std::process::id()
+    ))
 }
 
 /// One CLI subprocess invocation's captured result.
@@ -67,9 +72,19 @@ struct CliRun {
 /// `capture_dir`/`call_index` name this invocation's stdout/stderr capture
 /// files uniquely — see the module doc's stdio pitfall for why real files
 /// (not piped `output()`) are used.
-fn run_cli(args: &[&str], xdg_runtime_dir: &Path, sink_path: &Path, capture_dir: &Path, call_index: usize) -> CliRun {
+fn run_cli(
+    args: &[&str],
+    xdg_runtime_dir: &Path,
+    sink_path: &Path,
+    capture_dir: &Path,
+    call_index: usize,
+) -> CliRun {
     let bin = PathBuf::from(env!("CARGO_BIN_EXE_rdpilot"));
-    let daemon_bin = bin.with_file_name(if cfg!(windows) { "rdpilot-daemon.exe" } else { "rdpilot-daemon" });
+    let daemon_bin = bin.with_file_name(if cfg!(windows) {
+        "rdpilot-daemon.exe"
+    } else {
+        "rdpilot-daemon"
+    });
     assert!(
         daemon_bin.exists(),
         "expected the rdpilot-daemon binary at {daemon_bin:?} — run `cargo build --workspace` \
@@ -119,11 +134,25 @@ fn connect_list_disconnect_lifecycle_auto_starts_the_real_daemon() {
 
     // Precondition: nothing is running yet — the first `connect` call must
     // be what auto-starts the daemon (CLI-01/DAEMON-03).
-    assert!(!socket_path.exists(), "no daemon should be listening before the CLI's first invocation");
+    assert!(
+        !socket_path.exists(),
+        "no daemon should be listening before the CLI's first invocation"
+    );
 
     // --- connect (auto-starts the daemon) -> Connected ---
     let connect_run = run_cli(
-        &["connect", "--name", "web", "--host", "10.0.0.5", "--username", "u", "--password", "p", "--json"],
+        &[
+            "connect",
+            "--name",
+            "web",
+            "--host",
+            "10.0.0.5",
+            "--username",
+            "u",
+            "--password",
+            "p",
+            "--json",
+        ],
         &xdg_runtime_dir,
         &sink_path,
         &capture_dir,
@@ -135,28 +164,63 @@ fn connect_list_disconnect_lifecycle_auto_starts_the_real_daemon() {
         connect_run.stdout,
         connect_run.stderr
     );
-    let connect_json: serde_json::Value =
-        serde_json::from_str(connect_run.stdout.trim()).expect("connect --json must emit valid JSON");
-    let session_id = connect_json["session"].as_str().expect("connect --json must include a session id").to_owned();
-    assert_eq!(session_id, "web", "a caller-supplied name reserves that exact session id (D-29)");
-    assert!(socket_path.exists(), "the daemon must be listening after connect auto-starts it");
+    let connect_json: serde_json::Value = serde_json::from_str(connect_run.stdout.trim())
+        .expect("connect --json must emit valid JSON");
+    let session_id = connect_json["session"]
+        .as_str()
+        .expect("connect --json must include a session id")
+        .to_owned();
+    assert_eq!(
+        session_id, "web",
+        "a caller-supplied name reserves that exact session id (D-29)"
+    );
+    assert!(
+        socket_path.exists(),
+        "the daemon must be listening after connect auto-starts it"
+    );
 
     // --- list --json -> the session, status Live (D-30) ---
-    let list_run = run_cli(&["list", "--json"], &xdg_runtime_dir, &sink_path, &capture_dir, 2);
-    assert!(list_run.status.success(), "list must exit 0; stderr={}", list_run.stderr);
+    let list_run = run_cli(
+        &["list", "--json"],
+        &xdg_runtime_dir,
+        &sink_path,
+        &capture_dir,
+        2,
+    );
+    assert!(
+        list_run.status.success(),
+        "list must exit 0; stderr={}",
+        list_run.stderr
+    );
     let sessions_json: serde_json::Value =
         serde_json::from_str(list_run.stdout.trim()).expect("list --json must emit valid JSON");
-    let sessions = sessions_json.as_array().expect("list --json must emit a JSON array");
+    let sessions = sessions_json
+        .as_array()
+        .expect("list --json must emit a JSON array");
     let entry = sessions
         .iter()
         .find(|s| s["id"].as_str() == Some(session_id.as_str()))
         .unwrap_or_else(|| panic!("expected session {session_id} in list output: {sessions:?}"));
-    assert_eq!(entry["status"].as_str(), Some("Live"), "a fake-connector session must be Live immediately (D-30)");
-    assert_eq!(entry["name"].as_str(), Some("web"), "the caller-supplied name must round-trip");
+    assert_eq!(
+        entry["status"].as_str(),
+        Some("Live"),
+        "a fake-connector session must be Live immediately (D-30)"
+    );
+    assert_eq!(
+        entry["name"].as_str(),
+        Some("web"),
+        "the caller-supplied name must round-trip"
+    );
     assert_eq!(entry["host"].as_str(), Some("10.0.0.5"));
 
     // --- disconnect -> success ---
-    let disconnect_run = run_cli(&["disconnect", "--session", &session_id], &xdg_runtime_dir, &sink_path, &capture_dir, 3);
+    let disconnect_run = run_cli(
+        &["disconnect", "--session", &session_id],
+        &xdg_runtime_dir,
+        &sink_path,
+        &capture_dir,
+        3,
+    );
     assert!(
         disconnect_run.status.success(),
         "disconnect must exit 0; stdout={} stderr={}",
@@ -165,9 +229,17 @@ fn connect_list_disconnect_lifecycle_auto_starts_the_real_daemon() {
     );
 
     // --- a second disconnect on the now-gone session -> SessionNotFound, exit 2 (D-28) ---
-    let second_disconnect =
-        run_cli(&["disconnect", "--session", &session_id], &xdg_runtime_dir, &sink_path, &capture_dir, 4);
-    assert!(!second_disconnect.status.success(), "a disconnect on an unknown session must not exit 0");
+    let second_disconnect = run_cli(
+        &["disconnect", "--session", &session_id],
+        &xdg_runtime_dir,
+        &sink_path,
+        &capture_dir,
+        4,
+    );
+    assert!(
+        !second_disconnect.status.success(),
+        "a disconnect on an unknown session must not exit 0"
+    );
     assert_eq!(
         second_disconnect.status.code(),
         Some(2),

@@ -254,11 +254,16 @@ pub fn parse_wire_key(name: &str) -> Result<WireKey, String> {
         "pagedown" | "page-down" => WireKey::PageDown,
         "insert" | "ins" => WireKey::Insert,
         "win" | "windows" | "super" => WireKey::Win,
-        other => return Err(format!("unknown key name '{other}' (original token: '{trimmed}')")),
+        other => {
+            return Err(format!(
+                "unknown key name '{other}' (original token: '{trimmed}')"
+            ))
+        }
     })
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -272,13 +277,32 @@ mod tests {
     }
 
     #[test]
-    fn wire_mouse_action_round_trips_through_serde_json() -> Result<(), Box<dyn std::error::Error>> {
+    fn wire_mouse_action_round_trips_through_serde_json() -> Result<(), Box<dyn std::error::Error>>
+    {
         let samples = vec![
             WireMouseAction::Move { x: 1, y: 2 },
-            WireMouseAction::Click { x: 1, y: 2, button: WireButton::Left },
-            WireMouseAction::DoubleClick { x: 1, y: 2, button: WireButton::Right },
-            WireMouseAction::Scroll { x: 1, y: 2, dy: -120 },
-            WireMouseAction::Drag { from_x: 1, from_y: 2, to_x: 3, to_y: 4, button: WireButton::Middle },
+            WireMouseAction::Click {
+                x: 1,
+                y: 2,
+                button: WireButton::Left,
+            },
+            WireMouseAction::DoubleClick {
+                x: 1,
+                y: 2,
+                button: WireButton::Right,
+            },
+            WireMouseAction::Scroll {
+                x: 1,
+                y: 2,
+                dy: -120,
+            },
+            WireMouseAction::Drag {
+                from_x: 1,
+                from_y: 2,
+                to_x: 3,
+                to_y: 4,
+                button: WireButton::Middle,
+            },
         ];
         for action in samples {
             let json = serde_json::to_string(&action)?;
@@ -289,7 +313,14 @@ mod tests {
 
     #[test]
     fn wire_key_round_trips_through_serde_json() -> Result<(), Box<dyn std::error::Error>> {
-        for key in [WireKey::Ctrl, WireKey::A, WireKey::Digit0, WireKey::F1, WireKey::Enter, WireKey::Win] {
+        for key in [
+            WireKey::Ctrl,
+            WireKey::A,
+            WireKey::Digit0,
+            WireKey::F1,
+            WireKey::Enter,
+            WireKey::Win,
+        ] {
             let json = serde_json::to_string(&key)?;
             let parsed: WireKey = serde_json::from_str(&json)?;
             assert_eq!(parsed, key);
@@ -388,7 +419,11 @@ mod tests {
             WireKey::Insert,
             WireKey::Win,
         ];
-        assert_eq!(all.len(), 67, "WireKey must mirror rdpilot::Key's full 67-variant set 1:1");
+        assert_eq!(
+            all.len(),
+            67,
+            "WireKey must mirror rdpilot::Key's full 67-variant set 1:1"
+        );
     }
 
     #[test]
@@ -401,6 +436,9 @@ mod tests {
         assert_eq!(parse_wire_key("page-up"), Ok(WireKey::PageUp));
 
         let err = parse_wire_key("nope").expect_err("unknown key name must be rejected");
-        assert!(err.contains("nope"), "error must name the offending token, got: {err}");
+        assert!(
+            err.contains("nope"),
+            "error must name the offending token, got: {err}"
+        );
     }
 }

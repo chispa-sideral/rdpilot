@@ -8,6 +8,7 @@
 //! `ironrdp_input::Operation`s (`Session`, a later plan, just calls it and
 //! forwards the result to `ironrdp_input::Database::apply`).
 
+#[cfg(test)]
 use crate::error::Error;
 use ironrdp_input::{MouseButton, MousePosition, Operation, Scancode, WheelRotations};
 
@@ -305,7 +306,13 @@ fn click_batch(x: u16, y: u16, button: Button) -> Vec<Operation> {
 /// interpolated moves ending exactly at `to`, then release (D-3.8). Every
 /// interpolated move is its own batch so `Session::send_mouse` can space
 /// them with a real `tokio::time::sleep` between `input_tx.send()` calls.
-fn drag_batches(from_x: u16, from_y: u16, to_x: u16, to_y: u16, button: Button) -> Vec<Vec<Operation>> {
+fn drag_batches(
+    from_x: u16,
+    from_y: u16,
+    to_x: u16,
+    to_y: u16,
+    button: Button,
+) -> Vec<Vec<Operation>> {
     let btn = mouse_button(button);
     let mut batches = Vec::with_capacity(usize::from(DRAG_INTERPOLATION_STEPS) + 2);
     batches.push(vec![
@@ -328,7 +335,14 @@ fn drag_batches(from_x: u16, from_y: u16, to_x: u16, to_y: u16, button: Button) 
 /// without wrapping; the result always lies within `[from, to]` (both
 /// originally `u16`), so the final cast back to `u16` never truncates in
 /// practice — the `unwrap_or` clamp is defensive only (API-01).
-fn interpolate(from_x: u16, from_y: u16, to_x: u16, to_y: u16, step: u16, total: u16) -> (u16, u16) {
+fn interpolate(
+    from_x: u16,
+    from_y: u16,
+    to_x: u16,
+    to_y: u16,
+    step: u16,
+    total: u16,
+) -> (u16, u16) {
     let lerp = |from: u16, to: u16| -> u16 {
         let from = i32::from(from);
         let to = i32::from(to);
@@ -362,7 +376,8 @@ pub(crate) fn key_operations(action: &KeyAction) -> Vec<Operation> {
 /// indexing out of range (API-01, T-03-04) — an empty `Combo` yields an
 /// empty (but well-formed) sequence, never a panic.
 fn combo_operations(keys: &[Key]) -> Vec<Operation> {
-    let (modifiers, others): (Vec<Key>, Vec<Key>) = keys.iter().copied().partition(|k| k.is_modifier());
+    let (modifiers, others): (Vec<Key>, Vec<Key>) =
+        keys.iter().copied().partition(|k| k.is_modifier());
     let mut ops = Vec::with_capacity((modifiers.len() + others.len()) * 2);
     for &k in &modifiers {
         ops.push(Operation::KeyPressed(scancode(k)));
@@ -502,8 +517,19 @@ mod tests {
             }
         );
 
-        let scroll = MouseAction::Scroll { x: 3, y: 4, dy: 120 };
-        assert_eq!(scroll, MouseAction::Scroll { x: 3, y: 4, dy: 120 });
+        let scroll = MouseAction::Scroll {
+            x: 3,
+            y: 4,
+            dy: 120,
+        };
+        assert_eq!(
+            scroll,
+            MouseAction::Scroll {
+                x: 3,
+                y: 4,
+                dy: 120
+            }
+        );
 
         let typed = KeyAction::Type("h".into());
         assert_eq!(typed, KeyAction::Type("h".to_owned()));
@@ -637,7 +663,11 @@ mod tests {
 
     #[test]
     fn scroll_always_emits_move_before_wheel_rotations() {
-        let batches = mouse_operations(&MouseAction::Scroll { x: 10, y: 20, dy: 120 });
+        let batches = mouse_operations(&MouseAction::Scroll {
+            x: 10,
+            y: 20,
+            dy: 120,
+        });
         assert_eq!(batches.len(), 1);
         let batch = &batches[0];
         assert_eq!(op_kind(&batch[0]), "MouseMove");
@@ -646,7 +676,11 @@ mod tests {
 
     #[test]
     fn scroll_single_notch_produces_exactly_one_wheel_rotation() {
-        let batches = mouse_operations(&MouseAction::Scroll { x: 0, y: 0, dy: 120 });
+        let batches = mouse_operations(&MouseAction::Scroll {
+            x: 0,
+            y: 0,
+            dy: 120,
+        });
         let wheel_ops = batches[0]
             .iter()
             .filter(|op| op_kind(op) == "WheelRotations")
@@ -656,7 +690,11 @@ mod tests {
 
     #[test]
     fn scroll_over_255_magnitude_splits_into_in_range_operations() {
-        let batches = mouse_operations(&MouseAction::Scroll { x: 0, y: 0, dy: 600 });
+        let batches = mouse_operations(&MouseAction::Scroll {
+            x: 0,
+            y: 0,
+            dy: 600,
+        });
         let wheel_ops: Vec<i16> = batches[0]
             .iter()
             .filter_map(|op| match op {
@@ -678,7 +716,11 @@ mod tests {
 
     #[test]
     fn scroll_negative_magnitude_preserves_sign_when_split() {
-        let batches = mouse_operations(&MouseAction::Scroll { x: 0, y: 0, dy: -600 });
+        let batches = mouse_operations(&MouseAction::Scroll {
+            x: 0,
+            y: 0,
+            dy: -600,
+        });
         let wheel_ops: Vec<i16> = batches[0]
             .iter()
             .filter_map(|op| match op {
@@ -716,7 +758,11 @@ mod tests {
             to_y: 50,
             button: Button::Left,
         });
-        assert!(batches.len() >= 3, "expected >= 3 batches, got {}", batches.len());
+        assert!(
+            batches.len() >= 3,
+            "expected >= 3 batches, got {}",
+            batches.len()
+        );
         assert!(batches
             .first()
             .expect("non-empty")

@@ -34,11 +34,10 @@
 //! CLI-side transport module has no business owning listener-side security
 //! decisions.
 
-use serde::Serialize;
 use serde::de::DeserializeOwned;
+use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-#[cfg(unix)]
 use std::io;
 #[cfg(unix)]
 use std::os::unix::fs::DirBuilderExt;
@@ -85,7 +84,7 @@ pub enum TransportError {
 /// bytes are read or a buffer of that size is allocated (T-13-01, V5 input
 /// validation) — preserved exactly from the original `rdpilot-daemon`
 /// implementation, not weakened by this relocation.
-const MAX_FRAME_LEN: u32 = 16 * 1024 * 1024;
+pub const MAX_FRAME_LEN: u32 = 16 * 1024 * 1024;
 
 /// Write `value` as one length-prefixed JSON frame to `w`.
 ///
@@ -104,12 +103,27 @@ where
     W: AsyncWrite + Unpin,
     T: Serialize,
 {
-    let body = serde_json::to_vec(value).map_err(|e| TransportError::Encode(format!("frame encode failed: {e}")))?;
-    let len = u32::try_from(body.len())
-        .map_err(|_| TransportError::Encode("frame body exceeds u32::MAX bytes, cannot encode length prefix".to_owned()))?;
-    w.write_all(&len.to_be_bytes()).await.map_err(|e| TransportError::Io(e.to_string()))?;
-    w.write_all(&body).await.map_err(|e| TransportError::Io(e.to_string()))?;
-    w.flush().await.map_err(|e| TransportError::Io(e.to_string()))?;
+    let body = serde_json::to_vec(value)
+        .map_err(|e| TransportError::Encode(format!("frame encode failed: {e}")))?;
+    let len = u32::try_from(body.len()).map_err(|_| {
+        TransportError::Encode(
+            "frame body exceeds u32::MAX bytes, cannot encode length prefix".to_owned(),
+        )
+    })?;
+    if len > MAX_FRAME_LEN {
+        return Err(TransportError::Encode(format!(
+            "frame exceeds {MAX_FRAME_LEN}-byte cap"
+        )));
+    }
+    w.write_all(&len.to_be_bytes())
+        .await
+        .map_err(|e| TransportError::Io(e.to_string()))?;
+    w.write_all(&body)
+        .await
+        .map_err(|e| TransportError::Io(e.to_string()))?;
+    w.flush()
+        .await
+        .map_err(|e| TransportError::Io(e.to_string()))?;
     Ok(())
 }
 
@@ -127,7 +141,9 @@ where
     T: DeserializeOwned,
 {
     let mut len_buf = [0_u8; 4];
-    r.read_exact(&mut len_buf).await.map_err(|e| TransportError::Io(e.to_string()))?;
+    r.read_exact(&mut len_buf)
+        .await
+        .map_err(|e| TransportError::Io(e.to_string()))?;
     let len = u32::from_be_bytes(len_buf);
     if len > MAX_FRAME_LEN {
         return Err(TransportError::Io(format!(
@@ -136,8 +152,11 @@ where
     }
 
     let mut body = vec![0_u8; len as usize];
-    r.read_exact(&mut body).await.map_err(|e| TransportError::Io(e.to_string()))?;
-    serde_json::from_slice(&body).map_err(|e| TransportError::Decode(format!("frame decode failed: {e}")))
+    r.read_exact(&mut body)
+        .await
+        .map_err(|e| TransportError::Io(e.to_string()))?;
+    serde_json::from_slice(&body)
+        .map_err(|e| TransportError::Decode(format!("frame decode failed: {e}")))
 }
 
 // ---------------------------------------------------------------------
@@ -163,9 +182,16 @@ where
 /// Returns an error if no home/runtime directory can be resolved on this
 /// platform, or if directory creation fails.
 pub fn socket_dir() -> io::Result<PathBuf> {
-    let base = BaseDirs::new()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "could not resolve a home/runtime directory on this platform"))?;
-    let dir = base.runtime_dir().unwrap_or_else(|| base.cache_dir()).join("rdpilot");
+    let base = BaseDirs::new().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "could not resolve a home/runtime directory on this platform",
+        )
+    })?;
+    let dir = base
+        .runtime_dir()
+        .unwrap_or_else(|| base.cache_dir())
+        .join("rdpilot");
     std::fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700) // atomic at creation — no TOCTOU window (V4)
@@ -248,8 +274,72 @@ pub async fn connect_or_spawn(socket_path: &Path, daemon_exe: &Path) -> io::Resu
 
     Err(io::Error::new(
         io::ErrorKind::TimedOut,
-        format!("daemon at {} did not become reachable after spawning {}", socket_path.display(), daemon_exe.display()),
+        format!(
+            "daemon at {} did not become reachable after spawning {}",
+            socket_path.display(),
+            daemon_exe.display()
+        ),
     ))
+}
+
+#[cfg(windows)]
+pub type LocalStream = tokio::net::windows::named_pipe::NamedPipeClient;
+#[cfg(unix)]
+pub type LocalStream = UnixStream;
+
+#[cfg(windows)]
+pub fn socket_path() -> io::Result<std::path::PathBuf> {
+    Ok(std::path::PathBuf::from(r"\\.\pipe\rdpilot-daemon"))
+}
+
+#[cfg(windows)]
+pub async fn connect_or_spawn(
+    path: &std::path::Path,
+    daemon_exe: &std::path::Path,
+) -> io::Result<LocalStream> {
+    use tokio::net::windows::named_pipe::ClientOptions;
+    if let Ok(stream) = ClientOptions::new().open(path) {
+        return Ok(stream);
+    }
+    std::process::Command::new(daemon_exe)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+    for delay in [50, 100, 200, 400, 800] {
+        tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+        if let Ok(stream) = ClientOptions::new().open(path) {
+            return Ok(stream);
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::TimedOut,
+        "daemon named pipe unavailable",
+    ))
+}
+
+#[cfg(test)]
+mod output_limit_tests {
+    use super::*;
+    #[tokio::test]
+    async fn serialized_outer_frame_limit_is_enforced_before_any_write() {
+        let (mut writer, mut reader) = tokio::io::duplex(1);
+        let oversized = crate::CuaStreamFrame::Message {
+            message: serde_json::Value::String("x".repeat(MAX_FRAME_LEN as usize - 2)),
+        };
+        assert!(matches!(
+            write_frame(&mut writer, &oversized).await,
+            Err(TransportError::Encode(_))
+        ));
+        drop(writer);
+        let mut buf = [0];
+        assert_eq!(
+            tokio::io::AsyncReadExt::read(&mut reader, &mut buf)
+                .await
+                .unwrap_or(1),
+            0
+        );
+    }
 }
 
 #[cfg(test)]
@@ -269,9 +359,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_frame_then_read_frame_round_trips_over_a_duplex_pipe() -> Result<(), Box<dyn std::error::Error>> {
+    async fn write_frame_then_read_frame_round_trips_over_a_duplex_pipe(
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let (mut client, mut server) = tokio::io::duplex(4096);
-        let value = Sample { a: "hello".to_owned(), b: 42 };
+        let value = Sample {
+            a: "hello".to_owned(),
+            b: 42,
+        };
 
         write_frame(&mut client, &value).await?;
         let received: Sample = read_frame(&mut server).await?;
@@ -297,7 +391,10 @@ mod tests {
         drop(client); // no body bytes ever follow
 
         let result: Result<Sample, TransportError> = read_frame(&mut server).await;
-        assert!(matches!(result, Err(TransportError::Io(_))), "expected an Io error for an oversized frame, got {result:?}");
+        assert!(
+            matches!(result, Err(TransportError::Io(_))),
+            "expected an Io error for an oversized frame, got {result:?}"
+        );
     }
 
     #[tokio::test]
@@ -318,7 +415,12 @@ mod tests {
 
         let dir = socket_dir().expect("socket_dir should succeed on this host");
         let meta = std::fs::metadata(&dir).expect("stat should succeed on a freshly created dir");
-        assert_eq!(meta.mode() & 0o777, 0o700, "expected mode 0700, got {:o}", meta.mode() & 0o777);
+        assert_eq!(
+            meta.mode() & 0o777,
+            0o700,
+            "expected mode 0700, got {:o}",
+            meta.mode() & 0o777
+        );
     }
 
     // --- Connect-or-spawn tests (moved from
@@ -334,12 +436,18 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn try_connect_against_a_socket_with_no_listener_fails_the_would_spawn_condition() {
-        let dir = std::env::temp_dir().join(format!("rdpilot-ipc-transport-autostart-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "rdpilot-ipc-transport-autostart-test-{}",
+            std::process::id()
+        ));
         let _ = std::fs::create_dir_all(&dir);
         let socket_path = dir.join("no-listener.sock");
         // Deliberately never bound -- no daemon, no stale file, nothing.
         let result = try_connect(&socket_path).await;
-        assert!(result.is_err(), "connecting to a path with no listener must fail (the would-spawn condition)");
+        assert!(
+            result.is_err(),
+            "connecting to a path with no listener must fail (the would-spawn condition)"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -349,14 +457,22 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn try_connect_against_a_real_listener_succeeds() {
-        let dir = std::env::temp_dir().join(format!("rdpilot-ipc-transport-autostart-test-listener-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "rdpilot-ipc-transport-autostart-test-listener-{}",
+            std::process::id()
+        ));
         let _ = std::fs::create_dir_all(&dir);
         let socket_path = dir.join("listener.sock");
-        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind should succeed in a fresh temp dir");
+        let listener = tokio::net::UnixListener::bind(&socket_path)
+            .expect("bind should succeed in a fresh temp dir");
 
-        let (accept_result, connect_result) = tokio::join!(listener.accept(), try_connect(&socket_path));
+        let (accept_result, connect_result) =
+            tokio::join!(listener.accept(), try_connect(&socket_path));
         assert!(accept_result.is_ok());
-        assert!(connect_result.is_ok(), "connecting to a real listener must succeed");
+        assert!(
+            connect_result.is_ok(),
+            "connecting to a real listener must succeed"
+        );
 
         drop(listener);
         let _ = std::fs::remove_dir_all(&dir);

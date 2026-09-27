@@ -28,7 +28,7 @@ pub struct WireError {
 /// The D-28 fixed wire error code set, plus an `internal` catch-all
 /// (Decision 3) for the ~9 SDK [`rdpilot::Error`] variants outside D-28's
 /// five fixed codes (e.g. `Connect`, `Tls`, `Decode`, `Session`,
-/// `CoordinateOutOfBounds`, `Dvc`, `Bootstrap`, `SensorRejected`, `Config`).
+/// `CoordinateOutOfBounds`, `Dvc`, `Bootstrap`, `BridgeRejected`, `Config`).
 ///
 /// `#[non_exhaustive]`: Phase 11 ships exactly six variants; Phase 12 adds a
 /// seventh (`DuplicateSession`); a future phase may need a more granular
@@ -65,19 +65,6 @@ pub enum WireErrorCode {
     /// SESSION-04). Produced by the registry's atomic-insert collision path
     /// (Plan 12-03). Wire string: `duplicate-session`.
     DuplicateSession,
-    /// Maps 1:1 from `rdpilot::Error::SecureDesktopActive`: a raw
-    /// `Mouse`/`Key` (`Combo`) request was rejected because a UAC/elevation
-    /// prompt is active in this session. Wire string: `secure-desktop-active`.
-    SecureDesktopActive,
-    /// Maps 1:1 from `rdpilot::Error::UacPromptNotActive`: `UacRespond` was
-    /// called but no elevation prompt is active in this session. Wire
-    /// string: `uac-prompt-not-active`.
-    UacPromptNotActive,
-    /// Maps 1:1 from `rdpilot::Error::UacResponseUnconfirmed`: the response
-    /// sequence was sent but the follow-up structural recheck does not
-    /// match the requested decision's postcondition. Wire string:
-    /// `uac-response-unconfirmed`.
-    UacResponseUnconfirmed,
 }
 
 #[cfg(test)]
@@ -94,9 +81,6 @@ mod tests {
             (WireErrorCode::ChecksumMismatch, "\"checksum-mismatch\""),
             (WireErrorCode::Internal, "\"internal\""),
             (WireErrorCode::DuplicateSession, "\"duplicate-session\""),
-            (WireErrorCode::SecureDesktopActive, "\"secure-desktop-active\""),
-            (WireErrorCode::UacPromptNotActive, "\"uac-prompt-not-active\""),
-            (WireErrorCode::UacResponseUnconfirmed, "\"uac-response-unconfirmed\""),
         ];
         for (code, expected) in cases {
             let json = serde_json::to_string(&code)?;
@@ -115,9 +99,6 @@ mod tests {
             "\"checksum-mismatch\"",
             "\"internal\"",
             "\"duplicate-session\"",
-            "\"secure-desktop-active\"",
-            "\"uac-prompt-not-active\"",
-            "\"uac-response-unconfirmed\"",
         ] {
             let code: WireErrorCode = serde_json::from_str(json)?;
             let round_tripped = serde_json::to_string(&code)?;

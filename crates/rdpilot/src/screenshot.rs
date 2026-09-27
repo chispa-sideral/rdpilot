@@ -253,7 +253,9 @@ mod tests {
     fn screenshot_serializes_dims_only_never_rgba() {
         let img = Screenshot::from_rgba(2, 2, vec![0; 2 * 2 * 4]).expect("valid buffer");
         let value = serde_json::to_value(&img).expect("Screenshot serializes");
-        let obj = value.as_object().expect("Screenshot serializes as a JSON object");
+        let obj = value
+            .as_object()
+            .expect("Screenshot serializes as a JSON object");
         assert_eq!(obj.get("width").and_then(|v| v.as_u64()), Some(2));
         assert_eq!(obj.get("height").and_then(|v| v.as_u64()), Some(2));
         assert!(

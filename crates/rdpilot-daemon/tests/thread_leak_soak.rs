@@ -28,7 +28,7 @@ use std::sync::mpsc as std_mpsc;
 use std::thread::JoinHandle;
 
 use rdpilot::ConnectionConfig;
-use rdpilot_daemon::{DaemonError, ManagedSession, Registry, ReconciliationSink, SessionConnector};
+use rdpilot_daemon::{DaemonError, ManagedSession, ReconciliationSink, Registry, SessionConnector};
 use rdpilot_ipc::SessionLifecycle;
 use sysinfo::{ProcessesToUpdate, System};
 
@@ -71,59 +71,45 @@ impl ManagedSession for ThreadOwningFakeSession {
     }
 
     fn screenshot(&self) -> OpFuture<'_, Result<rdpilot::Screenshot, DaemonError>> {
-        Box::pin(async { Ok(rdpilot::Screenshot { width: 1, height: 1, rgba: vec![0, 0, 0, 0] }) })
-    }
-    fn world_state(&self, _opts: rdpilot::WorldStateOptions) -> OpFuture<'_, Result<rdpilot::WorldState, DaemonError>> {
         Box::pin(async {
-            Ok(rdpilot::WorldState {
-                timestamp: std::time::SystemTime::now(),
-                capture_span: std::time::Duration::from_millis(0),
-                screenshot: None,
-                window_list: None,
-                uia: None,
-                elevation_active: None,
+            Ok(rdpilot::Screenshot {
+                width: 1,
+                height: 1,
+                rgba: vec![0, 0, 0, 0],
             })
         })
     }
-    fn get_window_list(&self) -> OpFuture<'_, Result<Vec<rdpilot::WindowInfo>, DaemonError>> {
-        Box::pin(async { Ok(vec![]) })
-    }
-    fn get_process_tree(&self) -> OpFuture<'_, Result<Vec<rdpilot::ProcessInfo>, DaemonError>> {
-        Box::pin(async { Ok(vec![]) })
-    }
-    fn get_uia_tree(&self, _hwnd: u64, _scope: rdpilot::UiaScope) -> OpFuture<'_, Result<Vec<rdpilot::UiaElement>, DaemonError>> {
-        Box::pin(async { Ok(vec![]) })
-    }
+
     fn send_mouse(&self, _action: rdpilot::MouseAction) -> OpFuture<'_, Result<(), DaemonError>> {
         Box::pin(async { Ok(()) })
     }
     fn send_key(&self, _action: rdpilot::KeyAction) -> OpFuture<'_, Result<(), DaemonError>> {
         Box::pin(async { Ok(()) })
     }
-    fn set_foreground_window(&self, _hwnd: u64) -> OpFuture<'_, Result<(), DaemonError>> {
-        Box::pin(async { Ok(()) })
-    }
-    fn launch_process(
-        &self,
-        _exe: String,
-        _args: Option<String>,
-        _cwd: Option<String>,
-    ) -> OpFuture<'_, Result<u32, DaemonError>> {
-        Box::pin(async { Ok(0) })
-    }
+
     fn upload_file(
         &self,
         _local: std::path::PathBuf,
         _remote_name: String,
     ) -> OpFuture<'_, Result<rdpilot::TransferOutcome, DaemonError>> {
-        Box::pin(async { Ok(rdpilot::TransferOutcome { bytes_transferred: 0, checksum: String::new() }) })
+        Box::pin(async {
+            Ok(rdpilot::TransferOutcome {
+                bytes_transferred: 0,
+                checksum: String::new(),
+            })
+        })
     }
     fn download_file(
         &self,
         _remote_name: String,
         _local: std::path::PathBuf,
     ) -> OpFuture<'_, Result<rdpilot::TransferOutcome, DaemonError>> {
-        Box::pin(async { Ok(rdpilot::TransferOutcome { bytes_transferred: 0, checksum: String::new() }) })
+        Box::pin(async {
+            Ok(rdpilot::TransferOutcome {
+                bytes_transferred: 0,
+                checksum: String::new(),
+            })
+        })
     }
     fn ping(&self) -> OpFuture<'_, Result<std::time::Duration, DaemonError>> {
         Box::pin(async { Ok(std::time::Duration::from_millis(0)) })
@@ -134,23 +120,15 @@ impl ManagedSession for ThreadOwningFakeSession {
     fn deploy_and_launch(&self) -> OpFuture<'_, Result<std::time::Duration, DaemonError>> {
         Box::pin(async move { Ok(std::time::Duration::from_millis(0)) })
     }
-    fn uac_respond(
-        &self,
-        decision: rdpilot::UacDecision,
-    ) -> OpFuture<'_, Result<rdpilot::UacResponseOutcome, DaemonError>> {
-        Box::pin(async move {
-            Ok(rdpilot::UacResponseOutcome {
-                decision,
-                confirmation: rdpilot::Screenshot { width: 1, height: 1, rgba: vec![0, 0, 0, 0] },
-            })
-        })
-    }
 }
 
 struct ThreadOwningFakeConnector;
 
 impl SessionConnector for ThreadOwningFakeConnector {
-    fn connect(&self, _cfg: ConnectionConfig) -> TestFuture<Result<Box<dyn ManagedSession>, DaemonError>> {
+    fn connect(
+        &self,
+        _cfg: ConnectionConfig,
+    ) -> TestFuture<Result<Box<dyn ManagedSession>, DaemonError>> {
         Box::pin(async move {
             let (stop_tx, stop_rx) = std_mpsc::channel::<()>();
             let thread = std::thread::Builder::new()
@@ -161,8 +139,13 @@ impl SessionConnector for ThreadOwningFakeConnector {
                     // `close()`'s shutdown signal arrives.
                     let _ = stop_rx.recv();
                 })
-                .map_err(|e| DaemonError::Io(format!("failed to spawn fake session thread: {e}")))?;
-            Ok(Box::new(ThreadOwningFakeSession { stop_tx, thread: Some(thread) }) as Box<dyn ManagedSession>)
+                .map_err(|e| {
+                    DaemonError::Io(format!("failed to spawn fake session thread: {e}"))
+                })?;
+            Ok(Box::new(ThreadOwningFakeSession {
+                stop_tx,
+                thread: Some(thread),
+            }) as Box<dyn ManagedSession>)
         })
     }
 }
@@ -243,14 +226,20 @@ fn run_cycles(cycles: usize) -> ((u64, u64), (u64, u64)) {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         let baseline = (read_thread_count(), read_rss_bytes());
 
-        let registry = Registry::new(std::sync::Arc::new(ThreadOwningFakeConnector), std::sync::Arc::new(NoopSink));
+        let registry = Registry::new(
+            std::sync::Arc::new(ThreadOwningFakeConnector),
+            std::sync::Arc::new(NoopSink),
+        );
 
         for _ in 0..cycles {
             let id = registry
                 .open(None, "10.0.0.5".to_owned(), test_cfg())
                 .await
                 .expect("open should succeed against the thread-owning fake connector");
-            registry.close(&id).await.expect("close should join the fake session's thread");
+            registry
+                .close(&id)
+                .await
+                .expect("close should join the fake session's thread");
         }
 
         // Settle past the short `thread_keep_alive` window so any blocking-
@@ -269,7 +258,9 @@ fn run_cycles(cycles: usize) -> ((u64, u64), (u64, u64)) {
 /// into the full soak.
 #[test]
 fn thread_count_returns_to_baseline_after_a_few_cycles() {
-    let _guard = SOAK_SERIALIZE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _guard = SOAK_SERIALIZE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (baseline, after) = run_cycles(3);
     assert_eq!(
         after.0, baseline.0,
@@ -288,7 +279,9 @@ fn thread_count_returns_to_baseline_after_a_few_cycles() {
 #[test]
 #[ignore = "heavy soak (N=50 real OS thread spawn/join cycles) -- run via `-- --include-ignored`"]
 fn thread_and_rss_return_to_baseline_after_fifty_cycles() {
-    let _guard = SOAK_SERIALIZE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _guard = SOAK_SERIALIZE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     const CYCLES: usize = 50;
     // Allocator retention (glibc/jemalloc arenas rarely fully return freed
     // pages to the OS) means RSS is not expected to land back at EXACTLY

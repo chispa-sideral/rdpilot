@@ -53,8 +53,8 @@
 // individually `#[allow]`d and fully covered by the crate-wide `#![deny]`.
 #![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used))]
 
-mod dispatch;
 mod diagnostics;
+mod dispatch;
 mod error_map;
 mod ipc;
 mod lifecycle;
@@ -63,10 +63,12 @@ mod registry;
 mod seams;
 mod server;
 
-pub use reconcile::{JsonReconciliationSink, ReconciliationRecord, scan_orphans, seed_into};
+pub use reconcile::{scan_orphans, seed_into, JsonReconciliationSink, ReconciliationRecord};
 pub use registry::Registry;
-pub use seams::{DaemonError, ManagedSession, ReconciliationSink, SessionConnector, SessionEntry};
-pub use server::{RunConfig, run};
+pub use seams::{
+    DaemonError, ManagedCua, ManagedSession, ReconciliationSink, SessionConnector, SessionEntry,
+};
+pub use server::{run, RunConfig};
 
 // Re-exported so `tests/ipc_security.rs` (the SC#4 [BLOCKING] DAEMON-02
 // integration test, Plan 12-04) can reach the Unix IPC primitives across

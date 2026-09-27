@@ -25,7 +25,10 @@ pub struct ConfigFlags {
     /// Prefer `RDPILOT_PASSWORD` (env) or the config file over this flag —
     /// a process's command line (and therefore this value) is visible to
     /// other local users via `ps`/shell history (T-13-13).
-    #[arg(long, help = "Password (prefer RDPILOT_PASSWORD env var or the config file — visible via `ps`)")]
+    #[arg(
+        long,
+        help = "Password (prefer RDPILOT_PASSWORD env var or the config file — visible via `ps`)"
+    )]
     pub password: Option<String>,
     /// Optional Windows domain.
     #[arg(long)]
@@ -50,7 +53,7 @@ impl ConfigFlags {
             domain: self.domain,
             accept_invalid_certs: self.accept_invalid_certs,
             share_root: None,
-            sensor_binary_path: None,
+            bundle_path: None,
         }
     }
 }

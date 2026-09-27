@@ -88,40 +88,17 @@ pub trait ManagedSession: Send + 'static {
     // Dispatch wiring onto these methods is deferred to Plan 13-04 — this
     // plan only builds the seam + the storage/`Registry::call` shape.
 
+    /// Acquire an owned stream. The registry releases its locks before forwarding it.
+    fn attach_cua(&self) -> BoxFuture<'_, Result<Box<dyn ManagedCua>, DaemonError>> {
+        Box::pin(async { Err(DaemonError::Connect("Cua bridge unavailable".into())) })
+    }
+
     /// Capture a full-desktop screenshot (mirrors [`rdpilot::Session::screenshot`]).
     ///
     /// # Errors
     ///
     /// Returns [`DaemonError::Sdk`] on any underlying SDK failure.
     fn screenshot(&self) -> BoxFuture<'_, Result<rdpilot::Screenshot, DaemonError>>;
-
-    /// Capture a batched world-state snapshot (mirrors [`rdpilot::Session::world_state`]).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`DaemonError::Sdk`] on any underlying SDK failure.
-    fn world_state(&self, opts: rdpilot::WorldStateOptions) -> BoxFuture<'_, Result<rdpilot::WorldState, DaemonError>>;
-
-    /// List top-level windows (mirrors [`rdpilot::Session::get_window_list`]).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`DaemonError::Sdk`] on any underlying SDK failure.
-    fn get_window_list(&self) -> BoxFuture<'_, Result<Vec<rdpilot::WindowInfo>, DaemonError>>;
-
-    /// List the remote process tree (mirrors [`rdpilot::Session::get_process_tree`]).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`DaemonError::Sdk`] on any underlying SDK failure.
-    fn get_process_tree(&self) -> BoxFuture<'_, Result<Vec<rdpilot::ProcessInfo>, DaemonError>>;
-
-    /// Walk the UI Automation tree rooted at `hwnd` (mirrors [`rdpilot::Session::get_uia_tree`]).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`DaemonError::Sdk`] on any underlying SDK failure.
-    fn get_uia_tree(&self, hwnd: u64, scope: rdpilot::UiaScope) -> BoxFuture<'_, Result<Vec<rdpilot::UiaElement>, DaemonError>>;
 
     /// Inject a mouse action (mirrors [`rdpilot::Session::send_mouse`]).
     ///
@@ -136,25 +113,6 @@ pub trait ManagedSession: Send + 'static {
     ///
     /// Returns [`DaemonError::Sdk`] on any underlying SDK failure.
     fn send_key(&self, action: rdpilot::KeyAction) -> BoxFuture<'_, Result<(), DaemonError>>;
-
-    /// Set the foreground window (mirrors [`rdpilot::Session::set_foreground_window`]).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`DaemonError::Sdk`] on any underlying SDK failure.
-    fn set_foreground_window(&self, hwnd: u64) -> BoxFuture<'_, Result<(), DaemonError>>;
-
-    /// Launch a remote process (mirrors [`rdpilot::Session::launch_process`]).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`DaemonError::Sdk`] on any underlying SDK failure.
-    fn launch_process(
-        &self,
-        exe: String,
-        args: Option<String>,
-        cwd: Option<String>,
-    ) -> BoxFuture<'_, Result<u32, DaemonError>>;
 
     /// Upload a local file to the remote transfer root (mirrors [`rdpilot::Session::upload_file`]).
     ///
@@ -191,26 +149,8 @@ pub trait ManagedSession: Send + 'static {
     /// `.await`/`BoxFuture` needed.
     fn desktop_size(&self) -> (u32, u32);
 
-    /// Deploy and start the remote sensor process (mirrors
-    /// [`rdpilot::Session::deploy_and_launch`]).
-    ///
-    /// **Live-diagnosed (Plan 15-06):** every `rdpilot`-crate live test
-    /// calls this explicitly before any sensor-mediated request
-    /// (window/process/UIA/launch/put/get) -- it was never called ANYWHERE
-    /// in the daemon before this plan, so every real `Connect` left the
-    /// remote sensor never started; every subsequent sensor-backed verb
-    /// then failed with a DVC channel timeout. `dispatch.rs`'s `Connect`
-    /// handler now calls this once, right after a successful connect, only
-    /// when a sensor binary path was configured (see
-    /// `resolve_sensor_binary_path`) -- an unconfigured (sensor-less)
-    /// session skips this call entirely, preserving the legitimate
-    /// session-management-only mode.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`DaemonError::Sdk`] on any underlying SDK failure (e.g. the
-    /// RDPDR copy-and-launch sequence never got a sensor pong within its
-    /// own bounded retry budget).
+    /// Deploy the configured bundle and start the bridge in the interactive session.
+    /// Returns only after bridge readiness or a bounded bootstrap error.
     fn deploy_and_launch(&self) -> BoxFuture<'_, Result<std::time::Duration, DaemonError>>;
 
     /// Fixed, redacted bootstrap milestones observed by this session. The
@@ -218,26 +158,6 @@ pub trait ManagedSession: Send + 'static {
     fn bootstrap_stages(&self) -> Vec<rdpilot::BootstrapStage> {
         Vec::new()
     }
-
-    /// This session's own RDP session id, if resolved by a prior
-    /// `get_process_tree` round trip (mirrors
-    /// [`rdpilot::Session::own_session_id`]). A plain synchronous getter,
-    /// like `desktop_size` — never a `BoxFuture`. The default (`None`)
-    /// keeps existing fake sessions source-compatible.
-    fn own_session_id(&self) -> Option<u32> {
-        None
-    }
-
-    /// Respond to an active UAC/elevation consent prompt (mirrors
-    /// [`rdpilot::Session::uac_respond`]).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`DaemonError::Sdk`] on any underlying SDK failure.
-    fn uac_respond(
-        &self,
-        decision: rdpilot::UacDecision,
-    ) -> BoxFuture<'_, Result<rdpilot::UacResponseOutcome, DaemonError>>;
 }
 
 impl ManagedSession for Session {
@@ -252,24 +172,14 @@ impl ManagedSession for Session {
         SessionLifecycle::Live
     }
 
+    fn attach_cua(&self) -> BoxFuture<'_, Result<Box<dyn ManagedCua>, DaemonError>> {
+        Box::pin(async move {
+            Ok(Box::new(self.attach_cua().await.map_err(DaemonError::Sdk)?) as Box<dyn ManagedCua>)
+        })
+    }
+
     fn screenshot(&self) -> BoxFuture<'_, Result<rdpilot::Screenshot, DaemonError>> {
         Box::pin(async move { self.screenshot().await.map_err(DaemonError::Sdk) })
-    }
-
-    fn world_state(&self, opts: rdpilot::WorldStateOptions) -> BoxFuture<'_, Result<rdpilot::WorldState, DaemonError>> {
-        Box::pin(async move { self.world_state(opts).await.map_err(DaemonError::Sdk) })
-    }
-
-    fn get_window_list(&self) -> BoxFuture<'_, Result<Vec<rdpilot::WindowInfo>, DaemonError>> {
-        Box::pin(async move { self.get_window_list().await.map_err(DaemonError::Sdk) })
-    }
-
-    fn get_process_tree(&self) -> BoxFuture<'_, Result<Vec<rdpilot::ProcessInfo>, DaemonError>> {
-        Box::pin(async move { self.get_process_tree().await.map_err(DaemonError::Sdk) })
-    }
-
-    fn get_uia_tree(&self, hwnd: u64, scope: rdpilot::UiaScope) -> BoxFuture<'_, Result<Vec<rdpilot::UiaElement>, DaemonError>> {
-        Box::pin(async move { self.get_uia_tree(hwnd, scope).await.map_err(DaemonError::Sdk) })
     }
 
     fn send_mouse(&self, action: rdpilot::MouseAction) -> BoxFuture<'_, Result<(), DaemonError>> {
@@ -280,29 +190,16 @@ impl ManagedSession for Session {
         Box::pin(async move { self.send_key(action).await.map_err(DaemonError::Sdk) })
     }
 
-    fn set_foreground_window(&self, hwnd: u64) -> BoxFuture<'_, Result<(), DaemonError>> {
-        Box::pin(async move { self.set_foreground_window(hwnd).await.map_err(DaemonError::Sdk) })
-    }
-
-    fn launch_process(
-        &self,
-        exe: String,
-        args: Option<String>,
-        cwd: Option<String>,
-    ) -> BoxFuture<'_, Result<u32, DaemonError>> {
-        Box::pin(async move {
-            self.launch_process(&exe, args.as_deref(), cwd.as_deref())
-                .await
-                .map_err(DaemonError::Sdk)
-        })
-    }
-
     fn upload_file(
         &self,
         local: std::path::PathBuf,
         remote_name: String,
     ) -> BoxFuture<'_, Result<rdpilot::TransferOutcome, DaemonError>> {
-        Box::pin(async move { self.upload_file(&local, &remote_name).await.map_err(DaemonError::Sdk) })
+        Box::pin(async move {
+            self.upload_file(&local, &remote_name)
+                .await
+                .map_err(DaemonError::Sdk)
+        })
     }
 
     fn download_file(
@@ -310,7 +207,11 @@ impl ManagedSession for Session {
         remote_name: String,
         local: std::path::PathBuf,
     ) -> BoxFuture<'_, Result<rdpilot::TransferOutcome, DaemonError>> {
-        Box::pin(async move { self.download_file(&remote_name, &local).await.map_err(DaemonError::Sdk) })
+        Box::pin(async move {
+            self.download_file(&remote_name, &local)
+                .await
+                .map_err(DaemonError::Sdk)
+        })
     }
 
     fn ping(&self) -> BoxFuture<'_, Result<std::time::Duration, DaemonError>> {
@@ -328,17 +229,6 @@ impl ManagedSession for Session {
     fn bootstrap_stages(&self) -> Vec<rdpilot::BootstrapStage> {
         self.bootstrap_stages()
     }
-
-    fn own_session_id(&self) -> Option<u32> {
-        self.own_session_id()
-    }
-
-    fn uac_respond(
-        &self,
-        decision: rdpilot::UacDecision,
-    ) -> BoxFuture<'_, Result<rdpilot::UacResponseOutcome, DaemonError>> {
-        Box::pin(async move { self.uac_respond(decision).await.map_err(DaemonError::Sdk) })
-    }
 }
 
 /// Abstracts `rdpilot::Session::connect` so the registry (Plan 12-03) can
@@ -351,7 +241,10 @@ pub trait SessionConnector: Send + Sync + 'static {
     ///
     /// Returns [`DaemonError::Sdk`] (production) or a fake-specific
     /// [`DaemonError::Connect`] (tests) on failure.
-    fn connect(&self, cfg: ConnectionConfig) -> BoxFuture<'static, Result<Box<dyn ManagedSession>, DaemonError>>;
+    fn connect(
+        &self,
+        cfg: ConnectionConfig,
+    ) -> BoxFuture<'static, Result<Box<dyn ManagedSession>, DaemonError>>;
 }
 
 /// The production [`SessionConnector`]: delegates to
@@ -361,7 +254,10 @@ pub trait SessionConnector: Send + Sync + 'static {
 pub struct RealConnector;
 
 impl SessionConnector for RealConnector {
-    fn connect(&self, cfg: ConnectionConfig) -> BoxFuture<'static, Result<Box<dyn ManagedSession>, DaemonError>> {
+    fn connect(
+        &self,
+        cfg: ConnectionConfig,
+    ) -> BoxFuture<'static, Result<Box<dyn ManagedSession>, DaemonError>> {
         Box::pin(async move {
             let session = Session::connect(&cfg).await.map_err(DaemonError::Sdk)?;
             Ok(Box::new(session) as Box<dyn ManagedSession>)
@@ -449,6 +345,8 @@ pub enum SessionEntry {
         /// Monotonic timestamp of the last observed activity (idle-reap,
         /// Plan 12-06).
         last_activity: Instant,
+        /// Owned Cua stream leases prevent idle reaping while a tool or caller is waiting.
+        cua_leases: Arc<std::sync::atomic::AtomicUsize>,
         /// ISO-8601 wall-clock rendering of `last_activity`. No
         /// operational verb is wired to update activity yet in this phase
         /// (dispatch resolves them to a not-implemented error, Plan
@@ -507,7 +405,10 @@ impl SessionEntry {
                 connected_since: Some(connected_since_wall.clone()),
                 last_activity: Some(last_activity_wall.clone()),
             },
-            SessionEntry::Orphaned { host, connected_since } => SessionStatus {
+            SessionEntry::Orphaned {
+                host,
+                connected_since,
+            } => SessionStatus {
                 id: id.as_str().to_owned(),
                 name: None,
                 host: host.clone(),
@@ -561,6 +462,32 @@ pub enum DaemonError {
     /// password field).
     #[error("config resolution failed: {0}")]
     Config(String),
+}
+
+/// Owned attachment boundary used by the IPC upgrade and its portable tests.
+pub trait ManagedCua: Send {
+    fn identity(&self) -> (u64, u64, u64);
+    fn send(&self, message: serde_json::Value) -> BoxFuture<'_, Result<(), DaemonError>>;
+    fn recv(&mut self) -> BoxFuture<'_, Result<Option<serde_json::Value>, DaemonError>>;
+    fn close(&mut self) -> BoxFuture<'_, Result<(), DaemonError>>;
+}
+impl ManagedCua for rdpilot::CuaAttachment {
+    fn identity(&self) -> (u64, u64, u64) {
+        (
+            self.bridge_generation(),
+            self.runtime_generation(),
+            self.attachment_id(),
+        )
+    }
+    fn send(&self, message: serde_json::Value) -> BoxFuture<'_, Result<(), DaemonError>> {
+        Box::pin(async move { self.send(message).await.map_err(DaemonError::Sdk) })
+    }
+    fn recv(&mut self) -> BoxFuture<'_, Result<Option<serde_json::Value>, DaemonError>> {
+        Box::pin(async move { self.recv().await.map_err(DaemonError::Sdk) })
+    }
+    fn close(&mut self) -> BoxFuture<'_, Result<(), DaemonError>> {
+        Box::pin(async move { self.close().await.map_err(DaemonError::Sdk) })
+    }
 }
 
 #[cfg(test)]

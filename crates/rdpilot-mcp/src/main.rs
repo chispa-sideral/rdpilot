@@ -1,43 +1,60 @@
-//! `rdpilot-mcp` — the MCP server binary entry point (MCP-01).
-//!
-//! Bootstraps an rmcp stdio server: stdin/stdout carry the JSON-RPC MCP
-//! wire, so ALL logging goes to stderr (Pitfall 1, T-14-04) — this is the
-//! first statement `main` executes, before anything else can possibly log.
-//! Thin client only: this binary links `rdpilot-ipc`/`rdpilot-config`/
-//! `rmcp`/`schemars` and nothing daemon/SDK-side (D-17; enforced by the
-//! `cargo tree` gate in `14-02-PLAN.md`'s `<verification>`).
-
+//! Target-bound transparent Cua MCP endpoint. Protocol stdout contains only Cua JSON.
 #![deny(unsafe_code)]
-#![deny(clippy::unwrap_used)]
-#![deny(clippy::expect_used)]
-// stdout is the JSON-RPC wire (Pitfall 1) — a stray `println!` corrupts
-// every subsequent frame the MCP host tries to parse. `tracing` (stderr-only,
-// initialized first below) is this crate's only sanctioned output channel.
-#![deny(clippy::print_stdout)]
+#![deny(clippy::unwrap_used, clippy::expect_used)]
+mod proxy;
+use clap::Parser;
+use rdpilot_ipc::{connect_or_spawn, socket_path, SessionId};
 
-mod computer;
-mod config_params;
-mod connect;
-mod error;
-mod handler;
-mod native_tools;
-mod timeouts;
+#[derive(Parser)]
+#[command(
+    version,
+    about = "Expose native Cua MCP for one existing rdpilot connection"
+)]
+struct Args {
+    /// Existing named RDP connection. Cua session labels never change this binding.
+    #[arg(long)]
+    session: SessionId,
+}
 
-use rmcp::{ServiceExt, transport::stdio};
+fn main() -> std::process::ExitCode {
+    let args = Args::parse();
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("rdpilot-mcp: {error}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    let result = runtime.block_on(run(args));
+    // Tokio's stdin uses a blocking read that cannot be cancelled. Bound runtime
+    // teardown so a dead target also exits when the caller leaves stdin open.
+    runtime.shutdown_timeout(std::time::Duration::from_millis(100));
+    match result {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("rdpilot-mcp: {error}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
 
-use handler::RdpilotMcpHandler;
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // MUST be the first statement: stdout is the JSON-RPC wire, so every
-    // log line — including anything logged before this point, which is why
-    // nothing may run before it — is routed to stderr only.
-    tracing_subscriber::fmt().with_writer(std::io::stderr).init();
-
-    let service = RdpilotMcpHandler::new().serve(stdio()).await.inspect_err(|e| {
-        tracing::error!("serving error: {:?}", e);
-    })?;
-
-    service.waiting().await?;
+async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
+    let socket = socket_path()?;
+    let daemon = std::env::current_exe()?.with_file_name(if cfg!(windows) {
+        "rdpilot-daemon.exe"
+    } else {
+        "rdpilot-daemon"
+    });
+    let mut stream = connect_or_spawn(&socket, &daemon).await?;
+    proxy::attach(&mut stream, args.session).await?;
+    proxy::forward(
+        stream,
+        tokio::io::BufReader::new(tokio::io::stdin()),
+        tokio::io::stdout(),
+    )
+    .await?;
     Ok(())
 }

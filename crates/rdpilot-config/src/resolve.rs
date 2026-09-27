@@ -32,7 +32,9 @@ const ENV_KEY_SEPARATOR: &str = "__";
 /// the real platform path and ambient process environment — this is what
 /// makes the CONFIG-01 precedence test deterministic.
 fn deserialize_layered(built: Config) -> Result<ResolvedConfig, ConfigError> {
-    built.try_deserialize().map_err(|e| ConfigError::file(e.to_string()))
+    built
+        .try_deserialize()
+        .map_err(|e| ConfigError::file(e.to_string()))
 }
 
 /// Build the file+env `config::Config` layers for the real platform config
@@ -42,7 +44,8 @@ fn deserialize_layered(built: Config) -> Result<ResolvedConfig, ConfigError> {
 fn real_file_and_env_builder() -> config::ConfigBuilder<config::builder::DefaultState> {
     let mut builder = Config::builder();
     if let Some(path) = crate::paths::config_file_path() {
-        builder = builder.add_source(File::new(&path.to_string_lossy(), FileFormat::Toml).required(false));
+        builder = builder
+            .add_source(File::new(&path.to_string_lossy(), FileFormat::Toml).required(false));
     }
     builder.add_source(
         Environment::with_prefix(ENV_PREFIX)
@@ -96,8 +99,8 @@ pub fn apply_overrides(mut base: ResolvedConfig, overrides: ResolvedConfig) -> R
     if overrides.share_root.is_some() {
         base.share_root = overrides.share_root;
     }
-    if overrides.sensor_binary_path.is_some() {
-        base.sensor_binary_path = overrides.sensor_binary_path;
+    if overrides.bundle_path.is_some() {
+        base.bundle_path = overrides.bundle_path;
     }
     base
 }
@@ -154,7 +157,7 @@ fn empty_overrides() -> ResolvedConfig {
         domain: None,
         accept_invalid_certs: false,
         share_root: None,
-        sensor_binary_path: None,
+        bundle_path: None,
     }
 }
 
@@ -184,8 +187,16 @@ mod tests {
             )
             .build()?;
         let resolved = deserialize_layered(built)?;
-        assert_eq!(resolved.host.as_deref(), Some("env-host"), "env must beat file");
-        assert_eq!(resolved.port, Some(1), "port only set by file, must survive");
+        assert_eq!(
+            resolved.host.as_deref(),
+            Some("env-host"),
+            "env must beat file"
+        );
+        assert_eq!(
+            resolved.port,
+            Some(1),
+            "port only set by file, must survive"
+        );
 
         // override wins over env+file.
         let mut with_override = empty_overrides();
@@ -243,7 +254,10 @@ mod tests {
     fn share_root_or_default_returns_the_configured_value_when_set() {
         let mut cfg = empty_overrides();
         cfg.share_root = Some("/configured/share-root".to_owned());
-        assert_eq!(share_root_or_default(&cfg), PathBuf::from("/configured/share-root"));
+        assert_eq!(
+            share_root_or_default(&cfg),
+            PathBuf::from("/configured/share-root")
+        );
     }
 
     /// `share_root_or_default` falls back to a non-empty, `rdpilot`-scoped
@@ -253,7 +267,10 @@ mod tests {
     fn share_root_or_default_returns_a_nonempty_default_path_when_unset() {
         let cfg = empty_overrides();
         let default_path = share_root_or_default(&cfg);
-        assert!(!default_path.as_os_str().is_empty(), "default share_root path must not be empty");
+        assert!(
+            !default_path.as_os_str().is_empty(),
+            "default share_root path must not be empty"
+        );
         let components: Vec<String> = default_path
             .components()
             .map(|c| c.as_os_str().to_string_lossy().into_owned())

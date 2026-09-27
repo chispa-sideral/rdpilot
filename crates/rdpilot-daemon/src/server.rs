@@ -18,10 +18,10 @@
 //! every `spawn_local` task to the single OS thread that polls
 //! `run_until`'s own future.
 
+use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::future::Future;
 use std::time::Duration;
 
 use rdpilot::ConnectionConfig;
@@ -31,7 +31,9 @@ use crate::diagnostics::Diagnostics;
 use crate::lifecycle::{self, LifecycleConfig, ShutdownSignal};
 use crate::reconcile::{self, JsonReconciliationSink};
 use crate::registry::Registry;
-use crate::seams::{BoxFuture, DaemonError, ManagedSession, RealConnector, ReconciliationSink, SessionConnector};
+use crate::seams::{
+    BoxFuture, DaemonError, ManagedSession, RealConnector, ReconciliationSink, SessionConnector,
+};
 
 /// When set (to any value), [`run`] selects [`FakeTestConnector`] instead
 /// of [`RealConnector`] -- lets the offline `autostart_lifecycle`
@@ -42,7 +44,7 @@ const TEST_CONNECTOR_ENV: &str = "RDPILOT_DAEMON_TEST_CONNECTOR";
 
 /// When set (to a valid `u64` millisecond count) alongside
 /// [`TEST_CONNECTOR_ENV`], makes [`FakeTestSession`]'s slow-class methods
-/// (`upload_file`/`download_file`/`launch_process`) genuinely
+/// (`upload_file`/`download_file`) genuinely
 /// `tokio::time::sleep` that long before resolving -- an env-gated,
 /// TEST-only hook (14-05, MCP-06) that lets a slow daemon round trip be
 /// exercised offline. Absent or unparseable -> `0` (no sleep, identical to
@@ -52,7 +54,7 @@ const TEST_CONNECTOR_ENV: &str = "RDPILOT_DAEMON_TEST_CONNECTOR";
 /// production connector is untouched (T-14-16).
 const TEST_SLOW_MS_ENV: &str = "RDPILOT_DAEMON_TEST_SLOW_MS";
 
-/// Fake-connector-only delay before the canned sensor bootstrap reports
+/// Fake-connector-only delay before the canned bridge bootstrap reports
 /// success. It is read only when the explicit fake connector is selected and
 /// is unreachable by [`RealConnector`].
 const TEST_BOOTSTRAP_DELAY_MS_ENV: &str = "RDPILOT_DAEMON_TEST_BOOTSTRAP_DELAY_MS";
@@ -139,19 +141,35 @@ async fn run_inner(config: RunConfig) -> Result<(), DaemonError> {
 
     let sink = Arc::new(match config.sink_path_override {
         Some(path) => JsonReconciliationSink::at(path),
-        None => JsonReconciliationSink::new()
-            .ok_or_else(|| DaemonError::Io("could not resolve the platform cache directory for reconciliation state".to_owned()))?,
+        None => JsonReconciliationSink::new().ok_or_else(|| {
+            DaemonError::Io(
+                "could not resolve the platform cache directory for reconciliation state"
+                    .to_owned(),
+            )
+        })?,
     });
 
     let connector: Arc<dyn SessionConnector> = if std::env::var(TEST_CONNECTOR_ENV).is_ok() {
-        let slow_ms = std::env::var(TEST_SLOW_MS_ENV).ok().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
-        let bootstrap_delay_ms = std::env::var(TEST_BOOTSTRAP_DELAY_MS_ENV).ok().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
-        Arc::new(FakeTestConnector { slow_ms, bootstrap_delay_ms })
+        let slow_ms = std::env::var(TEST_SLOW_MS_ENV)
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+        let bootstrap_delay_ms = std::env::var(TEST_BOOTSTRAP_DELAY_MS_ENV)
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+        Arc::new(FakeTestConnector {
+            slow_ms,
+            bootstrap_delay_ms,
+        })
     } else {
         Arc::new(RealConnector)
     };
 
-    let registry = Arc::new(Registry::new(connector, sink.clone() as Arc<dyn ReconciliationSink>));
+    let registry = Arc::new(Registry::new(
+        connector,
+        sink.clone() as Arc<dyn ReconciliationSink>,
+    ));
     let diagnostics = Diagnostics::from_env().map(Arc::new);
 
     // Startup reconciliation (DAEMON-04): scan + seed BEFORE the accept
@@ -217,7 +235,7 @@ async fn run_inner(config: RunConfig) -> Result<(), DaemonError> {
 /// exercised separately.
 ///
 /// Every method resolves immediately EXCEPT the three slow-class methods
-/// (`upload_file`/`download_file`/`launch_process`), which -- when
+/// (`upload_file`/`download_file`), which -- when
 /// `slow_ms` is non-zero (14-05, MCP-06) -- `tokio::time::sleep(slow_ms)`
 /// before returning their existing canned result. `slow_ms` is `0` unless
 /// [`TEST_SLOW_MS_ENV`] was set at daemon startup, so every other existing
@@ -255,82 +273,12 @@ impl ManagedSession for FakeTestSession {
         })
     }
 
-    fn world_state(&self, opts: rdpilot::WorldStateOptions) -> BoxFuture<'_, Result<rdpilot::WorldState, DaemonError>> {
-        Box::pin(async move {
-            let screenshot = if opts.screenshot {
-                Some(rdpilot::Screenshot {
-                    width: 2,
-                    height: 1,
-                    rgba: vec![255, 0, 0, 255, 0, 255, 0, 255],
-                })
-            } else {
-                None
-            };
-            let window_list = if opts.window_list { Some(vec![canned_window_info()]) } else { None };
-            let uia = match opts.uia {
-                rdpilot::UiaMode::None => None,
-                rdpilot::UiaMode::Foreground | rdpilot::UiaMode::Hwnd(_) | rdpilot::UiaMode::AllTopLevel => {
-                    Some(vec![(1u64, vec![canned_uia_element()])])
-                }
-            };
-            Ok(rdpilot::WorldState {
-                timestamp: std::time::SystemTime::now(),
-                capture_span: std::time::Duration::from_millis(1),
-                screenshot,
-                window_list,
-                uia,
-                elevation_active: None,
-            })
-        })
-    }
-
-    fn get_window_list(&self) -> BoxFuture<'_, Result<Vec<rdpilot::WindowInfo>, DaemonError>> {
-        Box::pin(async { Ok(vec![canned_window_info()]) })
-    }
-
-    fn get_process_tree(&self) -> BoxFuture<'_, Result<Vec<rdpilot::ProcessInfo>, DaemonError>> {
-        Box::pin(async {
-            Ok(vec![rdpilot::ProcessInfo {
-                pid: 1234,
-                parent_pid: 4,
-                name: "notepad.exe".to_owned(),
-                path: r"C:\Windows\notepad.exe".to_owned(),
-                command_line: None,
-                owner: None,
-                session_id: None,
-            }])
-        })
-    }
-
-    fn get_uia_tree(&self, _hwnd: u64, _scope: rdpilot::UiaScope) -> BoxFuture<'_, Result<Vec<rdpilot::UiaElement>, DaemonError>> {
-        Box::pin(async { Ok(vec![canned_uia_element()]) })
-    }
-
     fn send_mouse(&self, _action: rdpilot::MouseAction) -> BoxFuture<'_, Result<(), DaemonError>> {
         Box::pin(async { Ok(()) })
     }
 
     fn send_key(&self, _action: rdpilot::KeyAction) -> BoxFuture<'_, Result<(), DaemonError>> {
         Box::pin(async { Ok(()) })
-    }
-
-    fn set_foreground_window(&self, _hwnd: u64) -> BoxFuture<'_, Result<(), DaemonError>> {
-        Box::pin(async { Ok(()) })
-    }
-
-    fn launch_process(
-        &self,
-        _exe: String,
-        _args: Option<String>,
-        _cwd: Option<String>,
-    ) -> BoxFuture<'_, Result<u32, DaemonError>> {
-        let slow_ms = self.slow_ms;
-        Box::pin(async move {
-            if slow_ms > 0 {
-                tokio::time::sleep(Duration::from_millis(slow_ms)).await;
-            }
-            Ok(4242)
-        })
     }
 
     fn upload_file(
@@ -353,13 +301,14 @@ impl ManagedSession for FakeTestSession {
     fn download_file(
         &self,
         _remote_name: String,
-        _local: std::path::PathBuf,
+        local: std::path::PathBuf,
     ) -> BoxFuture<'_, Result<rdpilot::TransferOutcome, DaemonError>> {
         let slow_ms = self.slow_ms;
         Box::pin(async move {
             if slow_ms > 0 {
                 tokio::time::sleep(Duration::from_millis(slow_ms)).await;
             }
+            std::fs::write(local, vec![0_u8; 1024]).map_err(|e| DaemonError::Io(e.to_string()))?;
             Ok(rdpilot::TransferOutcome {
                 bytes_transferred: 1024,
                 checksum: "0".repeat(64),
@@ -383,48 +332,6 @@ impl ManagedSession for FakeTestSession {
             Ok(std::time::Duration::from_millis(0))
         })
     }
-    fn uac_respond(
-        &self,
-        decision: rdpilot::UacDecision,
-    ) -> BoxFuture<'_, Result<rdpilot::UacResponseOutcome, DaemonError>> {
-        Box::pin(async move {
-            Ok(rdpilot::UacResponseOutcome {
-                decision,
-                confirmation: rdpilot::Screenshot { width: 1, height: 1, rgba: vec![0, 0, 0, 0] },
-            })
-        })
-    }
-}
-
-/// A canned [`rdpilot::WindowInfo`] shared by [`FakeTestSession::get_window_list`]
-/// and [`FakeTestSession::world_state`] so both return the same plausible value.
-fn canned_window_info() -> rdpilot::WindowInfo {
-    rdpilot::WindowInfo {
-        hwnd: 1,
-        title: "Notepad".to_owned(),
-        rect: rdpilot::Rect { x: 0, y: 0, w: 800, h: 600 },
-        z_order: 0,
-        state: rdpilot::WindowState::Normal,
-        class_name: "Notepad".to_owned(),
-        pid: 1234,
-    }
-}
-
-/// A canned [`rdpilot::UiaElement`] shared by [`FakeTestSession::get_uia_tree`]
-/// and [`FakeTestSession::world_state`] so both return the same plausible value.
-fn canned_uia_element() -> rdpilot::UiaElement {
-    rdpilot::UiaElement {
-        id: "42".to_owned(),
-        role: "Button".to_owned(),
-        name: "OK".to_owned(),
-        bbox: rdpilot::Rect { x: 10, y: 10, w: 80, h: 24 },
-        enabled: true,
-        visible: true,
-        focusable: true,
-        focused: false,
-        depth: 1,
-        parent_id: String::new(),
-    }
 }
 
 /// A light, in-process fake [`SessionConnector`] selected by [`run`]
@@ -440,10 +347,18 @@ struct FakeTestConnector {
 }
 
 impl SessionConnector for FakeTestConnector {
-    fn connect(&self, _cfg: ConnectionConfig) -> Pin<Box<dyn Future<Output = Result<Box<dyn ManagedSession>, DaemonError>>>> {
+    fn connect(
+        &self,
+        _cfg: ConnectionConfig,
+    ) -> Pin<Box<dyn Future<Output = Result<Box<dyn ManagedSession>, DaemonError>>>> {
         let slow_ms = self.slow_ms;
         let bootstrap_delay_ms = self.bootstrap_delay_ms;
-        Box::pin(async move { Ok(Box::new(FakeTestSession { slow_ms, bootstrap_delay_ms }) as Box<dyn ManagedSession>) })
+        Box::pin(async move {
+            Ok(Box::new(FakeTestSession {
+                slow_ms,
+                bootstrap_delay_ms,
+            }) as Box<dyn ManagedSession>)
+        })
     }
 }
 
@@ -459,9 +374,19 @@ mod tests {
     /// short empty_grace self-shuts-down on its own (no client ever
     /// connects at all), proving the assembly wiring end-to-end without
     /// process spawning.
+    fn fake_download_path(slow_ms: u64) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "rdpilot-fake-download-{}-{slow_ms}",
+            std::process::id()
+        ))
+    }
+
     #[tokio::test]
     async fn run_with_an_immediately_empty_registry_and_a_short_grace_self_shuts_down() {
-        let dir = std::env::temp_dir().join(format!("rdpilot-daemon-server-run-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "rdpilot-daemon-server-run-test-{}",
+            std::process::id()
+        ));
         let _ = std::fs::create_dir_all(&dir);
         let sink_path = dir.join("sessions.json");
 
@@ -481,10 +406,16 @@ mod tests {
         // test instead of hanging the suite.
         let local = tokio::task::LocalSet::new();
         let result = local
-            .run_until(tokio::time::timeout(Duration::from_secs(5), run_inner_without_bind_for_test(config)))
+            .run_until(tokio::time::timeout(
+                Duration::from_secs(5),
+                run_inner_without_bind_for_test(config),
+            ))
             .await;
 
-        assert!(result.is_ok(), "run_inner's lifecycle assembly must self-shut-down well within the timeout");
+        assert!(
+            result.is_ok(),
+            "run_inner's lifecycle assembly must self-shut-down well within the timeout"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -500,19 +431,33 @@ mod tests {
     async fn run_inner_without_bind_for_test(config: RunConfig) {
         let sink = Arc::new(match config.sink_path_override {
             Some(path) => JsonReconciliationSink::at(path),
-            None => JsonReconciliationSink::new().expect("platform cache dir should resolve in this test environment"),
+            None => JsonReconciliationSink::new()
+                .expect("platform cache dir should resolve in this test environment"),
         });
 
-        let connector: Arc<dyn SessionConnector> = Arc::new(FakeTestConnector { slow_ms: 0, bootstrap_delay_ms: 0 });
-        let registry = Arc::new(Registry::new(connector, sink.clone() as Arc<dyn ReconciliationSink>));
+        let connector: Arc<dyn SessionConnector> = Arc::new(FakeTestConnector {
+            slow_ms: 0,
+            bootstrap_delay_ms: 0,
+        });
+        let registry = Arc::new(Registry::new(
+            connector,
+            sink.clone() as Arc<dyn ReconciliationSink>,
+        ));
 
         let orphans = reconcile::scan_orphans(sink.path());
         reconcile::seed_into(orphans, &registry);
 
         let shutdown = ShutdownSignal::new();
-        let reaper_handle = tokio::task::spawn_local(lifecycle::idle_reaper(Arc::clone(&registry), config.lifecycle, shutdown.clone()));
-        let watcher_handle =
-            tokio::task::spawn_local(lifecycle::empty_watcher(Arc::clone(&registry), config.lifecycle, shutdown.clone()));
+        let reaper_handle = tokio::task::spawn_local(lifecycle::idle_reaper(
+            Arc::clone(&registry),
+            config.lifecycle,
+            shutdown.clone(),
+        ));
+        let watcher_handle = tokio::task::spawn_local(lifecycle::empty_watcher(
+            Arc::clone(&registry),
+            config.lifecycle,
+            shutdown.clone(),
+        ));
 
         shutdown.wait().await;
         let _ = reaper_handle.await;
@@ -527,7 +472,10 @@ mod tests {
     /// method immediately, byte-for-byte the same as before this plan.
     #[tokio::test]
     async fn fake_session_slow_class_methods_resolve_immediately_when_slow_ms_is_zero() {
-        let session = FakeTestSession { slow_ms: 0, bootstrap_delay_ms: 0 };
+        let session = FakeTestSession {
+            slow_ms: 0,
+            bootstrap_delay_ms: 0,
+        };
         let immediate_bound = Duration::from_millis(50);
 
         let start = std::time::Instant::now();
@@ -535,18 +483,21 @@ mod tests {
             .upload_file(std::path::PathBuf::from("/tmp/x"), "remote".to_owned())
             .await
             .expect("upload_file should succeed");
-        assert!(start.elapsed() < immediate_bound, "slow_ms=0 upload_file must resolve immediately (env-unset regression guard)");
+        assert!(
+            start.elapsed() < immediate_bound,
+            "slow_ms=0 upload_file must resolve immediately (env-unset regression guard)"
+        );
 
         let start = std::time::Instant::now();
         session
-            .download_file("remote".to_owned(), std::path::PathBuf::from("/tmp/x"))
+            .download_file("remote".to_owned(), fake_download_path(session.slow_ms))
             .await
             .expect("download_file should succeed");
-        assert!(start.elapsed() < immediate_bound, "slow_ms=0 download_file must resolve immediately (env-unset regression guard)");
-
-        let start = std::time::Instant::now();
-        session.launch_process("notepad.exe".to_owned(), None, None).await.expect("launch_process should succeed");
-        assert!(start.elapsed() < immediate_bound, "slow_ms=0 launch_process must resolve immediately (env-unset regression guard)");
+        assert!(
+            start.elapsed() < immediate_bound,
+            "slow_ms=0 download_file must resolve immediately (env-unset regression guard)"
+        );
+        let _ = std::fs::remove_file(fake_download_path(session.slow_ms));
     }
 
     /// With `slow_ms` set, every slow-class method genuinely sleeps at
@@ -556,7 +507,10 @@ mod tests {
     #[tokio::test]
     async fn fake_session_slow_class_methods_sleep_the_configured_slow_ms() {
         const SLOW_MS: u64 = 30;
-        let session = FakeTestSession { slow_ms: SLOW_MS, bootstrap_delay_ms: 0 };
+        let session = FakeTestSession {
+            slow_ms: SLOW_MS,
+            bootstrap_delay_ms: 0,
+        };
         let bound = Duration::from_millis(SLOW_MS);
 
         let start = std::time::Instant::now();
@@ -564,23 +518,29 @@ mod tests {
             .upload_file(std::path::PathBuf::from("/tmp/x"), "remote".to_owned())
             .await
             .expect("upload_file should succeed");
-        assert!(start.elapsed() >= bound, "slow_ms={SLOW_MS} upload_file must sleep at least that long");
+        assert!(
+            start.elapsed() >= bound,
+            "slow_ms={SLOW_MS} upload_file must sleep at least that long"
+        );
 
         let start = std::time::Instant::now();
         session
-            .download_file("remote".to_owned(), std::path::PathBuf::from("/tmp/x"))
+            .download_file("remote".to_owned(), fake_download_path(session.slow_ms))
             .await
             .expect("download_file should succeed");
-        assert!(start.elapsed() >= bound, "slow_ms={SLOW_MS} download_file must sleep at least that long");
-
-        let start = std::time::Instant::now();
-        session.launch_process("notepad.exe".to_owned(), None, None).await.expect("launch_process should succeed");
-        assert!(start.elapsed() >= bound, "slow_ms={SLOW_MS} launch_process must sleep at least that long");
+        assert!(
+            start.elapsed() >= bound,
+            "slow_ms={SLOW_MS} download_file must sleep at least that long"
+        );
+        let _ = std::fs::remove_file(fake_download_path(session.slow_ms));
 
         // Fast methods stay immediate regardless of slow_ms (only the
         // three slow-class methods above consult it at all).
         let start = std::time::Instant::now();
         session.ping().await.expect("ping should succeed");
-        assert!(start.elapsed() < bound, "ping must stay immediate even when slow_ms is set");
+        assert!(
+            start.elapsed() < bound,
+            "ping must stay immediate even when slow_ms is set"
+        );
     }
 }

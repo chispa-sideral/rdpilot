@@ -2,7 +2,7 @@
 //!
 //! Its fixed stage enum and numeric attempt correlation prevent the diagnostic
 //! sink from becoming an accidental path for RDP target details, credentials,
-//! command lines, session names, sensor payloads, or error strings.
+//! command lines, session names, bridge payloads, or error strings.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -21,8 +21,8 @@ static TMP_SUFFIX: AtomicU64 = AtomicU64::new(0);
 #[derive(Clone, Copy)]
 pub(crate) enum Stage {
     RegistryOpened,
-    SensorBootstrapStarted,
-    SensorBootstrapFinished,
+    BridgeBootstrapStarted,
+    BridgeBootstrapFinished,
     IpcResponseWritten,
     IpcPeerClosed,
     RegistryClosed,
@@ -33,8 +33,8 @@ impl Stage {
     const fn as_str(self) -> &'static str {
         match self {
             Self::RegistryOpened => "registry_opened",
-            Self::SensorBootstrapStarted => "sensor_bootstrap_started",
-            Self::SensorBootstrapFinished => "sensor_bootstrap_finished",
+            Self::BridgeBootstrapStarted => "bridge_bootstrap_started",
+            Self::BridgeBootstrapFinished => "bridge_bootstrap_finished",
             Self::IpcResponseWritten => "ipc_response_written",
             Self::IpcPeerClosed => "ipc_peer_closed",
             Self::RegistryClosed => "registry_closed",
@@ -201,7 +201,8 @@ mod tests {
             TMP_SUFFIX.fetch_add(1, Ordering::Relaxed)
         ));
         let path = parent.join("diagnostics.json");
-        let diagnostics = Diagnostics::at_owner_only_path(path.clone()).expect("owner-only diagnostics");
+        let diagnostics =
+            Diagnostics::at_owner_only_path(path.clone()).expect("owner-only diagnostics");
         let stages = [
             rdpilot::BootstrapStage::RdpdrFileAccess,
             rdpilot::BootstrapStage::RdpdrFileRead,
@@ -218,8 +219,14 @@ mod tests {
         let json = std::fs::read_to_string(path).expect("diagnostics written");
         let events: Vec<Event> = serde_json::from_str(&json).expect("fixed event schema");
         assert_eq!(
-            events.iter().map(|event| event.stage.as_str()).collect::<Vec<_>>(),
-            stages.iter().map(|stage| stage.as_str()).collect::<Vec<_>>()
+            events
+                .iter()
+                .map(|event| event.stage.as_str())
+                .collect::<Vec<_>>(),
+            stages
+                .iter()
+                .map(|stage| stage.as_str())
+                .collect::<Vec<_>>()
         );
         assert!(!json.contains("attempt-1"));
         assert!(!json.contains("password"));
