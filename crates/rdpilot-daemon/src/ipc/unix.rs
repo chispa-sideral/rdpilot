@@ -129,9 +129,13 @@ mod tests {
         // matches the daemon's own effective uid, so this is the
         // same-uid control case (the genuine different-uid rejection is
         // Task 3's BLOCKING integration test).
-        let (accepted, connected) = tokio::join!(accept_and_authorize(&listener), UnixStream::connect(&path));
+        let (accepted, connected) =
+            tokio::join!(accept_and_authorize(&listener), UnixStream::connect(&path));
 
-        assert!(accepted.is_ok(), "a same-uid connection must be authorized: {accepted:?}");
+        assert!(
+            accepted.is_ok(),
+            "a same-uid connection must be authorized: {accepted:?}"
+        );
         assert!(connected.is_ok());
 
         drop(listener);

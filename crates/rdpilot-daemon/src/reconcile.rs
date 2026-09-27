@@ -105,7 +105,10 @@ impl JsonReconciliationSink {
             // must not crash the daemon. The worst case is a missed
             // orphan surface on a future crash — a visibility gap, not a
             // data-destroying action.
-            eprintln!("rdpilot-daemon: failed to write reconciliation file {:?}: {err}", self.path);
+            eprintln!(
+                "rdpilot-daemon: failed to write reconciliation file {:?}: {err}",
+                self.path
+            );
         }
     }
 }
@@ -206,7 +209,10 @@ pub fn seed_into(records: Vec<ReconciliationRecord>, registry: &Registry) {
         match SessionId::from_str(&record.id) {
             Ok(id) => registry.seed_orphan(id, record.host, record.connected_since),
             Err(err) => {
-                eprintln!("rdpilot-daemon: skipping malformed reconciliation record id {:?}: {err}", record.id);
+                eprintln!(
+                    "rdpilot-daemon: skipping malformed reconciliation record id {:?}: {err}",
+                    record.id
+                );
             }
         }
     }
@@ -214,8 +220,8 @@ pub fn seed_into(records: Vec<ReconciliationRecord>, registry: &Registry) {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
 
     use super::*;
     use crate::seams::{NoopReconciliationSink, SessionConnector};
@@ -227,7 +233,10 @@ mod tests {
     static UNIQUE_COUNTER: AtomicU64 = AtomicU64::new(0);
     fn unique_test_path(label: &str) -> PathBuf {
         let n = UNIQUE_COUNTER.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!("rdpilot-daemon-reconcile-test-{}-{label}-{n}.json", std::process::id()))
+        std::env::temp_dir().join(format!(
+            "rdpilot-daemon-reconcile-test-{}-{label}-{n}.json",
+            std::process::id()
+        ))
     }
 
     fn test_id(s: &str) -> SessionId {
@@ -264,7 +273,10 @@ mod tests {
         sink.record_closed(&test_id("payroll"));
 
         let scanned = scan_orphans(&path);
-        assert!(scanned.is_empty(), "expected no records after a clean close, got {scanned:?}");
+        assert!(
+            scanned.is_empty(),
+            "expected no records after a clean close, got {scanned:?}"
+        );
 
         let _ = fs::remove_file(&path);
     }
@@ -283,7 +295,10 @@ mod tests {
         fs::write(&path, b"{ not valid json at all [[[").expect("scratch write should succeed");
 
         let scanned = scan_orphans(&path);
-        assert!(scanned.is_empty(), "a corrupt file must yield an empty scan, not a panic");
+        assert!(
+            scanned.is_empty(),
+            "a corrupt file must yield an empty scan, not a panic"
+        );
 
         let _ = fs::remove_file(&path);
     }
@@ -312,7 +327,11 @@ mod tests {
         sink.record_open(&test_id("payroll"), "10.0.0.10", "2026-01-01T00:05:00Z");
 
         let scanned = scan_orphans(&path);
-        assert_eq!(scanned.len(), 1, "re-opening the same id must upsert, not append a duplicate");
+        assert_eq!(
+            scanned.len(),
+            1,
+            "re-opening the same id must upsert, not append a duplicate"
+        );
         assert_eq!(scanned[0].host, "10.0.0.10");
 
         let _ = fs::remove_file(&path);
@@ -328,7 +347,11 @@ mod tests {
         sink.record_open(&test_id("payroll"), "10.0.0.9", "2026-01-01T00:00:00Z");
 
         let dir = path.parent().expect("temp path has a parent").to_path_buf();
-        let stem = path.file_name().expect("temp path has a file name").to_string_lossy().into_owned();
+        let stem = path
+            .file_name()
+            .expect("temp path has a file name")
+            .to_string_lossy()
+            .into_owned();
         let leftover_tmp = fs::read_dir(&dir)
             .expect("temp dir should be readable")
             .filter_map(Result::ok)
@@ -336,17 +359,25 @@ mod tests {
                 let name = entry.file_name().to_string_lossy().into_owned();
                 name.starts_with(&stem) && name.contains(".tmp-")
             });
-        assert!(!leftover_tmp, "no .tmp- sibling should survive a completed atomic write");
+        assert!(
+            !leftover_tmp,
+            "no .tmp- sibling should survive a completed atomic write"
+        );
 
         let _ = fs::remove_file(&path);
     }
 
     #[test]
     fn seed_into_populates_the_registry_with_orphaned_entries() {
-        let registry = Registry::new(Arc::new(NoopSessionConnector), Arc::new(NoopReconciliationSink));
-        let records = vec![
-            ReconciliationRecord { id: "payroll".to_owned(), host: "10.0.0.9".to_owned(), connected_since: "2026-01-01T00:00:00Z".to_owned() },
-        ];
+        let registry = Registry::new(
+            Arc::new(NoopSessionConnector),
+            Arc::new(NoopReconciliationSink),
+        );
+        let records = vec![ReconciliationRecord {
+            id: "payroll".to_owned(),
+            host: "10.0.0.9".to_owned(),
+            connected_since: "2026-01-01T00:00:00Z".to_owned(),
+        }];
         seed_into(records, &registry);
 
         let statuses = registry.list();
@@ -358,13 +389,21 @@ mod tests {
 
     #[test]
     fn seed_into_skips_malformed_ids_without_panicking() {
-        let registry = Registry::new(Arc::new(NoopSessionConnector), Arc::new(NoopReconciliationSink));
-        let records = vec![
-            ReconciliationRecord { id: String::new(), host: "10.0.0.9".to_owned(), connected_since: "2026-01-01T00:00:00Z".to_owned() },
-        ];
+        let registry = Registry::new(
+            Arc::new(NoopSessionConnector),
+            Arc::new(NoopReconciliationSink),
+        );
+        let records = vec![ReconciliationRecord {
+            id: String::new(),
+            host: "10.0.0.9".to_owned(),
+            connected_since: "2026-01-01T00:00:00Z".to_owned(),
+        }];
         seed_into(records, &registry);
 
-        assert!(registry.list().is_empty(), "a malformed id must be skipped, not seeded");
+        assert!(
+            registry.list().is_empty(),
+            "a malformed id must be skipped, not seeded"
+        );
     }
 
     /// A `SessionConnector` never actually invoked by these tests
@@ -375,7 +414,16 @@ mod tests {
         fn connect(
             &self,
             _cfg: rdpilot::ConnectionConfig,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Box<dyn crate::seams::ManagedSession>, crate::seams::DaemonError>>>> {
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                    Output = Result<
+                        Box<dyn crate::seams::ManagedSession>,
+                        crate::seams::DaemonError,
+                    >,
+                >,
+            >,
+        > {
             Box::pin(async { Err(crate::seams::DaemonError::Connect("unused".to_owned())) })
         }
     }

@@ -109,9 +109,10 @@ fn load_config() -> Result<ConnectionConfig, String> {
         ));
     }
 
-    let raw = std::fs::read_to_string(&path).map_err(|e| format!("reading connection.json: {e}"))?;
-    let json: serde_json::Value =
-        serde_json::from_str(&raw).map_err(|e| format!("connection.json is not valid JSON: {e}"))?;
+    let raw =
+        std::fs::read_to_string(&path).map_err(|e| format!("reading connection.json: {e}"))?;
+    let json: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|e| format!("connection.json is not valid JSON: {e}"))?;
 
     let host = json
         .get("host")

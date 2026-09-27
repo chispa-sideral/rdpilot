@@ -19,8 +19,8 @@
 
 use core::time::Duration;
 
-use ironrdp::pdu::input::mouse::PointerFlags;
 use ironrdp::pdu::input::fast_path::FastPathInputEvent;
+use ironrdp::pdu::input::mouse::PointerFlags;
 use ironrdp::pdu::input::MousePdu;
 
 /// How often the keepalive fires. 60 s is shorter than any realistic RDP idle

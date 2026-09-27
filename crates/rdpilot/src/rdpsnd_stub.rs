@@ -25,9 +25,11 @@
 //! unconditionally (never panics, mirrors the "drop-never-panic" discipline
 //! used throughout this crate, T-05-01) and sends nothing back.
 
-use ironrdp_pdu::PduResult;
 use ironrdp_pdu::gcc::ChannelName;
-use ironrdp_svc::{CompressionCondition, SvcClientProcessor, SvcMessage, SvcProcessor, impl_as_any};
+use ironrdp_pdu::PduResult;
+use ironrdp_svc::{
+    impl_as_any, CompressionCondition, SvcClientProcessor, SvcMessage, SvcProcessor,
+};
 
 /// A static channel processor that only exists to satisfy the MS-RDPEFS
 /// Appendix A<1> "rdpdr requires rdpsnd to be present" server-side gate. See
@@ -78,7 +80,9 @@ mod tests {
     #[test]
     fn process_ignores_arbitrary_bytes_without_panic() {
         let mut stub = RdpsndStub::new();
-        let out = stub.process(&[0xFF, 0x00, 0x01, 0x02]).expect("never errors");
+        let out = stub
+            .process(&[0xFF, 0x00, 0x01, 0x02])
+            .expect("never errors");
         assert!(out.is_empty(), "the stub never replies");
 
         // Empty input must not panic either.

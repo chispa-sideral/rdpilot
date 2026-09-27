@@ -75,7 +75,7 @@ pub async fn connect(args: ConnectArgs, json: bool) -> Result<(), CliError> {
 /// Human-readable result for a successful connect.
 ///
 /// A session can be usable for basic RDP operations without the optional
-/// bridge executable, but bridge-backed perception and automation will not
+/// bridge executable, but native Cua desktop tools will not
 /// work. Make that degraded mode unmissable instead of presenting it as a
 /// routine connection status.
 fn connect_status_message(session: &str, bridge_live: bool) -> String {

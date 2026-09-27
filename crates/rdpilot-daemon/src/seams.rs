@@ -475,8 +475,8 @@ impl ManagedCua for rdpilot::CuaAttachment {
     fn identity(&self) -> (u64, u64, u64) {
         (
             self.bridge_generation(),
-            self.runtime_generation,
-            self.attachment_id,
+            self.runtime_generation(),
+            self.attachment_id(),
         )
     }
     fn send(&self, message: serde_json::Value) -> BoxFuture<'_, Result<(), DaemonError>> {

@@ -1,4 +1,4 @@
-//! Redacted progress for one sensor bootstrap attempt.
+//! Redacted progress for one Cua bootstrap attempt.
 //!
 //! The stages are a closed vocabulary. They intentionally carry no target,
 //! command, path, payload, or error text, so callers can persist them in an
@@ -6,7 +6,7 @@
 
 use std::sync::Mutex;
 
-/// A fixed, redacted milestone in the in-band sensor bootstrap.
+/// A fixed, redacted milestone in the in-band Cua bootstrap.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BootstrapStage {
     RdpdrFileAccess,
@@ -89,6 +89,12 @@ mod tests {
                 BootstrapStage::PongReceived,
             ]
         );
-        assert_eq!(stages.iter().map(|stage| stage.as_str()).collect::<Vec<_>>(), vec!["rdpdr_file_access", "pong_received"]);
+        assert_eq!(
+            stages
+                .iter()
+                .map(|stage| stage.as_str())
+                .collect::<Vec<_>>(),
+            vec!["rdpdr_file_access", "pong_received"]
+        );
     }
 }

@@ -17,7 +17,9 @@
 //! The module is named `session_loop` (NOT `loop`, a reserved keyword). No
 //! `unwrap`/`expect`/`panic` in non-test code (API-01).
 
-use ironrdp::connector::connection_activation::{ConnectionActivationSequence, ConnectionActivationState};
+use ironrdp::connector::connection_activation::{
+    ConnectionActivationSequence, ConnectionActivationState,
+};
 use ironrdp::core::WriteBuf;
 use ironrdp::graphics::image_processing::PixelFormat;
 use ironrdp::session::fast_path;
@@ -48,16 +50,16 @@ pub(crate) enum RdpInputEvent {
     /// A pre-built batch of fast-path input events to forward to the active
     /// stage, unchanged, in the same order.
     FastPath(Vec<ironrdp::pdu::input::fast_path::FastPathInputEvent>),
-    /// A proactive typed request on the `RDPILOT_SENSOR` DVC channel
-    /// (SENSOR-03, SC#2; generalized Phase 6, RESEARCH Pattern 2), carrying
+    /// A proactive typed request on the `RDPILOT_BRIDGE` DVC channel
+    /// (BRIDGE-03, SC#2; generalized Phase 6, RESEARCH Pattern 2), carrying
     /// the message type, the correlation `req_id` the caller allocated, and
     /// an optional JSON payload. Unlike `FastPath`, this loop *builds* the
     /// outbound bytes itself (via `ActiveStage::get_dvc` +
-    /// `RdpilotSensorProcessor::encode_request` +
+    /// `BridgeProcessor::encode_request` +
     /// `ironrdp_dvc::encode_dvc_messages`) rather than merely forwarding a
     /// pre-built payload — `DvcProcessor::start()`/`process()` are reactive
     /// only and cannot originate a send on their own (RESEARCH Q1).
-    Request(crate::sensor::MsgType, u64, Option<serde_json::Value>),
+    Request(rdpilot_bridge_protocol::Envelope),
 }
 
 /// Run the active-session pump until the connection terminates or the input
@@ -71,6 +73,7 @@ pub(crate) async fn run(
     connection_result: ironrdp::connector::ConnectionResult,
     mut input_rx: mpsc::Receiver<RdpInputEvent>,
     frame: SharedFrame,
+    bridge: std::sync::Arc<crate::bridge::BridgeShared>,
 ) -> Result<()> {
     let (mut reader, mut writer) = ironrdp_tokio::split_tokio_framed(framed);
 
@@ -89,9 +92,23 @@ pub(crate) async fn run(
     // The first tick fires immediately; consume it so the keepalive does not emit
     // an event the instant the session starts.
     keepalive.tick().await;
+    let mut bridge_ping = interval(std::time::Duration::from_secs(10));
+    bridge_ping.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
     loop {
         let outputs = tokio::select! {
+            biased;
+            _=bridge.shutdown.notified()=>break,
+            _=bridge.retire_ready.notified()=>{
+                match bridge.take_retire(){Some(e)=>match build_request_frame(&mut active_stage,e){Ok(b)=>vec![ActiveStageOutput::ResponseFrame(b)],Err(_)=>vec![]},None=>vec![]}
+            },
+            _=bridge_ping.tick()=>{
+                bridge.check_liveness();
+                if bridge.ready(){
+                    let envelope=rdpilot_bridge_protocol::Envelope::new(bridge.generation,0,rdpilot_bridge_protocol::Message::Ping);
+                    match build_request_frame(&mut active_stage,envelope){Ok(bytes)=>vec![ActiveStageOutput::ResponseFrame(bytes)],Err(_)=>vec![]}
+                }else{vec![]}
+            },
             frame_read = reader.read_pdu() => {
                 let (action, payload) = frame_read
                     .map_err(|e| Error::Session(format!("read PDU failed: {e}")))?;
@@ -116,7 +133,7 @@ pub(crate) async fn run(
                             .process_fastpath_input(&mut image, &events)
                             .map_err(|e| Error::Session(format!("input injection failed: {e}")))?
                     }
-                    Some(RdpInputEvent::Request(msg_type, req_id, payload)) => {
+                    Some(RdpInputEvent::Request(envelope)) => {
                         // Proactive send: DvcProcessor::start()/process() are
                         // reactive only (RESEARCH Q1), so the outbound request
                         // bytes are built here, from outside the processor,
@@ -136,10 +153,10 @@ pub(crate) async fn run(
                         // request would be fatal to every other in-flight/future
                         // operation (mouse/keyboard/screenshot) too — bug fixed
                         // during the Phase 4 live gate (SC#2/SC#3).
-                        match build_request_frame(&mut active_stage, msg_type, req_id, payload) {
+                        match build_request_frame(&mut active_stage, envelope) {
                             Ok(frame_bytes) => vec![ActiveStageOutput::ResponseFrame(frame_bytes)],
                             Err(e) => {
-                                debug!(%e, "sensor request dropped (sensor DVC not ready yet); \
+                                debug!(%e, "bridge request dropped (bridge DVC not ready yet); \
                                     the caller's client-side timeout will surface a retryable error");
                                 vec![]
                             }
@@ -153,6 +170,9 @@ pub(crate) async fn run(
                     }
                 }
             }
+            _=bridge.data_ready.notified()=>{
+                match bridge.take_data(){Some(e)=>match build_request_frame(&mut active_stage,e){Ok(b)=>vec![ActiveStageOutput::ResponseFrame(b)],Err(_)=>vec![]},None=>vec![]}
+            },
             _ = keepalive.tick() => {
                 trace!("keepalive tick");
                 active_stage
@@ -165,10 +185,13 @@ pub(crate) async fn run(
         for out in outputs {
             match out {
                 ActiveStageOutput::ResponseFrame(frame_bytes) => {
-                    writer
-                        .write_all(&frame_bytes)
-                        .await
-                        .map_err(|e| Error::Session(format!("write response failed: {e}")))?;
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        writer.write_all(&frame_bytes),
+                    )
+                    .await
+                    .map_err(|_| Error::Session("RDP write deadline exceeded".into()))?
+                    .map_err(|e| Error::Session(format!("write response failed: {e}")))?;
                 }
                 ActiveStageOutput::GraphicsUpdate(_region) => {
                     // Snapshot the whole framebuffer into the shared frame. We
@@ -183,11 +206,16 @@ pub(crate) async fn run(
                     // Server resize / share change: run the reactivation sequence
                     // and rebuild the framebuffer at the new size, or screenshots
                     // go stale / wrong-size (Pitfall 2, criterion #4).
-                    reactivate(&mut reader, &mut writer, &mut active_stage, &mut image, &mut activation)
-                        .await?;
+                    tokio::select! {
+                        _=bridge.shutdown.notified()=>return Ok(()),
+                        outcome=tokio::time::timeout(std::time::Duration::from_secs(10),reactivate(&mut reader,&mut writer,&mut active_stage,&mut image,&mut activation))=>{
+                            outcome.map_err(|_|Error::Session("RDP reactivation deadline exceeded".into()))??;
+                        }
+                    }
                 }
                 ActiveStageOutput::Terminate(reason) => {
                     debug!(%reason, "session terminated by server");
+                    bridge.invalidate(&format!("RDP server ended session: {reason}"));
                     terminate = true;
                 }
                 // Pointer* variants: ignored — enable_server_pointer is false, so
@@ -204,15 +232,15 @@ pub(crate) async fn run(
     Ok(())
 }
 
-/// Build the outbound DVC frame bytes for a single typed sensor request
+/// Build the outbound DVC frame bytes for a single typed bridge request
 /// (RESEARCH Pattern 2: one builder for every `MsgType`, not one per message
 /// type).
 ///
-/// Looks up the registered [`crate::sensor::RdpilotSensorProcessor`] DVC,
+/// Looks up the registered [`crate::bridge::BridgeProcessor`] DVC,
 /// requires it to be open (`channel_id()` populated — i.e. the server-side
 /// responder has completed `WTSVirtualChannelOpenEx` and the drdynvc Create
 /// handshake), encodes the request envelope via
-/// [`crate::sensor::RdpilotSensorProcessor::encode_request`], and wraps it
+/// [`crate::bridge::BridgeProcessor::encode_request`], and wraps it
 /// into a single outbound frame via [`ActiveStage::encode_dvc_messages`].
 ///
 /// Returns [`Error::Dvc`] — deliberately NOT propagated with `?` by the caller
@@ -222,45 +250,34 @@ pub(crate) async fn run(
 /// error (see the call site in [`run`]).
 fn build_request_frame(
     active_stage: &mut ActiveStage,
-    msg_type: crate::sensor::MsgType,
-    req_id: u64,
-    payload: Option<serde_json::Value>,
+    envelope: rdpilot_bridge_protocol::Envelope,
 ) -> Result<Vec<u8>> {
-    let (channel_id, dvc_messages, sensor) = {
-        // Block-scoped: `get_dvc()` borrows `&mut active_stage`; that borrow
-        // MUST end before the second `&mut active_stage` call below
-        // (Pitfall 3) — this scope is load-bearing.
+    let (channel_id, dvc_messages) = {
         let dvc = active_stage
-            .get_dvc::<crate::sensor::RdpilotSensorProcessor>()
-            .ok_or_else(|| Error::Dvc("sensor channel not registered".to_owned()))?;
-        let channel_id = dvc
+            .get_dvc::<crate::bridge::BridgeProcessor>()
+            .ok_or_else(|| Error::dvc("bridge channel not registered"))?;
+        let id = dvc
             .channel_id()
-            .ok_or_else(|| Error::Dvc("sensor channel not yet open".to_owned()))?;
+            .ok_or_else(|| Error::dvc("bridge channel not open"))?;
         let processor = dvc
-            .channel_processor_downcast_ref::<crate::sensor::RdpilotSensorProcessor>()
-            .ok_or_else(|| Error::Dvc("sensor processor downcast failed".to_owned()))?;
-        let dvc_messages = processor
-            .encode_request(msg_type, req_id, payload)
-            .map_err(|e| Error::Dvc(e.to_string()))?;
-        (channel_id, dvc_messages, processor.sensor_shared())
+            .channel_processor_downcast_ref::<crate::bridge::BridgeProcessor>()
+            .ok_or_else(|| Error::dvc("bridge processor unavailable"))?;
+        (
+            id,
+            processor
+                .encode_request(envelope)
+                .map_err(|e| Error::dvc(e.to_string()))?,
+        )
     };
-    let svc_messages =
-        ironrdp::dvc::encode_dvc_messages(channel_id, dvc_messages, ironrdp::svc::ChannelFlags::empty())
-            .map_err(|e| Error::Dvc(e.to_string()))?;
-    let frame = active_stage
-        .encode_dvc_messages(svc_messages)
-        .map_err(|e| Error::Dvc(e.to_string()))?;
-    record_request_stages(&sensor, msg_type);
-    Ok(frame)
-}
-
-/// Mark only requests that were fully encoded for outbound dispatch. A DVC
-/// lookup or encoding failure therefore cannot claim that a Ping was sent.
-fn record_request_stages(sensor: &crate::sensor::SensorShared, msg_type: crate::sensor::MsgType) {
-    sensor.bootstrap.record(crate::BootstrapStage::DvcChannelOpen);
-    if msg_type == crate::sensor::MsgType::Ping {
-        sensor.bootstrap.record(crate::BootstrapStage::PingSent);
-    }
+    let svc = ironrdp::dvc::encode_dvc_messages(
+        channel_id,
+        dvc_messages,
+        ironrdp::svc::ChannelFlags::empty(),
+    )
+    .map_err(|e| Error::dvc(e.to_string()))?;
+    active_stage
+        .encode_dvc_messages(svc)
+        .map_err(|e| Error::dvc(e.to_string()))
 }
 
 /// Run the Deactivation-Reactivation sequence and rebuild the framebuffer.
@@ -300,7 +317,8 @@ async fn reactivate(
             pointer_software_rendering,
         } = activation.connection_activation_state()
         {
-            *image = DecodedImage::new(PixelFormat::RgbA32, desktop_size.width, desktop_size.height);
+            *image =
+                DecodedImage::new(PixelFormat::RgbA32, desktop_size.width, desktop_size.height);
 
             let processor = fast_path::ProcessorBuilder {
                 io_channel_id,
@@ -332,7 +350,6 @@ async fn reactivate(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
 
     /// The keepalive event the loop emits is a well-formed null pointer move
     /// (sanity that the loop's keepalive source is the no-op input, no VM).
@@ -343,15 +360,5 @@ mod tests {
             ev,
             ironrdp::pdu::input::fast_path::FastPathInputEvent::MouseEvent(_)
         ));
-    }
-
-    #[test]
-    fn encoded_ping_dispatch_records_dvc_open_and_ping_sent() {
-        let sensor = Arc::new(crate::sensor::SensorShared::new());
-        record_request_stages(&sensor, crate::sensor::MsgType::Ping);
-        assert_eq!(
-            sensor.bootstrap.snapshot(),
-            vec![crate::BootstrapStage::DvcChannelOpen, crate::BootstrapStage::PingSent]
-        );
     }
 }

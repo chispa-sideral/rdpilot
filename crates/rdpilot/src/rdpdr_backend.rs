@@ -1,4 +1,4 @@
-//! The RDPDR (drive-redirection) `RdpilotDriveBackend` (05-02, SENSOR-02).
+//! The RDPDR (drive-redirection) `RdpilotDriveBackend` (05-02, BRIDGE-02).
 //!
 //! Crate-internal only (D-09): nothing here is re-exported from `lib.rs`, and
 //! no `ironrdp-rdpdr` type ever leaks into the public API. `ironrdp-rdpdr`
@@ -7,13 +7,13 @@
 //! and empty there, 05-RESEARCH Pitfall 2) -- this module supplies the SDK's
 //! own `std::fs`-based backend instead.
 //!
-//! [`RdpilotDriveBackend`] serves the sensor exe read-only (the copied
-//! `rdpilot-sensor.exe`, wired up by Plan 03's launch bootstrap) and, when a
+//! [`RdpilotDriveBackend`] serves the bridge exe read-only (the copied
+//! `rdpilot-bridge.exe`, wired up by Plan 03's launch bootstrap) and, when a
 //! share root is configured (D-10.1, 10-01), every path under it that
 //! resolves via [`RdpilotDriveBackend::resolve_under_root`] -- a
 //! canonicalize and component-wise ancestry check (D-10.2), never substring
 //! matching, run against every RDPDR-supplied path other than the fixed
-//! sensor exe name. Any path that fails to resolve is rejected with a
+//! bridge exe name. Any path that fails to resolve is rejected with a
 //! not-found `NtStatus` and never touches `std::fs` -- this validator IS the
 //! entire security posture of this backend (T-05-04/T-10-01, ASVS V4). No
 //! `unwrap`/`expect`/`panic!` outside `#[cfg(test)]` (API-01): every
@@ -26,7 +26,7 @@
 //! `ServerDriveIoRequest` variant list and `NtStatus` values this module
 //! relies on (RESEARCH Open Question #1).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
@@ -38,30 +38,33 @@ use ironrdp::core::impl_as_any;
 use ironrdp::pdu::PduResult;
 use ironrdp::svc::SvcMessage;
 use ironrdp_rdpdr::backend::RdpdrBackend;
-use ironrdp_rdpdr::pdu::RdpdrPdu;
 use ironrdp_rdpdr::pdu::efs::{
-    Boolean, Characteristics, ClientDriveQueryDirectoryResponse, ClientDriveQueryInformationResponse,
-    ClientDriveQueryVolumeInformationResponse, ClientDriveSetInformationResponse, CreateDisposition,
-    DeviceCloseRequest, DeviceCloseResponse, DeviceControlRequest, DeviceCreateRequest, DeviceCreateResponse,
-    DeviceIoRequest, DeviceIoResponse, DeviceReadRequest, DeviceReadResponse, DeviceWriteRequest,
+    Boolean, Characteristics, ClientDriveQueryDirectoryResponse,
+    ClientDriveQueryInformationResponse, ClientDriveQueryVolumeInformationResponse,
+    ClientDriveSetInformationResponse, CreateDisposition, DeviceCloseRequest, DeviceCloseResponse,
+    DeviceControlRequest, DeviceCreateRequest, DeviceCreateResponse, DeviceIoRequest,
+    DeviceIoResponse, DeviceReadRequest, DeviceReadResponse, DeviceWriteRequest,
     DeviceWriteResponse, FileAttributeTagInformation, FileAttributes, FileBasicInformation,
-    FileBothDirectoryInformation, FileDirectoryInformation, FileEndOfFileInformation, FileFsAttributeInformation,
-    FileFsDeviceInformation, FileFsFullSizeInformation, FileFsSizeInformation, FileFsVolumeInformation,
-    FileFullDirectoryInformation, FileInformationClass, FileInformationClassLevel, FileNamesInformation,
-    FileStandardInformation, FileSystemAttributes, FileSystemInformationClass, FileSystemInformationClassLevel,
-    Information, NtStatus, ServerDeviceAnnounceResponse, ServerDriveIoRequest, ServerDriveQueryDirectoryRequest,
-    ServerDriveQueryInformationRequest, ServerDriveQueryVolumeInformationRequest, ServerDriveSetInformationRequest,
+    FileBothDirectoryInformation, FileDirectoryInformation, FileEndOfFileInformation,
+    FileFsAttributeInformation, FileFsDeviceInformation, FileFsFullSizeInformation,
+    FileFsSizeInformation, FileFsVolumeInformation, FileFullDirectoryInformation,
+    FileInformationClass, FileInformationClassLevel, FileNamesInformation, FileStandardInformation,
+    FileSystemAttributes, FileSystemInformationClass, FileSystemInformationClassLevel, Information,
+    NtStatus, ServerDeviceAnnounceResponse, ServerDriveIoRequest, ServerDriveQueryDirectoryRequest,
+    ServerDriveQueryInformationRequest, ServerDriveQueryVolumeInformationRequest,
+    ServerDriveSetInformationRequest,
 };
 use ironrdp_rdpdr::pdu::esc::{ScardCall, ScardIoCtlCode};
+use ironrdp_rdpdr::pdu::RdpdrPdu;
 
 use crate::bootstrap::BootstrapStage;
-use crate::sensor::SensorShared;
+use crate::bridge::BridgeShared;
 
 /// What a previously-granted RDPDR file id refers to: the drive root (a
 /// directory), a resolved read-only file path, or an in-progress staged
 /// write (10-02, D-10.3).
 ///
-/// [`OpenEntry::File`] is either the sensor exe (the pre-Phase-10 read-only
+/// [`OpenEntry::File`] is either the bridge exe (the pre-Phase-10 read-only
 /// special case) or a file under the configured share root, already
 /// validated by [`RdpilotDriveBackend::resolve_under_root`] at `Create`
 /// time (D-10.1/D-10.2). `handle_read` only ever streams bytes for
@@ -88,6 +91,7 @@ use crate::sensor::SensorShared;
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum OpenEntry {
     Root,
+    BundleRoot,
     File(PathBuf),
     WriteFile {
         staging: PathBuf,
@@ -96,21 +100,21 @@ enum OpenEntry {
     },
 }
 
-/// A `std::fs`-based [`RdpdrBackend`] that serves the sensor exe read-only
+/// A `std::fs`-based [`RdpdrBackend`] that serves the bridge exe read-only
 /// (the pre-Phase-10 bootstrap special case) AND, when a share root is
 /// configured, an allow-listed share root generalized for bidirectional file
-/// transfer (05-02/10-01, SENSOR-02, D-10.1).
+/// transfer (05-02/10-01, BRIDGE-02, D-10.1).
 ///
 /// Constructed once per connection (`connect.rs`) with the local path of the
-/// sensor exe, the name it should appear under in the redirected drive
-/// (e.g. under `\\tsclient\RDPILOT\<sensor_name>`), and an optional share
-/// root. When `share_root` is `None`, every non-sensor-exe path is rejected
+/// bridge exe, the name it should appear under in the redirected drive
+/// (e.g. under `\\tsclient\RDPILOT\<bridge_name>`), and an optional share
+/// root. When `share_root` is `None`, every non-bridge-exe path is rejected
 /// -- the connect path is byte-for-byte the pre-Phase-10 behavior.
 #[derive(Debug)]
 pub(crate) struct RdpilotDriveBackend {
-    sensor_path: PathBuf,
-    sensor_name: String,
-    sensor: Arc<SensorShared>,
+    bridge_path: PathBuf,
+    bridge_name: String,
+    bridge: Arc<BridgeShared>,
     /// The configured share root, if any (D-10.1). Canonicalized fresh on
     /// every [`RdpilotDriveBackend::resolve_under_root`] call rather than
     /// cached at construction time -- cheap for a per-IRP validator, and
@@ -119,6 +123,7 @@ pub(crate) struct RdpilotDriveBackend {
     /// it before calling `new`, but this backend does not assume that).
     share_root: Option<PathBuf>,
     open_files: HashMap<u32, OpenEntry>,
+    listings: HashMap<u32, VecDeque<(PathBuf, String, bool)>>,
     next_file_id: u32,
     /// A fresh counter (10-02, D-10.3) mixed into every staged `.part`
     /// filename alongside a nanosecond timestamp and the process id --
@@ -131,36 +136,46 @@ pub(crate) struct RdpilotDriveBackend {
 impl_as_any!(RdpilotDriveBackend);
 
 impl RdpilotDriveBackend {
-    /// Build a backend serving `sensor_path` read-only under `sensor_name`,
+    /// Build a backend serving `bridge_path` read-only under `bridge_name`,
     /// plus (when `share_root` is `Some`) every path under that root that
-    /// [`RdpilotDriveBackend::resolve_under_root`] accepts. `sensor_path` is
+    /// [`RdpilotDriveBackend::resolve_under_root`] accepts. `bridge_path` is
     /// read lazily (on each `Read` IRP) -- the file does not need to exist
     /// yet at construction time.
     #[cfg(test)]
-    pub(crate) fn new(sensor_path: PathBuf, sensor_name: impl Into<String>, share_root: Option<PathBuf>) -> Self {
-        Self::new_with_sensor(sensor_path, sensor_name, share_root, Arc::new(SensorShared::new()))
+    pub(crate) fn new(
+        bridge_path: PathBuf,
+        bridge_name: impl Into<String>,
+        share_root: Option<PathBuf>,
+    ) -> Self {
+        Self::new_with_bridge(
+            bridge_path,
+            bridge_name,
+            share_root,
+            Arc::new(BridgeShared::new()),
+        )
     }
 
-    pub(crate) fn new_with_sensor(
-        sensor_path: PathBuf,
-        sensor_name: impl Into<String>,
+    pub(crate) fn new_with_bridge(
+        bridge_path: PathBuf,
+        bridge_name: impl Into<String>,
         share_root: Option<PathBuf>,
-        sensor: Arc<SensorShared>,
+        bridge: Arc<BridgeShared>,
     ) -> Self {
         Self {
-            sensor_path,
-            sensor_name: sensor_name.into(),
-            sensor,
+            bridge_path,
+            bridge_name: bridge_name.into(),
+            bridge,
             share_root,
             open_files: HashMap::new(),
+            listings: HashMap::new(),
             next_file_id: 1,
             next_staging_id: 1,
         }
     }
 
     /// Strip the leading backslash(es) from an RDPDR wire path so the drive
-    /// root (`""`/`"\"`) and a bare filename (`"\sensor.exe"`) both compare
-    /// cleanly against [`RdpilotDriveBackend::sensor_name`].
+    /// root (`""`/`"\"`) and a bare filename (`"\bridge.exe"`) both compare
+    /// cleanly against [`RdpilotDriveBackend::bridge_name`].
     fn normalize(path: &str) -> &str {
         path.trim_start_matches('\\')
     }
@@ -284,7 +299,7 @@ impl RdpilotDriveBackend {
     }
 
     /// [`ServerDriveIoRequest::ServerCreateDriveRequest`]: the drive root
-    /// always resolves; the sensor exe name resolves to its fixed read-only
+    /// always resolves; the bridge exe name resolves to its fixed read-only
     /// path (the pre-Phase-10 bootstrap special case, unchanged); a
     /// create/overwrite disposition ([`Self::is_write_disposition`], D-10.3)
     /// against any other name resolves the destination via
@@ -309,19 +324,43 @@ impl RdpilotDriveBackend {
 
         let entry = if normalized.is_empty() {
             Some(OpenEntry::Root)
-        } else if normalized.eq_ignore_ascii_case(&self.sensor_name) {
-            Some(OpenEntry::File(self.sensor_path.clone()))
+        } else if normalized
+            .trim_end_matches('\\')
+            .eq_ignore_ascii_case("bundle")
+            && self.bridge_path.is_dir()
+        {
+            Some(OpenEntry::BundleRoot)
+        } else if normalized.replace('\\', "/").starts_with("bundle/") {
+            (|| {
+                let normalized = normalized.replace('\\', "/");
+                let name = normalized.strip_prefix("bundle/")?;
+                if name.is_empty() || name.contains('/') || name == ".." || name.contains(':') {
+                    return None;
+                }
+                let root = fs::canonicalize(&self.bridge_path).ok()?;
+                let path = fs::canonicalize(root.join(name)).ok()?;
+                if !path.starts_with(&root) || !path.is_file() {
+                    return None;
+                }
+                Some(OpenEntry::File(path))
+            })()
+        } else if normalized.eq_ignore_ascii_case(&self.bridge_name) && self.bridge_path.is_file() {
+            Some(OpenEntry::File(self.bridge_path.clone()))
         } else if Self::is_write_disposition(create_disposition) {
             match self.resolve_under_root(normalized) {
-                Ok(dest) => self.allocate_staging_path().map(|staging| OpenEntry::WriteFile {
-                    staging,
-                    dest,
-                    expected_len: None,
-                }),
+                Ok(dest) => self
+                    .allocate_staging_path()
+                    .map(|staging| OpenEntry::WriteFile {
+                        staging,
+                        dest,
+                        expected_len: None,
+                    }),
                 Err(()) => None,
             }
         } else {
-            self.resolve_under_root(normalized).ok().map(OpenEntry::File)
+            self.resolve_under_root(normalized)
+                .ok()
+                .map(OpenEntry::File)
         };
 
         let Some(entry) = entry else {
@@ -330,20 +369,26 @@ impl RdpilotDriveBackend {
                 file_id: 0,
                 information: Information::FILE_SUPERSEDED,
             };
-            return Ok(vec![SvcMessage::from(RdpdrPdu::DeviceCreateResponse(response))]);
+            return Ok(vec![SvcMessage::from(RdpdrPdu::DeviceCreateResponse(
+                response,
+            ))]);
         };
 
         let file_id = self.allocate_file_id();
         self.open_files.insert(file_id, entry);
-        if normalized.eq_ignore_ascii_case(&self.sensor_name) {
-            self.sensor.bootstrap.record(BootstrapStage::RdpdrFileAccess);
+        if normalized.starts_with("bundle") || normalized.eq_ignore_ascii_case(&self.bridge_name) {
+            self.bridge
+                .bootstrap
+                .record(BootstrapStage::RdpdrFileAccess);
         }
         let response = DeviceCreateResponse {
             device_io_reply: DeviceIoResponse::new(device_io_request, NtStatus::SUCCESS),
             file_id,
             information: Information::FILE_OPENED,
         };
-        Ok(vec![SvcMessage::from(RdpdrPdu::DeviceCreateResponse(response))])
+        Ok(vec![SvcMessage::from(RdpdrPdu::DeviceCreateResponse(
+            response,
+        ))])
     }
 
     /// [`ServerDriveIoRequest::DeviceCloseRequest`]: drop the handle. Always
@@ -360,6 +405,7 @@ impl RdpilotDriveBackend {
     /// the stale `.part`, not an error status on this response.
     fn handle_close(&mut self, req: DeviceCloseRequest) -> PduResult<Vec<SvcMessage>> {
         let DeviceCloseRequest { device_io_request } = req;
+        self.listings.remove(&device_io_request.file_id);
         if let Some(OpenEntry::WriteFile {
             staging,
             dest,
@@ -385,7 +431,9 @@ impl RdpilotDriveBackend {
         let response = DeviceCloseResponse {
             device_io_response: DeviceIoResponse::new(device_io_request, NtStatus::SUCCESS),
         };
-        Ok(vec![SvcMessage::from(RdpdrPdu::DeviceCloseResponse(response))])
+        Ok(vec![SvcMessage::from(RdpdrPdu::DeviceCloseResponse(
+            response,
+        ))])
     }
 
     /// Complete a [`OpenEntry::WriteFile`] handle's staged transfer on
@@ -399,7 +447,7 @@ impl RdpilotDriveBackend {
     /// `expected_len` to be `Some` (a prior `FILE_END_OF_FILE_INFORMATION`
     /// `SetInformation`) AND exactly match the staged length before ever
     /// renaming. The 10-05 live gate proved this assumption FALSE against a
-    /// real Windows target: the C# sensor's plain sequential
+    /// real Windows target: the C# bridge's plain sequential
     /// `FileStream.Write`+`Dispose` copy (`FileTransfer.Transfer`, no
     /// `SetLength`/truncate call) NEVER triggers a
     /// `FILE_END_OF_FILE_INFORMATION` `SetInformation` IRP at all -- a live
@@ -422,9 +470,9 @@ impl RdpilotDriveBackend {
     /// disconnect signal -- so an ABORTED transfer simply never reaches this
     /// function, leaving the stale `.part` in staging exactly as before
     /// (`interrupted_transfer_is_detectable`, 10-05 live-confirmed). A
-    /// sensor-side copy error (thrown mid-`FileStream` loop) still disposes
+    /// bridge-side copy error (thrown mid-`FileStream` loop) still disposes
     /// its handles and DOES reach `Close`, but is independently surfaced to
-    /// the SDK caller via the sensor's own `success:false`/`error_kind`
+    /// the SDK caller via the bridge's own `success:false`/`error_kind`
     /// reply (`Session::upload_file`/`download_file` never touch the local
     /// share_root on a non-success reply) -- the caller-visible contract
     /// ("an interrupted transfer surfaces a clean, detectable failure") is
@@ -470,7 +518,9 @@ impl RdpilotDriveBackend {
                 device_io_reply: DeviceIoResponse::new(device_io_request, NtStatus::ACCESS_DENIED),
                 read_data: Vec::new(),
             };
-            return Ok(vec![SvcMessage::from(RdpdrPdu::DeviceReadResponse(response))]);
+            return Ok(vec![SvcMessage::from(RdpdrPdu::DeviceReadResponse(
+                response,
+            ))]);
         };
 
         // 10-05 live-gate diagnostic only (Rule 2 addition, 10-RESEARCH Open
@@ -488,15 +538,19 @@ impl RdpilotDriveBackend {
             Err(_io_error) => (NtStatus::UNSUCCESSFUL, Vec::new()),
         };
 
-        if status == NtStatus::SUCCESS && path == &self.sensor_path {
-            self.sensor.bootstrap.record(BootstrapStage::RdpdrFileRead);
+        if status == NtStatus::SUCCESS
+            && (path == &self.bridge_path || path.starts_with(&self.bridge_path))
+        {
+            self.bridge.bootstrap.record(BootstrapStage::RdpdrFileRead);
         }
 
         let response = DeviceReadResponse {
             device_io_reply: DeviceIoResponse::new(device_io_request, status),
             read_data,
         };
-        Ok(vec![SvcMessage::from(RdpdrPdu::DeviceReadResponse(response))])
+        Ok(vec![SvcMessage::from(RdpdrPdu::DeviceReadResponse(
+            response,
+        ))])
     }
 
     /// Read up to `length` bytes of `path` starting at `offset`.
@@ -523,7 +577,7 @@ impl RdpilotDriveBackend {
     /// whatever size it turns out to be.
     ///
     /// A `file_id` that is unknown, or was granted [`OpenEntry::Root`]/
-    /// [`OpenEntry::File`] (read-only, including the sensor exe) rather than
+    /// [`OpenEntry::File`] (read-only, including the bridge exe) rather than
     /// [`OpenEntry::WriteFile`], is rejected with `NtStatus::ACCESS_DENIED`
     /// *before* any `std::fs` call -- mirrors [`Self::handle_read`]'s
     /// access-control discipline (T-05-04). Any IO failure on the actual
@@ -536,12 +590,16 @@ impl RdpilotDriveBackend {
             write_data,
         } = req;
 
-        let Some(OpenEntry::WriteFile { staging, .. }) = self.open_files.get(&device_io_request.file_id) else {
+        let Some(OpenEntry::WriteFile { staging, .. }) =
+            self.open_files.get(&device_io_request.file_id)
+        else {
             let response = DeviceWriteResponse {
                 device_io_reply: DeviceIoResponse::new(device_io_request, NtStatus::ACCESS_DENIED),
                 length: 0,
             };
-            return Ok(vec![SvcMessage::from(RdpdrPdu::DeviceWriteResponse(response))]);
+            return Ok(vec![SvcMessage::from(RdpdrPdu::DeviceWriteResponse(
+                response,
+            ))]);
         };
 
         // 10-05 live-gate diagnostic only (Rule 2 addition, 10-RESEARCH Open
@@ -561,7 +619,9 @@ impl RdpilotDriveBackend {
             device_io_reply: DeviceIoResponse::new(device_io_request, status),
             length,
         };
-        Ok(vec![SvcMessage::from(RdpdrPdu::DeviceWriteResponse(response))])
+        Ok(vec![SvcMessage::from(RdpdrPdu::DeviceWriteResponse(
+            response,
+        ))])
     }
 
     /// `seek` to `offset` and write exactly `data` into `path` (the staged
@@ -607,12 +667,17 @@ impl RdpilotDriveBackend {
     /// principle, fail to encode (an oversized `set_buffer.size()`) -- that
     /// case falls back to a generic reject completion rather than
     /// unwrapping/panicking (API-01).
-    fn handle_set_information(&mut self, req: ServerDriveSetInformationRequest) -> PduResult<Vec<SvcMessage>> {
+    fn handle_set_information(
+        &mut self,
+        req: ServerDriveSetInformationRequest,
+    ) -> PduResult<Vec<SvcMessage>> {
         let file_id = req.device_io_request.file_id;
 
         let status = match self.open_files.get_mut(&file_id) {
             Some(OpenEntry::WriteFile { expected_len, .. }) => {
-                if let FileInformationClass::EndOfFile(FileEndOfFileInformation { end_of_file }) = &req.set_buffer {
+                if let FileInformationClass::EndOfFile(FileEndOfFileInformation { end_of_file }) =
+                    &req.set_buffer
+                {
                     if let Ok(len) = u64::try_from(*end_of_file) {
                         *expected_len = Some(len);
                     }
@@ -626,13 +691,20 @@ impl RdpilotDriveBackend {
         };
 
         match ClientDriveSetInformationResponse::new(&req, status) {
-            Ok(resp) => Ok(vec![SvcMessage::from(RdpdrPdu::ClientDriveSetInformationResponse(resp))]),
+            Ok(resp) => Ok(vec![SvcMessage::from(
+                RdpdrPdu::ClientDriveSetInformationResponse(resp),
+            )]),
             // Encoding failure maps to a typed reject completion, never a
             // panic (API-01) -- practically unreachable for the 5 small,
             // fixed-size FileInformationClass payloads this IRP admits.
-            Err(_encode_error) => Ok(vec![SvcMessage::from(RdpdrPdu::DeviceCloseResponse(DeviceCloseResponse {
-                device_io_response: DeviceIoResponse::new(req.device_io_request, NtStatus::UNSUCCESSFUL),
-            }))]),
+            Err(_encode_error) => Ok(vec![SvcMessage::from(RdpdrPdu::DeviceCloseResponse(
+                DeviceCloseResponse {
+                    device_io_response: DeviceIoResponse::new(
+                        req.device_io_request,
+                        NtStatus::UNSUCCESSFUL,
+                    ),
+                },
+            ))]),
         }
     }
 
@@ -643,50 +715,73 @@ impl RdpilotDriveBackend {
     /// the same handle (`InitialQuery == 0`) reports `NO_MORE_FILES` with no
     /// buffer -- this backend never enumerates more than the single served
     /// entry.
-    fn handle_query_directory(&self, req: ServerDriveQueryDirectoryRequest) -> PduResult<Vec<SvcMessage>> {
-        let ServerDriveQueryDirectoryRequest {
-            device_io_request,
-            file_info_class_lvl,
-            initial_query,
-            ..
-        } = req;
-
-        if initial_query == 0 {
-            let response = ClientDriveQueryDirectoryResponse {
-                device_io_reply: DeviceIoResponse::new(device_io_request, NtStatus::NO_MORE_FILES),
-                buffer: None,
+    fn handle_query_directory(
+        &mut self,
+        req: ServerDriveQueryDirectoryRequest,
+    ) -> PduResult<Vec<SvcMessage>> {
+        let id = req.device_io_request.file_id;
+        if req.initial_query != 0 {
+            let entries: Vec<(PathBuf, String, bool)> = match self.open_files.get(&id) {
+                Some(OpenEntry::BundleRoot) => [
+                    "bootstrap.ps1",
+                    "manifest.json",
+                    "cua.zip",
+                    "rdpilot-bridge.exe",
+                ]
+                .into_iter()
+                .map(|name| (self.bridge_path.join(name), name.to_string(), false))
+                .collect(),
+                Some(OpenEntry::Root) if self.bridge_path.is_dir() => {
+                    vec![(self.bridge_path.clone(), "bundle".into(), true)]
+                }
+                Some(OpenEntry::File(path)) => vec![(
+                    path.clone(),
+                    Self::display_name(path, &self.bridge_name),
+                    false,
+                )],
+                Some(OpenEntry::Root) => {
+                    vec![(self.bridge_path.clone(), self.bridge_name.clone(), false)]
+                }
+                _ => vec![],
             };
-            return Ok(vec![SvcMessage::from(RdpdrPdu::ClientDriveQueryDirectoryResponse(
-                response,
-            ))]);
+            let pattern = req.path.rsplit(['\\', '/']).next().unwrap_or("*");
+            self.listings.insert(
+                id,
+                entries
+                    .into_iter()
+                    .filter(|(_, name, _)| {
+                        pattern.is_empty()
+                            || pattern == "*"
+                            || pattern == "*.*"
+                            || name.eq_ignore_ascii_case(pattern)
+                    })
+                    .collect(),
+            );
         }
-
-        // The one entry this backend lists for ANY directory handle:
-        // the per-handle resolved `OpenEntry::File` path if the queried
-        // handle is one (share-root file or sensor exe), else the sensor
-        // exe entry (preserves pre-Phase-10 behavior byte-for-byte when the
-        // handle is the drive root or unrecognized -- true share-root
-        // directory enumeration is out of this plan's scope). A `stat`
-        // failure (file not present yet/anymore) degrades to a zero-size
-        // entry rather than a hard error -- Plan 03's launch bootstrap
-        // copies the sensor exe before enumerating it, so this is a
-        // defensive fallback, not the expected path.
-        let (entry_path, entry_name) = match self.open_files.get(&device_io_request.file_id) {
-            Some(OpenEntry::File(path)) => (path.clone(), Self::display_name(path, &self.sensor_name)),
-            _ => (self.sensor_path.clone(), self.sensor_name.clone()),
+        let item = self.listings.get_mut(&id).and_then(VecDeque::pop_front);
+        let (status, buffer) = match item {
+            Some((path, name, dir)) => {
+                let size = fs::metadata(path)
+                    .map(|m| i64::try_from(m.len()).unwrap_or(i64::MAX))
+                    .unwrap_or(0);
+                (
+                    NtStatus::SUCCESS,
+                    Some(Self::directory_entry(
+                        req.file_info_class_lvl,
+                        size,
+                        name,
+                        dir,
+                    )),
+                )
+            }
+            None => (NtStatus::NO_MORE_FILES, None),
         };
-        let file_size = fs::metadata(&entry_path)
-            .map(|meta| i64::try_from(meta.len()).unwrap_or(i64::MAX))
-            .unwrap_or(0);
-        let buffer = Some(Self::directory_entry(file_info_class_lvl, file_size, entry_name));
-
-        let response = ClientDriveQueryDirectoryResponse {
-            device_io_reply: DeviceIoResponse::new(device_io_request, NtStatus::SUCCESS),
-            buffer,
-        };
-        Ok(vec![SvcMessage::from(RdpdrPdu::ClientDriveQueryDirectoryResponse(
-            response,
-        ))])
+        Ok(vec![SvcMessage::from(
+            RdpdrPdu::ClientDriveQueryDirectoryResponse(ClientDriveQueryDirectoryResponse {
+                device_io_reply: DeviceIoResponse::new(req.device_io_request, status),
+                buffer,
+            }),
+        )])
     }
 
     /// [`ServerDriveIoRequest::ServerDriveQueryInformationRequest`]: part of
@@ -699,13 +794,16 @@ impl RdpilotDriveBackend {
     /// generic 7-variant reject list) makes the ENTIRE redirected drive
     /// unusable -- Explorer/`cmd`'s `dir`/`copy` all fail with "The device
     /// is not connected" the moment they try to stat the root they just
-    /// opened. A known/open `file_id` (root, the sensor exe, or a resolved
+    /// opened. A known/open `file_id` (root, the bridge exe, or a resolved
     /// share-root file) always succeeds; an unknown id is rejected with
     /// `NtStatus::ACCESS_DENIED` (mirrors `handle_read`'s access-control
     /// discipline, T-05-04) with no buffer, per this response's own doc
     /// comment ("if io_status has an io_status besides SUCCESS, buffer can
     /// be omitted").
-    fn handle_query_information(&self, req: ServerDriveQueryInformationRequest) -> PduResult<Vec<SvcMessage>> {
+    fn handle_query_information(
+        &self,
+        req: ServerDriveQueryInformationRequest,
+    ) -> PduResult<Vec<SvcMessage>> {
         let ServerDriveQueryInformationRequest {
             device_io_request,
             file_info_class_lvl,
@@ -713,21 +811,24 @@ impl RdpilotDriveBackend {
 
         let Some(entry) = self.open_files.get(&device_io_request.file_id).cloned() else {
             let response = ClientDriveQueryInformationResponse {
-                device_io_response: DeviceIoResponse::new(device_io_request, NtStatus::ACCESS_DENIED),
+                device_io_response: DeviceIoResponse::new(
+                    device_io_request,
+                    NtStatus::ACCESS_DENIED,
+                ),
                 buffer: None,
             };
-            return Ok(vec![SvcMessage::from(RdpdrPdu::ClientDriveQueryInformationResponse(
-                response,
-            ))]);
+            return Ok(vec![SvcMessage::from(
+                RdpdrPdu::ClientDriveQueryInformationResponse(response),
+            )]);
         };
 
-        let is_dir = entry == OpenEntry::Root;
+        let is_dir = matches!(entry, OpenEntry::Root | OpenEntry::BundleRoot);
         // A `stat` failure degrades to a zero-size entry rather than a hard
         // error -- mirrors `handle_query_directory`'s defensive fallback
         // (the file may not exist yet/anymore); only meaningful for
         // `OpenEntry::File`, the root has no backing `std::fs` metadata.
         let file_size = match &entry {
-            OpenEntry::Root => 0,
+            OpenEntry::Root | OpenEntry::BundleRoot => 0,
             OpenEntry::File(path) => fs::metadata(path)
                 .map(|meta| i64::try_from(meta.len()).unwrap_or(i64::MAX))
                 .unwrap_or(0),
@@ -760,15 +861,19 @@ impl RdpilotDriveBackend {
                     end_of_file: file_size,
                     number_of_links: 1,
                     delete_pending: Boolean::False,
-                    directory: if is_dir { Boolean::True } else { Boolean::False },
+                    directory: if is_dir {
+                        Boolean::True
+                    } else {
+                        Boolean::False
+                    },
                 }))
             }
-            FileInformationClassLevel::FILE_ATTRIBUTE_TAG_INFORMATION => {
-                Some(FileInformationClass::AttributeTag(FileAttributeTagInformation {
+            FileInformationClassLevel::FILE_ATTRIBUTE_TAG_INFORMATION => Some(
+                FileInformationClass::AttributeTag(FileAttributeTagInformation {
                     file_attributes: attrs,
                     reparse_tag: 0,
-                }))
-            }
+                }),
+            ),
             // Any other level this minimal backend does not model: succeed
             // with no buffer rather than fail the whole Create/stat sequence
             // (T-05-01 -- never turn an unrecognized-but-benign request into
@@ -780,9 +885,9 @@ impl RdpilotDriveBackend {
             device_io_response: DeviceIoResponse::new(device_io_request, NtStatus::SUCCESS),
             buffer,
         };
-        Ok(vec![SvcMessage::from(RdpdrPdu::ClientDriveQueryInformationResponse(
-            response,
-        ))])
+        Ok(vec![SvcMessage::from(
+            RdpdrPdu::ClientDriveQueryInformationResponse(response),
+        )])
     }
 
     /// [`ServerDriveIoRequest::ServerDriveQueryVolumeInformationRequest`]:
@@ -806,7 +911,7 @@ impl RdpilotDriveBackend {
             fs_info_class_lvl,
         } = req;
 
-        if self.open_files.get(&device_io_request.file_id).is_none() {
+        if !self.open_files.contains_key(&device_io_request.file_id) {
             let response = ClientDriveQueryVolumeInformationResponse {
                 device_io_reply: DeviceIoResponse::new(device_io_request, NtStatus::ACCESS_DENIED),
                 buffer: None,
@@ -822,45 +927,49 @@ impl RdpilotDriveBackend {
         // sector per allocation unit: the smallest self-consistent, nonzero
         // values a Windows client would accept without misbehaving.
         let buffer = match fs_info_class_lvl {
-            FileSystemInformationClassLevel::FILE_FS_VOLUME_INFORMATION => {
-                Some(FileSystemInformationClass::FileFsVolumeInformation(FileFsVolumeInformation {
+            FileSystemInformationClassLevel::FILE_FS_VOLUME_INFORMATION => Some(
+                FileSystemInformationClass::FileFsVolumeInformation(FileFsVolumeInformation {
                     volume_creation_time: 0,
                     volume_serial_number: 0x1234_5678,
                     supports_objects: Boolean::False,
                     volume_label: "RDPILOT".to_owned(),
-                }))
-            }
-            FileSystemInformationClassLevel::FILE_FS_SIZE_INFORMATION => {
-                Some(FileSystemInformationClass::FileFsSizeInformation(FileFsSizeInformation {
+                }),
+            ),
+            FileSystemInformationClassLevel::FILE_FS_SIZE_INFORMATION => Some(
+                FileSystemInformationClass::FileFsSizeInformation(FileFsSizeInformation {
                     total_alloc_units: 1,
                     available_alloc_units: 0,
                     sectors_per_alloc_unit: 1,
                     bytes_per_sector: 512,
-                }))
-            }
+                }),
+            ),
             FileSystemInformationClassLevel::FILE_FS_ATTRIBUTE_INFORMATION => {
-                Some(FileSystemInformationClass::FileFsAttributeInformation(FileFsAttributeInformation {
-                    file_system_attributes: FileSystemAttributes::FILE_CASE_SENSITIVE_SEARCH,
-                    max_component_name_len: 255,
-                    file_system_name: "RDPILOTFS".to_owned(),
-                }))
+                Some(FileSystemInformationClass::FileFsAttributeInformation(
+                    FileFsAttributeInformation {
+                        file_system_attributes: FileSystemAttributes::FILE_CASE_SENSITIVE_SEARCH,
+                        max_component_name_len: 255,
+                        file_system_name: "RDPILOTFS".to_owned(),
+                    },
+                ))
             }
-            FileSystemInformationClassLevel::FILE_FS_FULL_SIZE_INFORMATION => {
-                Some(FileSystemInformationClass::FileFsFullSizeInformation(FileFsFullSizeInformation {
+            FileSystemInformationClassLevel::FILE_FS_FULL_SIZE_INFORMATION => Some(
+                FileSystemInformationClass::FileFsFullSizeInformation(FileFsFullSizeInformation {
                     total_alloc_units: 1,
                     caller_available_alloc_units: 0,
                     actual_available_alloc_units: 0,
                     sectors_per_alloc_unit: 1,
                     bytes_per_sector: 512,
-                }))
-            }
+                }),
+            ),
             FileSystemInformationClassLevel::FILE_FS_DEVICE_INFORMATION => {
-                Some(FileSystemInformationClass::FileFsDeviceInformation(FileFsDeviceInformation {
-                    // FILE_DEVICE_DISK (0x00000007) -- the standard Windows
-                    // DDK device-type constant for a disk-like volume.
-                    device_type: 0x0000_0007,
-                    characteristics: Characteristics::FILE_REMOTE_DEVICE,
-                }))
+                Some(FileSystemInformationClass::FileFsDeviceInformation(
+                    FileFsDeviceInformation {
+                        // FILE_DEVICE_DISK (0x00000007) -- the standard Windows
+                        // DDK device-type constant for a disk-like volume.
+                        device_type: 0x0000_0007,
+                        characteristics: Characteristics::FILE_REMOTE_DEVICE,
+                    },
+                ))
             }
             // `decode` (efs.rs) already rejects any level besides the 5
             // handled above at the wire-parsing stage, so this arm is
@@ -880,8 +989,8 @@ impl RdpilotDriveBackend {
 
     /// The display filename for a resolved [`OpenEntry::File`] path: its
     /// final path component if it has one (share-root files), else
-    /// `fallback` (the sensor exe, whose display name is the fixed
-    /// `sensor_name`, not derived from its local on-disk path).
+    /// `fallback` (the bridge exe, whose display name is the fixed
+    /// `bridge_name`, not derived from its local on-disk path).
     fn display_name(path: &Path, fallback: &str) -> String {
         path.file_name()
             .and_then(|n| n.to_str())
@@ -895,18 +1004,33 @@ impl RdpilotDriveBackend {
     /// [`FileInformationClassLevel`] values, so the wildcard arm is
     /// unreachable in practice but still needs a safe, non-panicking default
     /// (API-01).
-    fn directory_entry(level: FileInformationClassLevel, file_size: i64, file_name: String) -> FileInformationClass {
-        let attrs = FileAttributes::FILE_ATTRIBUTE_NORMAL;
+    fn directory_entry(
+        level: FileInformationClassLevel,
+        file_size: i64,
+        file_name: String,
+        directory: bool,
+    ) -> FileInformationClass {
+        let attrs = if directory {
+            FileAttributes::FILE_ATTRIBUTE_DIRECTORY
+        } else {
+            FileAttributes::FILE_ATTRIBUTE_NORMAL
+        };
         match level {
-            FileInformationClassLevel::FILE_BOTH_DIRECTORY_INFORMATION => FileInformationClass::BothDirectory(
-                FileBothDirectoryInformation::new(0, 0, 0, 0, file_size, attrs, file_name),
-            ),
-            FileInformationClassLevel::FILE_FULL_DIRECTORY_INFORMATION => FileInformationClass::FullDirectory(
-                FileFullDirectoryInformation::new(0, 0, 0, 0, file_size, attrs, file_name),
-            ),
-            FileInformationClassLevel::FILE_DIRECTORY_INFORMATION => FileInformationClass::Directory(
-                FileDirectoryInformation::new(0, 0, 0, 0, file_size, attrs, file_name),
-            ),
+            FileInformationClassLevel::FILE_BOTH_DIRECTORY_INFORMATION => {
+                FileInformationClass::BothDirectory(FileBothDirectoryInformation::new(
+                    0, 0, 0, 0, file_size, attrs, file_name,
+                ))
+            }
+            FileInformationClassLevel::FILE_FULL_DIRECTORY_INFORMATION => {
+                FileInformationClass::FullDirectory(FileFullDirectoryInformation::new(
+                    0, 0, 0, 0, file_size, attrs, file_name,
+                ))
+            }
+            FileInformationClassLevel::FILE_DIRECTORY_INFORMATION => {
+                FileInformationClass::Directory(FileDirectoryInformation::new(
+                    0, 0, 0, 0, file_size, attrs, file_name,
+                ))
+            }
             // FILE_NAMES_INFORMATION, and the unreachable default above.
             _ => FileInformationClass::Names(FileNamesInformation::new(file_name)),
         }
@@ -923,16 +1047,25 @@ impl RdpilotDriveBackend {
         let response = DeviceCloseResponse {
             device_io_response: DeviceIoResponse::new(device_io_request, NtStatus::NOT_SUPPORTED),
         };
-        Ok(vec![SvcMessage::from(RdpdrPdu::DeviceCloseResponse(response))])
+        Ok(vec![SvcMessage::from(RdpdrPdu::DeviceCloseResponse(
+            response,
+        ))])
     }
 }
 
 impl RdpdrBackend for RdpilotDriveBackend {
-    fn handle_server_device_announce_response(&mut self, _pdu: ServerDeviceAnnounceResponse) -> PduResult<()> {
+    fn handle_server_device_announce_response(
+        &mut self,
+        _pdu: ServerDeviceAnnounceResponse,
+    ) -> PduResult<()> {
         Ok(())
     }
 
-    fn handle_scard_call(&mut self, _req: DeviceControlRequest<ScardIoCtlCode>, _call: ScardCall) -> PduResult<()> {
+    fn handle_scard_call(
+        &mut self,
+        _req: DeviceControlRequest<ScardIoCtlCode>,
+        _call: ScardCall,
+    ) -> PduResult<()> {
         Ok(())
     }
 
@@ -947,8 +1080,12 @@ impl RdpdrBackend for RdpilotDriveBackend {
             ServerDriveIoRequest::ServerCreateDriveRequest(r) => self.handle_create(r),
             ServerDriveIoRequest::DeviceCloseRequest(r) => self.handle_close(r),
             ServerDriveIoRequest::DeviceReadRequest(r) => self.handle_read(r),
-            ServerDriveIoRequest::ServerDriveQueryDirectoryRequest(r) => self.handle_query_directory(r),
-            ServerDriveIoRequest::ServerDriveQueryInformationRequest(r) => self.handle_query_information(r),
+            ServerDriveIoRequest::ServerDriveQueryDirectoryRequest(r) => {
+                self.handle_query_directory(r)
+            }
+            ServerDriveIoRequest::ServerDriveQueryInformationRequest(r) => {
+                self.handle_query_information(r)
+            }
             ServerDriveIoRequest::ServerDriveNotifyChangeDirectoryRequest(r) => {
                 Self::reject_unsupported(r.device_io_request)
             }
@@ -957,8 +1094,12 @@ impl RdpdrBackend for RdpilotDriveBackend {
             }
             ServerDriveIoRequest::DeviceControlRequest(r) => Self::reject_unsupported(r.header),
             ServerDriveIoRequest::DeviceWriteRequest(r) => self.handle_write(r),
-            ServerDriveIoRequest::ServerDriveSetInformationRequest(r) => self.handle_set_information(r),
-            ServerDriveIoRequest::ServerDriveLockControlRequest(r) => Self::reject_unsupported(r.device_io_request),
+            ServerDriveIoRequest::ServerDriveSetInformationRequest(r) => {
+                self.handle_set_information(r)
+            }
+            ServerDriveIoRequest::ServerDriveLockControlRequest(r) => {
+                Self::reject_unsupported(r.device_io_request)
+            }
         }
     }
 }
@@ -971,17 +1112,17 @@ mod tests {
     use ironrdp::svc::SvcMessage;
     use ironrdp_rdpdr::backend::RdpdrBackend as _;
     use ironrdp_rdpdr::pdu::efs::{
-        CreateDisposition, CreateOptions, DesiredAccess, DeviceCloseRequest, DeviceCreateRequest, DeviceIoRequest,
-        DeviceIoResponse, DeviceReadRequest, DeviceWriteRequest, FileAttributes, FileEndOfFileInformation,
-        FileInformationClass, FileInformationClassLevel, FileSystemInformationClassLevel, MajorFunction,
-        MinorFunction, NtStatus, ServerDriveIoRequest, ServerDriveQueryDirectoryRequest,
-        ServerDriveQueryInformationRequest, ServerDriveQueryVolumeInformationRequest, ServerDriveSetInformationRequest,
-        SharedAccess,
+        CreateDisposition, CreateOptions, DesiredAccess, DeviceCloseRequest, DeviceCreateRequest,
+        DeviceIoRequest, DeviceIoResponse, DeviceReadRequest, DeviceWriteRequest, FileAttributes,
+        FileEndOfFileInformation, FileInformationClass, FileInformationClassLevel,
+        FileSystemInformationClassLevel, MajorFunction, MinorFunction, NtStatus,
+        ServerDriveIoRequest, ServerDriveQueryDirectoryRequest, ServerDriveQueryInformationRequest,
+        ServerDriveQueryVolumeInformationRequest, ServerDriveSetInformationRequest, SharedAccess,
     };
 
     use super::RdpilotDriveBackend;
     use crate::bootstrap::BootstrapStage;
-    use crate::sensor::SensorShared;
+    use crate::bridge::BridgeShared;
 
     /// Write `bytes` to a fresh temp file and return its path -- the local
     /// "served file" backing store for these tests. Every caller removes it
@@ -1011,7 +1152,8 @@ mod tests {
         let bytes = msg.encode_unframed_pdu().expect("message encodes");
         let mut cursor = ReadCursor::new(&bytes);
         let _shared_header = cursor.read_slice(4);
-        let io_response = DeviceIoResponse::decode(&mut cursor).expect("decodes a DeviceIoResponse prefix");
+        let io_response =
+            DeviceIoResponse::decode(&mut cursor).expect("decodes a DeviceIoResponse prefix");
         let tail = cursor.read_slice(cursor.len()).to_vec();
         (io_response.io_status, tail)
     }
@@ -1041,6 +1183,35 @@ mod tests {
             major_function: major,
             minor_function: MinorFunction::from(0),
         }
+    }
+
+    #[test]
+    fn bundle_folder_opens_and_payload_bytes_are_read_only() {
+        use super::OpenEntry;
+        use std::fs;
+        let root = write_temp_file(b"");
+        fs::remove_file(&root).unwrap();
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("bootstrap.ps1"), b"payload").unwrap();
+        let mut backend = RdpilotDriveBackend::new(root.clone(), "rdpilot-bridge.exe", None);
+        let folder = backend.handle_create(create_req(0, "\\bundle")).unwrap();
+        let (status, id) = create_response_fields(&folder[0]);
+        assert_eq!(status, NtStatus::SUCCESS);
+        assert_eq!(backend.open_files.get(&id), Some(&OpenEntry::BundleRoot));
+        let file = backend
+            .handle_create(create_req(0, "\\bundle\\bootstrap.ps1"))
+            .unwrap();
+        let (status, id) = create_response_fields(&file[0]);
+        assert_eq!(status, NtStatus::SUCCESS);
+        assert_eq!(
+            backend.open_files.get(&id),
+            Some(&OpenEntry::File(root.join("bootstrap.ps1")))
+        );
+        let bad = backend
+            .handle_create(create_req(0, "\\bundle\\..\\outside"))
+            .unwrap();
+        assert_eq!(create_response_fields(&bad[0]).0, NtStatus::NO_SUCH_FILE);
+        fs::remove_dir_all(root).unwrap();
     }
 
     fn create_req(file_id: u32, path: &str) -> DeviceCreateRequest {
@@ -1083,12 +1254,14 @@ mod tests {
         });
         assert!(backend.handle_drive_io_request(read).is_ok());
 
-        let query_dir = ServerDriveIoRequest::ServerDriveQueryDirectoryRequest(ServerDriveQueryDirectoryRequest {
-            device_io_request: dev_io_req(1, MajorFunction::DirectoryControl),
-            file_info_class_lvl: FileInformationClassLevel::FILE_BOTH_DIRECTORY_INFORMATION,
-            initial_query: 1,
-            path: "\\*".to_owned(),
-        });
+        let query_dir = ServerDriveIoRequest::ServerDriveQueryDirectoryRequest(
+            ServerDriveQueryDirectoryRequest {
+                device_io_request: dev_io_req(1, MajorFunction::DirectoryControl),
+                file_info_class_lvl: FileInformationClassLevel::FILE_BOTH_DIRECTORY_INFORMATION,
+                initial_query: 1,
+                path: "\\*".to_owned(),
+            },
+        );
         assert!(backend.handle_drive_io_request(query_dir).is_ok());
     }
 
@@ -1100,10 +1273,13 @@ mod tests {
     #[test]
     fn create_accepts_root_and_served_file_but_rejects_other_paths() {
         let served_path = write_temp_file(b"payload");
-        let mut backend = RdpilotDriveBackend::new(served_path.clone(), "served.bin".to_owned(), None);
+        let mut backend =
+            RdpilotDriveBackend::new(served_path.clone(), "served.bin".to_owned(), None);
 
         let root = backend
-            .handle_drive_io_request(ServerDriveIoRequest::ServerCreateDriveRequest(create_req(1, "")))
+            .handle_drive_io_request(ServerDriveIoRequest::ServerCreateDriveRequest(create_req(
+                1, "",
+            )))
             .expect("root create returns Ok");
         let (status, _file_id) = create_response_fields(&root[0]);
         assert_eq!(status, NtStatus::SUCCESS);
@@ -1132,18 +1308,21 @@ mod tests {
     }
 
     #[test]
-    fn successful_sensor_create_and_read_record_only_the_rdpdr_milestones() {
+    fn successful_bridge_create_and_read_record_only_the_rdpdr_milestones() {
         let served_path = write_temp_file(b"payload");
-        let sensor = std::sync::Arc::new(SensorShared::new());
-        let mut backend = RdpilotDriveBackend::new_with_sensor(
+        let bridge = std::sync::Arc::new(BridgeShared::new());
+        let mut backend = RdpilotDriveBackend::new_with_bridge(
             served_path.clone(),
             "served.bin",
             None,
-            sensor.clone(),
+            bridge.clone(),
         );
         let created = backend
-            .handle_drive_io_request(ServerDriveIoRequest::ServerCreateDriveRequest(create_req(1, "\\served.bin")))
-            .expect("sensor create succeeds");
+            .handle_drive_io_request(ServerDriveIoRequest::ServerCreateDriveRequest(create_req(
+                1,
+                "\\served.bin",
+            )))
+            .expect("bridge create succeeds");
         let (_, file_id) = create_response_fields(&created[0]);
         let read = backend
             .handle_drive_io_request(ServerDriveIoRequest::DeviceReadRequest(DeviceReadRequest {
@@ -1151,11 +1330,14 @@ mod tests {
                 length: 7,
                 offset: 0,
             }))
-            .expect("sensor read succeeds");
+            .expect("bridge read succeeds");
         assert_eq!(read_response_fields(&read[0]).0, NtStatus::SUCCESS);
         assert_eq!(
-            sensor.bootstrap.snapshot(),
-            vec![BootstrapStage::RdpdrFileAccess, BootstrapStage::RdpdrFileRead]
+            bridge.bootstrap.snapshot(),
+            vec![
+                BootstrapStage::RdpdrFileAccess,
+                BootstrapStage::RdpdrFileRead
+            ]
         );
         let _ = std::fs::remove_file(served_path);
     }
@@ -1195,10 +1377,13 @@ mod tests {
     #[test]
     fn query_information_succeeds_for_known_file_ids_and_rejects_unknown() {
         let served_path = write_temp_file(b"0123456789");
-        let mut backend = RdpilotDriveBackend::new(served_path.clone(), "served.bin".to_owned(), None);
+        let mut backend =
+            RdpilotDriveBackend::new(served_path.clone(), "served.bin".to_owned(), None);
 
         let root_created = backend
-            .handle_drive_io_request(ServerDriveIoRequest::ServerCreateDriveRequest(create_req(1, "")))
+            .handle_drive_io_request(ServerDriveIoRequest::ServerCreateDriveRequest(create_req(
+                1, "",
+            )))
             .expect("root create returns Ok");
         let (status, root_file_id) = create_response_fields(&root_created[0]);
         assert_eq!(status, NtStatus::SUCCESS);
@@ -1227,7 +1412,11 @@ mod tests {
                 .handle_drive_io_request(query_root)
                 .expect("query on root returns Ok");
             let (status, _tail) = decode_io_status_and_tail(&out[0]);
-            assert_eq!(status, NtStatus::SUCCESS, "root QueryInformation({level}) must succeed");
+            assert_eq!(
+                status,
+                NtStatus::SUCCESS,
+                "root QueryInformation({level}) must succeed"
+            );
 
             let query_file = ServerDriveIoRequest::ServerDriveQueryInformationRequest(
                 ServerDriveQueryInformationRequest {
@@ -1239,7 +1428,11 @@ mod tests {
                 .handle_drive_io_request(query_file)
                 .expect("query on served file returns Ok");
             let (status, _tail) = decode_io_status_and_tail(&out[0]);
-            assert_eq!(status, NtStatus::SUCCESS, "file QueryInformation({level}) must succeed");
+            assert_eq!(
+                status,
+                NtStatus::SUCCESS,
+                "file QueryInformation({level}) must succeed"
+            );
         }
 
         let query_unknown = ServerDriveIoRequest::ServerDriveQueryInformationRequest(
@@ -1267,10 +1460,13 @@ mod tests {
     #[test]
     fn query_volume_information_succeeds_for_known_file_id_and_rejects_unknown() {
         let served_path = write_temp_file(b"0123456789");
-        let mut backend = RdpilotDriveBackend::new(served_path.clone(), "served.bin".to_owned(), None);
+        let mut backend =
+            RdpilotDriveBackend::new(served_path.clone(), "served.bin".to_owned(), None);
 
         let root_created = backend
-            .handle_drive_io_request(ServerDriveIoRequest::ServerCreateDriveRequest(create_req(1, "")))
+            .handle_drive_io_request(ServerDriveIoRequest::ServerCreateDriveRequest(create_req(
+                1, "",
+            )))
             .expect("root create returns Ok");
         let (status, root_file_id) = create_response_fields(&root_created[0]);
         assert_eq!(status, NtStatus::SUCCESS);
@@ -1284,7 +1480,10 @@ mod tests {
         ] {
             let query = ServerDriveIoRequest::ServerDriveQueryVolumeInformationRequest(
                 ServerDriveQueryVolumeInformationRequest {
-                    device_io_request: dev_io_req(root_file_id, MajorFunction::QueryVolumeInformation),
+                    device_io_request: dev_io_req(
+                        root_file_id,
+                        MajorFunction::QueryVolumeInformation,
+                    ),
                     fs_info_class_lvl: level.clone(),
                 },
             );
@@ -1292,7 +1491,11 @@ mod tests {
                 .handle_drive_io_request(query)
                 .expect("query volume info returns Ok");
             let (status, _tail) = decode_io_status_and_tail(&out[0]);
-            assert_eq!(status, NtStatus::SUCCESS, "QueryVolumeInformation({level:?}) must succeed");
+            assert_eq!(
+                status,
+                NtStatus::SUCCESS,
+                "QueryVolumeInformation({level:?}) must succeed"
+            );
         }
 
         let query_unknown = ServerDriveIoRequest::ServerDriveQueryVolumeInformationRequest(
@@ -1315,7 +1518,8 @@ mod tests {
     #[test]
     fn read_returns_exact_served_bytes_at_offset() {
         let served_path = write_temp_file(b"0123456789");
-        let mut backend = RdpilotDriveBackend::new(served_path.clone(), "served.bin".to_owned(), None);
+        let mut backend =
+            RdpilotDriveBackend::new(served_path.clone(), "served.bin".to_owned(), None);
 
         let created = backend
             .handle_drive_io_request(ServerDriveIoRequest::ServerCreateDriveRequest(create_req(
@@ -1331,7 +1535,9 @@ mod tests {
             length: 4,
             offset: 3,
         });
-        let out = backend.handle_drive_io_request(read).expect("read returns Ok");
+        let out = backend
+            .handle_drive_io_request(read)
+            .expect("read returns Ok");
         let (status, data) = read_response_fields(&out[0]);
         assert_eq!(status, NtStatus::SUCCESS);
         assert_eq!(data, b"3456");
@@ -1377,10 +1583,11 @@ mod tests {
             std::fs::create_dir_all(root.join("sub/dir")).expect("share/sub/dir creates");
             let sibling = base.join("share-evil");
             std::fs::create_dir_all(&sibling).expect("sibling share-evil creates");
-            std::fs::write(sibling.join("secret.txt"), b"top secret").expect("sibling secret writes");
+            std::fs::write(sibling.join("secret.txt"), b"top secret")
+                .expect("sibling secret writes");
 
             let backend = RdpilotDriveBackend::new(
-                std::env::temp_dir().join("rdpilot-rdpdr-traversal-sensor-placeholder"),
+                std::env::temp_dir().join("rdpilot-rdpdr-traversal-bridge-placeholder"),
                 "served.bin".to_owned(),
                 Some(root),
             );
@@ -1393,10 +1600,18 @@ mod tests {
         /// a propagated `Err`, API-01).
         fn assert_rejected(backend: &mut RdpilotDriveBackend, path: &str) {
             let out = backend
-                .handle_drive_io_request(ServerDriveIoRequest::ServerCreateDriveRequest(create_req(1, path)))
-                .unwrap_or_else(|e| panic!("rejected create for {path:?} must still return Ok, got Err: {e}"));
+                .handle_drive_io_request(ServerDriveIoRequest::ServerCreateDriveRequest(
+                    create_req(1, path),
+                ))
+                .unwrap_or_else(|e| {
+                    panic!("rejected create for {path:?} must still return Ok, got Err: {e}")
+                });
             let (status, file_id) = create_response_fields(&out[0]);
-            assert_eq!(status, NtStatus::NO_SUCH_FILE, "path {path:?} must be rejected with NO_SUCH_FILE");
+            assert_eq!(
+                status,
+                NtStatus::NO_SUCH_FILE,
+                "path {path:?} must be rejected with NO_SUCH_FILE"
+            );
             assert_eq!(file_id, 0, "path {path:?} must not be granted a file id");
         }
 
@@ -1405,11 +1620,22 @@ mod tests {
         /// over-reject a legitimate nested path.
         fn assert_accepted(backend: &mut RdpilotDriveBackend, path: &str) {
             let out = backend
-                .handle_drive_io_request(ServerDriveIoRequest::ServerCreateDriveRequest(create_req(1, path)))
-                .unwrap_or_else(|e| panic!("accepted create for {path:?} must return Ok, got Err: {e}"));
+                .handle_drive_io_request(ServerDriveIoRequest::ServerCreateDriveRequest(
+                    create_req(1, path),
+                ))
+                .unwrap_or_else(|e| {
+                    panic!("accepted create for {path:?} must return Ok, got Err: {e}")
+                });
             let (status, file_id) = create_response_fields(&out[0]);
-            assert_eq!(status, NtStatus::SUCCESS, "legitimate nested path {path:?} must be accepted");
-            assert_ne!(file_id, 0, "legitimate nested path {path:?} must be granted a nonzero file id");
+            assert_eq!(
+                status,
+                NtStatus::SUCCESS,
+                "legitimate nested path {path:?} must be accepted"
+            );
+            assert_ne!(
+                file_id, 0,
+                "legitimate nested path {path:?} must be granted a nonzero file id"
+            );
         }
 
         /// Case (1): trailing `..` with NO following separator -- the exact
@@ -1428,7 +1654,7 @@ mod tests {
 
         /// Case (2): mixed `/`+`\` separators. Unconditional `\`-to-`/`
         /// normalization BEFORE any `Path`/`PathBuf` construction (Pitfall
-        /// 1) makes these faithful on this Linux test host, which does not
+        /// one) makes these faithful on this Linux test host, which does not
         /// otherwise treat `\` as a separator.
         #[test]
         fn rejects_mixed_separators() {
@@ -1499,17 +1725,22 @@ mod tests {
                 std::process::id()
             ));
             let root = base.join("share");
-            std::fs::create_dir_all(root.join(".rdpilot-staging")).expect("share/.rdpilot-staging creates");
+            std::fs::create_dir_all(root.join(".rdpilot-staging"))
+                .expect("share/.rdpilot-staging creates");
 
             let backend = RdpilotDriveBackend::new(
-                std::env::temp_dir().join("rdpilot-rdpdr-write-sensor-placeholder"),
+                std::env::temp_dir().join("rdpilot-rdpdr-write-bridge-placeholder"),
                 "served.bin".to_owned(),
                 Some(root),
             );
             (backend, base)
         }
 
-        fn create_write_req(file_id: u32, path: &str, disposition: CreateDisposition) -> DeviceCreateRequest {
+        fn create_write_req(
+            file_id: u32,
+            path: &str,
+            disposition: CreateDisposition,
+        ) -> DeviceCreateRequest {
             DeviceCreateRequest {
                 create_disposition: disposition,
                 ..create_req(file_id, path)
@@ -1562,11 +1793,9 @@ mod tests {
             let root = base.join("share");
 
             let created = backend
-                .handle_drive_io_request(ServerDriveIoRequest::ServerCreateDriveRequest(create_write_req(
-                    1,
-                    "\\upload.bin",
-                    CreateDisposition::FILE_OPEN_IF,
-                )))
+                .handle_drive_io_request(ServerDriveIoRequest::ServerCreateDriveRequest(
+                    create_write_req(1, "\\upload.bin", CreateDisposition::FILE_OPEN_IF),
+                ))
                 .expect("write-disposition create returns Ok");
             let (status, file_id) = create_response_fields(&created[0]);
             assert_eq!(status, NtStatus::SUCCESS);
@@ -1585,20 +1814,27 @@ mod tests {
                     .expect("write returns Ok");
                 let (status, length) = write_response_fields(&out[0]);
                 assert_eq!(status, NtStatus::SUCCESS);
-                assert_eq!(length as usize, chunk.len(), "response must echo bytes actually written");
+                assert_eq!(
+                    length as usize,
+                    chunk.len(),
+                    "response must echo bytes actually written"
+                );
                 offset += chunk.len() as u64;
                 expected.extend_from_slice(chunk);
             }
 
             let staged_bytes = read_sole_staged_file(&root);
-            assert_eq!(staged_bytes, expected, "staged file must reassemble the writes in exact order");
+            assert_eq!(
+                staged_bytes, expected,
+                "staged file must reassemble the writes in exact order"
+            );
 
             let _ = std::fs::remove_dir_all(&base);
         }
 
         /// A `Write` against a file id that was never granted an
         /// `OpenEntry::WriteFile` -- unknown id, OR a plain read-only
-        /// `OpenEntry::File` handle (the sensor exe) -- is rejected with
+        /// `OpenEntry::File` handle (the bridge exe) -- is rejected with
         /// `NtStatus::ACCESS_DENIED` and touches no `std::fs` write (mirrors
         /// `read_for_unopened_file_id_is_rejected_without_touching_filesystem`'s
         /// access-control discipline, T-05-04).
@@ -1608,26 +1844,27 @@ mod tests {
 
             // Unknown file id entirely.
             let unknown = backend
-                .handle_drive_io_request(ServerDriveIoRequest::DeviceWriteRequest(write_req(9999, 0, b"x")))
+                .handle_drive_io_request(ServerDriveIoRequest::DeviceWriteRequest(write_req(
+                    9999, 0, b"x",
+                )))
                 .expect("rejected write still returns Ok");
             let (status, length) = write_response_fields(&unknown[0]);
             assert_eq!(status, NtStatus::ACCESS_DENIED);
             assert_eq!(length, 0);
 
-            // A read-only OpenEntry::File handle (the sensor exe special
+            // A read-only OpenEntry::File handle (the bridge exe special
             // case, FILE_OPEN disposition) must also reject a Write.
-            let sensor_created = backend
-                .handle_drive_io_request(ServerDriveIoRequest::ServerCreateDriveRequest(create_req(
-                    1,
-                    "\\served.bin",
-                )))
-                .expect("sensor-exe create returns Ok");
-            let (status, sensor_file_id) = create_response_fields(&sensor_created[0]);
+            let bridge_created = backend
+                .handle_drive_io_request(ServerDriveIoRequest::ServerCreateDriveRequest(
+                    create_req(1, "\\served.bin"),
+                ))
+                .expect("bridge-exe create returns Ok");
+            let (status, bridge_file_id) = create_response_fields(&bridge_created[0]);
             assert_eq!(status, NtStatus::SUCCESS);
 
             let rejected = backend
                 .handle_drive_io_request(ServerDriveIoRequest::DeviceWriteRequest(write_req(
-                    sensor_file_id,
+                    bridge_file_id,
                     0,
                     b"x",
                 )))
@@ -1653,29 +1890,31 @@ mod tests {
             let dest = root_canonical.join("upload.bin");
 
             let created = backend
-                .handle_drive_io_request(ServerDriveIoRequest::ServerCreateDriveRequest(create_write_req(
-                    1,
-                    "\\upload.bin",
-                    CreateDisposition::FILE_OPEN_IF,
-                )))
+                .handle_drive_io_request(ServerDriveIoRequest::ServerCreateDriveRequest(
+                    create_write_req(1, "\\upload.bin", CreateDisposition::FILE_OPEN_IF),
+                ))
                 .expect("write-disposition create returns Ok");
             let (status, file_id) = create_response_fields(&created[0]);
             assert_eq!(status, NtStatus::SUCCESS);
 
             let payload = b"the-quick-brown-fox";
             let write_out = backend
-                .handle_drive_io_request(ServerDriveIoRequest::DeviceWriteRequest(write_req(file_id, 0, payload)))
+                .handle_drive_io_request(ServerDriveIoRequest::DeviceWriteRequest(write_req(
+                    file_id, 0, payload,
+                )))
                 .expect("write returns Ok");
             let (status, length) = write_response_fields(&write_out[0]);
             assert_eq!(status, NtStatus::SUCCESS);
             assert_eq!(length as usize, payload.len());
 
-            let set_info = ServerDriveIoRequest::ServerDriveSetInformationRequest(ServerDriveSetInformationRequest {
-                device_io_request: dev_io_req(file_id, MajorFunction::SetInformation),
-                set_buffer: FileInformationClass::EndOfFile(FileEndOfFileInformation {
-                    end_of_file: payload.len() as i64,
-                }),
-            });
+            let set_info = ServerDriveIoRequest::ServerDriveSetInformationRequest(
+                ServerDriveSetInformationRequest {
+                    device_io_request: dev_io_req(file_id, MajorFunction::SetInformation),
+                    set_buffer: FileInformationClass::EndOfFile(FileEndOfFileInformation {
+                        end_of_file: payload.len() as i64,
+                    }),
+                },
+            );
             let set_info_out = backend
                 .handle_drive_io_request(set_info)
                 .expect("set-information returns Ok");
@@ -1685,11 +1924,16 @@ mod tests {
             let close = ServerDriveIoRequest::DeviceCloseRequest(DeviceCloseRequest {
                 device_io_request: dev_io_req(file_id, MajorFunction::Close),
             });
-            let close_out = backend.handle_drive_io_request(close).expect("close returns Ok");
+            let close_out = backend
+                .handle_drive_io_request(close)
+                .expect("close returns Ok");
             let (status, _tail) = decode_io_status_and_tail(&close_out[0]);
             assert_eq!(status, NtStatus::SUCCESS);
 
-            assert!(dest.exists(), "clean transfer must rename staging to the destination");
+            assert!(
+                dest.exists(),
+                "clean transfer must rename staging to the destination"
+            );
             assert_eq!(std::fs::read(&dest).expect("destination reads"), payload);
 
             let staging_dir = root.join(".rdpilot-staging");
@@ -1697,7 +1941,10 @@ mod tests {
                 .expect("staging dir reads")
                 .filter_map(|e| e.ok())
                 .collect();
-            assert!(remaining.is_empty(), "no stale .part should remain after a clean rename");
+            assert!(
+                remaining.is_empty(),
+                "no stale .part should remain after a clean rename"
+            );
 
             let _ = std::fs::remove_dir_all(&base);
         }
@@ -1716,21 +1963,23 @@ mod tests {
             let dest = root_canonical.join("upload.bin");
 
             let created = backend
-                .handle_drive_io_request(ServerDriveIoRequest::ServerCreateDriveRequest(create_write_req(
-                    1,
-                    "\\upload.bin",
-                    CreateDisposition::FILE_OPEN_IF,
-                )))
+                .handle_drive_io_request(ServerDriveIoRequest::ServerCreateDriveRequest(
+                    create_write_req(1, "\\upload.bin", CreateDisposition::FILE_OPEN_IF),
+                ))
                 .expect("write-disposition create returns Ok");
             let (status, file_id) = create_response_fields(&created[0]);
             assert_eq!(status, NtStatus::SUCCESS);
 
             // Declare a total size of 20 bytes but only ever write 5 --
             // the interrupted-transfer case.
-            let set_info = ServerDriveIoRequest::ServerDriveSetInformationRequest(ServerDriveSetInformationRequest {
-                device_io_request: dev_io_req(file_id, MajorFunction::SetInformation),
-                set_buffer: FileInformationClass::EndOfFile(FileEndOfFileInformation { end_of_file: 20 }),
-            });
+            let set_info = ServerDriveIoRequest::ServerDriveSetInformationRequest(
+                ServerDriveSetInformationRequest {
+                    device_io_request: dev_io_req(file_id, MajorFunction::SetInformation),
+                    set_buffer: FileInformationClass::EndOfFile(FileEndOfFileInformation {
+                        end_of_file: 20,
+                    }),
+                },
+            );
             let set_info_out = backend
                 .handle_drive_io_request(set_info)
                 .expect("set-information returns Ok");
@@ -1738,7 +1987,9 @@ mod tests {
             assert_eq!(status, NtStatus::SUCCESS);
 
             let write_out = backend
-                .handle_drive_io_request(ServerDriveIoRequest::DeviceWriteRequest(write_req(file_id, 0, b"first")))
+                .handle_drive_io_request(ServerDriveIoRequest::DeviceWriteRequest(write_req(
+                    file_id, 0, b"first",
+                )))
                 .expect("write returns Ok");
             let (status, _length) = write_response_fields(&write_out[0]);
             assert_eq!(status, NtStatus::SUCCESS);
@@ -1746,18 +1997,31 @@ mod tests {
             let close = ServerDriveIoRequest::DeviceCloseRequest(DeviceCloseRequest {
                 device_io_request: dev_io_req(file_id, MajorFunction::Close),
             });
-            let close_out = backend.handle_drive_io_request(close).expect("close returns Ok");
+            let close_out = backend
+                .handle_drive_io_request(close)
+                .expect("close returns Ok");
             let (status, _tail) = decode_io_status_and_tail(&close_out[0]);
-            assert_eq!(status, NtStatus::SUCCESS, "Close itself always succeeds per MS-RDPEFS");
+            assert_eq!(
+                status,
+                NtStatus::SUCCESS,
+                "Close itself always succeeds per MS-RDPEFS"
+            );
 
-            assert!(!dest.exists(), "an interrupted transfer must NEVER produce the destination file");
+            assert!(
+                !dest.exists(),
+                "an interrupted transfer must NEVER produce the destination file"
+            );
 
             let staging_dir = root.join(".rdpilot-staging");
             let remaining: Vec<_> = std::fs::read_dir(&staging_dir)
                 .expect("staging dir reads")
                 .filter_map(|e| e.ok())
                 .collect();
-            assert_eq!(remaining.len(), 1, "the stale .part must remain in staging for detection");
+            assert_eq!(
+                remaining.len(),
+                1,
+                "the stale .part must remain in staging for detection"
+            );
 
             let _ = std::fs::remove_dir_all(&base);
         }
@@ -1786,18 +2050,18 @@ mod tests {
             let dest = root_canonical.join("upload.bin");
 
             let created = backend
-                .handle_drive_io_request(ServerDriveIoRequest::ServerCreateDriveRequest(create_write_req(
-                    1,
-                    "\\upload.bin",
-                    CreateDisposition::FILE_OPEN_IF,
-                )))
+                .handle_drive_io_request(ServerDriveIoRequest::ServerCreateDriveRequest(
+                    create_write_req(1, "\\upload.bin", CreateDisposition::FILE_OPEN_IF),
+                ))
                 .expect("write-disposition create returns Ok");
             let (status, file_id) = create_response_fields(&created[0]);
             assert_eq!(status, NtStatus::SUCCESS);
 
             let payload = b"data";
             let write_out = backend
-                .handle_drive_io_request(ServerDriveIoRequest::DeviceWriteRequest(write_req(file_id, 0, payload)))
+                .handle_drive_io_request(ServerDriveIoRequest::DeviceWriteRequest(write_req(
+                    file_id, 0, payload,
+                )))
                 .expect("write returns Ok");
             let (status, _length) = write_response_fields(&write_out[0]);
             assert_eq!(status, NtStatus::SUCCESS);
@@ -1805,7 +2069,9 @@ mod tests {
             let close = ServerDriveIoRequest::DeviceCloseRequest(DeviceCloseRequest {
                 device_io_request: dev_io_req(file_id, MajorFunction::Close),
             });
-            let close_out = backend.handle_drive_io_request(close).expect("close returns Ok");
+            let close_out = backend
+                .handle_drive_io_request(close)
+                .expect("close returns Ok");
             let (status, _tail) = decode_io_status_and_tail(&close_out[0]);
             assert_eq!(status, NtStatus::SUCCESS);
 
@@ -1826,10 +2092,14 @@ mod tests {
         fn set_information_against_read_only_or_unknown_handle_is_rejected() {
             let (mut backend, base) = setup();
 
-            let unknown = ServerDriveIoRequest::ServerDriveSetInformationRequest(ServerDriveSetInformationRequest {
-                device_io_request: dev_io_req(9999, MajorFunction::SetInformation),
-                set_buffer: FileInformationClass::EndOfFile(FileEndOfFileInformation { end_of_file: 4 }),
-            });
+            let unknown = ServerDriveIoRequest::ServerDriveSetInformationRequest(
+                ServerDriveSetInformationRequest {
+                    device_io_request: dev_io_req(9999, MajorFunction::SetInformation),
+                    set_buffer: FileInformationClass::EndOfFile(FileEndOfFileInformation {
+                        end_of_file: 4,
+                    }),
+                },
+            );
             let out = backend
                 .handle_drive_io_request(unknown)
                 .expect("rejected set-information still returns Ok");
