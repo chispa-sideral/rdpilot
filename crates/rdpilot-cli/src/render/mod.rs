@@ -7,7 +7,7 @@
 
 pub mod table;
 
-pub use table::{render_process_table, render_table, render_uia_table, render_window_table};
+pub use table::render_table;
 
 use crate::exit_codes::CliError;
 
@@ -19,8 +19,8 @@ use crate::exit_codes::CliError;
 /// this crate renders derives `Serialize` infallibly, so this is not
 /// expected to trigger in practice).
 pub fn print_json<T: serde::Serialize>(value: &T) -> Result<(), CliError> {
-    let json =
-        serde_json::to_string_pretty(value).map_err(|e| CliError::Internal(format!("failed to serialize JSON output: {e}")))?;
+    let json = serde_json::to_string_pretty(value)
+        .map_err(|e| CliError::Internal(format!("failed to serialize JSON output: {e}")))?;
     println!("{json}");
     Ok(())
 }

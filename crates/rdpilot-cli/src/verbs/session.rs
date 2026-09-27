@@ -20,17 +20,23 @@ use crate::render::{print_json, render_table};
 /// `DuplicateSession`) if `Connect` is rejected; or a transport/auto-start
 /// failure.
 pub async fn connect(args: ConnectArgs, json: bool) -> Result<(), CliError> {
-    let resolved =
-        rdpilot_config::resolve(args.config.into_overrides()).map_err(|e| CliError::MissingConfig(e.to_string()))?;
+    let resolved = rdpilot_config::resolve(args.config.into_overrides())
+        .map_err(|e| CliError::MissingConfig(e.to_string()))?;
 
-    let host = resolved
-        .host
-        .ok_or_else(|| CliError::MissingConfig("host is required (config file, RDPILOT_HOST, or --host)".to_owned()))?;
+    let host = resolved.host.ok_or_else(|| {
+        CliError::MissingConfig(
+            "host is required (config file, RDPILOT_HOST, or --host)".to_owned(),
+        )
+    })?;
     let username = resolved.username.ok_or_else(|| {
-        CliError::MissingConfig("username is required (config file, RDPILOT_USERNAME, or --username)".to_owned())
+        CliError::MissingConfig(
+            "username is required (config file, RDPILOT_USERNAME, or --username)".to_owned(),
+        )
     })?;
     let password = resolved.password.ok_or_else(|| {
-        CliError::MissingConfig("password is required (config file, RDPILOT_PASSWORD, or --password)".to_owned())
+        CliError::MissingConfig(
+            "password is required (config file, RDPILOT_PASSWORD, or --password)".to_owned(),
+        )
     })?;
 
     let req = Request::Connect {
@@ -45,30 +51,38 @@ pub async fn connect(args: ConnectArgs, json: bool) -> Result<(), CliError> {
     };
 
     match connect_round_trip(req).await? {
-        WireResponse::Connected { session, sensor_live, .. } => {
+        WireResponse::Connected {
+            session,
+            bridge_live,
+            ..
+        } => {
             if json {
-                print_json(&serde_json::json!({ "session": session.as_str(), "sensor_live": sensor_live }))
+                print_json(
+                    &serde_json::json!({ "session": session.as_str(), "bridge_live": bridge_live }),
+                )
             } else {
-                println!("{}", connect_status_message(session.as_str(), sensor_live));
+                println!("{}", connect_status_message(session.as_str(), bridge_live));
                 Ok(())
             }
         }
         WireResponse::Error(err) => Err(CliError::from(err)),
-        other => Err(CliError::Internal(format!("unexpected response to Connect: {other:?}"))),
+        other => Err(CliError::Internal(format!(
+            "unexpected response to Connect: {other:?}"
+        ))),
     }
 }
 
 /// Human-readable result for a successful connect.
 ///
 /// A session can be usable for basic RDP operations without the optional
-/// sensor executable, but sensor-backed perception and automation will not
+/// bridge executable, but bridge-backed perception and automation will not
 /// work. Make that degraded mode unmissable instead of presenting it as a
 /// routine connection status.
-fn connect_status_message(session: &str, sensor_live: bool) -> String {
-    if sensor_live {
-        format!("connected {session}; sensor live")
+fn connect_status_message(session: &str, bridge_live: bool) -> String {
+    if bridge_live {
+        format!("connected {session}; bridge live")
     } else {
-        format!("connected {session}; sensor not configured; session management available")
+        format!("connected {session}; bridge not configured; session management available")
     }
 }
 
@@ -84,7 +98,14 @@ pub async fn list(json: bool) -> Result<(), CliError> {
             if json {
                 print_json(&sessions)
             } else {
-                const HEADERS: [&str; 6] = ["id", "name", "host", "status", "connected-since", "last-activity"];
+                const HEADERS: [&str; 6] = [
+                    "id",
+                    "name",
+                    "host",
+                    "status",
+                    "connected-since",
+                    "last-activity",
+                ];
                 let rows: Vec<Vec<String>> = sessions
                     .iter()
                     .map(|s| {
@@ -103,7 +124,9 @@ pub async fn list(json: bool) -> Result<(), CliError> {
             }
         }
         WireResponse::Error(err) => Err(CliError::from(err)),
-        other => Err(CliError::Internal(format!("unexpected response to List: {other:?}"))),
+        other => Err(CliError::Internal(format!(
+            "unexpected response to List: {other:?}"
+        ))),
     }
 }
 
@@ -115,27 +138,6 @@ fn lifecycle_str(status: SessionLifecycle) -> &'static str {
         SessionLifecycle::Reconnecting => "Reconnecting",
         SessionLifecycle::Disconnected => "Disconnected",
         SessionLifecycle::Orphaned => "Orphaned",
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::connect_status_message;
-
-    #[test]
-    fn sensorless_status_reports_session_management_only() {
-        assert_eq!(
-            connect_status_message("desktop", false),
-            "connected desktop; sensor not configured; session management available"
-        );
-    }
-
-    #[test]
-    fn live_sensor_status_remains_concise() {
-        assert_eq!(
-            connect_status_message("desktop", true),
-            "connected desktop; sensor live"
-        );
     }
 }
 
@@ -159,6 +161,47 @@ pub async fn disconnect(args: SessionArg, json: bool) -> Result<(), CliError> {
             }
         }
         WireResponse::Error(err) => Err(CliError::from(err)),
-        other => Err(CliError::Internal(format!("unexpected response to Disconnect: {other:?}"))),
+        other => Err(CliError::Internal(format!(
+            "unexpected response to Disconnect: {other:?}"
+        ))),
+    }
+}
+
+pub async fn ping(args: SessionArg, json: bool) -> Result<(), CliError> {
+    let session = args.session.parse().map_err(CliError::Internal)?;
+    match round_trip(Request::Ping { session }).await? {
+        WireResponse::Ack => {
+            if json {
+                print_json(&serde_json::json!({"ok":true}))
+            } else {
+                println!("ok");
+                Ok(())
+            }
+        }
+        WireResponse::Error(e) => Err(e.into()),
+        other => Err(CliError::Internal(format!(
+            "unexpected ping response: {other:?}"
+        ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::connect_status_message;
+
+    #[test]
+    fn bridgeless_status_reports_session_management_only() {
+        assert_eq!(
+            connect_status_message("desktop", false),
+            "connected desktop; bridge not configured; session management available"
+        );
+    }
+
+    #[test]
+    fn live_bridge_status_remains_concise() {
+        assert_eq!(
+            connect_status_message("desktop", true),
+            "connected desktop; bridge live"
+        );
     }
 }

@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.78"
 license = "LGPL-3.0-or-later"
-description = "Thin `rdpilot-ipc`/`rdpilot-config` MCP server client (`rdpilot-mcp` binary) — exposes rdpilot over the Model Context Protocol via rmcp's stdio transport. Never links `rdpilot`/`rdpilot-daemon` (thin-client invariant, D-17)."
+description = "Thin target-bound Cua MCP stdio endpoint (`rdpilot-mcp` binary) — forwards native Cua MCP via a target-bound stdio stream. Never links `rdpilot`/`rdpilot-daemon` (thin-client invariant, D-17)."
 repository = "https://github.com/marcfargas/rdpilot"
 
 [[bin]]
@@ -12,28 +12,10 @@ name = "rdpilot-mcp"
 path = "src/main.rs"
 
 [dependencies]
-rmcp = { version = "2.2.0", features = ["server", "macros", "transport-io"] }
-schemars = "1"
+clap = { version = "4", features = ["derive"] }
 rdpilot-ipc = { path = "../rdpilot-ipc" }
-rdpilot-config = { path = "../rdpilot-config" }
-tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "io-std", "macros", "time"] }
-serde = "1"
+tokio = { version = "1", features = ["rt", "net", "io-util", "io-std", "macros", "time"] }
 serde_json = "1"
-thiserror = "2"
-tracing = "0.1"
-tracing-subscriber = "0.3"
 
-# rmcp's CLIENT-side dev-dependency (PROOF-03/MCP-04 live half, Plan 15-03):
-# additive `client`/`transport-child-process` FEATURES on the SAME already
-# D-26-approved rmcp version -- never merged into the production
-# `[dependencies] rmcp` entry above (server/macros/transport-io), so the
-# thin-client `cargo tree` gate (D-17) is unaffected (dev-dependencies are
-# excluded from a production `cargo tree` invocation). Used only by
-# `tests/live_proof.rs`/`tests/live_mcp_computer.rs` to drive the REAL
-# compiled `rdpilot-mcp` binary as an rmcp client subprocess
-# (`TokioChildProcess` + `().serve(...)`), speaking actual MCP JSON-RPC over
-# its stdio -- no hand-rolled client, guaranteed wire-compatible by
-# construction. Deliberately NO `reqwest`/`base64`: the capstone (Plan
-# 15-04) drives `claude -p`, not the Anthropic HTTP API.
 [dev-dependencies]
-rmcp = { version = "2.2.0", features = ["client", "transport-child-process"] }
+tokio = { version = "1", features = ["process", "test-util"] }

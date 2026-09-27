@@ -259,6 +259,7 @@ pub fn parse_wire_key(name: &str) -> Result<WireKey, String> {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
 

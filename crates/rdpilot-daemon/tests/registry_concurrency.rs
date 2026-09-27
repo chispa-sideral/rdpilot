@@ -28,7 +28,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rdpilot::ConnectionConfig;
-use rdpilot_daemon::{DaemonError, ManagedSession, Registry, ReconciliationSink, SessionConnector};
+use rdpilot_daemon::{DaemonError, ManagedSession, ReconciliationSink, Registry, SessionConnector};
 use rdpilot_ipc::SessionLifecycle;
 
 type TestFuture<T> = Pin<Box<dyn Future<Output = T>>>;
@@ -49,59 +49,45 @@ impl ManagedSession for FakeSession {
     }
 
     fn screenshot(&self) -> OpFuture<'_, Result<rdpilot::Screenshot, DaemonError>> {
-        Box::pin(async { Ok(rdpilot::Screenshot { width: 1, height: 1, rgba: vec![0, 0, 0, 0] }) })
-    }
-    fn world_state(&self, _opts: rdpilot::WorldStateOptions) -> OpFuture<'_, Result<rdpilot::WorldState, DaemonError>> {
         Box::pin(async {
-            Ok(rdpilot::WorldState {
-                timestamp: std::time::SystemTime::now(),
-                capture_span: std::time::Duration::from_millis(0),
-                screenshot: None,
-                window_list: None,
-                uia: None,
-                elevation_active: None,
+            Ok(rdpilot::Screenshot {
+                width: 1,
+                height: 1,
+                rgba: vec![0, 0, 0, 0],
             })
         })
     }
-    fn get_window_list(&self) -> OpFuture<'_, Result<Vec<rdpilot::WindowInfo>, DaemonError>> {
-        Box::pin(async { Ok(vec![]) })
-    }
-    fn get_process_tree(&self) -> OpFuture<'_, Result<Vec<rdpilot::ProcessInfo>, DaemonError>> {
-        Box::pin(async { Ok(vec![]) })
-    }
-    fn get_uia_tree(&self, _hwnd: u64, _scope: rdpilot::UiaScope) -> OpFuture<'_, Result<Vec<rdpilot::UiaElement>, DaemonError>> {
-        Box::pin(async { Ok(vec![]) })
-    }
+
     fn send_mouse(&self, _action: rdpilot::MouseAction) -> OpFuture<'_, Result<(), DaemonError>> {
         Box::pin(async { Ok(()) })
     }
     fn send_key(&self, _action: rdpilot::KeyAction) -> OpFuture<'_, Result<(), DaemonError>> {
         Box::pin(async { Ok(()) })
     }
-    fn set_foreground_window(&self, _hwnd: u64) -> OpFuture<'_, Result<(), DaemonError>> {
-        Box::pin(async { Ok(()) })
-    }
-    fn launch_process(
-        &self,
-        _exe: String,
-        _args: Option<String>,
-        _cwd: Option<String>,
-    ) -> OpFuture<'_, Result<u32, DaemonError>> {
-        Box::pin(async { Ok(0) })
-    }
+
     fn upload_file(
         &self,
         _local: std::path::PathBuf,
         _remote_name: String,
     ) -> OpFuture<'_, Result<rdpilot::TransferOutcome, DaemonError>> {
-        Box::pin(async { Ok(rdpilot::TransferOutcome { bytes_transferred: 0, checksum: String::new() }) })
+        Box::pin(async {
+            Ok(rdpilot::TransferOutcome {
+                bytes_transferred: 0,
+                checksum: String::new(),
+            })
+        })
     }
     fn download_file(
         &self,
         _remote_name: String,
         _local: std::path::PathBuf,
     ) -> OpFuture<'_, Result<rdpilot::TransferOutcome, DaemonError>> {
-        Box::pin(async { Ok(rdpilot::TransferOutcome { bytes_transferred: 0, checksum: String::new() }) })
+        Box::pin(async {
+            Ok(rdpilot::TransferOutcome {
+                bytes_transferred: 0,
+                checksum: String::new(),
+            })
+        })
     }
     fn ping(&self) -> OpFuture<'_, Result<std::time::Duration, DaemonError>> {
         Box::pin(async { Ok(std::time::Duration::from_millis(0)) })
@@ -112,17 +98,6 @@ impl ManagedSession for FakeSession {
     fn deploy_and_launch(&self) -> OpFuture<'_, Result<std::time::Duration, DaemonError>> {
         Box::pin(async move { Ok(std::time::Duration::from_millis(0)) })
     }
-    fn uac_respond(
-        &self,
-        decision: rdpilot::UacDecision,
-    ) -> OpFuture<'_, Result<rdpilot::UacResponseOutcome, DaemonError>> {
-        Box::pin(async move {
-            Ok(rdpilot::UacResponseOutcome {
-                decision,
-                confirmation: rdpilot::Screenshot { width: 1, height: 1, rgba: vec![0, 0, 0, 0] },
-            })
-        })
-    }
 }
 
 /// Sleeps briefly before succeeding, widening the atomic-insert race
@@ -131,7 +106,10 @@ impl ManagedSession for FakeSession {
 struct SlowFakeConnector;
 
 impl SessionConnector for SlowFakeConnector {
-    fn connect(&self, _cfg: ConnectionConfig) -> TestFuture<Result<Box<dyn ManagedSession>, DaemonError>> {
+    fn connect(
+        &self,
+        _cfg: ConnectionConfig,
+    ) -> TestFuture<Result<Box<dyn ManagedSession>, DaemonError>> {
         Box::pin(async move {
             tokio::time::sleep(Duration::from_millis(5)).await;
             Ok(Box::new(FakeSession) as Box<dyn ManagedSession>)
@@ -157,7 +135,10 @@ fn test_cfg() -> ConnectionConfig {
 async fn n_simultaneous_same_name_connects_yield_exactly_one_winner() {
     const N: usize = 16;
 
-    let registry = Arc::new(Registry::new(Arc::new(SlowFakeConnector), Arc::new(NoopSink)));
+    let registry = Arc::new(Registry::new(
+        Arc::new(SlowFakeConnector),
+        Arc::new(NoopSink),
+    ));
 
     let local = tokio::task::LocalSet::new();
     let results: Vec<Result<rdpilot_ipc::SessionId, DaemonError>> = local
@@ -167,7 +148,9 @@ async fn n_simultaneous_same_name_connects_yield_exactly_one_winner() {
                 let registry = Arc::clone(&registry);
                 let cfg = test_cfg();
                 handles.push(tokio::task::spawn_local(async move {
-                    registry.open(Some("same-name".to_owned()), "10.0.0.5".to_owned(), cfg).await
+                    registry
+                        .open(Some("same-name".to_owned()), "10.0.0.5".to_owned(), cfg)
+                        .await
                 }));
             }
             let mut results = Vec::with_capacity(N);
@@ -184,9 +167,21 @@ async fn n_simultaneous_same_name_connects_yield_exactly_one_winner() {
         .filter(|r| matches!(r, Err(DaemonError::DuplicateSession(name)) if name == "same-name"))
         .count();
 
-    assert_eq!(ok_count, 1, "expected exactly one winner, got {ok_count} of {N}: {results:?}");
-    assert_eq!(duplicate_count, N - 1, "expected {} DuplicateSession rejections, got {duplicate_count}", N - 1);
-    assert_eq!(registry.list().len(), 1, "registry must hold exactly one entry after the race");
+    assert_eq!(
+        ok_count, 1,
+        "expected exactly one winner, got {ok_count} of {N}: {results:?}"
+    );
+    assert_eq!(
+        duplicate_count,
+        N - 1,
+        "expected {} DuplicateSession rejections, got {duplicate_count}",
+        N - 1
+    );
+    assert_eq!(
+        registry.list().len(),
+        1,
+        "registry must hold exactly one entry after the race"
+    );
 }
 
 /// N unnamed (auto-id) `open` calls racing concurrently must yield N
@@ -197,7 +192,10 @@ async fn n_simultaneous_same_name_connects_yield_exactly_one_winner() {
 async fn n_simultaneous_unnamed_connects_yield_n_distinct_auto_ids() {
     const N: usize = 16;
 
-    let registry = Arc::new(Registry::new(Arc::new(SlowFakeConnector), Arc::new(NoopSink)));
+    let registry = Arc::new(Registry::new(
+        Arc::new(SlowFakeConnector),
+        Arc::new(NoopSink),
+    ));
 
     let local = tokio::task::LocalSet::new();
     let results: Vec<Result<rdpilot_ipc::SessionId, DaemonError>> = local
@@ -218,9 +216,20 @@ async fn n_simultaneous_unnamed_connects_yield_n_distinct_auto_ids() {
         })
         .await;
 
-    let ids: std::collections::HashSet<String> =
-        results.into_iter().map(|r| r.expect("unnamed open should never collide-reject").as_str().to_owned()).collect();
+    let ids: std::collections::HashSet<String> = results
+        .into_iter()
+        .map(|r| {
+            r.expect("unnamed open should never collide-reject")
+                .as_str()
+                .to_owned()
+        })
+        .collect();
 
-    assert_eq!(ids.len(), N, "expected {N} distinct auto-generated ids, got {}: {ids:?}", ids.len());
+    assert_eq!(
+        ids.len(),
+        N,
+        "expected {N} distinct auto-generated ids, got {}: {ids:?}",
+        ids.len()
+    );
     assert_eq!(registry.list().len(), N);
 }

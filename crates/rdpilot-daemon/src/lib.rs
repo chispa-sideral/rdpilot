@@ -65,7 +65,7 @@ mod server;
 
 pub use reconcile::{JsonReconciliationSink, ReconciliationRecord, scan_orphans, seed_into};
 pub use registry::Registry;
-pub use seams::{DaemonError, ManagedSession, ReconciliationSink, SessionConnector, SessionEntry};
+pub use seams::{DaemonError, ManagedCua, ManagedSession, ReconciliationSink, SessionConnector, SessionEntry};
 pub use server::{RunConfig, run};
 
 // Re-exported so `tests/ipc_security.rs` (the SC#4 [BLOCKING] DAEMON-02

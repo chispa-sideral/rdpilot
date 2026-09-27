@@ -26,9 +26,9 @@ mod unix;
 mod windows;
 
 #[cfg(unix)]
-pub use unix::{accept_and_authorize, authorize_uid, bind};
-#[cfg(unix)]
 pub use rdpilot_ipc::transport::socket_path;
+#[cfg(unix)]
+pub use unix::{accept_and_authorize, authorize_uid, bind};
 
 #[cfg(windows)]
 pub use windows::{accept_and_authorize, bind, socket_path};
@@ -39,8 +39,9 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use crate::diagnostics::{Diagnostics, Stage};
 use crate::dispatch::dispatch_for_ipc;
 use crate::registry::Registry;
+use crate::seams::ManagedCua;
 use rdpilot_ipc::transport::{read_frame, write_frame};
-use rdpilot_ipc::{Request, WireResponse};
+use rdpilot_ipc::{CuaStreamFrame, Request, WireResponse};
 
 const CONNECT_ACK_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -51,8 +52,11 @@ const CONNECT_ACK_TIMEOUT: Duration = Duration::from_secs(5);
 /// Generic over any `AsyncRead + AsyncWrite` stream — the same loop serves
 /// both the Unix `UnixStream` (this plan) and the Windows named pipe
 /// (Plan 12-07). Used by Plan 12-06's accept loop.
-pub(crate) async fn serve_connection<S>(mut stream: S, registry: &Registry, diagnostics: Option<&Diagnostics>)
-where
+pub(crate) async fn serve_connection<S>(
+    mut stream: S,
+    registry: &Registry,
+    diagnostics: Option<&Diagnostics>,
+) where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     loop {
@@ -64,6 +68,50 @@ where
             // decoded `Request` to begin with on this branch).
             Err(_) => return,
         };
+        if let Request::CuaAttach { session } = req {
+            match tokio::time::timeout(Duration::from_secs(30), registry.attach_cua(&session)).await
+            {
+                Ok(Ok((session_incarnation, mut attachment))) => {
+                    let (bridge_generation, runtime_generation, attachment_id) =
+                        attachment.identity();
+                    let ack = WireResponse::CuaAttached {
+                        session_incarnation,
+                        bridge_generation,
+                        runtime_generation,
+                        attachment_id,
+                    };
+                    if matches!(
+                        tokio::time::timeout(STREAM_WRITE_TIMEOUT, write_frame(&mut stream, &ack))
+                            .await,
+                        Ok(Ok(()))
+                    ) {
+                        forward_cua(
+                            &mut stream,
+                            attachment.as_mut(),
+                            registry,
+                            &session,
+                            session_incarnation,
+                        )
+                        .await;
+                    }
+                    let _ = tokio::time::timeout(STREAM_WRITE_TIMEOUT, attachment.close()).await;
+                }
+                result => {
+                    let message = match result {
+                        Ok(Err(e)) => e.to_string(),
+                        _ => "Cua attachment timed out".into(),
+                    };
+                    let response =
+                        WireResponse::Error(crate::seams::DaemonError::Connect(message).into());
+                    let _ = tokio::time::timeout(
+                        STREAM_WRITE_TIMEOUT,
+                        write_frame(&mut stream, &response),
+                    )
+                    .await;
+                }
+            }
+            return;
+        }
         let outcome = dispatch_for_ipc(registry, req, diagnostics).await;
         if write_frame(&mut stream, &outcome.response).await.is_err() {
             if let Some(lease) = outcome.connect_lease {
@@ -82,8 +130,19 @@ where
             if let Some(diagnostics) = diagnostics {
                 diagnostics.record(lease.id.as_str(), Stage::IpcResponseWritten);
             }
-            if matches!(outcome.response, WireResponse::Connected { connect_ack_required: true, .. }) {
-                match tokio::time::timeout(CONNECT_ACK_TIMEOUT, read_frame::<_, Request>(&mut stream)).await {
+            if matches!(
+                outcome.response,
+                WireResponse::Connected {
+                    connect_ack_required: true,
+                    ..
+                }
+            ) {
+                match tokio::time::timeout(
+                    CONNECT_ACK_TIMEOUT,
+                    read_frame::<_, Request>(&mut stream),
+                )
+                .await
+                {
                     Ok(Ok(Request::ConnectAck { session })) if session == lease.id => {
                         if write_frame(&mut stream, &WireResponse::Ack).await.is_err() {
                             return;
@@ -101,3 +160,62 @@ where
         }
     }
 }
+
+const STREAM_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Preserve a partially read IPC frame while forwarding spontaneous Cua output.
+/// A blocked reader or writer never holds a registry/session lock. No retry or reattach.
+async fn forward_cua<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    attachment: &mut dyn ManagedCua,
+    registry: &Registry,
+    session: &rdpilot_ipc::SessionId,
+    incarnation: u64,
+) {
+    let (mut reader, mut writer) = tokio::io::split(stream);
+    let reason = 'stream: loop {
+        let incoming = read_frame::<_, CuaStreamFrame>(&mut reader);
+        tokio::pin!(incoming);
+        loop {
+            tokio::select! {
+                frame = &mut incoming => {
+                    match frame {
+                        Ok(CuaStreamFrame::Message {message}) => {
+                            if !registry.touch_generation(session, incarnation) { break 'stream "target incarnation closed"; }
+                            if !matches!(tokio::time::timeout(STREAM_WRITE_TIMEOUT, attachment.send(message)).await, Ok(Ok(()))) {
+                                break 'stream "Cua input unavailable";
+                            }
+                        }
+                        Ok(CuaStreamFrame::Closed {..}) | Err(_) => break 'stream "caller closed or malformed frame",
+                    }
+                    break;
+                }
+                output = attachment.recv() => {
+                    match output {
+                        Ok(Some(message)) => {
+                            if !registry.touch_generation(session, incarnation) { break 'stream "target incarnation closed"; }
+                            let frame = CuaStreamFrame::Message { message };
+                            if !matches!(tokio::time::timeout(STREAM_WRITE_TIMEOUT, write_frame(&mut writer, &frame)).await, Ok(Ok(()))) {
+                                break 'stream "caller output unavailable";
+                            }
+                        }
+                        Ok(None) | Err(_) => break 'stream "Cua attachment closed",
+                    }
+                }
+            }
+        }
+    };
+    let _ = tokio::time::timeout(
+        STREAM_WRITE_TIMEOUT,
+        write_frame(
+            &mut writer,
+            &CuaStreamFrame::Closed {
+                reason: reason.into(),
+            },
+        ),
+    )
+    .await;
+}
+
+#[cfg(test)]
+mod cua_tests;

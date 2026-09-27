@@ -282,6 +282,8 @@ fn get_no_clobber_refuses_without_force_and_succeeds_with_force() {
         force_run.stdout,
         force_run.stderr
     );
+    assert_eq!(std::fs::read(&existing_dest).expect("download replaces the original"), vec![0_u8; 1024]);
+    assert!(!std::fs::read_dir(&root).expect("test directory").any(|entry| entry.expect("directory entry").file_name().to_string_lossy().starts_with(".rdpilot-download-")), "download staging must be cleaned");
 
     let _ = std::fs::remove_dir_all(&root);
 }

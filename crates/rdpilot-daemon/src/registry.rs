@@ -29,8 +29,8 @@
 // `NoopReconciliationSink` for the same reason).
 #![allow(dead_code)]
 
-use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -40,18 +40,20 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use rdpilot::ConnectionConfig;
 use rdpilot_ipc::{SessionId, SessionLifecycle, SessionStatus};
 
-use crate::seams::{BoxFuture, DaemonError, ManagedSession, ReconciliationSink, SessionConnector, SessionEntry};
+use crate::seams::{
+    BoxFuture, DaemonError, ManagedSession, ReconciliationSink, SessionConnector, SessionEntry,
+};
 
 /// Word lists for [`generate_auto_id`] (D-29: short, human-legible
 /// adjective-noun auto-generated ids, e.g. `brave-otter`). Deliberately
 /// small, fixed, and offline — no wordlist crate dependency.
 const ADJECTIVES: &[&str] = &[
-    "brave", "quiet", "swift", "calm", "bold", "clever", "gentle", "lucky", "quick", "wise", "eager", "sunny",
-    "amber", "civil", "dapper", "earnest",
+    "brave", "quiet", "swift", "calm", "bold", "clever", "gentle", "lucky", "quick", "wise",
+    "eager", "sunny", "amber", "civil", "dapper", "earnest",
 ];
 const NOUNS: &[&str] = &[
-    "otter", "falcon", "badger", "heron", "lynx", "raven", "wolf", "fox", "hawk", "owl", "otter2", "marten",
-    "kestrel", "beetle", "sparrow", "cricket",
+    "otter", "falcon", "badger", "heron", "lynx", "raven", "wolf", "fox", "hawk", "owl", "otter2",
+    "marten", "kestrel", "beetle", "sparrow", "cricket",
 ];
 
 /// Bound on [`Registry::claim_with_auto_id`]'s retry loop — collisions are
@@ -96,14 +98,16 @@ fn iso8601_now() -> String {
 /// Render an arbitrary [`SystemTime`] as an ISO-8601 / RFC 3339 UTC
 /// timestamp — the same conversion [`iso8601_now`] applies to "now",
 /// factored out so callers with their own captured `SystemTime` (e.g.
-/// `dispatch.rs`'s `WorldState` arm, Plan 13-04, converting
-/// `rdpilot::WorldState::timestamp`) reuse this exact civil-calendar math
+/// registry status serialization) reuse this exact civil-calendar math
 /// rather than duplicating it (research: "reuse the same ISO-8601 helper
 /// registry.rs uses"). A `SystemTime` before the Unix epoch (clock skew /
 /// test fixture) degrades to the epoch itself rather than panicking
 /// (API-01 discipline mirrored from `rdpilot`).
 pub(crate) fn iso8601_from_system_time(t: SystemTime) -> String {
-    let secs = t.duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let secs = t
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
     iso8601_from_unix_seconds(i64::try_from(secs).unwrap_or(i64::MAX))
 }
 
@@ -180,7 +184,9 @@ impl Registry {
         match guard.entry(id.clone()) {
             Entry::Occupied(_) => Err(DaemonError::DuplicateSession(id.as_str().to_owned())),
             Entry::Vacant(slot) => {
-                slot.insert(SessionEntry::Connecting { claimed_at: Instant::now() });
+                slot.insert(SessionEntry::Connecting {
+                    claimed_at: Instant::now(),
+                });
                 Ok(())
             }
         }
@@ -219,7 +225,12 @@ impl Registry {
     /// claimed/live/orphaned, or the connector's error (mapped through
     /// [`DaemonError`]) if the connect itself fails — in which case the
     /// claim is released so a retry with the same name can succeed.
-    pub async fn open(&self, name: Option<String>, host: String, cfg: ConnectionConfig) -> Result<SessionId, DaemonError> {
+    pub async fn open(
+        &self,
+        name: Option<String>,
+        host: String,
+        cfg: ConnectionConfig,
+    ) -> Result<SessionId, DaemonError> {
         Ok(self.open_tracked(name, host, cfg).await?.id)
     }
 
@@ -264,6 +275,7 @@ impl Registry {
                             name,
                             host: host.clone(),
                             last_activity: Instant::now(),
+                            cua_leases: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                             last_activity_wall: now_wall.clone(),
                         },
                     );
@@ -345,12 +357,17 @@ impl Registry {
     /// Reclaim only the exact live generation created for a Connect response
     /// whose IPC peer closed. A normal Disconnect or a reused public name is
     /// benignly left untouched.
-    pub(crate) async fn close_if_generation(&self, lease: &ConnectLease) -> Result<bool, DaemonError> {
+    pub(crate) async fn close_if_generation(
+        &self,
+        lease: &ConnectLease,
+    ) -> Result<bool, DaemonError> {
         let entry = {
             #[allow(clippy::expect_used)] // A poisoned registry mutex is unrecoverable.
             let mut guard = self.sessions.lock().expect("registry mutex poisoned");
             match guard.get(&lease.id) {
-                Some(SessionEntry::Live { generation, .. }) if *generation == lease.generation => guard.remove(&lease.id),
+                Some(SessionEntry::Live { generation, .. }) if *generation == lease.generation => {
+                    guard.remove(&lease.id)
+                }
                 _ => None,
             }
         };
@@ -409,13 +426,72 @@ impl Registry {
         }
     }
 
+    /// Capture the incarnation and acquire a stream under one short session lease.
+    /// Neither the global registry lock nor the per-session lock escapes this call.
+    pub(crate) async fn attach_cua(
+        &self,
+        id: &SessionId,
+    ) -> Result<(u64, Box<dyn crate::seams::ManagedCua>), DaemonError> {
+        let (generation, entry, cua_leases) = {
+            #[allow(clippy::expect_used)]
+            let guard = self.sessions.lock().expect("registry mutex poisoned");
+            match guard.get(id) {
+                Some(SessionEntry::Live {
+                    generation,
+                    session,
+                    cua_leases,
+                    ..
+                }) => (*generation, Arc::clone(session), Arc::clone(cua_leases)),
+                Some(SessionEntry::Connecting { .. }) => {
+                    return Err(DaemonError::StillConnecting(id.as_str().into()))
+                }
+                _ => return Err(DaemonError::SessionNotFound(id.as_str().into())),
+            }
+        };
+        let guard = entry.lock().await;
+        let session = guard
+            .as_deref()
+            .ok_or_else(|| DaemonError::SessionNotFound(id.as_str().into()))?;
+        let attachment = session.attach_cua().await?;
+        cua_leases.fetch_add(1, Ordering::Relaxed);
+        Ok((
+            generation,
+            Box::new(CuaLease {
+                inner: attachment,
+                active: cua_leases,
+            }),
+        ))
+    }
+
+    /// Refresh activity only for the captured incarnation; a replacement name is never touched.
+    pub(crate) fn touch_generation(&self, id: &SessionId, expected: u64) -> bool {
+        #[allow(clippy::expect_used)]
+        let mut entries = self.sessions.lock().expect("registry mutex poisoned");
+        match entries.get_mut(id) {
+            Some(SessionEntry::Live {
+                generation,
+                last_activity,
+                last_activity_wall,
+                ..
+            }) if *generation == expected => {
+                *last_activity = Instant::now();
+                *last_activity_wall = iso8601_now();
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// A credential-free snapshot of every session currently known to the
     /// registry (D-30/D-31) — used by `list` (Plan 12-04).
     #[must_use]
     pub fn list(&self) -> Vec<SessionStatus> {
         #[allow(clippy::expect_used)] // A poisoned registry mutex is unrecoverable.
         let guard = self.sessions.lock().expect("registry mutex poisoned");
-        guard.iter().map(|(id, entry)| entry.to_status(id)).collect()
+        guard
+            .iter()
+            .map(|(id, entry)| entry.to_status(id))
+            .collect()
     }
 
     /// Insert an `Orphaned` entry directly (no I/O here — used by the
@@ -425,7 +501,13 @@ impl Registry {
     pub fn seed_orphan(&self, id: SessionId, host: String, connected_since: String) {
         #[allow(clippy::expect_used)] // A poisoned registry mutex is unrecoverable.
         let mut guard = self.sessions.lock().expect("registry mutex poisoned");
-        guard.insert(id, SessionEntry::Orphaned { host, connected_since });
+        guard.insert(
+            id,
+            SessionEntry::Orphaned {
+                host,
+                connected_since,
+            },
+        );
     }
 
     /// The number of entries currently in the registry (test/diagnostic
@@ -457,10 +539,40 @@ impl Registry {
         guard
             .iter()
             .filter_map(|(id, entry)| match entry {
-                SessionEntry::Live { last_activity, .. } => Some((id.clone(), last_activity.elapsed())),
+                SessionEntry::Live {
+                    last_activity,
+                    cua_leases,
+                    ..
+                } => (cua_leases.load(Ordering::Relaxed) == 0)
+                    .then(|| (id.clone(), last_activity.elapsed())),
                 SessionEntry::Connecting { .. } | SessionEntry::Orphaned { .. } => None,
             })
             .collect()
+    }
+}
+
+/// Counts owned streams without retaining either registry lock.
+struct CuaLease {
+    inner: Box<dyn crate::seams::ManagedCua>,
+    active: Arc<std::sync::atomic::AtomicUsize>,
+}
+impl Drop for CuaLease {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+impl crate::seams::ManagedCua for CuaLease {
+    fn identity(&self) -> (u64, u64, u64) {
+        self.inner.identity()
+    }
+    fn send(&self, value: serde_json::Value) -> BoxFuture<'_, Result<(), DaemonError>> {
+        self.inner.send(value)
+    }
+    fn recv(&mut self) -> BoxFuture<'_, Result<Option<serde_json::Value>, DaemonError>> {
+        self.inner.recv()
+    }
+    fn close(&mut self) -> BoxFuture<'_, Result<(), DaemonError>> {
+        self.inner.close()
     }
 }
 
@@ -494,59 +606,48 @@ mod tests {
         }
 
         fn screenshot(&self) -> BoxFuture<'_, Result<rdpilot::Screenshot, DaemonError>> {
-            Box::pin(async { Ok(rdpilot::Screenshot { width: 1, height: 1, rgba: vec![0, 0, 0, 0] }) })
-        }
-        fn world_state(&self, _opts: rdpilot::WorldStateOptions) -> BoxFuture<'_, Result<rdpilot::WorldState, DaemonError>> {
             Box::pin(async {
-                Ok(rdpilot::WorldState {
-                    timestamp: std::time::SystemTime::now(),
-                    capture_span: std::time::Duration::from_millis(0),
-                    screenshot: None,
-                    window_list: None,
-                    uia: None,
-                    elevation_active: None,
+                Ok(rdpilot::Screenshot {
+                    width: 1,
+                    height: 1,
+                    rgba: vec![0, 0, 0, 0],
                 })
             })
         }
-        fn get_window_list(&self) -> BoxFuture<'_, Result<Vec<rdpilot::WindowInfo>, DaemonError>> {
-            Box::pin(async { Ok(vec![]) })
-        }
-        fn get_process_tree(&self) -> BoxFuture<'_, Result<Vec<rdpilot::ProcessInfo>, DaemonError>> {
-            Box::pin(async { Ok(vec![]) })
-        }
-        fn get_uia_tree(&self, _hwnd: u64, _scope: rdpilot::UiaScope) -> BoxFuture<'_, Result<Vec<rdpilot::UiaElement>, DaemonError>> {
-            Box::pin(async { Ok(vec![]) })
-        }
-        fn send_mouse(&self, _action: rdpilot::MouseAction) -> BoxFuture<'_, Result<(), DaemonError>> {
+
+        fn send_mouse(
+            &self,
+            _action: rdpilot::MouseAction,
+        ) -> BoxFuture<'_, Result<(), DaemonError>> {
             Box::pin(async { Ok(()) })
         }
         fn send_key(&self, _action: rdpilot::KeyAction) -> BoxFuture<'_, Result<(), DaemonError>> {
             Box::pin(async { Ok(()) })
         }
-        fn set_foreground_window(&self, _hwnd: u64) -> BoxFuture<'_, Result<(), DaemonError>> {
-            Box::pin(async { Ok(()) })
-        }
-        fn launch_process(
-            &self,
-            _exe: String,
-            _args: Option<String>,
-            _cwd: Option<String>,
-        ) -> BoxFuture<'_, Result<u32, DaemonError>> {
-            Box::pin(async { Ok(0) })
-        }
+
         fn upload_file(
             &self,
             _local: std::path::PathBuf,
             _remote_name: String,
         ) -> BoxFuture<'_, Result<rdpilot::TransferOutcome, DaemonError>> {
-            Box::pin(async { Ok(rdpilot::TransferOutcome { bytes_transferred: 0, checksum: String::new() }) })
+            Box::pin(async {
+                Ok(rdpilot::TransferOutcome {
+                    bytes_transferred: 0,
+                    checksum: String::new(),
+                })
+            })
         }
         fn download_file(
             &self,
             _remote_name: String,
             _local: std::path::PathBuf,
         ) -> BoxFuture<'_, Result<rdpilot::TransferOutcome, DaemonError>> {
-            Box::pin(async { Ok(rdpilot::TransferOutcome { bytes_transferred: 0, checksum: String::new() }) })
+            Box::pin(async {
+                Ok(rdpilot::TransferOutcome {
+                    bytes_transferred: 0,
+                    checksum: String::new(),
+                })
+            })
         }
         fn ping(&self) -> BoxFuture<'_, Result<std::time::Duration, DaemonError>> {
             Box::pin(async { Ok(std::time::Duration::from_millis(0)) })
@@ -556,17 +657,6 @@ mod tests {
         }
         fn deploy_and_launch(&self) -> BoxFuture<'_, Result<std::time::Duration, DaemonError>> {
             Box::pin(async move { Ok(std::time::Duration::from_millis(0)) })
-        }
-        fn uac_respond(
-            &self,
-            decision: rdpilot::UacDecision,
-        ) -> BoxFuture<'_, Result<rdpilot::UacResponseOutcome, DaemonError>> {
-            Box::pin(async move {
-                Ok(rdpilot::UacResponseOutcome {
-                    decision,
-                    confirmation: rdpilot::Screenshot { width: 1, height: 1, rgba: vec![0, 0, 0, 0] },
-                })
-            })
         }
     }
 
@@ -584,22 +674,33 @@ mod tests {
 
     impl FakeConnector {
         fn succeeding() -> Self {
-            FakeConnector { fail: false, connect_count: AtomicU32::new(0) }
+            FakeConnector {
+                fail: false,
+                connect_count: AtomicU32::new(0),
+            }
         }
         fn failing() -> Self {
-            FakeConnector { fail: true, connect_count: AtomicU32::new(0) }
+            FakeConnector {
+                fail: true,
+                connect_count: AtomicU32::new(0),
+            }
         }
     }
 
     impl SessionConnector for FakeConnector {
-        fn connect(&self, _cfg: ConnectionConfig) -> TestFuture<Result<Box<dyn ManagedSession>, DaemonError>> {
+        fn connect(
+            &self,
+            _cfg: ConnectionConfig,
+        ) -> TestFuture<Result<Box<dyn ManagedSession>, DaemonError>> {
             self.connect_count.fetch_add(1, Ordering::SeqCst);
             let fail = self.fail;
             Box::pin(async move {
                 if fail {
                     Err(DaemonError::Connect("fake connect failure".to_owned()))
                 } else {
-                    Ok(Box::new(FakeSession { closed: Arc::new(AtomicBool::new(false)) }) as Box<dyn ManagedSession>)
+                    Ok(Box::new(FakeSession {
+                        closed: Arc::new(AtomicBool::new(false)),
+                    }) as Box<dyn ManagedSession>)
                 }
             })
         }
@@ -610,11 +711,17 @@ mod tests {
     }
 
     fn succeeding_registry() -> Registry {
-        Registry::new(Arc::new(FakeConnector::succeeding()), Arc::new(NoopReconciliationSink))
+        Registry::new(
+            Arc::new(FakeConnector::succeeding()),
+            Arc::new(NoopReconciliationSink),
+        )
     }
 
     fn failing_registry() -> Registry {
-        Registry::new(Arc::new(FakeConnector::failing()), Arc::new(NoopReconciliationSink))
+        Registry::new(
+            Arc::new(FakeConnector::failing()),
+            Arc::new(NoopReconciliationSink),
+        )
     }
 
     #[tokio::test]
@@ -640,7 +747,9 @@ mod tests {
             .await
             .expect("first open should succeed");
 
-        let second = registry.open(Some("web".to_owned()), "h".to_owned(), test_cfg()).await;
+        let second = registry
+            .open(Some("web".to_owned()), "h".to_owned(), test_cfg())
+            .await;
         assert!(matches!(second, Err(DaemonError::DuplicateSession(name)) if name == "web"));
         // Exactly one entry survives the rejected duplicate.
         assert_eq!(registry.len(), 1);
@@ -649,21 +758,35 @@ mod tests {
     #[tokio::test]
     async fn open_with_no_name_mints_an_auto_generated_id() {
         let registry = succeeding_registry();
-        let id = registry.open(None, "h".to_owned(), test_cfg()).await.expect("open should succeed");
-        assert!(id.as_str().contains('-'), "expected a hyphenated auto-id: {id:?}");
+        let id = registry
+            .open(None, "h".to_owned(), test_cfg())
+            .await
+            .expect("open should succeed");
+        assert!(
+            id.as_str().contains('-'),
+            "expected a hyphenated auto-id: {id:?}"
+        );
         assert_eq!(registry.len(), 1);
     }
 
     #[tokio::test]
     async fn a_failed_connect_removes_the_placeholder_so_the_name_is_reusable() {
         let registry = failing_registry();
-        let first = registry.open(Some("web".to_owned()), "h".to_owned(), test_cfg()).await;
+        let first = registry
+            .open(Some("web".to_owned()), "h".to_owned(), test_cfg())
+            .await;
         assert!(first.is_err(), "fake connector is configured to fail");
-        assert_eq!(registry.len(), 0, "the Connecting placeholder must be released on connect failure");
+        assert_eq!(
+            registry.len(),
+            0,
+            "the Connecting placeholder must be released on connect failure"
+        );
 
         // The name must be reusable immediately after the failure — proves
         // the claim was actually released, not merely errored past.
-        let second = registry.open(Some("web".to_owned()), "h".to_owned(), test_cfg()).await;
+        let second = registry
+            .open(Some("web".to_owned()), "h".to_owned(), test_cfg())
+            .await;
         assert!(second.is_err(), "still using the failing connector");
         assert_eq!(registry.len(), 0);
     }
@@ -677,7 +800,11 @@ mod tests {
             .expect("open should succeed");
 
         registry.close(&id).await.expect("close should succeed");
-        assert_eq!(registry.len(), 0, "a closed session must be removed from the registry");
+        assert_eq!(
+            registry.len(),
+            0,
+            "a closed session must be removed from the registry"
+        );
 
         // Closing again is a clean SessionNotFound, not a panic/leak.
         let again = registry.close(&id).await;
@@ -686,12 +813,17 @@ mod tests {
 
     #[tokio::test]
     async fn close_on_a_still_connecting_id_is_rejected_and_the_placeholder_survives() {
-        let registry = Registry::new(Arc::new(FakeConnector::succeeding()), Arc::new(NoopReconciliationSink));
+        let registry = Registry::new(
+            Arc::new(FakeConnector::succeeding()),
+            Arc::new(NoopReconciliationSink),
+        );
         // Manually seed a Connecting placeholder (as `open` would, mid-flight)
         // without actually running a connect, to exercise `close`'s
         // still-connecting branch in isolation.
         let id = SessionId::from_str("web").expect("non-empty literal");
-        registry.claim(&id).expect("claim should succeed on an empty registry");
+        registry
+            .claim(&id)
+            .expect("claim should succeed on an empty registry");
 
         let result = registry.close(&id).await;
         assert!(matches!(result, Err(DaemonError::StillConnecting(name)) if name == "web"));
@@ -712,10 +844,17 @@ mod tests {
     async fn close_on_an_orphaned_entry_clears_it_without_a_close_call() {
         let registry = succeeding_registry();
         let id = SessionId::from_str("orphan").expect("non-empty literal");
-        registry.seed_orphan(id.clone(), "10.0.0.9".to_owned(), "2026-01-01T00:00:00Z".to_owned());
+        registry.seed_orphan(
+            id.clone(),
+            "10.0.0.9".to_owned(),
+            "2026-01-01T00:00:00Z".to_owned(),
+        );
         assert_eq!(registry.len(), 1);
 
-        registry.close(&id).await.expect("reclaiming an orphan should succeed");
+        registry
+            .close(&id)
+            .await
+            .expect("reclaiming an orphan should succeed");
         assert_eq!(registry.len(), 0);
     }
 
@@ -737,8 +876,14 @@ mod tests {
         assert_eq!(status.name.as_deref(), Some("web"));
         assert_eq!(status.host, "10.0.0.5");
         assert_eq!(status.status, SessionLifecycle::Live);
-        assert!(status.connected_since.is_some(), "connected_since must be populated for a live session");
-        assert!(status.last_activity.is_some(), "last_activity must be populated for a live session");
+        assert!(
+            status.connected_since.is_some(),
+            "connected_since must be populated for a live session"
+        );
+        assert!(
+            status.last_activity.is_some(),
+            "last_activity must be populated for a live session"
+        );
     }
 
     #[test]
@@ -753,7 +898,14 @@ mod tests {
         // Compile-time structural check: SessionStatus's fields are id /
         // name / host / status / connected_since / last_activity only.
         fn _assert_shape(s: &SessionStatus) {
-            let _ = (&s.id, &s.name, &s.host, &s.status, &s.connected_since, &s.last_activity);
+            let _ = (
+                &s.id,
+                &s.name,
+                &s.host,
+                &s.status,
+                &s.connected_since,
+                &s.last_activity,
+            );
         }
     }
 
@@ -767,21 +919,35 @@ mod tests {
         // Seed an Orphaned entry too -- it must never be reported here (only
         // Live entries have a last_activity to age).
         let orphan_id = SessionId::from_str("orphan").expect("non-empty literal");
-        registry.seed_orphan(orphan_id, "10.0.0.9".to_owned(), "2026-01-01T00:00:00Z".to_owned());
+        registry.seed_orphan(
+            orphan_id,
+            "10.0.0.9".to_owned(),
+            "2026-01-01T00:00:00Z".to_owned(),
+        );
 
         let first = registry.live_idle_durations();
-        assert_eq!(first.len(), 1, "only the Live entry should be reported, not the Orphaned one");
+        assert_eq!(
+            first.len(),
+            1,
+            "only the Live entry should be reported, not the Orphaned one"
+        );
         assert_eq!(first[0].0.as_str(), "web");
 
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         let second = registry.live_idle_durations();
-        assert!(second[0].1 >= first[0].1, "elapsed idle duration must not go backwards");
+        assert!(
+            second[0].1 >= first[0].1,
+            "elapsed idle duration must not go backwards"
+        );
     }
 
     #[test]
     fn iso8601_from_system_time_matches_iso8601_from_unix_seconds() {
         let t = UNIX_EPOCH + std::time::Duration::from_secs(1_704_067_200);
-        assert_eq!(iso8601_from_system_time(t), iso8601_from_unix_seconds(1_704_067_200));
+        assert_eq!(
+            iso8601_from_system_time(t),
+            iso8601_from_unix_seconds(1_704_067_200)
+        );
     }
 
     #[test]
@@ -789,13 +955,22 @@ mod tests {
         // 1970-01-01T00:00:00Z (Unix epoch).
         assert_eq!(iso8601_from_unix_seconds(0), "1970-01-01T00:00:00Z");
         // 2024-01-01T00:00:00Z == 1704067200.
-        assert_eq!(iso8601_from_unix_seconds(1_704_067_200), "2024-01-01T00:00:00Z");
+        assert_eq!(
+            iso8601_from_unix_seconds(1_704_067_200),
+            "2024-01-01T00:00:00Z"
+        );
         // 2000-03-01T00:00:00Z == 951868800 (crosses a leap-year boundary:
         // 2000 IS a leap year, exercising the civil_from_days century/400
         // rule correctly).
-        assert_eq!(iso8601_from_unix_seconds(951_868_800), "2000-03-01T00:00:00Z");
+        assert_eq!(
+            iso8601_from_unix_seconds(951_868_800),
+            "2000-03-01T00:00:00Z"
+        );
         // A time-of-day mid-value.
-        assert_eq!(iso8601_from_unix_seconds(1_704_067_200 + 3661), "2024-01-01T01:01:01Z");
+        assert_eq!(
+            iso8601_from_unix_seconds(1_704_067_200 + 3661),
+            "2024-01-01T01:01:01Z"
+        );
     }
 
     #[test]
@@ -810,6 +985,9 @@ mod tests {
     #[test]
     fn generate_auto_id_varies_across_calls() {
         let ids: std::collections::HashSet<String> = (0..20).map(|_| generate_auto_id()).collect();
-        assert!(ids.len() > 1, "20 calls should not all collide on one word pair: {ids:?}");
+        assert!(
+            ids.len() > 1,
+            "20 calls should not all collide on one word pair: {ids:?}"
+        );
     }
 }
