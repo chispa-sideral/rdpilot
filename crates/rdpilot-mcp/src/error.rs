@@ -9,7 +9,7 @@
 
 use std::time::Duration;
 
-use rdpilot_ipc::WireError;
+use rdpilot_ipc::{WireError, daemon_incompatible_message};
 
 /// The client-side error type every tool handler / transport helper
 /// returns.
@@ -33,6 +33,11 @@ pub enum McpError {
     /// client-only precedent).
     #[error("daemon unreachable: {0}")]
     DaemonUnreachable(String),
+
+    /// A current client reached a legacy or incompatible daemon during its
+    /// credential-free List preflight.
+    #[error("{}", daemon_incompatible_message(*.0))]
+    DaemonIncompatible(Option<u32>),
 
     /// A transport-layer failure (frame encode/decode, I/O) below the wire
     /// protocol itself.
@@ -89,6 +94,7 @@ fn code_str_for(err: &McpError) -> String {
             .unwrap_or_else(|| "internal".to_owned()),
         McpError::Timeout(_) => "timeout".to_owned(),
         McpError::DaemonUnreachable(_) => "daemon-unreachable".to_owned(),
+        McpError::DaemonIncompatible(_) => "daemon-incompatible".to_owned(),
         McpError::Transport(_) => "transport".to_owned(),
         McpError::InvalidArgument(_) => "invalid-argument".to_owned(),
     }
@@ -139,6 +145,7 @@ mod tests {
     #[test]
     fn client_local_classes_render_legibly() {
         assert!(McpError::daemon_unreachable("no socket").to_string().contains("no socket"));
+        assert!(McpError::DaemonIncompatible(None).to_string().contains("legacy"));
         assert!(McpError::transport("broken pipe").to_string().contains("broken pipe"));
         assert!(McpError::invalid_argument("bad duration").to_string().contains("bad duration"));
     }
@@ -151,5 +158,13 @@ mod tests {
             Some(data) => assert_eq!(data["code"], "invalid-argument"),
             None => panic!("data must carry the code discriminant (D-28)"),
         }
+    }
+
+    #[test]
+    fn daemon_incompatible_renders_the_shared_code_and_recovery_message() {
+        let rmcp_err: rmcp::ErrorData = McpError::DaemonIncompatible(Some(99)).into();
+        assert!(rmcp_err.message.contains("client expects"));
+        assert!(rmcp_err.message.contains("restart or reinstall rdpilot-daemon"));
+        assert_eq!(rmcp_err.data.as_ref().map(|data| &data["code"]), Some(&serde_json::json!("daemon-incompatible")));
     }
 }

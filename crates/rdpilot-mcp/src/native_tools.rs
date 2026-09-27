@@ -392,7 +392,7 @@ fn render_connected(resp: WireResponse) -> Result<CallToolResult, McpError> {
 
 fn render_session_list(resp: WireResponse) -> Result<CallToolResult, McpError> {
     match resp {
-        WireResponse::SessionList { sessions } => {
+        WireResponse::SessionList { sessions, .. } => {
             let rendered: Vec<_> = sessions
                 .iter()
                 .map(|s| {
@@ -993,6 +993,7 @@ mod tests {
                 connected_since: None,
                 last_activity: None,
             }],
+            compatibility_version: Some(rdpilot_ipc::IPC_COMPATIBILITY_VERSION),
         };
         let result = render_session_list(resp).expect("success must render");
         assert!(text_of(&result).contains("\"Live\""));

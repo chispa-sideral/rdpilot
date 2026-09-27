@@ -34,6 +34,25 @@
 #![deny(clippy::unwrap_used)]
 #![deny(clippy::expect_used)]
 
+/// Compatibility identity for the IPC request/response protocol.
+///
+/// Bump this manually whenever a request or response change is not mutually
+/// compatible. The workspace package version is deliberately not the
+/// protocol identity: a long-lived daemon and a newly installed client must
+/// detect different wire contracts.
+pub const IPC_COMPATIBILITY_VERSION: u32 = 1;
+
+/// Sanitized recovery guidance for a client that reached an incompatible
+/// daemon. It contains no socket, connection, or credential details so the
+/// CLI and MCP can expose exactly the same safe message.
+#[must_use]
+pub fn daemon_incompatible_message(observed: Option<u32>) -> String {
+    let observed = observed.map_or_else(|| "legacy".to_owned(), |version| version.to_string());
+    format!(
+        "daemon compatibility version mismatch: client expects {IPC_COMPATIBILITY_VERSION}, daemon reports {observed}; restart or reinstall rdpilot-daemon"
+    )
+}
+
 mod error;
 mod input;
 mod perception;

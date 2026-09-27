@@ -153,7 +153,7 @@ async fn daemon_auto_starts_on_first_connect_and_self_exits_once_the_registry_em
     // --- List -> exactly one session ---
     write_frame(&mut stream, &Request::List {}).await.expect("write List frame");
     match read_frame::<WireResponse>(&mut stream).await.expect("read List response") {
-        WireResponse::SessionList { sessions } => {
+        WireResponse::SessionList { sessions, .. } => {
             assert_eq!(sessions.len(), 1, "exactly one session should be listed after Connect");
             assert_eq!(sessions[0].id, session.as_str());
         }

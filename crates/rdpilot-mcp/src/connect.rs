@@ -1,8 +1,8 @@
 //! The transport client: resolve the daemon socket + sibling
 //! `rdpilot-daemon` binary, auto-start it via
 //! `rdpilot_ipc::transport::connect_or_spawn` on first use, and round-trip
-//! exactly one `Request`/`WireResponse` frame pair per tool call over a
-//! FRESH `UnixStream` (never pooled/shared — a shared stream would
+//! a credential-free `List` compatibility probe before every requested frame
+//! over a FRESH `UnixStream` (never pooled/shared — a shared stream would
 //! reintroduce the head-of-line blocking MCP-06 forbids: a slow `Put`/`Get`
 //! would occupy the one stream and stall every other call's framing on it).
 //!
@@ -16,7 +16,10 @@
 use std::future::Future;
 use std::time::Duration;
 
-use rdpilot_ipc::{Request, WireResponse, connect_or_spawn, read_frame, socket_path, write_frame};
+use rdpilot_ipc::{
+    IPC_COMPATIBILITY_VERSION, Request, WireResponse, connect_or_spawn, read_frame, socket_path, write_frame,
+};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::UnixStream;
 
 use crate::error::McpError;
@@ -56,10 +59,43 @@ pub async fn open_stream() -> Result<UnixStream, McpError> {
     connect_or_spawn(&socket, &daemon_exe).await.map_err(McpError::daemon_unreachable)
 }
 
-/// Open a FRESH stream (auto-starting the daemon if needed) and send `req`,
-/// returning exactly one `WireResponse` frame read back. Never call this
-/// directly from a tool handler — go through [`round_trip_bounded`] so
-/// every daemon round trip carries an explicit MCP-06 bound.
+async fn write_and_read<S>(stream: &mut S, request: &Request) -> Result<WireResponse, McpError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    write_frame(stream, request).await.map_err(McpError::transport)?;
+    read_frame(stream).await.map_err(McpError::transport)
+}
+
+fn validate_preflight(response: &WireResponse) -> Result<(), McpError> {
+    match response {
+        WireResponse::SessionList { compatibility_version: Some(version), .. }
+            if *version == IPC_COMPATIBILITY_VERSION => Ok(()),
+        WireResponse::SessionList { compatibility_version, .. } => Err(McpError::DaemonIncompatible(*compatibility_version)),
+        WireResponse::Error(error) => Err(error.clone().into()),
+        other => Err(McpError::invalid_argument(format!("unexpected response to compatibility List probe: {other:?}"))),
+    }
+}
+
+/// Send a credential-free List probe, validate it, and then send `req`.
+/// A requested List returns the validated probe result without a duplicate
+/// frame, preserving a single user-visible request/result pair.
+async fn verified_round_trip<S>(stream: &mut S, req: Request) -> Result<WireResponse, McpError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let preflight = write_and_read(stream, &Request::List {}).await?;
+    validate_preflight(&preflight)?;
+    if matches!(req, Request::List {}) {
+        return Ok(preflight);
+    }
+    write_and_read(stream, &req).await
+}
+
+/// Open a FRESH stream (auto-starting the daemon if needed), validate its
+/// compatibility identity, then send `req`. Never call this directly from a
+/// tool handler — go through [`round_trip_bounded`] so every daemon round
+/// trip carries an explicit MCP-06 bound.
 ///
 /// # Errors
 ///
@@ -68,22 +104,17 @@ pub async fn open_stream() -> Result<UnixStream, McpError> {
 #[allow(dead_code)] // see `open_stream`'s note above
 async fn round_trip(req: Request) -> Result<WireResponse, McpError> {
     let mut stream = open_stream().await?;
-    write_frame(&mut stream, &req).await.map_err(McpError::transport)?;
-    read_frame(&mut stream).await.map_err(McpError::transport)
+    verified_round_trip(&mut stream, req).await
 }
 
 async fn connect_round_trip(req: Request) -> Result<WireResponse, McpError> {
     let mut stream = open_stream().await?;
-    write_frame(&mut stream, &req).await.map_err(McpError::transport)?;
-    let response: WireResponse = read_frame(&mut stream).await.map_err(McpError::transport)?;
+    let response = verified_round_trip(&mut stream, req).await?;
     let WireResponse::Connected { session, connect_ack_required, .. } = &response else {
         return Ok(response);
     };
     if *connect_ack_required {
-        write_frame(&mut stream, &Request::ConnectAck { session: session.clone() })
-            .await
-            .map_err(McpError::transport)?;
-        match read_frame(&mut stream).await.map_err(McpError::transport)? {
+        match write_and_read(&mut stream, &Request::ConnectAck { session: session.clone() }).await? {
             WireResponse::Ack => {}
             WireResponse::Error(error) => return Err(error.into()),
             other => return Err(McpError::invalid_argument(format!("unexpected response to ConnectAck: {other:?}"))),
@@ -111,8 +142,9 @@ where
 ///
 /// # Errors
 ///
-/// [`McpError::Timeout`] if `bound` elapses before the round trip
-/// completes; otherwise propagates [`round_trip`]'s errors.
+/// [`McpError::Timeout`] if `bound` elapses before connection, the List
+/// preflight, requested frame, or required ConnectAck exchange completes;
+/// otherwise propagates [`round_trip`]'s errors.
 #[allow(dead_code)] // see `open_stream`'s note above
 pub async fn round_trip_bounded(req: Request, bound: Duration) -> Result<WireResponse, McpError> {
     timeout_wrap(bound, round_trip(req)).await
@@ -156,5 +188,43 @@ mod tests {
         let result: Result<(), McpError> = timeout_wrap(bound, immediate).await;
 
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn incompatible_preflight_never_dispatches_a_normal_request() {
+        let (mut client, mut daemon) = tokio::io::duplex(4096);
+        let peer = tokio::spawn(async move {
+            assert!(matches!(read_frame::<_, Request>(&mut daemon).await.unwrap(), Request::List {}));
+            write_frame(&mut daemon, &WireResponse::SessionList { sessions: vec![], compatibility_version: None }).await.unwrap();
+            assert!(tokio::time::timeout(Duration::from_millis(10), read_frame::<_, Request>(&mut daemon)).await.is_err());
+        });
+        assert!(matches!(
+            verified_round_trip(
+                &mut client,
+                Request::Ping { session: "test".parse().unwrap_or_else(|_| unreachable!()) }
+            )
+            .await,
+            Err(McpError::DaemonIncompatible(None))
+        ));
+        peer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn compatible_preflight_precedes_the_normal_request() {
+        let (mut client, mut daemon) = tokio::io::duplex(4096);
+        let peer = tokio::spawn(async move {
+            assert!(matches!(read_frame::<_, Request>(&mut daemon).await.unwrap(), Request::List {}));
+            write_frame(
+                &mut daemon,
+                &WireResponse::SessionList { sessions: vec![], compatibility_version: Some(IPC_COMPATIBILITY_VERSION) },
+            )
+            .await
+            .unwrap();
+            assert!(matches!(read_frame::<_, Request>(&mut daemon).await.unwrap(), Request::Ping { .. }));
+            write_frame(&mut daemon, &WireResponse::Ack).await.unwrap();
+        });
+        let request = Request::Ping { session: "test".parse().unwrap_or_else(|_| unreachable!()) };
+        assert!(matches!(verified_round_trip(&mut client, request).await, Ok(WireResponse::Ack)));
+        peer.await.unwrap();
     }
 }
