@@ -38,10 +38,11 @@ use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::diagnostics::{Diagnostics, Stage};
 use crate::dispatch::dispatch_for_ipc;
-use crate::registry::Registry;
+use crate::registry::{Registry, ViewerRegistry};
 use crate::seams::ManagedCua;
+use crate::viewer::{ViewerGate, ViewerParams};
 use rdpilot_ipc::transport::{read_frame, write_frame};
-use rdpilot_ipc::{CuaStreamFrame, Request, WireResponse};
+use rdpilot_ipc::{CuaStreamFrame, Request, ViewerToken, WireResponse, WireViewerBind};
 
 const CONNECT_ACK_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -56,6 +57,7 @@ pub(crate) async fn serve_connection<S>(
     mut stream: S,
     registry: &Registry,
     diagnostics: Option<&Diagnostics>,
+    viewer: Option<&ViewerContext>,
 ) where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -68,6 +70,14 @@ pub(crate) async fn serve_connection<S>(
             // decoded `Request` to begin with on this branch).
             Err(_) => return,
         };
+        if let Request::ViewerStart {
+            bind,
+            tailnet_address,
+        } = req
+        {
+            hold_viewer(&mut stream, viewer, bind, tailnet_address).await;
+            return;
+        }
         if let Request::CuaAttach { session } = req {
             match tokio::time::timeout(Duration::from_secs(30), registry.attach_cua(&session)).await
             {
@@ -162,6 +172,62 @@ pub(crate) async fn serve_connection<S>(
 }
 
 const STREAM_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// What `serve_connection` needs to start the live viewer.
+#[derive(Clone)]
+pub(crate) struct ViewerContext {
+    pub(crate) registry: ViewerRegistry,
+    pub(crate) gate: ViewerGate,
+}
+
+/// Start the viewer, answer `ViewerStarted`, then keep it running until the
+/// peer closes this connection (or sends anything else). The viewer is off
+/// again when this returns. No request content or token is logged.
+async fn hold_viewer<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    viewer: Option<&ViewerContext>,
+    bind: WireViewerBind,
+    tailnet_address: Option<String>,
+) {
+    let refuse =
+        |message: String| WireResponse::Error(crate::seams::DaemonError::Connect(message).into());
+    let started = match (viewer, tailnet_address.as_deref().map(str::parse)) {
+        (None, _) => Err(refuse("the viewer is not available in this daemon".into())),
+        (_, Some(Err(_))) => Err(refuse("tailnet address must be an IPv4 address".into())),
+        (Some(ctx), parsed) => {
+            let params = ViewerParams {
+                bind,
+                tailnet_override: parsed.and_then(Result::ok),
+            };
+            crate::viewer::start(ctx.registry.clone(), &ctx.gate, params)
+                .await
+                .map_err(refuse)
+        }
+    };
+    let started = match started {
+        Ok(started) => started,
+        Err(response) => {
+            let _ =
+                tokio::time::timeout(STREAM_WRITE_TIMEOUT, write_frame(stream, &response)).await;
+            return;
+        }
+    };
+    let response = WireResponse::ViewerStarted {
+        addresses: started.addresses.clone(),
+        token: ViewerToken(started.token.expose().to_owned()),
+        notices: started.notices.clone(),
+    };
+    if !matches!(
+        tokio::time::timeout(STREAM_WRITE_TIMEOUT, write_frame(stream, &response)).await,
+        Ok(Ok(()))
+    ) {
+        return;
+    }
+    // The viewer lives exactly as long as this connection. `rdpilot view`
+    // sends nothing more; EOF (Ctrl-C, terminal closed) or any frame ends it.
+    let _ = read_frame::<_, serde_json::Value>(stream).await;
+    drop(started.handle);
+}
 
 /// Preserve a partially read IPC frame while forwarding spontaneous Cua output.
 /// A blocked reader or writer never holds a registry/session lock. No retry or reattach.

@@ -30,6 +30,25 @@ thiserror = "2"
 # live current version at plan-execution time. Plan 13-06's CLI addition
 # reuses this exact pin.
 base64 = "0.22.1"
+# Read-only live viewer (Ticket 560): HTTP/1.1 server on explicit loopback and
+# tailnet addresses. hyper, hyper-util, http-body-util, bytes, subtle and
+# getrandom were already resolved in Cargo.lock (via ironrdp-tokio/reqwest and
+# the TLS chain) at these versions; promoting them to direct dependencies adds
+# no new supply-chain node. Only the `server`/`http1` (hyper) and `tokio`
+# (hyper-util) features are new. crates.io identities: hyperium/hyper,
+# hyperium/hyper-util, hyperium/http-body, tokio-rs/bytes, dalek-cryptography/
+# subtle, rust-random/getrandom. slopcheck scan: see the execution report.
+hyper = { version = "1.10.1", features = ["server", "http1"] }
+hyper-util = { version = "0.1.20", features = ["tokio"] }
+http-body-util = "0.1.3"
+bytes = "1.11.1"
+subtle = "2.6.1"
+getrandom = "0.3.4"
+# Interface enumeration for Tailscale address detection. New to the lockfile:
+# crates.io identity github.com/messense/if-addrs, MIT OR BSD-3-Clause; its
+# Windows dependency is windows-sys 0.61 (the line already in Cargo.lock),
+# its Unix dependency libc.
+if-addrs = "0.15.0"
 
 [target.'cfg(unix)'.dependencies]
 # Fallback for effective-uid retrieval if tokio's peer_cred() needs a

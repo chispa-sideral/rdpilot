@@ -28,14 +28,16 @@ use rdpilot::ConnectionConfig;
 use rdpilot_ipc::SessionLifecycle;
 
 use crate::diagnostics::Diagnostics;
+use crate::ipc::ViewerContext;
 use crate::lifecycle::{self, LifecycleConfig, ShutdownSignal};
 use crate::reconcile::{self, JsonReconciliationSink};
-use crate::registry::Registry;
+use crate::registry::{Registry, ViewerRegistry};
 use crate::seams::{
     BoxFuture, DaemonError, ManagedSession, RealConnector, ReconciliationSink, SessionConnector,
     ViewFrameSource,
 };
 use crate::synthetic_frames::SyntheticFrames;
+use crate::viewer::ViewerGate;
 
 /// When set (to any value), [`run`] selects [`FakeTestConnector`] instead
 /// of [`RealConnector`] -- lets the offline `autostart_lifecycle`
@@ -203,6 +205,11 @@ async fn run_inner(config: RunConfig) -> Result<(), DaemonError> {
         config.lifecycle,
         shutdown.clone(),
     ));
+    // The live viewer sees only this facade (list + passive frame lookup).
+    let viewer = ViewerContext {
+        registry: ViewerRegistry::new(Arc::clone(&registry)),
+        gate: ViewerGate::default(),
+    };
 
     loop {
         tokio::select! {
@@ -211,8 +218,9 @@ async fn run_inner(config: RunConfig) -> Result<(), DaemonError> {
                     Ok(stream) => {
                         let registry_for_conn = Arc::clone(&registry);
                         let diagnostics_for_conn = diagnostics.clone();
+                        let viewer_for_conn = viewer.clone();
                         tokio::task::spawn_local(async move {
-                            crate::ipc::serve_connection(stream, &registry_for_conn, diagnostics_for_conn.as_deref()).await;
+                            crate::ipc::serve_connection(stream, &registry_for_conn, diagnostics_for_conn.as_deref(), Some(&viewer_for_conn)).await;
                         });
                     }
                     Err(err) => {

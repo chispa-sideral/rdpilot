@@ -1,0 +1,195 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="referrer" content="no-referrer">
+<title>rdpilot live viewer (read-only)</title>
+<style nonce="__NONCE__">
+body { font-family: system-ui, sans-serif; margin: 1rem; background: #f4f4f4; color: #111; }
+h1 { font-size: 1.2rem; margin: 0 0 .5rem 0; }
+.note { color: #555; font-size: .85rem; margin: 0 0 1rem 0; }
+table { border-collapse: collapse; background: #fff; margin-bottom: 1rem; }
+th, td { border: 1px solid #ccc; padding: .25rem .5rem; font-size: .85rem; text-align: left; }
+.panels { display: flex; flex-wrap: wrap; gap: 1rem; }
+.panel { background: #fff; border: 1px solid #bbb; padding: .5rem; max-width: 100%; }
+.panel h2 { font-size: 1rem; margin: 0 0 .25rem 0; }
+.meta { font-size: .8rem; color: #444; margin-bottom: .25rem; }
+.stage { position: relative; }
+canvas { max-width: 100%; height: auto; border: 1px solid #ddd; display: block; }
+.banner { position: absolute; left: 0; right: 0; top: 0; padding: .5rem; background: rgba(160, 0, 0, .85); color: #fff; font-weight: bold; }
+.hidden { display: none; }
+#error { color: #a00; }
+</style>
+</head>
+<body>
+<h1>rdpilot live viewer <span class="note">(read-only)</span></h1>
+<p class="note">This page only shows sessions. It sends no input and cannot connect, disconnect or control a session. Keep the URL private: anyone with it and network access can view the screens. Reloading needs the printed URL again.</p>
+<p id="error"></p>
+<table>
+<thead><tr><th>session</th><th>name</th><th>host</th><th>status</th><th>connected since</th><th>last activity</th><th></th></tr></thead>
+<tbody id="sessions"></tbody>
+</table>
+<div class="panels" id="panels"></div>
+<script nonce="__NONCE__">
+(function () {
+  "use strict";
+  var MAX_PANELS = 4;
+  var params = new URLSearchParams(window.location.search);
+  var token = params.get("token");
+  if (token) {
+    try { window.sessionStorage.setItem("rdpilotViewerToken", token); } catch (e) {}
+    window.history.replaceState(null, "", "/");
+  } else {
+    try { token = window.sessionStorage.getItem("rdpilotViewerToken"); } catch (e) {}
+  }
+  // Read-only status for tests and the proof harness. It never holds the token.
+  var status = { sessions: {}, list: [], listUpdatedAt: 0 };
+  window.rdpilotViewer = status;
+  var panels = {};
+  var errorEl = document.getElementById("error");
+
+  function authHeaders() { return { "Authorization": "Bearer " + token }; }
+  function text(el, value) { el.textContent = value == null ? "" : String(value); return el; }
+  function cell(row, value) { var td = document.createElement("td"); text(td, value); row.appendChild(td); return td; }
+
+  function renderList(sessions) {
+    var body = document.getElementById("sessions");
+    while (body.firstChild) { body.removeChild(body.firstChild); }
+    sessions.forEach(function (s) {
+      var row = document.createElement("tr");
+      cell(row, s.id); cell(row, s.name); cell(row, s.host);
+      cell(row, s.ended ? "Disconnected" : s.status);
+      cell(row, s.connected_since); cell(row, s.last_activity);
+      var td = document.createElement("td");
+      if (s.frames) {
+        var button = document.createElement("button");
+        button.type = "button";
+        button.dataset.session = s.id;
+        text(button, panels[s.id] ? "Close view" : "View");
+        button.addEventListener("click", function () {
+          if (panels[s.id]) { closePanel(s.id); } else { openPanel(s.id); }
+          renderList(status.list);
+        });
+        td.appendChild(button);
+      }
+      row.appendChild(td);
+      body.appendChild(row);
+    });
+  }
+
+  function pollList() {
+    fetch("/api/sessions", { headers: authHeaders(), cache: "no-store" })
+      .then(function (r) {
+        if (!r.ok) { throw new Error("session list: HTTP " + r.status); }
+        return r.json();
+      })
+      .then(function (data) {
+        text(errorEl, "");
+        status.list = data.sessions;
+        status.listUpdatedAt = Date.now();
+        renderList(data.sessions);
+      })
+      .catch(function (e) { text(errorEl, e.message + " (is rdpilot view still running?)"); })
+      .then(function () { window.setTimeout(pollList, 1000); });
+  }
+
+  function openPanel(id) {
+    if (panels[id]) { return; }
+    if (Object.keys(panels).length >= MAX_PANELS) {
+      text(errorEl, "At most " + MAX_PANELS + " sessions can be viewed in one tab.");
+      return;
+    }
+    var panel = document.createElement("div");
+    panel.className = "panel";
+    panel.dataset.session = id;
+    var title = document.createElement("h2");
+    text(title, id);
+    var meta = document.createElement("div");
+    meta.className = "meta";
+    var stage = document.createElement("div");
+    stage.className = "stage";
+    var canvas = document.createElement("canvas");
+    var banner = document.createElement("div");
+    banner.className = "banner hidden";
+    stage.appendChild(canvas);
+    stage.appendChild(banner);
+    panel.appendChild(title);
+    panel.appendChild(meta);
+    panel.appendChild(stage);
+    document.getElementById("panels").appendChild(panel);
+    var p = { id: id, el: panel, canvas: canvas, meta: meta, banner: banner, seq: 0, open: true };
+    panels[id] = p;
+    status.sessions[id] = { seq: 0, receivedAt: 0, width: 0, height: 0, state: "waiting" };
+    text(meta, "waiting for the first frame");
+    pollFrame(p);
+  }
+
+  function closePanel(id) {
+    var p = panels[id];
+    if (!p) { return; }
+    p.open = false;
+    delete panels[id];
+    delete status.sessions[id];
+    p.el.parentNode.removeChild(p.el);
+  }
+
+  function showBanner(p, message, state) {
+    text(p.banner, message);
+    p.banner.className = "banner";
+    status.sessions[p.id].state = state;
+  }
+
+  function pollFrame(p) {
+    if (!p.open) { return; }
+    var url = "/api/sessions/" + encodeURIComponent(p.id) + "/frame?after=" + p.seq;
+    fetch(url, { headers: authHeaders(), cache: "no-store" })
+      .then(function (r) {
+        if (r.status === 200) {
+          var seq = Number(r.headers.get("X-Frame-Seq"));
+          var width = Number(r.headers.get("X-Frame-Width"));
+          var height = Number(r.headers.get("X-Frame-Height"));
+          return r.blob()
+            .then(function (blob) { return window.createImageBitmap(blob); })
+            .then(function (bitmap) {
+              if (!p.open) { return true; }
+              if (p.canvas.width !== width || p.canvas.height !== height) {
+                p.canvas.width = width;
+                p.canvas.height = height;
+              }
+              p.canvas.getContext("2d").drawImage(bitmap, 0, 0);
+              p.seq = seq;
+              var now = Date.now();
+              status.sessions[p.id] = { seq: seq, receivedAt: now, width: width, height: height, state: "live" };
+              text(p.meta, width + "x" + height + ", frame " + seq + ", " + new Date(now).toLocaleTimeString());
+              return true;
+            });
+        }
+        if (r.status === 204) { return true; }
+        if (r.status === 410) {
+          return r.json().then(function (body) {
+            if (body.state === "ended") {
+              showBanner(p, "Disconnected (server ended the session)", "ended");
+            } else {
+              showBanner(p, "Session closed", "closed");
+            }
+            return false;
+          });
+        }
+        throw new Error("frame: HTTP " + r.status);
+      })
+      .then(function (again) { if (again) { pollFrame(p); } })
+      .catch(function (e) {
+        text(p.meta, e.message + "; retrying");
+        window.setTimeout(function () { pollFrame(p); }, 1000);
+      });
+  }
+
+  if (!token) {
+    text(errorEl, "No access token. Open the URL printed by rdpilot view.");
+    return;
+  }
+  pollList();
+})();
+</script>
+</body>
+</html>
