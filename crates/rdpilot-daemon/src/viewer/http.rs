@@ -284,6 +284,7 @@ async fn frame(state: &ServerState, id: &SessionId, after: u64) -> Response<Body
                 ("x-frame-seq", encoded.seq),
                 ("x-frame-width", u64::from(encoded.width)),
                 ("x-frame-height", u64::from(encoded.height)),
+                ("x-frame-encode-ms", encoded.encode_ms),
             ] {
                 if let Ok(value) = header::HeaderValue::from_str(&value.to_string()) {
                     headers.insert(name, value);

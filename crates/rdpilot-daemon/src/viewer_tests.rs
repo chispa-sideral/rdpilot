@@ -781,6 +781,7 @@ async fn frames_reach_the_client_with_resize_ended_and_closed() {
     assert_eq!(reply.header("x-frame-seq"), Some("1"));
     assert_eq!(reply.header("x-frame-width"), Some("64"));
     assert_eq!(reply.header("x-frame-height"), Some("48"));
+    assert!(reply.header("x-frame-encode-ms").is_some());
     assert_eq!(&reply.body[..4], &[0x89, b'P', b'N', b'G']);
 
     // A waiting client wakes when the next frame arrives (resize here).
@@ -875,6 +876,7 @@ async fn a_stalled_client_blocks_neither_the_publisher_nor_other_clients() {
                 height: 8,
                 png: Bytes::from(vec![0_u8; 64 << 20]),
                 at: Instant::now(),
+                encode_ms: 0,
             },
         )
         .await;

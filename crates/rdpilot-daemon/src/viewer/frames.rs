@@ -33,6 +33,8 @@ pub(crate) struct Encoded {
     pub(crate) png: Bytes,
     /// When the frame was captured (rate-cap reference).
     pub(crate) at: Instant,
+    /// Capture plus PNG encode time, in milliseconds (proof evidence).
+    pub(crate) encode_ms: u64,
 }
 
 /// The answer to one long-poll.
@@ -168,6 +170,7 @@ impl FrameCache {
                 height: shot.height,
                 png: Bytes::from(png),
                 at,
+                encode_ms: u64::try_from(at.elapsed().as_millis()).unwrap_or(u64::MAX),
             })
         })
         .await;
