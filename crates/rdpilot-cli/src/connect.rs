@@ -7,8 +7,8 @@
 
 use rdpilot_ipc::transport::LocalStream;
 use rdpilot_ipc::{
-    connect_or_spawn, read_frame, socket_path, write_frame, Request, WireResponse,
-    IPC_COMPATIBILITY_VERSION,
+    connect_existing, connect_or_spawn, read_frame, socket_path, write_frame, Request,
+    WireResponse, IPC_COMPATIBILITY_VERSION,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 
@@ -40,6 +40,34 @@ pub async fn open_stream() -> Result<LocalStream, CliError> {
     connect_or_spawn(&socket, &daemon_exe)
         .await
         .map_err(|e| CliError::DaemonUnreachable(e.to_string()))
+}
+
+/// Connect to a daemon that is already running, without ever starting one
+/// (the live viewer must not start, and so keep alive, a daemon).
+///
+/// # Errors
+///
+/// [`CliError::DaemonUnreachable`] when no daemon is running.
+pub async fn open_existing_stream() -> Result<LocalStream, CliError> {
+    let socket = socket_path().map_err(|e| CliError::DaemonUnreachable(e.to_string()))?;
+    connect_existing(&socket).await.map_err(|_| {
+        CliError::DaemonUnreachable(
+            "no rdpilot daemon is running; connect a session first (rdpilot connect)".to_owned(),
+        )
+    })
+}
+
+/// Validate the daemon's compatibility identity on `stream`, then send
+/// `req` and return its response. The stream stays open for the caller.
+///
+/// # Errors
+///
+/// As for [`round_trip`].
+pub async fn verified_request<S>(stream: &mut S, req: Request) -> Result<WireResponse, CliError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    verified_round_trip(stream, req).await
 }
 
 async fn write_and_read<S>(stream: &mut S, request: &Request) -> Result<WireResponse, CliError>
