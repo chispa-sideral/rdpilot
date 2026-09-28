@@ -24,6 +24,14 @@ provisions nothing: lease the Windows machine with the crabbox-azure-windows
 skill first. Tailnet evidence is the host's own tailnet URL plus the rejection
 checks on loopback and tailnet; the cross-machine check is the human opening
 the printed tailnet URL from another tailnet device.
+
+The 2 s check times the first viewer frame that SHOWS the change: the harness
+keeps the canvas pixels of a region before the change and waits for a frame
+in which enough of those pixels differ. In live mode the region is the fixture
+text box and the change is the typed marker; in fake mode it is the whole
+canvas and the change is the next synthetic colour. The check fails if no
+frame shows the change within 2 s. Live mode ends session b from the server
+side by dropping its RDP connection after its Cua calls finish.
 """
 import argparse
 import asyncio
@@ -45,6 +53,44 @@ TARGETS = ("a", "b")
 CHANGE_BUDGET_MS = 2000
 # The viewer caps each session at 4 frames per second.
 MAX_FPS = 4
+# A canvas pixel counts as changed when a colour channel moves by more than this.
+PIXEL_DELTA = 48
+# The typed marker changes about 1400 text-box pixels at 1920x1080; a blinking
+# caret changes fewer than 100.
+MARKER_MIN_CHANGED = 200
+
+# Canvas helpers run in the page. `baseline` keeps the region pixels of one
+# session; `changed` counts region pixels that differ from them and returns the
+# frame status read in the same task as the pixels, so both describe one frame.
+CANVAS_JS = """
+([op, id, region, delta]) => {
+  const canvas = document.querySelector(`.panel[data-session="${id}"] canvas`);
+  const status = JSON.parse(JSON.stringify(window.rdpilotViewer.sessions[id] || {}));
+  const store = (window.rdpilotProofBaselines = window.rdpilotProofBaselines || {});
+  const [x0, y0, x1, y1] = region;
+  if (!canvas || canvas.width < x1 || canvas.height < y1) {
+    return { status, changed: null, reason: `canvas ${canvas ? canvas.width + "x" + canvas.height : "missing"}` };
+  }
+  const pixels = canvas.getContext("2d").getImageData(x0, y0, x1 - x0, y1 - y0).data;
+  if (op === "baseline") {
+    store[id] = { width: canvas.width, height: canvas.height, pixels: Array.from(pixels) };
+    return { status, changed: 0 };
+  }
+  const base = store[id];
+  if (base.width !== canvas.width || base.height !== canvas.height) {
+    return { status, changed: (x1 - x0) * (y1 - y0), reason: "canvas resized" };
+  }
+  let changed = 0;
+  for (let i = 0; i < pixels.length; i += 4) {
+    if (Math.abs(pixels[i] - base.pixels[i]) > delta ||
+        Math.abs(pixels[i + 1] - base.pixels[i + 1]) > delta ||
+        Math.abs(pixels[i + 2] - base.pixels[i + 2]) > delta) {
+      changed += 1;
+    }
+  }
+  return { status, changed };
+}
+"""
 
 
 class ProofError(Exception):
@@ -271,6 +317,54 @@ class Proof:
             "(id) => document.querySelector(`.panel[data-session=\"${id}\"] canvas`).toDataURL('image/png')", target)
         return self.write(name, base64.b64decode(data.split(",", 1)[1]))
 
+    async def canvas_baseline(self, page, target, region, name):
+        """Keep the region pixels of the current canvas as the pre-change baseline."""
+        result = await page.evaluate(CANVAS_JS, ["baseline", target, region, PIXEL_DELTA])
+        require(result["changed"] == 0, f"{target}: no baseline for region {region}: {result.get('reason')}")
+        await self.canvas_png(page, target, name)
+        self.summary.setdefault("baselines", {})[target] = {"region": region, "seq": result["status"].get("seq")}
+        return result["status"]
+
+    async def wait_visible_change(self, page, target, region, min_changed, t0, observe_ms=10000):
+        """Time from t0 (ms) until the first frame that shows the change.
+
+        A frame shows the change when at least `min_changed` region pixels
+        differ from the baseline. Fails when no frame shows it within the
+        2 s budget; it keeps polling up to `observe_ms` only to report how
+        late the change was.
+        """
+        seen, visible, samples = None, None, []
+        while time.time() * 1000 - t0 < observe_ms:
+            result = await page.evaluate(CANVAS_JS, ["changed", target, region, PIXEL_DELTA])
+            status = result["status"]
+            if status.get("seq") != seen:
+                seen = status.get("seq")
+                samples.append({"seq": seen, "received_after_t0_ms": round(status.get("receivedAt", 0) - t0),
+                                "changed_pixels": result["changed"]})
+                if result["changed"] is not None and result["changed"] >= min_changed:
+                    visible = status["receivedAt"] - t0
+                    await self.canvas_png(page, target, f"{target}-canvas-change-visible.png")
+                    break
+            await asyncio.sleep(0.02)
+        self.summary.setdefault("visibility_samples", {})[target] = samples
+        self.save()
+        require(visible is not None, f"{target}: no frame showed the change within {observe_ms} ms: {samples}")
+        require(visible <= CHANGE_BUDGET_MS,
+                f"{target}: the change became visible after {round(visible)} ms (budget {CHANGE_BUDGET_MS} ms)")
+        return visible, samples
+
+    def marker_region(self, width, height):
+        """The fixture text box interior on the guest desktop.
+
+        The fixture form (900x300) is centred on the working area above a 40 px
+        taskbar; the text box is 50 px right and 66 px down from the form's
+        top-left corner. At 1920x1080 this is (560, 436, 880, 466).
+        """
+        if self.args.marker_region:
+            return [int(v) for v in self.args.marker_region.split(",")]
+        x0, y0 = (width - 900) // 2 + 50, (height - 40 - 300) // 2 + 66
+        return [x0, y0, x0 + 320, y0 + 30]
+
     async def open_page(self, browser):
         url = self.tailnet_url() or self.urls[0]
         if not self.fake and not self.tailnet_url():
@@ -342,27 +436,31 @@ class Proof:
     # --- fake mode ---------------------------------------------------------------
 
     async def fake_flow(self, page):
-        # Changes appear quickly (the fake source changes every 100 ms).
+        # The fake source publishes a new solid colour every 100 ms; the change
+        # is visible when most canvas pixels differ from the baseline.
+        state = await self.status(page)
+        width, height = state["sessions"]["a"]["width"], state["sessions"]["a"]["height"]
+        region = [0, 0, width, height]
+        await self.canvas_baseline(page, "a", region, "02-a-canvas-before-change.png")
         t0 = time.time() * 1000
-        state = await self.wait_state(page, lambda s: s["sessions"]["a"]["receivedAt"] > t0, "a newer frame", 5)
-        latency = state["sessions"]["a"]["receivedAt"] - t0
-        require(latency <= CHANGE_BUDGET_MS, f"frame after {latency} ms")
-        self.check("a.change_visible_within_budget", latency_ms=round(latency), budget_ms=CHANGE_BUDGET_MS)
+        latency, samples = await self.wait_visible_change(page, "a", region, width * height // 2, t0)
+        self.check("a.change_visible_within_budget", latency_ms=round(latency), budget_ms=CHANGE_BUDGET_MS,
+                   region=region, samples=samples)
         await self.sample_rate(page, "a", 5)
         self.frame_samples("a")
         # The fake frame size switches between 64x48 and 96x64 every 3 s.
         first = (await self.status(page))["sessions"]["a"]["width"]
         await self.wait_state(page, lambda s: s["sessions"]["a"]["width"] not in (0, first), "resize", 8)
-        await self.screenshot(page, "02-resized.png")
+        await self.screenshot(page, "03-resized.png")
         self.check("a.resize_shown")
         # Session b's frames end 4 s after connect (a server-ended session).
         await self.wait_state(page, lambda s: s["sessions"]["b"]["state"] == "ended", "ended banner", 10)
-        await self.screenshot(page, "03-server-ended-banner.png")
+        await self.screenshot(page, "04-server-ended-banner.png")
         self.check("b.disconnect_shown", banner="Disconnected (server ended the session)")
         await self.cli("disconnect", "--session", "a")
         await self.wait_state(page, lambda s: s["sessions"]["a"]["state"] == "closed", "closed banner", 5)
         await self.wait_state(page, lambda s: "a" not in {x["id"] for x in s["list"]}, "list without a", 5)
-        await self.screenshot(page, "04-session-closed-banner.png")
+        await self.screenshot(page, "05-session-closed-banner.png")
         self.check("a.close_shown_and_listed")
 
     # --- live mode ---------------------------------------------------------------
@@ -399,35 +497,39 @@ $f.Controls.Add($t);[Windows.Forms.Application]::Run($f)
         for target in TARGETS:
             self.endpoints[target] = await self.e2e.Mcp(self, target).start()
         window = await self.launch_fixture("a")
-        await asyncio.sleep(2)
+        await asyncio.sleep(3)
+        state = await self.status(page)
+        region = self.marker_region(state["sessions"]["a"]["width"], state["sessions"]["a"]["height"])
+        await self.canvas_baseline(page, "a", region, "05-a-canvas-before-typing.png")
         marker = f"viewer-proof-{self.run_id}"
         await self.type_marker("a", window, marker)
+        # t0 is when the Cua call returns; the change counts only once a viewer
+        # frame shows the marker in the text box.
         t0 = time.time() * 1000
-        state = await self.wait_state(page, lambda s: s["sessions"]["a"]["receivedAt"] >= t0, "frame after typing", 10)
-        latency = state["sessions"]["a"]["receivedAt"] - t0
-        await self.canvas_png(page, "a", "05-a-canvas-after-typing.png")
-        await self.screenshot(page, "05-page-after-typing.png")
-        require(latency <= CHANGE_BUDGET_MS, f"first frame after the Cua type call came after {latency} ms")
-        self.check("a.cua_change_visible_within_budget", latency_ms=round(latency), budget_ms=CHANGE_BUDGET_MS, marker=marker)
-        native = self.output / "05-a-native-screenshot.png"
+        latency, samples = await self.wait_visible_change(page, "a", region, MARKER_MIN_CHANGED, t0)
+        await self.screenshot(page, "06-page-marker-visible.png")
+        self.check("a.cua_change_visible_within_budget", latency_ms=round(latency), budget_ms=CHANGE_BUDGET_MS,
+                   marker=marker, region=region, samples=samples)
+        native = self.output / "06-a-native-screenshot.png"
         await self.cli("screenshot", "--session", "a", "--output", str(native))
-        self.compare_optional(self.output / "05-a-canvas-after-typing.png", native)
+        self.compare_optional(self.output / "a-canvas-change-visible.png", native)
         await self.sample_rate(page, "a", 10)
         self.frame_samples("a")
         self.frame_samples("b")
-        # End session b from the server side.
-        if self.args.end_b == "logoff":
-            await self.endpoints["b"].tool("launch_app", {"path": r"C:\Windows\System32\logoff.exe"})
-        else:
-            await self.relays["b"][0].drop()
-        await self.wait_state(page, lambda s: s["sessions"]["b"]["state"] == "ended", "ended banner", 90)
-        await self.screenshot(page, "06-b-server-ended-banner.png")
-        self.check("b.disconnect_shown", method=self.args.end_b, banner="Disconnected (server ended the session)")
+        # End session b from the server side: stop its Cua MCP client first, so
+        # no Cua call is in flight, then drop its RDP connection. (A guest
+        # logoff through Cua ends the bridge before the call returns.)
+        await self.endpoints["b"].stop()
+        await self.relays["b"][0].drop()
+        await self.wait_state(page, lambda s: s["sessions"]["b"]["state"] == "ended", "ended banner", 120)
+        await self.screenshot(page, "07-b-server-ended-banner.png")
+        self.check("b.disconnect_shown", method="RDP connection dropped", banner="Disconnected (server ended the session)")
         await self.endpoints["a"].stop()
         await self.cli("disconnect", "--session", "a")
         await self.wait_state(page, lambda s: s["sessions"]["a"]["state"] == "closed", "closed banner", 10)
-        await self.screenshot(page, "07-a-session-closed-banner.png")
-        self.check("a.close_shown")
+        await self.wait_state(page, lambda s: "a" not in {x["id"] for x in s["list"]}, "list without a", 5)
+        await self.screenshot(page, "08-a-session-closed-banner.png")
+        self.check("a.close_shown_and_listed")
 
     def compare_optional(self, canvas, native):
         """Extra evidence only: a threshold miss never fails the proof."""
@@ -514,8 +616,8 @@ def main():
     parser.add_argument("--output", required=True, help="new evidence directory; must not already exist")
     parser.add_argument("--bind", choices=["loopback", "loopback+tailnet"],
                         help="viewer bind set (default: the viewer's default, loopback+tailnet)")
-    parser.add_argument("--end-b", choices=["logoff", "relay"], default="logoff",
-                        help="live mode: end session b by guest logoff (default) or by dropping its relay")
+    parser.add_argument("--marker-region", metavar="X0,Y0,X1,Y1",
+                        help="live mode: guest pixel box of the fixture text box (default: derived from the desktop size)")
     parser.add_argument("--allow-no-tailnet", action="store_true", help="live mode: run without a tailnet URL (leaves tailnet checks unverified)")
     parser.add_argument("--allow-debug", action="store_true", help="live mode: allow debug binaries (the 2 s budget assumes release builds)")
     parser.add_argument("--connect-timeout", type=int, default=600)
@@ -525,6 +627,13 @@ def main():
             parser.error("live mode needs --bundle")
         if "debug" in Path(args.bin_dir).resolve().parts and not args.allow_debug:
             parser.error("live mode needs release binaries (cargo build --release --workspace)")
+    if args.marker_region:
+        parts = args.marker_region.split(",")
+        if len(parts) != 4 or not all(v.strip().isdigit() for v in parts):
+            parser.error("--marker-region needs four non-negative integers X0,Y0,X1,Y1")
+        x0, y0, x1, y1 = (int(v) for v in parts)
+        if x1 <= x0 or y1 <= y0:
+            parser.error("--marker-region needs X1 > X0 and Y1 > Y0")
     os.umask(0o077)
     try:
         proof = Proof(args)
