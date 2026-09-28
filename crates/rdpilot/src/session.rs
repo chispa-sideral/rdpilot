@@ -2,7 +2,7 @@
 use crate::{
     bridge::BridgeShared,
     connect,
-    framebuffer::SharedFrame,
+    framebuffer::{FrameWatch, SharedFrame},
     session_loop::{self, RdpInputEvent},
 };
 use crate::{
@@ -103,9 +103,12 @@ impl Session {
                     framed,
                     connection_result,
                     input_rx,
-                    loop_frame,
+                    loop_frame.clone(),
                     loop_bridge.clone(),
                 ));
+                // Passive observers (the live viewer) see the end of the RDP
+                // session even while the registry entry still exists.
+                loop_frame.mark_ended();
                 if let Err(error) = &result {
                     tracing::error!(%error,"RDP session loop ended");
                     loop_bridge.invalidate(&error.to_string());
@@ -128,6 +131,15 @@ impl Session {
 
     pub fn desktop_size(&self) -> (u32, u32) {
         self.desktop_size
+    }
+
+    /// A passive, read-only observer of this session's framebuffer. It holds
+    /// only the shared frame (never the session), carries no input, Cua or
+    /// transfer capability, and reports `ended` once the RDP session loop
+    /// returns or the session is closed or dropped.
+    #[must_use]
+    pub fn frame_watch(&self) -> FrameWatch {
+        self.frame.watch()
     }
 
     fn check_bounds(&self, action: &MouseAction) -> Result<()> {
@@ -252,6 +264,7 @@ impl Session {
     }
 
     pub async fn close(mut self) -> Result<()> {
+        self.frame.mark_ended();
         self.bridge.stop("session closed");
         let _ = self.input_tx.try_send(RdpInputEvent::Close);
 
@@ -274,6 +287,7 @@ impl Session {
 }
 impl Drop for Session {
     fn drop(&mut self) {
+        self.frame.mark_ended();
         self.bridge.stop("session dropped");
         let _ = self.input_tx.try_send(RdpInputEvent::Close);
     }
@@ -519,5 +533,29 @@ mod tests {
             Err(Error::Config(_))
         ));
         assert!(rx.try_recv().is_err());
+    }
+    /// The frame watch added for the live viewer does not change what
+    /// `screenshot()` returns: the bytes equal the written frame exactly.
+    #[tokio::test]
+    async fn screenshot_bytes_are_unchanged_by_the_frame_watch() {
+        let (s, _rx) = session();
+        let rgba: Vec<u8> = (0u8..=255).cycle().take(3 * 2 * 4).collect();
+        let watch = s.frame_watch();
+        s.frame.write(3, 2, rgba.clone());
+        let shot = s.screenshot().await.unwrap();
+        assert_eq!((shot.width, shot.height), (3, 2));
+        assert_eq!(shot.rgba, rgba);
+        let (seq, watched) = watch.capture().unwrap();
+        assert_eq!(seq, 1);
+        assert_eq!(watched.rgba, shot.rgba);
+        assert_eq!(watched.to_png().unwrap(), shot.to_png().unwrap());
+    }
+    #[tokio::test]
+    async fn dropping_the_session_ends_its_frame_watch() {
+        let (s, _rx) = session();
+        let watch = s.frame_watch();
+        assert!(!watch.status().ended);
+        drop(s);
+        assert!(watch.status().ended);
     }
 }
