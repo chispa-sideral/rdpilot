@@ -69,7 +69,7 @@ impl AuthPolicy {
 
     fn authority_allowed(&self, value: &str) -> bool {
         let value = value.to_ascii_lowercase();
-        self.authorities.iter().any(|a| *a == value)
+        self.authorities.contains(&value)
     }
 
     /// Check one request. `Ok(())` means it may be routed.

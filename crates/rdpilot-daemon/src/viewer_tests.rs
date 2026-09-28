@@ -332,13 +332,13 @@ fn tailnet_selection_table() {
     ));
     // Config `loopback` disables the tailnet bind.
     assert_eq!(
-        select_tailnet_address(&[ts.clone()], WireViewerBind::Loopback, None),
+        select_tailnet_address(std::slice::from_ref(&ts), WireViewerBind::Loopback, None),
         TailnetSelection::Disabled
     );
     // Valid override (present on an interface, in range).
     assert_eq!(
         select_tailnet_address(
-            &[cgnat_wan.clone()],
+            std::slice::from_ref(&cgnat_wan),
             loopback_and_tailnet,
             Some(Ipv4Addr::new(100, 72, 1, 9))
         ),
@@ -347,7 +347,7 @@ fn tailnet_selection_table() {
     // Invalid overrides: out of range, or not on this host.
     assert!(matches!(
         select_tailnet_address(
-            &[lan.clone()],
+            std::slice::from_ref(&lan),
             loopback_and_tailnet,
             Some(Ipv4Addr::new(192, 168, 122, 168))
         ),
@@ -355,7 +355,7 @@ fn tailnet_selection_table() {
     ));
     assert!(matches!(
         select_tailnet_address(
-            &[ts.clone()],
+            std::slice::from_ref(&ts),
             loopback_and_tailnet,
             Some(Ipv4Addr::new(100, 64, 9, 9))
         ),
@@ -485,13 +485,21 @@ async fn two_address_server(fx: &Fixture) -> Server {
 
 #[tokio::test]
 async fn every_bound_address_rejects_bad_token_origin_and_host() {
+    /// name, path, Host override, headers, expected status
+    type Case<'a> = (
+        &'a str,
+        String,
+        Option<&'a str>,
+        Vec<(&'a str, String)>,
+        u16,
+    );
     let fx = Fixture::new();
     fx.open("alpha").await;
     let server = two_address_server(&fx).await;
     for &addr in &server.addrs {
         let doc_ok = format!("/?token={TOKEN}");
         let own_origin = format!("http://{addr}");
-        let cases: Vec<(&str, String, Option<&str>, Vec<(&str, String)>, u16)> = vec![
+        let cases: Vec<Case> = vec![
             ("document ok", doc_ok.clone(), None, vec![], 200),
             (
                 "api ok",
