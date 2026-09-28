@@ -42,6 +42,7 @@ use rdpilot_ipc::{SessionId, SessionLifecycle, SessionStatus};
 
 use crate::seams::{
     BoxFuture, DaemonError, ManagedSession, ReconciliationSink, SessionConnector, SessionEntry,
+    ViewFrameSource,
 };
 
 /// Word lists for [`generate_auto_id`] (D-29: short, human-legible
@@ -254,6 +255,7 @@ impl Registry {
 
         match self.connector.connect(cfg).await {
             Ok(session) => {
+                let frame = session.frame_source();
                 let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
                 // A single wall-clock capture shared by the entry's
                 // `connected_since_wall`/`last_activity_wall` and the
@@ -276,6 +278,7 @@ impl Registry {
                             host: host.clone(),
                             last_activity: Instant::now(),
                             cua_leases: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                            frame,
                             last_activity_wall: now_wall.clone(),
                         },
                     );
@@ -548,6 +551,91 @@ impl Registry {
                 SessionEntry::Connecting { .. } | SessionEntry::Orphaned { .. } => None,
             })
             .collect()
+    }
+}
+
+/// The result of a viewer frame-source lookup.
+pub(crate) enum FrameLookup {
+    /// A live session with a passive frame source.
+    Source(Arc<dyn ViewFrameSource>),
+    /// The session exists but has no frames (connecting, orphaned, or a
+    /// session type without a frame source).
+    Unavailable,
+    /// The session is not in the registry.
+    Closed,
+}
+
+/// One session as the live viewer sees it: the credential-free list entry
+/// plus its frame source's ended state.
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct ViewerSession {
+    #[serde(flatten)]
+    pub(crate) status: SessionStatus,
+    /// `true` once the session's RDP loop ended (display only).
+    pub(crate) ended: bool,
+    /// `true` when frames can be requested for this session.
+    pub(crate) frames: bool,
+}
+
+/// The only registry surface the live viewer receives.
+///
+/// Declared here, outside the `viewer` module tree, so the viewer cannot
+/// reach the private `Registry` field and therefore cannot call `call`,
+/// `close`, `open`, `attach_cua` or `touch_generation`. It never takes a
+/// per-session mutex and never changes activity, leases or entries.
+#[derive(Clone)]
+pub(crate) struct ViewerRegistry {
+    inner: Arc<Registry>,
+}
+
+impl ViewerRegistry {
+    pub(crate) fn new(registry: Arc<Registry>) -> Self {
+        ViewerRegistry { inner: registry }
+    }
+
+    /// The session list with each frame source's ended state.
+    pub(crate) fn sessions(&self) -> Vec<ViewerSession> {
+        self.inner.viewer_sessions()
+    }
+
+    /// The frame source for `id`, read under the registry lock only briefly.
+    pub(crate) fn frame_source(&self, id: &SessionId) -> FrameLookup {
+        self.inner.frame_source(id)
+    }
+}
+
+impl Registry {
+    fn viewer_sessions(&self) -> Vec<ViewerSession> {
+        #[allow(clippy::expect_used)] // A poisoned registry mutex is unrecoverable.
+        let guard = self.sessions.lock().expect("registry mutex poisoned");
+        guard
+            .iter()
+            .map(|(id, entry)| {
+                let (ended, frames) = match entry {
+                    SessionEntry::Live {
+                        frame: Some(frame), ..
+                    } => (frame.status().ended, true),
+                    _ => (false, false),
+                };
+                ViewerSession {
+                    status: entry.to_status(id),
+                    ended,
+                    frames,
+                }
+            })
+            .collect()
+    }
+
+    fn frame_source(&self, id: &SessionId) -> FrameLookup {
+        #[allow(clippy::expect_used)] // A poisoned registry mutex is unrecoverable.
+        let guard = self.sessions.lock().expect("registry mutex poisoned");
+        match guard.get(id) {
+            Some(SessionEntry::Live {
+                frame: Some(frame), ..
+            }) => FrameLookup::Source(Arc::clone(frame)),
+            Some(_) => FrameLookup::Unavailable,
+            None => FrameLookup::Closed,
+        }
     }
 }
 

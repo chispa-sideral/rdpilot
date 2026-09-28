@@ -251,6 +251,9 @@ pub(crate) async fn dispatch_for_ipc(
         Request::CuaAttach { .. } => WireResponse::Error(
             DaemonError::Connect("CuaAttach requires a stream upgrade".into()).into(),
         ),
+        Request::ViewerStart { .. } => WireResponse::Error(
+            DaemonError::Connect("ViewerStart requires a held IPC connection".into()).into(),
+        ),
     };
     DispatchOutcome {
         response,

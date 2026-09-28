@@ -85,5 +85,44 @@ pub enum WireResponse {
         runtime_generation: u64,
         attachment_id: u64,
     },
+    /// The live viewer is listening. Each address is `http://host:port/`;
+    /// the per-start token is carried separately and is redacted in `Debug`.
+    ViewerStarted {
+        addresses: Vec<String>,
+        token: ViewerToken,
+        notices: Vec<String>,
+    },
     Error(WireError),
+}
+
+/// The live viewer's per-start access token. It crosses only the owner-only
+/// IPC channel; `Debug` never prints it.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ViewerToken(pub String);
+
+impl std::fmt::Debug for ViewerToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ViewerToken(<redacted>)")
+    }
+}
+
+#[cfg(test)]
+mod viewer_tests {
+    use super::*;
+
+    #[test]
+    fn viewer_started_round_trips_and_redacts_the_token_in_debug() {
+        let token = "0123456789abcdef".repeat(4);
+        let response = WireResponse::ViewerStarted {
+            addresses: vec!["http://127.0.0.1:4000/".into()],
+            token: ViewerToken(token.clone()),
+            notices: vec![],
+        };
+        assert!(!format!("{response:?}").contains(&token));
+        let json = serde_json::to_string(&response).unwrap_or_default();
+        assert!(json.contains(&token));
+        let back: WireResponse = serde_json::from_str(&json).unwrap_or(WireResponse::Ack);
+        assert!(matches!(back, WireResponse::ViewerStarted { token: t, .. } if t.0 == token));
+    }
 }

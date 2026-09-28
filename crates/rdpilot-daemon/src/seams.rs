@@ -158,6 +158,43 @@ pub trait ManagedSession: Send + 'static {
     fn bootstrap_stages(&self) -> Vec<rdpilot::BootstrapStage> {
         Vec::new()
     }
+
+    /// A passive, read-only frame source for the live viewer, captured once
+    /// when the registry inserts the session. The default (`None`) keeps
+    /// existing fake sessions source-compatible.
+    fn frame_source(&self) -> Option<Arc<dyn ViewFrameSource>> {
+        None
+    }
+}
+
+/// A future that is `Send`, for frame-source waits run on the daemon's
+/// multi-thread runtime by the viewer.
+pub(crate) type SendFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+/// Read-only access to one session's latest framebuffer for the live viewer.
+///
+/// An implementation must never block the session's frame writer, must not
+/// keep the session alive, and has no input, Cua, transfer or lifecycle
+/// capability.
+pub trait ViewFrameSource: Send + Sync + 'static {
+    /// The latest sequence number and ended flag.
+    fn status(&self) -> rdpilot::FrameStatus;
+    /// Wait until a frame newer than `after_seq` exists or the source ends.
+    fn changed(&self, after_seq: u64) -> SendFuture<'_, rdpilot::FrameStatus>;
+    /// Copy the latest frame with its sequence number (`None` before the first frame).
+    fn capture(&self) -> Option<(u64, rdpilot::Screenshot)>;
+}
+
+impl ViewFrameSource for rdpilot::FrameWatch {
+    fn status(&self) -> rdpilot::FrameStatus {
+        rdpilot::FrameWatch::status(self)
+    }
+    fn changed(&self, after_seq: u64) -> SendFuture<'_, rdpilot::FrameStatus> {
+        Box::pin(rdpilot::FrameWatch::changed(self, after_seq))
+    }
+    fn capture(&self) -> Option<(u64, rdpilot::Screenshot)> {
+        rdpilot::FrameWatch::capture(self)
+    }
 }
 
 impl ManagedSession for Session {
@@ -228,6 +265,10 @@ impl ManagedSession for Session {
 
     fn bootstrap_stages(&self) -> Vec<rdpilot::BootstrapStage> {
         self.bootstrap_stages()
+    }
+
+    fn frame_source(&self) -> Option<Arc<dyn ViewFrameSource>> {
+        Some(Arc::new(self.frame_watch()))
     }
 }
 
@@ -347,6 +388,9 @@ pub enum SessionEntry {
         last_activity: Instant,
         /// Owned Cua stream leases prevent idle reaping while a tool or caller is waiting.
         cua_leases: Arc<std::sync::atomic::AtomicUsize>,
+        /// Passive frame source for the live viewer, captured once at insert
+        /// so viewer reads never take the per-session mutex above.
+        frame: Option<Arc<dyn ViewFrameSource>>,
         /// ISO-8601 wall-clock rendering of `last_activity`. No
         /// operational verb is wired to update activity yet in this phase
         /// (dispatch resolves them to a not-implemented error, Plan
