@@ -210,15 +210,39 @@ class Proof:
 
     # --- rdpilot processes --------------------------------------------------
 
-    def target_env(self, target):
-        env = dict(self.env)
+    def hosts_file(self, entries):
+        """Write a 0600 hosts file for this run; the password is passed only
+        through the CLI child's environment (PasswordCommand), never the file."""
+        def quote(value):
+            return '"' + str(value).replace("\\", "\\\\").replace('"', '\\"') + '"'
+        lines = []
+        for target, entry in entries.items():
+            lines += [f"Host {target}", f"  HostName {quote(entry['host'])}", f"  User {quote(entry['username'])}",
+                      f"  PasswordCommand {quote('printenv E2E_PASSWORD_' + target.upper())}"]
+            if entry.get("port"):
+                lines.append(f"  Port {entry['port']}")
+            if entry.get("domain"):
+                lines.append(f"  Domain {quote(entry['domain'])}")
+            if entry.get("accept_invalid_certs"):
+                lines.append("  AcceptInvalidCerts yes")
+        path = self.temp / "hosts"
+        path.write_text("\n".join(lines) + "\n")
+        path.chmod(0o600)
+        return path
+
+    def hosts_for_targets(self):
         if self.fake:
             # The fake connector ends the frames of host "fake-server-end" after 4 s.
-            host = "fake-server-end" if target == "b" else f"fake-{target}"
-            env.update({"RDPILOT_HOST": host, "RDPILOT_USERNAME": "fake", "RDPILOT_PASSWORD": "fake"})
-        else:
-            env.update({"RDPILOT_" + key.upper(): str(value) for key, value in self.credentials[target].items()})
-            env["RDPILOT_HOST"], env["RDPILOT_PORT"] = "127.0.0.1", str(self.relays[target][1])
+            return self.hosts_file({t: {"host": "fake-server-end" if t == "b" else f"fake-{t}", "username": "fake"}
+                                    for t in TARGETS})
+        return self.hosts_file({
+            t: {"host": "127.0.0.1", "port": self.relays[t][1], "username": self.credentials[t]["username"],
+                "domain": self.credentials[t].get("domain"), "accept_invalid_certs": True}
+            for t in TARGETS})
+
+    def target_env(self, target):
+        env = dict(self.env)
+        env["E2E_PASSWORD_" + target.upper()] = "fake" if self.fake else str(self.credentials[target]["password"])
         return env
 
     async def cli(self, *arguments, target=None, timeout=90, allow_failure=False):
@@ -236,8 +260,8 @@ class Proof:
         return json.loads(out) if out.strip() else {}
 
     async def connect(self, target):
-        extra = [] if self.fake else ["--accept-invalid-certs"]
-        result = await self.cli("connect", "--name", target, *extra, target=target, timeout=self.args.connect_timeout)
+        hosts = self.hosts_for_targets()
+        result = await self.cli("connect", target, "-F", str(hosts), "--name", target, target=target, timeout=self.args.connect_timeout)
         require(result.get("session") == target, f"connect {target}: {result}")
         if not self.fake:
             require(result.get("bridge_live"), f"{target}: Cua bridge not live")

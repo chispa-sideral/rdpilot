@@ -11,12 +11,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let output = PathBuf::from(std::env::args().nth(1).ok_or("output directory required")?);
     std::fs::create_dir_all(&output)?;
     let mut cfg = ConnectionConfig::new(
-        std::env::var("RDPILOT_HOST")?,
-        std::env::var("RDPILOT_USERNAME")?,
-        std::env::var("RDPILOT_PASSWORD")?,
+        std::env::var("PROBE_HOST")?,
+        std::env::var("PROBE_USERNAME")?,
+        std::env::var("PROBE_PASSWORD")?,
     )
-    .accept_invalid_certs(std::env::var("RDPILOT_ACCEPT_INVALID_CERTS").as_deref() == Ok("1"));
-    if let Ok(port) = std::env::var("RDPILOT_PORT") {
+    .accept_invalid_certs(std::env::var("PROBE_ACCEPT_INVALID_CERTS").as_deref() == Ok("1"));
+    if let Ok(port) = std::env::var("PROBE_PORT") {
         cfg = cfg.port(port.parse()?);
     }
     if let Ok(bundle) = std::env::var("RDPILOT_BUNDLE_PATH") {
