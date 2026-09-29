@@ -1,4 +1,4 @@
-//! Offline real-binary proof of `rdpilot view` (Ticket 560): the compiled
+//! Offline real-binary proof of `rdpilot view`: the compiled
 //! `rdpilot` CLI against the compiled `rdpilot-daemon` with the env-gated
 //! fake connector and synthetic frames (`RDPILOT_DAEMON_TEST_CONNECTOR=1`,
 //! `RDPILOT_DAEMON_TEST_FRAMES=1`). No RDP target is needed.

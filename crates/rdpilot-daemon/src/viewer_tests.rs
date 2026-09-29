@@ -1,4 +1,4 @@
-//! Offline tests for the live viewer (Ticket 560, acceptance 563).
+//! Offline tests for the live viewer.
 //!
 //! They live outside `src/viewer/` so the fixtures may build a full
 //! `Registry`, while the source scan below proves the viewer modules

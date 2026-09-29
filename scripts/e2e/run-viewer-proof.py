@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Proof run for the read-only live viewer (`rdpilot view`, Ticket 560).
+"""Proof run for the read-only live viewer (`rdpilot view`).
 
 Fake mode (offline, no Windows; fake connector with synthetic frames and a
 fake Cua): four sessions in one tab, their activity strips driven by Cua tool
