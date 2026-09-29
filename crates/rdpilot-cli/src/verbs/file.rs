@@ -177,7 +177,9 @@ mod tests {
     #[test]
     fn absolutize_passes_an_already_absolute_path_through_unchanged(
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let abs = std::path::PathBuf::from("/tmp/some/file.bin");
+        // `/tmp/...` has no drive letter, so it is not absolute on Windows.
+        let abs = std::env::temp_dir().join("some").join("file.bin");
+        assert!(abs.is_absolute());
         let resolved = absolutize(&abs)?;
         assert_eq!(resolved, abs);
         Ok(())
