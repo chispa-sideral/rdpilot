@@ -23,7 +23,7 @@ canvas { max-width: 100%; height: auto; border: 1px solid #ddd; display: block; 
 </head>
 <body>
 <h1>rdpilot live viewer <span class="note">(read-only)</span></h1>
-<p class="note">This page only shows sessions. It sends no input and cannot connect, disconnect or control a session. Keep the URL private: anyone with it and network access can view the screens. Reloading needs the printed URL again.</p>
+<p class="note">This page only shows sessions. It sends no input and cannot connect, disconnect or control a session. Keep the URL private: anyone with it and network access can view the screens. The URL contains the access token, so a reload keeps working.</p>
 <p id="error"></p>
 <table>
 <thead><tr><th>session</th><th>name</th><th>host</th><th>status</th><th>connected since</th><th>last activity</th><th></th></tr></thead>
@@ -36,12 +36,6 @@ canvas { max-width: 100%; height: auto; border: 1px solid #ddd; display: block; 
   var MAX_PANELS = 4;
   var params = new URLSearchParams(window.location.search);
   var token = params.get("token");
-  if (token) {
-    try { window.sessionStorage.setItem("rdpilotViewerToken", token); } catch (e) {}
-    window.history.replaceState(null, "", "/");
-  } else {
-    try { token = window.sessionStorage.getItem("rdpilotViewerToken"); } catch (e) {}
-  }
   // Read-only status for tests and the proof harness. It never holds the token.
   var status = { sessions: {}, list: [], listUpdatedAt: 0 };
   window.rdpilotViewer = status;

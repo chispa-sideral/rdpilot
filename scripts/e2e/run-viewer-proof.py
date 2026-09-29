@@ -372,7 +372,7 @@ class Proof:
             self.summary["unverified"].append("tailnet access (no tailnet address bound)")
         page = await browser.new_page(viewport={"width": 1600, "height": 1000})
         await page.goto(url)
-        require(page.url.endswith("/") and "token=" not in page.url, "the page strips the token from the address bar")
+        require("token=" in page.url, "the token stays in the address bar")
         state = await self.wait_state(page, lambda s: {x["id"] for x in s["list"]} >= set(TARGETS), "session list", 10)
         for target in TARGETS:
             await page.click(f"button[data-session=\"{target}\"]")

@@ -109,9 +109,9 @@ Access boundary:
   printed IP URL; a MagicDNS name is refused by the Host check.
 - There is no TLS. On the tailnet, WireGuard encrypts the traffic. Anyone with a
   URL and network access to its address can view all sessions of this daemon.
-- The page removes the token from the address bar. A reload or a new tab needs
-  the printed URL again. Browsers allow about 6 connections per origin across
-  all tabs; use one or two tabs.
+- The token stays in the address bar, so a reload or a bookmark keeps working
+  until the viewer restarts. Treat the URL as a secret. Browsers allow about 6
+  connections per origin across all tabs; use one or two tabs.
 
 Residual risk: the viewer runs inside the daemon, which holds the RDP passwords
 of its sessions in memory. The HTTP server parses requests from any peer that
