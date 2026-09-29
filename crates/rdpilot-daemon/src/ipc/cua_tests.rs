@@ -146,7 +146,7 @@ impl SessionConnector for Connector {
 fn server(registry: Arc<Registry>, capacity: usize) -> tokio::io::DuplexStream {
     let (client, daemon) = tokio::io::duplex(capacity);
     tokio::task::spawn_local(async move {
-        serve_connection(daemon, &registry, None).await;
+        serve_connection(daemon, &registry, None, None).await;
     });
     client
 }

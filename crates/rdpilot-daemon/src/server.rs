@@ -28,12 +28,16 @@ use rdpilot::ConnectionConfig;
 use rdpilot_ipc::SessionLifecycle;
 
 use crate::diagnostics::Diagnostics;
+use crate::ipc::ViewerContext;
 use crate::lifecycle::{self, LifecycleConfig, ShutdownSignal};
 use crate::reconcile::{self, JsonReconciliationSink};
-use crate::registry::Registry;
+use crate::registry::{Registry, ViewerRegistry};
 use crate::seams::{
     BoxFuture, DaemonError, ManagedSession, RealConnector, ReconciliationSink, SessionConnector,
+    ViewFrameSource,
 };
+use crate::synthetic_frames::SyntheticFrames;
+use crate::viewer::ViewerGate;
 
 /// When set (to any value), [`run`] selects [`FakeTestConnector`] instead
 /// of [`RealConnector`] -- lets the offline `autostart_lifecycle`
@@ -58,6 +62,17 @@ const TEST_SLOW_MS_ENV: &str = "RDPILOT_DAEMON_TEST_SLOW_MS";
 /// success. It is read only when the explicit fake connector is selected and
 /// is unreachable by [`RealConnector`].
 const TEST_BOOTSTRAP_DELAY_MS_ENV: &str = "RDPILOT_DAEMON_TEST_BOOTSTRAP_DELAY_MS";
+
+/// When set (to any value) alongside [`TEST_CONNECTOR_ENV`], every
+/// [`FakeTestSession`] carries a synthetic, changing frame source for the
+/// live viewer's offline tests and the proof harness's fake mode. Read only
+/// when the fake connector is selected; unreachable by [`RealConnector`].
+const TEST_FRAMES_ENV: &str = "RDPILOT_DAEMON_TEST_FRAMES";
+
+/// Fake-connector-only host value: a fake session connected with this host
+/// ends its synthetic frame source 4 s after connect, standing in for an
+/// RDP session that the server ended (logoff, network loss).
+const TEST_FRAMES_SERVER_END_HOST: &str = "fake-server-end";
 
 /// The env var overriding [`RunConfig`]'s reconciliation-state sink path
 /// (test injection point -- production always resolves the platform
@@ -161,6 +176,7 @@ async fn run_inner(config: RunConfig) -> Result<(), DaemonError> {
         Arc::new(FakeTestConnector {
             slow_ms,
             bootstrap_delay_ms,
+            frames: std::env::var(TEST_FRAMES_ENV).is_ok(),
         })
     } else {
         Arc::new(RealConnector)
@@ -189,6 +205,11 @@ async fn run_inner(config: RunConfig) -> Result<(), DaemonError> {
         config.lifecycle,
         shutdown.clone(),
     ));
+    // The live viewer sees only this facade (list + passive frame lookup).
+    let viewer = ViewerContext {
+        registry: ViewerRegistry::new(Arc::clone(&registry)),
+        gate: ViewerGate::default(),
+    };
 
     loop {
         tokio::select! {
@@ -197,8 +218,9 @@ async fn run_inner(config: RunConfig) -> Result<(), DaemonError> {
                     Ok(stream) => {
                         let registry_for_conn = Arc::clone(&registry);
                         let diagnostics_for_conn = diagnostics.clone();
+                        let viewer_for_conn = viewer.clone();
                         tokio::task::spawn_local(async move {
-                            crate::ipc::serve_connection(stream, &registry_for_conn, diagnostics_for_conn.as_deref()).await;
+                            crate::ipc::serve_connection(stream, &registry_for_conn, diagnostics_for_conn.as_deref(), Some(&viewer_for_conn)).await;
                         });
                     }
                     Err(err) => {
@@ -244,11 +266,22 @@ async fn run_inner(config: RunConfig) -> Result<(), DaemonError> {
 struct FakeTestSession {
     slow_ms: u64,
     bootstrap_delay_ms: u64,
+    /// Synthetic frames when [`TEST_FRAMES_ENV`] is set.
+    frames: Option<Arc<SyntheticFrames>>,
 }
 
 impl ManagedSession for FakeTestSession {
     fn close(self: Box<Self>) -> Pin<Box<dyn Future<Output = Result<(), DaemonError>>>> {
+        if let Some(frames) = &self.frames {
+            frames.end();
+        }
         Box::pin(async { Ok(()) })
+    }
+
+    fn frame_source(&self) -> Option<Arc<dyn ViewFrameSource>> {
+        self.frames
+            .as_ref()
+            .map(|f| Arc::clone(f) as Arc<dyn ViewFrameSource>)
     }
 
     fn describe(&self) -> SessionLifecycle {
@@ -344,19 +377,36 @@ struct FakeTestConnector {
     /// see [`TEST_SLOW_MS_ENV`].
     slow_ms: u64,
     bootstrap_delay_ms: u64,
+    /// See [`TEST_FRAMES_ENV`].
+    frames: bool,
 }
 
 impl SessionConnector for FakeTestConnector {
     fn connect(
         &self,
-        _cfg: ConnectionConfig,
+        cfg: ConnectionConfig,
     ) -> Pin<Box<dyn Future<Output = Result<Box<dyn ManagedSession>, DaemonError>>>> {
         let slow_ms = self.slow_ms;
         let bootstrap_delay_ms = self.bootstrap_delay_ms;
+        let frames = self.frames.then(|| {
+            let frames = SyntheticFrames::new();
+            frames.spawn_animation();
+            if cfg.host() == TEST_FRAMES_SERVER_END_HOST {
+                let weak = Arc::downgrade(&frames);
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_secs(4)).await;
+                    if let Some(frames) = weak.upgrade() {
+                        frames.end();
+                    }
+                });
+            }
+            frames
+        });
         Box::pin(async move {
             Ok(Box::new(FakeTestSession {
                 slow_ms,
                 bootstrap_delay_ms,
+                frames,
             }) as Box<dyn ManagedSession>)
         })
     }
@@ -438,6 +488,7 @@ mod tests {
         let connector: Arc<dyn SessionConnector> = Arc::new(FakeTestConnector {
             slow_ms: 0,
             bootstrap_delay_ms: 0,
+            frames: false,
         });
         let registry = Arc::new(Registry::new(
             connector,
@@ -475,6 +526,7 @@ mod tests {
         let session = FakeTestSession {
             slow_ms: 0,
             bootstrap_delay_ms: 0,
+            frames: None,
         };
         let immediate_bound = Duration::from_millis(50);
 
@@ -510,6 +562,7 @@ mod tests {
         let session = FakeTestSession {
             slow_ms: SLOW_MS,
             bootstrap_delay_ms: 0,
+            frames: None,
         };
         let bound = Duration::from_millis(SLOW_MS);
 

@@ -41,7 +41,7 @@ fn deserialize_layered(built: Config) -> Result<ResolvedConfig, ConfigError> {
 /// file ([`crate::config_file_path`], optional — `.required(false)`) and the
 /// real process environment (`RDPILOT_` prefix). The env source is added
 /// LAST so it wins over the file source (CONFIG-01: env beats file).
-fn real_file_and_env_builder() -> config::ConfigBuilder<config::builder::DefaultState> {
+pub(crate) fn real_file_and_env_builder() -> config::ConfigBuilder<config::builder::DefaultState> {
     let mut builder = Config::builder();
     if let Some(path) = crate::paths::config_file_path() {
         builder = builder

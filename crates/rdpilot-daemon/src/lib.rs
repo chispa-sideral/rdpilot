@@ -62,11 +62,16 @@ mod reconcile;
 mod registry;
 mod seams;
 mod server;
+mod synthetic_frames;
+mod viewer;
+#[cfg(test)]
+mod viewer_tests;
 
 pub use reconcile::{scan_orphans, seed_into, JsonReconciliationSink, ReconciliationRecord};
 pub use registry::Registry;
 pub use seams::{
     DaemonError, ManagedCua, ManagedSession, ReconciliationSink, SessionConnector, SessionEntry,
+    ViewFrameSource,
 };
 pub use server::{run, RunConfig};
 

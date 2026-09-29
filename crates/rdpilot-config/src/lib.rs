@@ -28,10 +28,12 @@
 mod paths;
 mod resolve;
 mod resolved;
+mod viewer;
 
 pub use paths::config_file_path;
 pub use resolve::{apply_overrides, resolve, share_root_or_default};
 pub use resolved::{ConfigError, ResolvedConfig};
+pub use viewer::{resolve_viewer, ViewerBind, ViewerConfig};
 
 /// A fully-commented, self-explanatory `config.toml` template documenting
 /// every D-27 key (CONFIG-02). All keys ship commented out, so an unedited

@@ -40,7 +40,7 @@
 /// compatible. The workspace package version is deliberately not the
 /// protocol identity: a long-lived daemon and a newly installed client must
 /// detect different wire contracts.
-pub const IPC_COMPATIBILITY_VERSION: u32 = 2;
+pub const IPC_COMPATIBILITY_VERSION: u32 = 3;
 
 /// Sanitized recovery guidance for a client that reached an incompatible
 /// daemon. It contains no socket, connection, or credential details so the
@@ -70,11 +70,11 @@ pub mod transport;
 
 pub use error::{WireError, WireErrorCode};
 pub use input::{parse_wire_key, WireButton, WireKey, WireKeyAction, WireMouseAction};
-pub use request::{Request, SessionScoped};
-pub use response::{SessionLifecycle, SessionStatus, WireResponse};
+pub use request::{Request, SessionScoped, WireViewerBind};
+pub use response::{SessionLifecycle, SessionStatus, ViewerToken, WireResponse};
 pub use session_id::SessionId;
 pub use transfer::TransferOutcome;
-pub use transport::{connect_or_spawn, socket_path};
+pub use transport::{connect_existing, connect_or_spawn, socket_path};
 pub use transport::{read_frame, write_frame, TransportError};
 
 mod cua;

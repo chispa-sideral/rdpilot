@@ -75,5 +75,6 @@ async fn dispatch(command: Command, json: bool) -> Result<(), CliError> {
         Command::Get(args) | Command::File(FileCmd::Get(args)) => {
             verbs::file::get(args, json).await
         }
+        Command::View(args) => verbs::view::view(args, json).await,
     }
 }

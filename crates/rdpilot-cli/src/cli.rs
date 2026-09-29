@@ -58,6 +58,29 @@ pub enum Command {
     /// File-transfer verbs, grouped (`rdpilot file put|get ...`, CLI-03).
     #[command(subcommand)]
     File(FileCmd),
+
+    /// Start the read-only live viewer for the running daemon and print its
+    /// URLs. Runs until Ctrl-C; never starts a daemon.
+    View(ViewArgs),
+}
+
+/// `view [--bind loopback|loopback+tailnet] [--tailnet-address <ipv4>]`.
+/// Unset flags fall back to the `[viewer]` config table and
+/// `RDPILOT_VIEWER__*` environment variables.
+#[derive(Debug, Args)]
+pub struct ViewArgs {
+    /// Bind set: `loopback` (127.0.0.1 only) or `loopback+tailnet` (also the
+    /// host's Tailscale address). Default: `loopback+tailnet`.
+    #[arg(long, value_parser = parse_viewer_bind)]
+    pub bind: Option<rdpilot_config::ViewerBind>,
+    /// Tailscale IPv4 address to bind when automatic detection finds none or
+    /// several (must be in 100.64.0.0/10 and present on this host).
+    #[arg(long = "tailnet-address")]
+    pub tailnet_address: Option<std::net::Ipv4Addr>,
+}
+
+fn parse_viewer_bind(value: &str) -> Result<rdpilot_config::ViewerBind, String> {
+    value.parse()
 }
 
 /// The grouped `session` subcommand family — shares `ConnectArgs`/`SessionArg`

@@ -53,6 +53,22 @@ pub enum Request {
     CuaAttach {
         session: SessionId,
     },
+    /// Start the read-only live viewer. The listener lives only while this
+    /// IPC connection stays open; closing it stops the viewer.
+    ViewerStart {
+        bind: WireViewerBind,
+        /// Explicit Tailscale IPv4 address; `None` detects it.
+        #[serde(default)]
+        tailnet_address: Option<String>,
+    },
+}
+/// Which addresses the live viewer binds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WireViewerBind {
+    /// `127.0.0.1` only.
+    Loopback,
+    /// `127.0.0.1` plus this host's Tailscale address, when one is found.
+    LoopbackAndTailnet,
 }
 pub trait SessionScoped {
     fn session(&self) -> Option<&SessionId>;
@@ -60,7 +76,7 @@ pub trait SessionScoped {
 impl SessionScoped for Request {
     fn session(&self) -> Option<&SessionId> {
         match self {
-            Self::Connect { .. } | Self::List {} => None,
+            Self::Connect { .. } | Self::List {} | Self::ViewerStart { .. } => None,
             Self::ConnectAck { session }
             | Self::Disconnect { session }
             | Self::Ping { session }
@@ -93,5 +109,24 @@ mod tests {
         ] {
             assert!(serde_json::from_value::<Request>(serde_json::json!({"op":op})).is_err());
         }
+    }
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn viewer_start_round_trips_and_is_not_session_scoped() {
+        let req = Request::ViewerStart {
+            bind: WireViewerBind::LoopbackAndTailnet,
+            tailnet_address: Some("100.64.0.1".into()),
+        };
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(json["op"], "ViewerStart");
+        let back: Request = serde_json::from_value(json).unwrap();
+        assert!(back.session().is_none());
+        assert!(matches!(
+            back,
+            Request::ViewerStart {
+                bind: WireViewerBind::LoopbackAndTailnet,
+                tailnet_address: Some(_)
+            }
+        ));
     }
 }

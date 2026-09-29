@@ -5,3 +5,4 @@ pub mod file;
 pub mod input;
 pub mod perceive;
 pub mod session;
+pub mod view;

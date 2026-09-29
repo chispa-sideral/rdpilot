@@ -234,6 +234,17 @@ async fn try_connect(socket_path: &Path) -> io::Result<UnixStream> {
 }
 
 #[cfg(unix)]
+/// Connect to an already-running daemon at `socket_path`. Never spawns the
+/// daemon: the live viewer must not start (and so keep alive) a daemon.
+///
+/// # Errors
+///
+/// Returns the connect error when no daemon is listening.
+pub async fn connect_existing(socket_path: &Path) -> io::Result<UnixStream> {
+    try_connect(socket_path).await
+}
+
+#[cfg(unix)]
 /// Connect to the daemon at `socket_path`, auto-starting it via
 /// `daemon_exe` if it is not already listening (CLI-01/DAEMON-03).
 ///
@@ -290,6 +301,12 @@ pub type LocalStream = UnixStream;
 #[cfg(windows)]
 pub fn socket_path() -> io::Result<std::path::PathBuf> {
     Ok(std::path::PathBuf::from(r"\\.\pipe\rdpilot-daemon"))
+}
+
+/// Connect to an already-running daemon pipe. Never spawns the daemon.
+#[cfg(windows)]
+pub async fn connect_existing(path: &std::path::Path) -> io::Result<LocalStream> {
+    tokio::net::windows::named_pipe::ClientOptions::new().open(path)
 }
 
 #[cfg(windows)]
@@ -475,6 +492,22 @@ mod tests {
         );
 
         drop(listener);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `connect_existing` fails when no daemon listens and never creates
+    /// anything at the socket path (it never spawns).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn connect_existing_fails_without_a_listener_and_spawns_nothing() {
+        let dir = std::env::temp_dir().join(format!(
+            "rdpilot-ipc-connect-existing-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let socket_path = dir.join("absent.sock");
+        assert!(connect_existing(&socket_path).await.is_err());
+        assert!(!socket_path.exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

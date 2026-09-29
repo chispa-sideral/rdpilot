@@ -52,3 +52,15 @@
 # Unset permits native RDP recovery without deploying Cua.
 # Env: RDPILOT_BUNDLE_PATH
 # bundle_path = "/absolute/path/to/rdpilot-bundle"
+
+# Read-only live viewer (`rdpilot view`). Nothing listens until you run
+# `rdpilot view`; it stops when that command exits.
+# [viewer]
+# Bind set: "loopback+tailnet" (default) binds 127.0.0.1 and this host's
+# Tailscale address; "loopback" binds 127.0.0.1 only. No other address is
+# ever bound. Env: RDPILOT_VIEWER__BIND. Flag: rdpilot view --bind.
+# bind = "loopback+tailnet"
+# Explicit Tailscale IPv4 address when automatic detection finds none or
+# several. It must be in 100.64.0.0/10 and present on a local interface.
+# Env: RDPILOT_VIEWER__TAILNET_ADDRESS. Flag: rdpilot view --tailnet-address.
+# tailnet_address = "100.64.0.1"
