@@ -237,6 +237,26 @@ class Run:
                 text = text.replace(cred["password"], "[REDACTED]")
         return text
 
+    def hosts_file(self, entries):
+        """Write a 0600 hosts file for this run; the password is passed only
+        through the CLI child's environment (PasswordCommand), never the file."""
+        def quote(value):
+            return '"' + str(value).replace("\\", "\\\\").replace('"', '\\"') + '"'
+        lines = []
+        for target, entry in entries.items():
+            lines += [f"Host {target}", f"  HostName {quote(entry['host'])}", f"  User {quote(entry['username'])}",
+                      f"  PasswordCommand {quote('printenv E2E_PASSWORD_' + target.upper())}"]
+            if entry.get("port"):
+                lines.append(f"  Port {entry['port']}")
+            if entry.get("domain"):
+                lines.append(f"  Domain {quote(entry['domain'])}")
+            if entry.get("accept_invalid_certs"):
+                lines.append("  AcceptInvalidCerts yes")
+        path = self.temp / "hosts"
+        path.write_text("\n".join(lines) + "\n")
+        path.chmod(0o600)
+        return path
+
     def check(self, name, **data):
         self.checks.append({"check": name, "passed": True, **data})
         self.save()
@@ -248,8 +268,7 @@ class Run:
     async def cli(self, *arguments, target=None, timeout=90, allow_failure=False):
         env = dict(self.env)
         if target:
-            env.update({"RDPILOT_" + key.upper(): str(value) for key, value in self.credentials[target].items()})
-            env["RDPILOT_HOST"], env["RDPILOT_PORT"] = "127.0.0.1", str(self.relays[target][1])
+            env["E2E_PASSWORD_" + target.upper()] = str(self.credentials[target]["password"])
         proc = await asyncio.create_subprocess_exec(str(self.bin / "rdpilot"), *arguments, "--json", env=env,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
         try:
@@ -262,8 +281,15 @@ class Run:
             raise ProofError(self.clean(f"CLI {arguments[0]} failed: {out.decode(errors='replace')} {err.decode(errors='replace')}"))
         return json.loads(out) if out.strip() else {}
 
+    def hosts_for_relays(self):
+        return self.hosts_file({
+            target: {"host": "127.0.0.1", "port": self.relays[target][1], "username": cred["username"],
+                     "domain": cred.get("domain"), "accept_invalid_certs": True}
+            for target, cred in self.credentials.items()})
+
     async def connect(self, target):
-        result = await self.cli("connect", "--name", target, "--accept-invalid-certs", target=target, timeout=self.args.connect_timeout)
+        hosts = self.hosts_for_relays()
+        result = await self.cli("connect", target, "-F", str(hosts), "--name", target, target=target, timeout=self.args.connect_timeout)
         require(result.get("bridge_live"), "Connect did not report live bridge")
         self.check(f"{target}.rdp_bundle_ready")
 

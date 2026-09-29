@@ -88,6 +88,7 @@ impl Env {
             // Never pick up the developer's own config or viewer settings.
             .env("XDG_CONFIG_HOME", self.root.join("config"))
             .env("HOME", &self.root)
+            .env("APPDATA", self.root.join("appdata"))
             .env_remove("RDPILOT_VIEWER__BIND")
             .env_remove("RDPILOT_VIEWER__TAILNET_ADDRESS");
         command
@@ -112,17 +113,7 @@ impl Env {
     }
 
     fn connect(&mut self, name: &str) {
-        let run = self.run(&[
-            "connect",
-            "--name",
-            name,
-            "--host",
-            "10.0.0.5",
-            "--username",
-            "u",
-            "--password",
-            "p",
-        ]);
+        let run = self.run(&["connect", "--name", name, "rdp://u:p@10.0.0.5"]);
         assert!(run.status.success(), "connect {name}: {}", run.stderr);
     }
 

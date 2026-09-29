@@ -26,7 +26,9 @@ python3 scripts/package-cua.py \
   --bin-dir target/debug --output dist
 export RDPILOT_BUNDLE_PATH="$PWD/dist/bundle"
 rdpilot session connect --help
-# Connect using configured credentials, then bind one MCP process to the name:
+# Connect to a host from your hosts file (or an rdp:// URL), then bind one MCP
+# process to the name:
+rdpilot connect my-host --name NAME
 rdpilot-mcp --session NAME
 ```
 
@@ -44,6 +46,95 @@ Use `rdpilot --help` for connection management, native framebuffer/input recover
 ping and file put/get. Cua paths refer to **guest files**. File transfer uses an
 explicit local path and a relative guest name under `%TEMP%\rdpilot-transfer-root`;
 both sides verify SHA256 and reject traversal and destination overwrites.
+
+## Hosts and targets
+
+`rdpilot connect TARGET` takes a **host alias** from your hosts file or an
+`rdp://` URL. Connection settings (address, port, user, credentials) live in the
+hosts file, which uses ssh_config syntax. The old `--host`, `--port`,
+`--username`, `--password`, `--domain` and `--accept-invalid-certs` flags, the
+matching `config.toml` keys and the `RDPILOT_HOST`-style variables are gone;
+leftovers are ignored. `config.toml` keeps only daemon-local settings
+(`share_root`, `bundle_path`, `[viewer]`).
+
+The hosts file is `~/.config/rdpilot/hosts` on Linux (`$XDG_CONFIG_HOME/rdpilot/hosts`),
+`~/Library/Application Support/rdpilot/hosts` on macOS and `%APPDATA%\rdpilot\hosts`
+on Windows. rdpilot never creates it. A missing file is fine; `-F FILE` reads a
+different file instead (which must exist).
+
+```
+# ~/.config/rdpilot/hosts
+Host lab
+  HostName 10.0.0.5
+  User alice
+  Domain CORP
+  Port 3390
+  AcceptInvalidCerts yes
+  PasswordCommand "pass show rdp/lab"
+
+Host *
+  CuaEnabled yes
+```
+
+**Matching and order.** `Host` takes patterns (`*`, `?`, `!negation`); a line of
+only negations never matches. As in ssh, the target host is lowercased and
+patterns are matched as written, so write patterns in lower case: `Host DevBox`
+never matches. The **first value obtained for each setting wins**: rdpilot reads
+the URL, then `-o` options in order, then the hosts file top to bottom, then the
+built-in default (`Host *` / `CuaEnabled yes`). Lines before the first `Host`
+apply to every host. `Include PATH` (globs allowed, sorted, `~` and paths
+relative to the hosts file's directory) reads more files; a pattern that matches
+nothing is skipped, cycles and nesting deeper than 16 are errors, and an
+`Include` inside a non-matching `Host` block is not read. `Match` is not
+supported. Keywords are case-insensitive; `Keyword value` and `Keyword=value` both
+work; quote values that contain spaces. Booleans accept only `yes` and `no`.
+
+| Keyword | Meaning |
+| --- | --- |
+| `HostName` | Address to connect to (`%h` = the target name, `%%` = `%`). Default: the target. |
+| `Port` | TCP port. Default 3389. |
+| `User`, `Domain` | Account. |
+| `Password` | Literal password. Prefer `PasswordCommand`. |
+| `PasswordCommand` | Shell command whose stdout is the password (see below). |
+| `AcceptInvalidCerts` | Accept any server certificate (`yes`/`no`, default `no`). |
+| `CuaEnabled` | `no` = native RDP only: no bridge is deployed and `put`/`get` and Cua are unavailable. Default `yes`. |
+| `Include` | Read more files. |
+
+`Password` and `PasswordCommand` share one slot, so whichever is obtained first
+wins. On Unix a hosts file that holds a literal `Password` and is readable by
+group or others is refused (`chmod 600` it).
+
+**URLs.** `rdp://[DOMAIN\]USER[:PASSWORD]@HOST[:PORT]`; `rdps://` is identical.
+Percent-encode special characters (`CORP%5Calice`). IPv6 hosts go in brackets.
+The URL has **no path, query or fragment**: every one is an error, including a
+lone trailing `/`. URL parts beat everything else. A password in a URL is visible
+in the process list and shell history; prefer `PasswordCommand`.
+
+**`-o KEYWORD=VALUE`** overrides one setting (`-o Port=3390 -o CuaEnabled=no`);
+`Host`, `Match` and `Include` cannot be used with `-o`.
+
+**`rdpilot config resolve TARGET [-o ...] [-F FILE] [--json]`** shows every
+resolved setting and where it came from (`url`, `-o #N`, `file:line`, built-in
+default). Passwords print as `<redacted>`; a `PasswordCommand` is shown as
+written and is never run.
+
+**PasswordCommand.** It runs through `sh -c` (`cmd /C` on Windows) only when a
+connection needs the password, with a 30 s timeout, stdin closed and stderr
+passed through. One trailing newline of stdout is removed. A failure, empty
+output or timeout is an error that never shows the output. A timed-out command
+is killed, but processes it started may keep running. `%h` (address), `%n` (the
+target name; for a URL just the hostname, never the URL), `%r` (user), `%p`
+(port, default 3389) and `%%` are substituted, then `${VAR}` reads your
+environment. Because the command goes to a shell, a value substituted for `%h`,
+`%n`, `%r` or `%p` must be non-empty, must not start with `-` and must not
+contain whitespace, control characters or any of
+`` ' " ` \ $ ; & | < > ( ) { } [ ] * ? ! # ~ % ^ = ``. This applies whatever the
+value's source. If a value legitimately needs one of these, write it literally in
+the command instead of using the token. `${VAR}` values are not checked and end
+up in the command text, so do not put a secret in `${VAR}`; have the command read
+it (`PasswordCommand "printenv MY_SECRET"`). `%%` yields one literal `%`:
+`PasswordCommand "printf %%s hunter"` runs `printf %s hunter`, and on Windows `PasswordCommand "cmd /c echo 100%%"`
+runs `cmd /c echo 100%`.
 
 ## Runtime and packaging
 
@@ -75,7 +166,7 @@ read-only: it sends no input, Cua call, file transfer, connect or disconnect,
 and it does not change session activity, idle reaping or daemon self-shutdown.
 
 ```sh
-rdpilot connect --name work ...   # the viewer needs a running daemon
+rdpilot connect my-host --name work   # the viewer needs a running daemon
 rdpilot view                      # prints one URL per bound address
 ```
 
@@ -155,7 +246,7 @@ printed loopback URL on your machine (the Host check needs the same port):
 ssh -L PORT:127.0.0.1:PORT user@daemon-host
 ```
 
-Upgrade note: this release changes the IPC compatibility version to 3. After
+Upgrade note: this release changes the IPC compatibility version to 4. After
 you upgrade, restart `rdpilot-daemon` (this ends its live sessions). Until then,
 the CLI and MCP adapter report the daemon compatibility mismatch message.
 
@@ -185,8 +276,8 @@ executable through the same RDP-only path.
 
 `cargo run -p rdpilot --example cua_probe -- BUNDLE REQUESTS.jsonl OUTPUT.jsonl`
 connects, deploys via RDPDR, initializes native MCP, runs supplied JSON-RPC requests,
-and captures a native recovery screenshot. It reads `RDPILOT_HOST`,
-`RDPILOT_PORT`, `RDPILOT_USERNAME`, `RDPILOT_PASSWORD` and optional
-`RDPILOT_ACCEPT_INVALID_CERTS=1`. Live verification also needs two independently
+and captures a native recovery screenshot. It reads `PROBE_HOST`,
+`PROBE_PORT`, `PROBE_USERNAME`, `PROBE_PASSWORD` and optional
+`PROBE_ACCEPT_INVALID_CERTS=1` (example-only variables, not rdpilot configuration). Live verification also needs two independently
 bound Windows sessions, transfer roundtrip, Cua crash/stall and reconnect checks.
 The probe never provisions machines. See the ticket's evidence for actual results.

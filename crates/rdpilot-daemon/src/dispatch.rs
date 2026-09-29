@@ -57,6 +57,139 @@ pub async fn dispatch(registry: &Registry, req: Request) -> WireResponse {
     dispatch_for_ipc(registry, req, None).await.response
 }
 
+/// The fields of `Request::Connect`.
+pub(crate) struct ConnectFields {
+    pub(crate) name: Option<String>,
+    pub(crate) host: String,
+    pub(crate) port: Option<u16>,
+    pub(crate) username: String,
+    pub(crate) password: String,
+    pub(crate) domain: Option<String>,
+    pub(crate) accept_invalid_certs: bool,
+    pub(crate) cua_enabled: bool,
+    pub(crate) connect_ack: bool,
+}
+
+/// Open a session. `resolve_bundle` is the daemon-local bridge bundle
+/// lookup, injected so tests need no process-global configuration; it is
+/// never called when `cua_enabled` is false.
+pub(crate) async fn dispatch_connect(
+    registry: &Registry,
+    fields: ConnectFields,
+    diagnostics: Option<&Diagnostics>,
+    resolve_bundle: impl FnOnce() -> Result<Option<PathBuf>, DaemonError>,
+) -> DispatchOutcome {
+    let ConnectFields {
+        name,
+        host,
+        port,
+        username,
+        password,
+        domain,
+        accept_invalid_certs,
+        cua_enabled,
+        connect_ack,
+    } = fields;
+    let mut cfg = ConnectionConfig::new(host.clone(), username, password)
+        .accept_invalid_certs(accept_invalid_certs);
+    if let Some(port) = port {
+        cfg = cfg.port(port);
+    }
+    if let Some(domain) = domain {
+        cfg = cfg.domain(domain);
+    }
+    // Source the daemon-local file-transfer staging root
+    // (research Pitfall 6): NOT a wire field — `share_root` is
+    // daemon-local operational config, never dictated per-Connect
+    // by a client. host/username/password/domain/
+    // accept_invalid_certs above already arrived resolved on the
+    // wire; only this one value is resolved here.
+    let share_root = match resolve_share_root() {
+        Ok(path) => path,
+        Err(e) => {
+            return DispatchOutcome {
+                response: WireResponse::Error(e.into()),
+                connect_lease: None,
+            }
+        }
+    };
+    cfg = cfg.share_root(share_root);
+    // The bundle is daemon-local: callers cannot supply arbitrary executable
+    // paths. With `cua_enabled` off the bundle is never resolved, so no
+    // bridge is deployed and the session stays native-only.
+    let bridge_configured = if cua_enabled {
+        match resolve_bundle() {
+            Ok(Some(bundle_path)) => {
+                cfg = cfg.bundle_path(bundle_path);
+                true
+            }
+            Ok(None) => false,
+            Err(e) => {
+                return DispatchOutcome {
+                    response: WireResponse::Error(e.into()),
+                    connect_lease: None,
+                }
+            }
+        }
+    } else {
+        false
+    };
+    let lease = match registry.open_tracked(name, host, cfg).await {
+        Ok(lease) => lease,
+        Err(e) => {
+            return DispatchOutcome {
+                response: WireResponse::Error(e.into()),
+                connect_lease: None,
+            }
+        }
+    };
+    let session = lease.id.clone();
+    if let Some(diagnostics) = diagnostics {
+        diagnostics.record(session.as_str(), Stage::RegistryOpened);
+    }
+    // A configured bundle must become ready before Connect succeeds.
+    if bridge_configured {
+        if let Some(diagnostics) = diagnostics {
+            diagnostics.record(session.as_str(), Stage::BridgeBootstrapStarted);
+        }
+        let bootstrap = registry.call(&session, |s| s.deploy_and_launch()).await;
+        let bootstrap_stages = registry
+            .call(&session, |s| {
+                Box::pin(async move { Ok(s.bootstrap_stages()) })
+            })
+            .await
+            .unwrap_or_default();
+        if let Some(diagnostics) = diagnostics {
+            diagnostics.record_bootstrap_stages(session.as_str(), &bootstrap_stages);
+        }
+        if let Err(e) = bootstrap {
+            if matches!(registry.close_if_generation(&lease).await, Ok(true)) {
+                if let Some(diagnostics) = diagnostics {
+                    diagnostics.record(session.as_str(), Stage::RegistryClosed);
+                }
+            }
+            return DispatchOutcome {
+                response: WireResponse::Error(e.into()),
+                connect_lease: None,
+            };
+        }
+        if let Some(diagnostics) = diagnostics {
+            diagnostics.record(session.as_str(), Stage::BridgeBootstrapFinished);
+        }
+    }
+    DispatchOutcome {
+        // A successful configured bootstrap has observed a bridge
+        // pong. Surface that fact to clients so they do not infer
+        // bridge readiness merely from an RDP connection.
+        response: WireResponse::Connected {
+            session,
+            connect_ack_required: connect_ack,
+            bridge_live: bridge_configured,
+        },
+        connect_lease: Some(lease),
+    }
+}
+
 /// Dispatch one request for the IPC server. Connect is special: the returned
 /// private lease is valid only until the matching Connected frame is written.
 pub(crate) async fn dispatch_for_ipc(
@@ -80,100 +213,26 @@ pub(crate) async fn dispatch_for_ipc(
             password,
             domain,
             accept_invalid_certs,
+            cua_enabled,
             connect_ack,
         } => {
-            let mut cfg = ConnectionConfig::new(host.clone(), username, password)
-                .accept_invalid_certs(accept_invalid_certs);
-            if let Some(port) = port {
-                cfg = cfg.port(port);
-            }
-            if let Some(domain) = domain {
-                cfg = cfg.domain(domain);
-            }
-            // Source the daemon-local file-transfer staging root
-            // (research Pitfall 6): NOT a wire field — `share_root` is
-            // daemon-local operational config, never dictated per-Connect
-            // by a client. host/username/password/domain/
-            // accept_invalid_certs above already arrived resolved on the
-            // wire; only this one value is resolved here.
-            let share_root = match resolve_share_root() {
-                Ok(path) => path,
-                Err(e) => {
-                    return DispatchOutcome {
-                        response: WireResponse::Error(e.into()),
-                        connect_lease: None,
-                    }
-                }
-            };
-            cfg = cfg.share_root(share_root);
-            // The bundle is daemon-local: callers cannot supply arbitrary executable paths.
-            let bridge_configured = match resolve_bundle_path() {
-                Ok(Some(bundle_path)) => {
-                    cfg = cfg.bundle_path(bundle_path);
-                    true
-                }
-                Ok(None) => false,
-                Err(e) => {
-                    return DispatchOutcome {
-                        response: WireResponse::Error(e.into()),
-                        connect_lease: None,
-                    }
-                }
-            };
-            let lease = match registry.open_tracked(name, host, cfg).await {
-                Ok(lease) => lease,
-                Err(e) => {
-                    return DispatchOutcome {
-                        response: WireResponse::Error(e.into()),
-                        connect_lease: None,
-                    }
-                }
-            };
-            let session = lease.id.clone();
-            if let Some(diagnostics) = diagnostics {
-                diagnostics.record(session.as_str(), Stage::RegistryOpened);
-            }
-            // A configured bundle must become ready before Connect succeeds.
-            if bridge_configured {
-                if let Some(diagnostics) = diagnostics {
-                    diagnostics.record(session.as_str(), Stage::BridgeBootstrapStarted);
-                }
-                let bootstrap = registry.call(&session, |s| s.deploy_and_launch()).await;
-                let bootstrap_stages = registry
-                    .call(&session, |s| {
-                        Box::pin(async move { Ok(s.bootstrap_stages()) })
-                    })
-                    .await
-                    .unwrap_or_default();
-                if let Some(diagnostics) = diagnostics {
-                    diagnostics.record_bootstrap_stages(session.as_str(), &bootstrap_stages);
-                }
-                if let Err(e) = bootstrap {
-                    if matches!(registry.close_if_generation(&lease).await, Ok(true)) {
-                        if let Some(diagnostics) = diagnostics {
-                            diagnostics.record(session.as_str(), Stage::RegistryClosed);
-                        }
-                    }
-                    return DispatchOutcome {
-                        response: WireResponse::Error(e.into()),
-                        connect_lease: None,
-                    };
-                }
-                if let Some(diagnostics) = diagnostics {
-                    diagnostics.record(session.as_str(), Stage::BridgeBootstrapFinished);
-                }
-            }
-            return DispatchOutcome {
-                // A successful configured bootstrap has observed a bridge
-                // pong. Surface that fact to clients so they do not infer
-                // bridge readiness merely from an RDP connection.
-                response: WireResponse::Connected {
-                    session,
-                    connect_ack_required: connect_ack,
-                    bridge_live: bridge_configured,
+            return dispatch_connect(
+                registry,
+                ConnectFields {
+                    name,
+                    host,
+                    port,
+                    username,
+                    password,
+                    domain,
+                    accept_invalid_certs,
+                    cua_enabled,
+                    connect_ack,
                 },
-                connect_lease: Some(lease),
-            };
+                diagnostics,
+                resolve_bundle_path,
+            )
+            .await;
         }
         Request::ConnectAck { .. } => WireResponse::Error(
             DaemonError::Connect("ConnectAck is only valid immediately after Connect".to_owned())
@@ -306,25 +365,12 @@ fn resolve_bundle_path() -> Result<Option<PathBuf>, DaemonError> {
 }
 
 /// Shared file -> env layered [`rdpilot_config::ResolvedConfig`] resolution
-/// (no flag/MCP-init override layer exists at the daemon for either
-/// `share_root` or `bundle_path`: neither is a wire field, so the
-/// override layer passed to `rdpilot_config::resolve` is always the
-/// all-`None` identity value). Factored out so [`resolve_share_root`] and
+/// (neither `share_root` nor `bundle_path` is a wire field). Factored out so [`resolve_share_root`] and
 /// [`resolve_bundle_path`] share one resolution call rather than two
 /// independent (and potentially divergent) reads of the same underlying
 /// config layers.
 fn resolve_identity_config() -> Result<rdpilot_config::ResolvedConfig, DaemonError> {
-    let identity_overrides = rdpilot_config::ResolvedConfig {
-        host: None,
-        port: None,
-        username: None,
-        password: None,
-        domain: None,
-        accept_invalid_certs: false,
-        share_root: None,
-        bundle_path: None,
-    };
-    rdpilot_config::resolve(identity_overrides).map_err(|e| DaemonError::Config(e.to_string()))
+    rdpilot_config::resolve().map_err(|e| DaemonError::Config(e.to_string()))
 }
 
 /// Encode a captured [`rdpilot::Screenshot`] as base64 PNG bytes (the
@@ -472,8 +518,9 @@ fn wire_transfer_outcome(o: rdpilot::TransferOutcome) -> WireTransferOutcome {
 mod tests {
     use std::future::Future;
     use std::pin::Pin;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::Mutex;
 
     use rdpilot_ipc::{SessionId, SessionLifecycle, WireError, WireErrorCode};
 
@@ -490,6 +537,7 @@ mod tests {
     /// mod tests`).
     struct FakeSession {
         closed: Arc<AtomicBool>,
+        deploys: Arc<AtomicUsize>,
     }
 
     impl ManagedSession for FakeSession {
@@ -552,28 +600,121 @@ mod tests {
             (1920, 1080)
         }
         fn deploy_and_launch(&self) -> BoxFuture<'_, Result<std::time::Duration, DaemonError>> {
+            self.deploys.fetch_add(1, Ordering::SeqCst);
             Box::pin(async move { Ok(std::time::Duration::from_millis(0)) })
         }
     }
 
-    /// A fake `SessionConnector` that always succeeds.
-    struct FakeConnector;
+    /// A fake `SessionConnector` that always succeeds and records what it saw.
+    #[derive(Default)]
+    struct FakeConnector {
+        deploys: Arc<AtomicUsize>,
+        bundles: Arc<Mutex<Vec<Option<PathBuf>>>>,
+    }
 
     impl SessionConnector for FakeConnector {
         fn connect(
             &self,
-            _cfg: ConnectionConfig,
+            cfg: ConnectionConfig,
         ) -> TestFuture<Result<Box<dyn ManagedSession>, DaemonError>> {
-            Box::pin(async {
+            if let Ok(mut bundles) = self.bundles.lock() {
+                bundles.push(cfg.get_bundle_path().map(std::path::Path::to_path_buf));
+            }
+            let deploys = self.deploys.clone();
+            Box::pin(async move {
                 Ok(Box::new(FakeSession {
                     closed: Arc::new(AtomicBool::new(false)),
+                    deploys,
                 }) as Box<dyn ManagedSession>)
             })
         }
     }
 
     fn test_registry() -> Registry {
-        Registry::new(Arc::new(FakeConnector), Arc::new(NoopReconciliationSink))
+        Registry::new(
+            Arc::new(FakeConnector::default()),
+            Arc::new(NoopReconciliationSink),
+        )
+    }
+
+    fn connect_fields(cua_enabled: bool) -> ConnectFields {
+        ConnectFields {
+            name: Some("web".to_owned()),
+            host: "10.0.0.5".to_owned(),
+            port: None,
+            username: "user".to_owned(),
+            password: "pw".to_owned(),
+            domain: None,
+            accept_invalid_certs: false,
+            cua_enabled,
+            connect_ack: false,
+        }
+    }
+
+    /// Run `dispatch_connect` with a resolver that reports a bundle and counts calls.
+    async fn connect_with_bundle(
+        cua_enabled: bool,
+    ) -> (WireResponse, usize, usize, Vec<Option<PathBuf>>) {
+        let connector = FakeConnector::default();
+        let (deploys, bundles) = (connector.deploys.clone(), connector.bundles.clone());
+        let registry = Registry::new(Arc::new(connector), Arc::new(NoopReconciliationSink));
+        let resolver_calls = Arc::new(AtomicUsize::new(0));
+        let calls = resolver_calls.clone();
+        let outcome = dispatch_connect(&registry, connect_fields(cua_enabled), None, move || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Some(PathBuf::from("/bundle")))
+        })
+        .await;
+        let recorded = bundles.lock().map(|b| b.clone()).unwrap_or_default();
+        (
+            outcome.response,
+            resolver_calls.load(Ordering::SeqCst),
+            deploys.load(Ordering::SeqCst),
+            recorded,
+        )
+    }
+
+    #[tokio::test]
+    async fn cua_disabled_never_resolves_a_bundle_or_deploys_a_bridge() {
+        let (response, resolver_calls, deploys, bundles) = connect_with_bundle(false).await;
+        assert_eq!(resolver_calls, 0, "the bundle resolver must not run");
+        assert_eq!(deploys, 0, "no bridge may be deployed");
+        assert_eq!(bundles, vec![None], "cfg.bundle_path must stay unset");
+        assert!(matches!(
+            response,
+            WireResponse::Connected {
+                bridge_live: false,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn cua_enabled_deploys_the_bridge_when_a_bundle_resolves() {
+        let (response, resolver_calls, deploys, bundles) = connect_with_bundle(true).await;
+        assert_eq!(resolver_calls, 1);
+        assert_eq!(deploys, 1);
+        assert_eq!(bundles, vec![Some(PathBuf::from("/bundle"))]);
+        assert!(matches!(
+            response,
+            WireResponse::Connected {
+                bridge_live: true,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn cua_enabled_without_a_bundle_stays_native_only() {
+        let registry = test_registry();
+        let outcome = dispatch_connect(&registry, connect_fields(true), None, || Ok(None)).await;
+        assert!(matches!(
+            outcome.response,
+            WireResponse::Connected {
+                bridge_live: false,
+                ..
+            }
+        ));
     }
 
     fn connect_request(name: Option<&str>, host: &str) -> Request {
@@ -585,30 +726,8 @@ mod tests {
             password: "pw".to_owned(),
             domain: None,
             accept_invalid_certs: false,
+            cua_enabled: true,
             connect_ack: false,
-        }
-    }
-
-    #[tokio::test]
-    async fn connect_reports_bridge_liveness_matching_the_resolved_configuration() {
-        let registry = test_registry();
-        let response = dispatch(&registry, connect_request(Some("web"), "10.0.0.5")).await;
-        let expected_bridge_live = resolve_bundle_path()
-            .expect("test configuration resolves")
-            .is_some();
-        match response {
-            WireResponse::Connected {
-                session,
-                bridge_live,
-                ..
-            } => {
-                assert_eq!(session.as_str(), "web");
-                assert_eq!(
-                    bridge_live, expected_bridge_live,
-                    "the Connect response must distinguish a verified configured bridge from RDP-only mode"
-                );
-            }
-            other => panic!("expected Connected, got {other:?}"),
         }
     }
 

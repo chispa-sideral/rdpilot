@@ -10,15 +10,15 @@
 #![deny(clippy::expect_used)]
 
 mod cli;
-mod config_flags;
 mod connect;
 mod exit_codes;
+mod password_command;
 mod render;
 mod verbs;
 
 use clap::Parser;
 
-use cli::{Cli, Command, FileCmd, InputCmd, PerceiveCmd, SessionCmd};
+use cli::{Cli, Command, ConfigCmd, FileCmd, InputCmd, PerceiveCmd, SessionCmd};
 use exit_codes::{code_str_for, exit_code_for, CliError};
 
 #[tokio::main(flavor = "current_thread")]
@@ -75,6 +75,7 @@ async fn dispatch(command: Command, json: bool) -> Result<(), CliError> {
         Command::Get(args) | Command::File(FileCmd::Get(args)) => {
             verbs::file::get(args, json).await
         }
+        Command::Config(ConfigCmd::Resolve(args)) => verbs::config::resolve(args, json),
         Command::View(args) => verbs::view::view(args, json).await,
     }
 }

@@ -74,6 +74,7 @@ fn request(name: &str) -> Request {
         password: "test-password".to_owned(),
         domain: None,
         accept_invalid_certs: false,
+        cua_enabled: false,
         connect_ack: true,
     }
 }

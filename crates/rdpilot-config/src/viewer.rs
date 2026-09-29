@@ -143,24 +143,24 @@ mod tests {
     }
 
     /// An existing config file without `[viewer]` still loads, and a file
-    /// with `[viewer]` still loads the connection settings unchanged.
+    /// with `[viewer]` still loads the other settings unchanged.
     #[test]
-    fn viewer_table_does_not_disturb_the_connection_config(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    fn viewer_table_does_not_disturb_the_other_settings() -> Result<(), Box<dyn std::error::Error>>
+    {
         let without = Config::builder()
-            .add_source(File::from_str("host = \"a\"", FileFormat::Toml))
+            .add_source(File::from_str("share_root = \"a\"", FileFormat::Toml))
             .build()?;
         assert_eq!(deserialize_viewer(without)?, ViewerConfig::default());
 
         let with = Config::builder()
             .add_source(File::from_str(
-                "host = \"a\"\nport = 3390\n[viewer]\nbind = \"loopback\"",
+                "share_root = \"a\"\nbundle_path = \"b\"\n[viewer]\nbind = \"loopback\"",
                 FileFormat::Toml,
             ))
             .build()?;
         let resolved: crate::ResolvedConfig = with.try_deserialize()?;
-        assert_eq!(resolved.host.as_deref(), Some("a"));
-        assert_eq!(resolved.port, Some(3390));
+        assert_eq!(resolved.share_root.as_deref(), Some("a"));
+        assert_eq!(resolved.bundle_path.as_deref(), Some("b"));
         Ok(())
     }
 }
