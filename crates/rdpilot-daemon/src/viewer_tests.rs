@@ -1147,3 +1147,51 @@ fn viewer_modules_never_import_registry_dispatch_or_managed_session() {
         }
     }
 }
+
+// --- Session event log: server-side end -----------------------------------
+
+fn ended_markers(log: &crate::events::SessionEvents) -> usize {
+    log.after(0)
+        .events
+        .iter()
+        .filter(|e| e.kind == crate::events::EventKind::SessionEnded)
+        .count()
+}
+
+#[tokio::test]
+async fn a_server_side_end_records_one_session_ended_marker() {
+    let fx = Fixture::new();
+    let (id, frames) = fx.open("alpha").await;
+    let log = fx.registry.events(&id).unwrap();
+    frames.publish_solid(64, 48, 1);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(ended_markers(&log), 0);
+    frames.end();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(ended_markers(&log), 1);
+    let ended = log.after(0).events.pop().unwrap();
+    assert_eq!(ended.source, crate::events::EventSource::Cli);
+    // Removing the ended session adds nothing more.
+    fx.registry.close(&id).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(ended_markers(&log), 1);
+}
+
+#[tokio::test]
+async fn closing_a_session_stops_its_watcher_without_a_marker() {
+    let fx = Fixture::new();
+    let (id, frames) = fx.open("alpha").await;
+    let log = fx.registry.events(&id).unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    // The watcher holds the frame source while it runs.
+    let running = Arc::strong_count(&frames);
+    fx.registry.close(&id).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(ended_markers(&log), 0, "our own close is not a server end");
+    assert!(Arc::strong_count(&frames) < running, "watcher released");
+    assert_eq!(
+        Arc::strong_count(&log),
+        1,
+        "entry and watcher dropped the log"
+    );
+}

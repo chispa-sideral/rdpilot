@@ -29,6 +29,7 @@ use rdpilot_ipc::{
 };
 
 use crate::diagnostics::{Diagnostics, Stage};
+use crate::events::CliCall;
 use crate::registry::{ConnectLease, Registry};
 use crate::seams::DaemonError;
 
@@ -63,6 +64,13 @@ pub(crate) async fn dispatch_for_ipc(
     req: Request,
     diagnostics: Option<&Diagnostics>,
 ) -> DispatchOutcome {
+    // Native verbs are recorded by name only (never coordinates, keys or
+    // paths). Unknown or connecting sessions have no log and record nothing.
+    let cli_call = native_verb(&req).and_then(|(session, name)| {
+        registry
+            .events(session)
+            .map(|events| CliCall::start(events, name))
+    });
     let response = match req {
         Request::Connect {
             name,
@@ -255,9 +263,26 @@ pub(crate) async fn dispatch_for_ipc(
             DaemonError::Connect("ViewerStart requires a held IPC connection".into()).into(),
         ),
     };
+    if let Some(call) = cli_call {
+        call.finish(!matches!(response, WireResponse::Error(_)));
+    }
     DispatchOutcome {
         response,
         connect_lease: None,
+    }
+}
+
+/// The session and recorded name of a native verb, or `None` for requests
+/// that are not recorded.
+fn native_verb(req: &Request) -> Option<(&rdpilot_ipc::SessionId, &'static str)> {
+    match req {
+        Request::Screenshot { session } => Some((session, "screenshot")),
+        Request::Mouse { session, .. } => Some((session, "mouse")),
+        Request::Key { session, .. } => Some((session, "key")),
+        Request::DesktopSize { session } => Some((session, "desktop_size")),
+        Request::Put { session, .. } => Some((session, "put")),
+        Request::Get { session, .. } => Some((session, "get")),
+        _ => None,
     }
 }
 

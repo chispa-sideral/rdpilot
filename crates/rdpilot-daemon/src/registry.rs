@@ -271,6 +271,9 @@ impl Registry {
                 let frame = session.frame_source();
                 let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
                 let events = Arc::new(SessionEvents::new(&id, generation, frame.clone(), None));
+                let ended_watch = frame
+                    .clone()
+                    .map(|frame| crate::events::watch_session_end(frame, Arc::clone(&events)));
                 // A single wall-clock capture shared by the entry's
                 // `connected_since_wall`/`last_activity_wall` and the
                 // reconciliation sink's `record_open` call below — avoids
@@ -294,6 +297,7 @@ impl Registry {
                             cua_leases: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                             frame,
                             events,
+                            ended_watch,
                             last_activity_wall: now_wall.clone(),
                         },
                     );
@@ -329,7 +333,14 @@ impl Registry {
         };
 
         match entry {
-            Some(SessionEntry::Live { session, .. }) => {
+            Some(SessionEntry::Live {
+                session,
+                ended_watch,
+                ..
+            }) => {
+                // Our own close is not a server-side end: stop the watcher
+                // before the session loop is told to stop.
+                drop(ended_watch);
                 // Take the SIZED `Box` out of the `Option` (never the
                 // unsized `dyn ManagedSession` itself, which does not
                 // compile out of an `Arc` -- research Pitfall 2) and close
@@ -390,9 +401,15 @@ impl Registry {
             }
         };
 
-        let Some(SessionEntry::Live { session, .. }) = entry else {
+        let Some(SessionEntry::Live {
+            session,
+            ended_watch,
+            ..
+        }) = entry
+        else {
             return Ok(false);
         };
+        drop(ended_watch);
         if let Some(session) = session.lock().await.take() {
             session.close().await?;
         }
@@ -446,11 +463,13 @@ impl Registry {
 
     /// Capture the incarnation and acquire a stream under one short session lease.
     /// Neither the global registry lock nor the per-session lock escapes this call.
+    /// Also returns the session's event log, so the stream records without
+    /// touching the registry per message.
     pub(crate) async fn attach_cua(
         &self,
         id: &SessionId,
-    ) -> Result<(u64, Box<dyn crate::seams::ManagedCua>), DaemonError> {
-        let (generation, entry, cua_leases) = {
+    ) -> Result<(u64, Arc<SessionEvents>, Box<dyn crate::seams::ManagedCua>), DaemonError> {
+        let (generation, entry, cua_leases, events) = {
             #[allow(clippy::expect_used)]
             let guard = self.sessions.lock().expect("registry mutex poisoned");
             match guard.get(id) {
@@ -458,8 +477,14 @@ impl Registry {
                     generation,
                     session,
                     cua_leases,
+                    events,
                     ..
-                }) => (*generation, Arc::clone(session), Arc::clone(cua_leases)),
+                }) => (
+                    *generation,
+                    Arc::clone(session),
+                    Arc::clone(cua_leases),
+                    Arc::clone(events),
+                ),
                 Some(SessionEntry::Connecting { .. }) => {
                     return Err(DaemonError::StillConnecting(id.as_str().into()))
                 }
@@ -474,6 +499,7 @@ impl Registry {
         cua_leases.fetch_add(1, Ordering::Relaxed);
         Ok((
             generation,
+            events,
             Box::new(CuaLease {
                 inner: attachment,
                 active: cua_leases,

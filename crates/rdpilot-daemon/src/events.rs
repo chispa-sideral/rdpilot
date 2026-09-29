@@ -314,6 +314,223 @@ impl SessionEvents {
     }
 }
 
+/// A spawned watcher task, aborted when dropped.
+pub struct WatchTask(tokio::task::AbortHandle);
+
+impl Drop for WatchTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Record `session_ended` once when `frame` reports that the session loop
+/// ended. Runs on the multi-thread runtime (`tokio::spawn`), never on the
+/// IPC `LocalSet`; the returned handle aborts it.
+pub(crate) fn watch_session_end(
+    frame: Arc<dyn ViewFrameSource>,
+    events: Arc<SessionEvents>,
+) -> WatchTask {
+    let task = tokio::spawn(async move {
+        let mut after = 0;
+        loop {
+            let status = frame.changed(after).await;
+            if status.ended {
+                events.record(EventSource::Cli, EventKind::SessionEnded);
+                return;
+            }
+            if status.seq <= after {
+                // A source that answers without progress: do not spin.
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+            after = status.seq.max(after);
+        }
+    });
+    WatchTask(task.abort_handle())
+}
+
+/// A native verb in flight. `finish` records its outcome; dropping it
+/// unfinished (the caller went away) records `no_reply`.
+pub(crate) struct CliCall {
+    events: Arc<SessionEvents>,
+    call: u64,
+    name: &'static str,
+    started: Instant,
+    finished: bool,
+}
+
+impl CliCall {
+    pub(crate) fn start(events: Arc<SessionEvents>, name: &'static str) -> Self {
+        let started = Instant::now();
+        let call = events.call_started(EventSource::Cli, name);
+        Self {
+            events,
+            call,
+            name,
+            started,
+            finished: false,
+        }
+    }
+
+    pub(crate) fn finish(mut self, ok: bool) {
+        self.end(if ok {
+            CallOutcome::Ok
+        } else {
+            CallOutcome::Error
+        });
+    }
+
+    fn end(&mut self, outcome: CallOutcome) {
+        if !self.finished {
+            self.finished = true;
+            self.events.call_finished(
+                EventSource::Cli,
+                self.call,
+                self.name,
+                outcome,
+                self.started,
+            );
+        }
+    }
+}
+
+impl Drop for CliCall {
+    fn drop(&mut self) {
+        self.end(CallOutcome::NoReply);
+    }
+}
+
+/// Most unanswered Cua tool calls tracked per attachment. When full, the
+/// oldest is finished as `no_reply`.
+pub(crate) const CUA_PENDING_CAP: usize = 64;
+
+/// Recorded in place of a tool name that is not a short plain identifier.
+pub(crate) const INVALID_NAME: &str = "(invalid name)";
+
+struct PendingCall {
+    id: serde_json::Value,
+    call: u64,
+    name: String,
+    started: Instant,
+}
+
+/// Pairs Cua `tools/call` requests with their responses for one
+/// attachment. Only the tool name, outcome and timing are recorded; the
+/// JSON-RPC id is used for matching and never stored in the log. Messages
+/// are only read, never changed.
+pub(crate) struct CuaCallTracker {
+    events: Arc<SessionEvents>,
+    pending: VecDeque<PendingCall>,
+}
+
+impl CuaCallTracker {
+    pub(crate) fn new(events: Arc<SessionEvents>) -> Self {
+        Self {
+            events,
+            pending: VecDeque::new(),
+        }
+    }
+
+    /// A message from the caller towards Cua.
+    pub(crate) fn observe_request(&mut self, message: &serde_json::Value) {
+        let Some(obj) = message.as_object() else {
+            return; // batches and non-objects are not recorded
+        };
+        if obj.get("method").and_then(serde_json::Value::as_str) != Some("tools/call") {
+            return;
+        }
+        let Some(id) = obj.get("id").filter(|id| id.is_string() || id.is_number()) else {
+            return; // a notification: no answer will come
+        };
+        let name = obj
+            .get("params")
+            .and_then(|p| p.get("name"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|n| valid_tool_name(n))
+            .unwrap_or(INVALID_NAME)
+            .to_owned();
+        if let Some(pos) = self.pending.iter().position(|p| p.id == *id) {
+            if let Some(old) = self.pending.remove(pos) {
+                self.finish(old, CallOutcome::NoReply);
+            }
+        }
+        if self.pending.len() >= CUA_PENDING_CAP {
+            if let Some(old) = self.pending.pop_front() {
+                self.finish(old, CallOutcome::NoReply);
+            }
+        }
+        let started = Instant::now();
+        let call = self.events.call_started(EventSource::Cua, &name);
+        self.pending.push_back(PendingCall {
+            id: id.clone(),
+            call,
+            name,
+            started,
+        });
+    }
+
+    /// A message from Cua towards the caller.
+    pub(crate) fn observe_response(&mut self, message: &serde_json::Value) {
+        let Some(obj) = message.as_object() else {
+            return;
+        };
+        if obj.contains_key("method") {
+            return;
+        }
+        let Some(id) = obj.get("id") else {
+            return;
+        };
+        let is_error = obj.contains_key("error");
+        let Some(result) = obj.get("result").or(obj.get("error")) else {
+            return;
+        };
+        let Some(pos) = self.pending.iter().position(|p| p.id == *id) else {
+            return;
+        };
+        let Some(pending) = self.pending.remove(pos) else {
+            return;
+        };
+        let outcome = if is_error
+            || result.get("isError").and_then(serde_json::Value::as_bool) == Some(true)
+        {
+            CallOutcome::Error
+        } else {
+            CallOutcome::Ok
+        };
+        self.finish(pending, outcome);
+    }
+
+    /// The attachment ended: every unanswered call is finished as `no_reply`.
+    pub(crate) fn close(&mut self) {
+        while let Some(pending) = self.pending.pop_front() {
+            self.finish(pending, CallOutcome::NoReply);
+        }
+    }
+
+    fn finish(&self, pending: PendingCall, outcome: CallOutcome) {
+        self.events.call_finished(
+            EventSource::Cua,
+            pending.call,
+            &pending.name,
+            outcome,
+            pending.started,
+        );
+    }
+}
+
+impl Drop for CuaCallTracker {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
+/// 1..=64 characters of `[A-Za-z0-9_.-]`.
+fn valid_tool_name(name: &str) -> bool {
+    (1..=64).contains(&name.len())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
+}
+
 /// 128 random bits as hex. Falls back to time-derived bits if the OS
 /// source fails, so a log can always be created.
 fn new_log_id() -> String {
@@ -549,5 +766,230 @@ mod tests {
         assert_eq!(seen.len() as u64, total);
         assert!(seen.iter().all(|(h, _)| h == log.header()));
         assert!(seen.iter().map(|(_, e)| e.seq).eq(1..=total));
+    }
+
+    fn kinds(log: &SessionEvents) -> Vec<EventKind> {
+        log.after(0).events.into_iter().map(|e| e.kind).collect()
+    }
+
+    fn finished(log: &SessionEvents) -> Vec<(u64, String, CallOutcome)> {
+        kinds(log)
+            .into_iter()
+            .filter_map(|k| match k {
+                EventKind::CallFinished {
+                    call,
+                    name,
+                    outcome,
+                    ..
+                } => Some((call, name, outcome)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn call(id: serde_json::Value, name: &str) -> serde_json::Value {
+        serde_json::json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":name,"arguments":{}}})
+    }
+
+    #[test]
+    fn tracker_pairs_calls_with_ok_and_error_answers() {
+        let log = Arc::new(log());
+        let mut t = CuaCallTracker::new(Arc::clone(&log));
+        t.observe_request(&call(1.into(), "click"));
+        t.observe_request(&call("b".into(), "type_text"));
+        t.observe_request(&call(3.into(), "screenshot"));
+        // Out of order; an isError result and a JSON-RPC error.
+        t.observe_response(
+            &serde_json::json!({"jsonrpc":"2.0","id":"b","result":{"isError":true,"content":[]}}),
+        );
+        t.observe_response(
+            &serde_json::json!({"jsonrpc":"2.0","id":3,"error":{"code":-1,"message":"no"}}),
+        );
+        t.observe_response(&serde_json::json!({"jsonrpc":"2.0","id":1,"result":{"content":[]}}));
+        // Unmatched and repeated answers are ignored.
+        t.observe_response(&serde_json::json!({"jsonrpc":"2.0","id":1,"result":{}}));
+        t.observe_response(&serde_json::json!({"jsonrpc":"2.0","id":99,"result":{}}));
+        assert_eq!(
+            finished(&log),
+            vec![
+                (2, "type_text".into(), CallOutcome::Error),
+                (3, "screenshot".into(), CallOutcome::Error),
+                (1, "click".into(), CallOutcome::Ok),
+            ]
+        );
+        t.close();
+        assert_eq!(finished(&log).len(), 3);
+    }
+
+    #[test]
+    fn tracker_ignores_everything_but_client_tool_calls() {
+        let log = Arc::new(log());
+        let mut t = CuaCallTracker::new(Arc::clone(&log));
+        for message in [
+            serde_json::json!({"jsonrpc":"2.0","method":"tools/call","params":{"name":"click"}}),
+            serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
+            serde_json::json!([call(2.into(), "click")]),
+            serde_json::json!("tools/call"),
+            serde_json::json!({"jsonrpc":"2.0","id":null,"method":"tools/call","params":{"name":"click"}}),
+        ] {
+            t.observe_request(&message);
+        }
+        // A server-to-client request is not an answer.
+        t.observe_response(&serde_json::json!({"jsonrpc":"2.0","id":1,"method":"sampling/createMessage","result":{}}));
+        t.observe_response(&serde_json::json!([{"jsonrpc":"2.0","id":1,"result":{}}]));
+        t.close();
+        assert!(kinds(&log).is_empty());
+    }
+
+    #[test]
+    fn tracker_replaces_bad_names() {
+        let log = Arc::new(log());
+        let mut t = CuaCallTracker::new(Arc::clone(&log));
+        let long = "a".repeat(65);
+        t.observe_request(&call(1.into(), "ok.name-1_x"));
+        t.observe_request(&call(2.into(), "has space"));
+        t.observe_request(&call(3.into(), ""));
+        t.observe_request(&call(4.into(), &long));
+        t.observe_request(&call(5.into(), "caf\u{e9}"));
+        t.observe_request(&serde_json::json!({"id":6,"method":"tools/call","params":{"name":7}}));
+        t.observe_request(&serde_json::json!({"id":7,"method":"tools/call"}));
+        let names: Vec<String> = kinds(&log)
+            .into_iter()
+            .filter_map(|k| match k {
+                EventKind::CallStarted { name, .. } => Some(name),
+                _ => None,
+            })
+            .collect();
+        let mut expected = vec!["ok.name-1_x".to_owned()];
+        expected.extend(std::iter::repeat_n(INVALID_NAME.to_owned(), 6));
+        assert_eq!(names, expected);
+        assert!(valid_tool_name(&"a".repeat(64)));
+    }
+
+    #[test]
+    fn tracker_finishes_duplicates_overflow_and_leftovers_as_no_reply() {
+        let log = Arc::new(log());
+        let mut t = CuaCallTracker::new(Arc::clone(&log));
+        t.observe_request(&call(1.into(), "first"));
+        t.observe_request(&call(1.into(), "again"));
+        assert_eq!(
+            finished(&log),
+            vec![(1, "first".into(), CallOutcome::NoReply)]
+        );
+        t.observe_response(&serde_json::json!({"id":1,"result":{}}));
+        assert_eq!(finished(&log)[1], (2, "again".into(), CallOutcome::Ok));
+
+        for id in 0..CUA_PENDING_CAP as u64 {
+            t.observe_request(&call((100 + id).into(), "fill"));
+        }
+        assert_eq!(finished(&log).len(), 2);
+        t.observe_request(&call(1000.into(), "over"));
+        let done = finished(&log);
+        assert_eq!(done.len(), 3);
+        assert_eq!(done[2], (3, "fill".into(), CallOutcome::NoReply));
+        // The evicted id no longer matches.
+        t.observe_response(&serde_json::json!({"id":100,"result":{}}));
+        assert_eq!(finished(&log).len(), 3);
+
+        drop(t);
+        let done = finished(&log);
+        assert_eq!(done.len(), 3 + CUA_PENDING_CAP);
+        assert!(done[3..]
+            .iter()
+            .all(|(_, _, outcome)| *outcome == CallOutcome::NoReply));
+    }
+
+    #[test]
+    fn cli_call_records_outcome_or_no_reply_when_dropped() {
+        let log = Arc::new(log());
+        CliCall::start(Arc::clone(&log), "screenshot").finish(true);
+        CliCall::start(Arc::clone(&log), "put").finish(false);
+        drop(CliCall::start(Arc::clone(&log), "key"));
+        assert_eq!(
+            finished(&log),
+            vec![
+                (1, "screenshot".into(), CallOutcome::Ok),
+                (2, "put".into(), CallOutcome::Error),
+                (3, "key".into(), CallOutcome::NoReply),
+            ]
+        );
+        assert!(log
+            .after(0)
+            .events
+            .iter()
+            .all(|e| e.source == EventSource::Cli));
+    }
+
+    struct EndingFrames(watch::Sender<rdpilot::FrameStatus>);
+
+    impl ViewFrameSource for EndingFrames {
+        fn status(&self) -> rdpilot::FrameStatus {
+            *self.0.borrow()
+        }
+        fn changed(&self, after_seq: u64) -> crate::seams::SendFuture<'_, rdpilot::FrameStatus> {
+            let mut rx = self.0.subscribe();
+            Box::pin(async move {
+                let status = rx
+                    .wait_for(|s| s.seq > after_seq || s.ended)
+                    .await
+                    .map(|s| *s);
+                status.unwrap_or(rdpilot::FrameStatus {
+                    seq: after_seq,
+                    ended: true,
+                })
+            })
+        }
+        fn capture(&self) -> Option<(u64, rdpilot::Screenshot)> {
+            None
+        }
+    }
+
+    fn ended_count(log: &SessionEvents) -> usize {
+        kinds(log)
+            .iter()
+            .filter(|k| **k == EventKind::SessionEnded)
+            .count()
+    }
+
+    #[tokio::test]
+    async fn watcher_records_session_ended_once() {
+        let (tx, _) = watch::channel(rdpilot::FrameStatus::default());
+        let frames = Arc::new(EndingFrames(tx));
+        let log = Arc::new(SessionEvents::new(
+            &"alpha".parse().unwrap(),
+            1,
+            Some(Arc::clone(&frames) as Arc<dyn ViewFrameSource>),
+            None,
+        ));
+        let _watch = watch_session_end(frames.clone(), Arc::clone(&log));
+        frames.0.send_modify(|s| s.seq = 1);
+        frames.0.send_modify(|s| s.seq = 2);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(ended_count(&log), 0);
+        frames.0.send_modify(|s| s.ended = true);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        frames.0.send_modify(|s| s.seq = 3);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(ended_count(&log), 1);
+        let ended = log.after(0).events.pop().unwrap();
+        assert_eq!(ended.source, EventSource::Cli);
+        assert_eq!(ended.frame_seq, 2);
+    }
+
+    #[tokio::test]
+    async fn dropped_watcher_records_nothing() {
+        let (tx, _) = watch::channel(rdpilot::FrameStatus::default());
+        let frames = Arc::new(EndingFrames(tx));
+        let log = Arc::new(log());
+        let watch = watch_session_end(frames.clone(), Arc::clone(&log));
+        tokio::task::yield_now().await;
+        drop(watch);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        frames.0.send_modify(|s| s.ended = true);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(ended_count(&log), 0);
+        // The task released its references.
+        assert_eq!(Arc::strong_count(&log), 1);
+        assert_eq!(Arc::strong_count(&frames), 1);
     }
 }
