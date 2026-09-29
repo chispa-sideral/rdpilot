@@ -34,6 +34,12 @@ text box and the change is the typed marker; in fake mode it is the whole
 canvas and the change is the next synthetic colour. The check fails if no
 frame shows the change within 2 s. Live mode ends session b from the server
 side by dropping its RDP connection after its Cua calls finish.
+
+Activity strips: each call row (a successful and a failing Cua call, and a
+native verb) must appear within 2 s of the call returning, only in its own
+session's strip, and without argument values. Live mode keeps the MCP
+transcripts in the temp directory, since they carry the typed text, and
+fails if the typed text reaches any evidence file.
 """
 import argparse
 import asyncio
@@ -58,6 +64,8 @@ FAKE_SERVER_END = "e"
 # Typed text and argument values carry this; it must never reach the daemon
 # output, the page, an HTTP response or any evidence file.
 ARGUMENT_MARKER = "rdpilot-argument-marker-5c1e"
+# A tool Cua does not have: live mode's failing call.
+LIVE_FAILING_TOOL = "rdpilot_proof_missing_tool"
 # Acceptance: a change appears in the viewer within 2 s at default settings.
 CHANGE_BUDGET_MS = 2000
 # The viewer caps each session at 4 frames per second.
@@ -202,6 +210,19 @@ class FakeMcp:
                 await self.proc.wait()
 
 
+class McpRun:
+    """What the shared Cua MCP client needs from a run, with its transcripts in
+    the temp directory: they carry typed text, so they are not evidence."""
+
+    def __init__(self, proof):
+        self.proof = proof
+        self.output = proof.temp / "mcp"
+        self.output.mkdir(mode=0o700, exist_ok=True)
+
+    def __getattr__(self, name):
+        return getattr(self.proof, name)
+
+
 class Proof:
     def __init__(self, args):
         self.args = args
@@ -214,6 +235,8 @@ class Proof:
         self.output.mkdir(parents=True, exist_ok=False, mode=0o700)
         self.temp = Path(tempfile.mkdtemp(prefix="rdpilot-viewer-proof-"))
         self.run_id = uuid.uuid4().hex[:10]
+        # Live mode types this into the guest; it must reach no evidence file.
+        self.typed_marker = f"viewer-proof-{self.run_id}-{uuid.uuid4().hex[:8]}"
         self.token = None
         self.checks = []
         self.summary = {"mode": "fake" if self.fake else "live", "status": "running", "checks": self.checks, "unverified": []}
@@ -270,15 +293,14 @@ class Proof:
 
     def scan_evidence(self):
         needles = [s.encode() for s in self.secrets()] + ([self.token.encode()] if self.token else [])
-        if self.fake:
-            needles.append(ARGUMENT_MARKER.encode())
+        needles.append((ARGUMENT_MARKER if self.fake else self.typed_marker).encode())
         leaks = []
         for path in self.output.rglob("*"):
             if path.is_file():
                 data = path.read_bytes()
                 leaks += [path.name for needle in needles if needle and needle in data]
         require(not leaks, f"token, credential or argument marker found in evidence: {sorted(set(leaks))}")
-        self.check("evidence_contains_no_token_or_credentials", argument_marker_scanned=self.fake,
+        self.check("evidence_contains_no_token_or_credentials", argument_marker_scanned=True,
                    files=sum(1 for p in self.output.rglob('*') if p.is_file()))
 
     # --- rdpilot processes --------------------------------------------------
@@ -710,10 +732,13 @@ class Proof:
 
     # --- live mode ---------------------------------------------------------------
 
-    async def launch_fixture(self, target):
-        """A small WinForms window with a text box, driven through Cua MCP."""
+    def fixture_title(self, target):
+        return f"rdpilot-view-{self.run_id}-{target}"
+
+    async def launch_app(self, target):
+        """Launch a small WinForms window with a text box through Cua MCP."""
         e2e, endpoint = self.e2e, self.endpoints[target]
-        title = f"rdpilot-view-{self.run_id}-{target}"
+        title = self.fixture_title(target)
         script = r"""
 Add-Type -AssemblyName System.Windows.Forms
 $f=New-Object Windows.Forms.Form;$f.Text=TITLE;$f.Width=900;$f.Height=300;$f.StartPosition='CenterScreen'
@@ -721,7 +746,11 @@ $t=New-Object Windows.Forms.TextBox;$t.AccessibleName='Proof input';$t.Left=20;$
 $t.Font=New-Object Drawing.Font('Consolas',20)
 $f.Controls.Add($t);[Windows.Forms.Application]::Run($f)
 """.replace("TITLE", e2e.psquote(title))
-        await endpoint.tool("launch_app", e2e.powershell(script))
+        return await endpoint.tool("launch_app", e2e.powershell(script))
+
+    async def find_fixture(self, target):
+        e2e, endpoint = self.e2e, self.endpoints[target]
+        title = self.fixture_title(target)
         for _ in range(40):
             listing = e2e.structured(await endpoint.tool("list_windows"))
             for obj in e2e.objects(listing):
@@ -732,31 +761,90 @@ $f.Controls.Add($t);[Windows.Forms.Application]::Run($f)
             await asyncio.sleep(0.5)
         raise ProofError(f"{target}: fixture window not discoverable")
 
-    async def type_marker(self, target, window, text):
-        e2e, endpoint = self.e2e, self.endpoints[target]
-        result = await endpoint.tool("get_window_state", {**window, "include_screenshot": False, "include_accessibility_tree": True})
-        token = e2e.Run.element(e2e.structured(result), "Proof input")
-        await endpoint.tool("type_text", {**window, "element_token": token, "text": text})
+    def call_row(self, name, source, outcome, after):
+        """A predicate: a call row newer than call-row count `after` shows `name`, `source`, `outcome`."""
+        def predicate(rows):
+            calls = self.calls(rows)[after:]
+            return any(f" {name} {source} {outcome} " in f" {text} " and got == outcome for text, got in calls)
+        return predicate
+
+    async def live_call(self, page, target, name, source, outcome, call):
+        """Run `call` (a coroutine factory) and time its strip row from when it returns."""
+        before = len(self.calls(await self.strip(page, target)))
+        result = await call()
+        rows, latency = await self.timed_row(page, target, self.call_row(name, source, outcome, before),
+                                             f"{name} {source} {outcome}")
+        self.summary.setdefault("strip_row_latency_ms", {})[f"{target}.{name}"] = latency
+        return result, rows, latency
+
+    async def failing_tool_call(self, target, name, arguments):
+        """A Cua call expected to fail; returns how it failed. Nothing is logged."""
+        endpoint = self.endpoints[target]
+        endpoint.number += 1
+        request_id = f"{target}-{endpoint.number}"
+        await endpoint.send({"jsonrpc": "2.0", "id": request_id, "method": "tools/call",
+                             "params": {"name": name, "arguments": arguments}})
+        deadline = time.monotonic() + 30
+        while True:
+            line = await asyncio.wait_for(endpoint.proc.stdout.readline(), max(0.1, deadline - time.monotonic()))
+            require(line, f"{target}: MCP EOF during the failing call")
+            message = json.loads(line)
+            if "method" in message and "id" in message:
+                await endpoint.send({"jsonrpc": "2.0", "id": message["id"],
+                                     "error": {"code": -32601, "message": "client capability not offered"}})
+                continue
+            if message.get("id") == request_id and "method" not in message:
+                if "error" in message:
+                    return "jsonrpc_error"
+                require(message.get("result", {}).get("isError") is True, f"{target}: {name} did not fail")
+                return "is_error"
 
     async def live_flow(self, page):
         for target in TARGETS:
-            self.endpoints[target] = await self.e2e.Mcp(self, target).start()
-        window = await self.launch_fixture("a")
+            # MCP transcripts carry typed text and screenshots: keep them out
+            # of the evidence directory (they are deleted with the temp dir).
+            self.endpoints[target] = await self.e2e.Mcp(McpRun(self), target).start()
+        for target in TARGETS:
+            await self.wait_strip(page, target, lambda rows: any("Cua attached" in r["text"] for r in rows),
+                                  "Cua attached", 5)
+        _, _, launch_ms = await self.live_call(page, "a", "launch_app", "cua", "ok",
+                                               lambda: self.launch_app("a"))
+        window = await self.find_fixture("a")
         await asyncio.sleep(3)
         state = await self.status(page)
         region = self.marker_region(state["sessions"]["a"]["width"], state["sessions"]["a"]["height"])
         await self.canvas_baseline(page, "a", region, "05-a-canvas-before-typing.png")
-        marker = f"viewer-proof-{self.run_id}"
-        await self.type_marker("a", window, marker)
+        marker = self.typed_marker
+        window_state = await self.endpoints["a"].tool(
+            "get_window_state", {**window, "include_screenshot": False, "include_accessibility_tree": True})
+        element = self.e2e.Run.element(self.e2e.structured(window_state), "Proof input")
+        await self.endpoints["a"].tool("type_text", {**window, "element_token": element, "text": marker})
         # t0 is when the Cua call returns; the change counts only once a viewer
-        # frame shows the marker in the text box.
+        # frame shows the marker in the text box. The strip row is timed from
+        # the same moment, concurrently.
         t0 = time.time() * 1000
-        latency, samples = await self.wait_visible_change(page, "a", region, MARKER_MIN_CHANGED, t0)
+        type_rows = self.wait_strip(page, "a", self.call_row("type_text", "cua", "ok", 0), "type_text cua ok",
+                                    CHANGE_BUDGET_MS / 1000)
+        (latency, samples), _ = await asyncio.gather(
+            self.wait_visible_change(page, "a", region, MARKER_MIN_CHANGED, t0), type_rows)
+        type_ms = round(time.time() * 1000 - t0)
+        self.summary.setdefault("strip_row_latency_ms", {})["a.type_text"] = f"<= {type_ms}"
         await self.screenshot(page, "06-page-marker-visible.png")
         self.check("a.cua_change_visible_within_budget", latency_ms=round(latency), budget_ms=CHANGE_BUDGET_MS,
-                   marker=marker, region=region, samples=samples)
+                   marker="typed marker (value withheld)", region=region, samples=samples)
+        failure, _, fail_ms = await self.live_call(
+            page, "a", LIVE_FAILING_TOOL, "cua", "error",
+            lambda: self.failing_tool_call("a", LIVE_FAILING_TOOL, {"text": marker}))
         native = self.output / "06-a-native-screenshot.png"
-        await self.cli("screenshot", "--session", "a", "--output", str(native))
+        _, rows, native_ms = await self.live_call(
+            page, "a", "screenshot", "cli", "ok",
+            lambda: self.cli("screenshot", "--session", "a", "--output", str(native)))
+        await self.screenshot(page, "06b-a-activity-strip.png")
+        await self.check_live_strips(page, marker)
+        self.check("a.strip_shows_each_call_within_budget", budget_ms=CHANGE_BUDGET_MS,
+                   row_latency_ms={"launch_app": launch_ms, "type_text": f"<= {type_ms}",
+                                   LIVE_FAILING_TOOL: fail_ms, "screenshot": native_ms},
+                   failing_call=failure, strip=[r["text"] for r in rows])
         self.compare_optional(self.output / "a-canvas-change-visible.png", native)
         await self.sample_rate(page, "a", 10)
         self.frame_samples("a")
@@ -767,14 +855,59 @@ $f.Controls.Add($t);[Windows.Forms.Application]::Run($f)
         await self.endpoints["b"].stop()
         await self.relays["b"][0].drop()
         await self.wait_state(page, lambda s: s["sessions"]["b"]["state"] == "ended", "ended banner", 120)
+        ended = await self.session_ended_marker(page, "b")
         await self.screenshot(page, "07-b-server-ended-banner.png")
-        self.check("b.disconnect_shown", method="RDP connection dropped", banner="Disconnected (server ended the session)")
+        self.check("b.disconnect_shown", method="RDP connection dropped", banner="Disconnected (server ended the session)",
+                   session_ended_marker=ended)
         await self.endpoints["a"].stop()
         await self.cli("disconnect", "--session", "a")
         await self.wait_state(page, lambda s: s["sessions"]["a"]["state"] == "closed", "closed banner", 10)
         await self.wait_state(page, lambda s: "a" not in {x["id"] for x in s["list"]}, "list without a", 5)
         await self.screenshot(page, "08-a-session-closed-banner.png")
         self.check("a.close_shown_and_listed")
+
+    async def check_live_strips(self, page, marker):
+        """Each strip holds only its own session's calls, names only; the
+        events route answers per session with no argument values."""
+        strips = await self.strips(page)
+        names = {t: [r["text"] for r in rows] for t, rows in strips.items()}
+        blob = json.dumps(names)
+        require(marker not in blob, "typed text in a strip")
+        require(self.token not in await page.content(), "viewer token in the page DOM")
+        for secret in self.secrets():
+            require(secret not in await page.content(), "credential in the page DOM")
+        a_names = [n for n, _ in self.calls(strips["a"])]
+        for name in ("launch_app", "type_text", LIVE_FAILING_TOOL):
+            require(not any(f" {name} " in f" {n} " for n, _ in self.calls(strips["b"])),
+                    f"b shows a's {name} call: {names['b']}")
+            require(any(f" {name} cua " in f" {n} " for n in a_names), f"a: no {name} row: {names['a']}")
+        for target, rows in strips.items():
+            require(any("Cua attached" in r["text"] for r in rows), f"{target}: no Cua attached row")
+            seqs = [r["seq"] for r in rows]
+            require(seqs == sorted(seqs, reverse=True), f"{target}: strip not newest first: {seqs}")
+        results = {}
+        for target in TARGETS:
+            status, _, body = self.events_request(target)
+            require(status == 200, f"{target}: events HTTP {status}")
+            require(marker.encode() not in body, f"{target}: typed text in the events route")
+            events = json.loads(body)
+            require(events["header"]["session"] == target, f"{target}: events of another session")
+            results[target] = {"events": len(events["events"]), "latest": events["latest"]}
+            self.write(f"events-{target}.json", json.dumps(events, indent=2))
+        self.check("strips_per_session_names_only", strips=names, events=results)
+
+    async def session_ended_marker(self, page, target):
+        """The server-ended session shows its end marker in the strip or, if the
+        panel stopped polling first, in the events route."""
+        try:
+            await self.wait_strip(page, target, lambda rows: any("Session ended by the server" in r["text"]
+                                                                 for r in rows), "session ended marker", 10)
+            return "strip"
+        except ProofError:
+            status, _, body = self.events_request(target)
+            require(status == 200 and any(e["kind"] == "session_ended" for e in json.loads(body)["events"]),
+                    f"{target}: no session_ended event (events HTTP {status})")
+            return "events route"
 
     def compare_optional(self, canvas, native):
         """Extra evidence only: a threshold miss never fails the proof."""
