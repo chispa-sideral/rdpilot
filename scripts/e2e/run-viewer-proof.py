@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Proof run for the read-only live viewer (`rdpilot view`, Ticket 560).
 
-Fake mode (offline, no Windows; fake connector with synthetic frames):
+Fake mode (offline, no Windows; fake connector with synthetic frames and a
+fake Cua): four sessions in one tab, their activity strips driven by Cua tool
+calls through rdpilot-mcp and a native verb, then a panel closed and reopened:
   cargo build --workspace
   uv run --with playwright python3 scripts/e2e/run-viewer-proof.py --fake \
     --bin-dir target/debug --output /private/viewer-fake-proof
@@ -49,6 +51,13 @@ import uuid
 
 HERE = Path(__file__).resolve().parent
 TARGETS = ("a", "b")
+# Fake mode views the page's maximum of four sessions at once; "e" is the
+# server-ended session, connected later into a freed panel.
+FAKE_TARGETS = ("a", "b", "c", "d")
+FAKE_SERVER_END = "e"
+# Typed text and argument values carry this; it must never reach the daemon
+# output, the page, an HTTP response or any evidence file.
+ARGUMENT_MARKER = "rdpilot-argument-marker-5c1e"
 # Acceptance: a change appears in the viewer within 2 s at default settings.
 CHANGE_BUDGET_MS = 2000
 # The viewer caps each session at 4 frames per second.
@@ -58,6 +67,15 @@ PIXEL_DELTA = 48
 # The typed marker changes about 1400 text-box pixels at 1920x1080; a blinking
 # caret changes fewer than 100.
 MARKER_MIN_CHANGED = 200
+
+# One panel's activity strip as rendered, newest first.
+STRIP_JS = """
+(id) => Array.from(document.querySelectorAll(`.panel[data-session="${id}"] .strip li`)).map((li) => ({
+  kind: li.dataset.kind, seq: Number(li.dataset.seq), call: li.dataset.call || null,
+  outcome: li.dataset.outcome || null,
+  text: Array.from(li.querySelectorAll("span")).map((span) => span.textContent).join(" "),
+}))
+"""
 
 # Canvas helpers run in the page. `baseline` keeps the region pixels of one
 # session; `changed` counts region pixels that differ from them and returns the
@@ -134,6 +152,56 @@ def http_request(addr, path, host=None, headers=None, method="GET", timeout=20):
         conn.close()
 
 
+class FakeMcp:
+    """A minimal MCP client over `rdpilot-mcp` for the fake Cua (fake mode only).
+
+    It keeps no transcript: requests carry the argument marker, and only the
+    daemon's and the viewer's outputs are evidence.
+    """
+
+    def __init__(self, run, target):
+        self.run, self.target, self.proc, self.number = run, target, None, 0
+
+    async def start(self):
+        stderr = open(self.run.output / f"mcp-{self.target}.stderr", "w")
+        self.proc = await asyncio.create_subprocess_exec(
+            str(self.run.bin / "rdpilot-mcp"), "--session", self.target, env=self.run.env,
+            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=stderr)
+        stderr.close()
+        result = await self.request("initialize", {"protocolVersion": "2025-06-18", "capabilities": {},
+                                                   "clientInfo": {"name": "rdpilot-viewer-proof", "version": "1"}})
+        require("serverInfo" in result, f"{self.target}: fake Cua initialize")
+        await self.send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        require(len((await self.request("tools/list", {}))["tools"]) == 3, f"{self.target}: fake Cua tools")
+        return self
+
+    async def send(self, message):
+        self.proc.stdin.write(json.dumps(message).encode() + b"\n")
+        await asyncio.wait_for(self.proc.stdin.drain(), 5)
+
+    async def request(self, method, params, timeout=10):
+        self.number += 1
+        request_id = f"{self.target}-{self.number}"
+        await self.send({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params})
+        deadline = time.monotonic() + timeout
+        while True:
+            line = await asyncio.wait_for(self.proc.stdout.readline(), max(0.1, deadline - time.monotonic()))
+            require(line, f"{self.target}: MCP EOF during {method}")
+            message = json.loads(line)
+            if message.get("id") == request_id:
+                require("error" not in message, f"{self.target}: {method} error")
+                return message["result"]
+
+    async def stop(self):
+        if self.proc and self.proc.returncode is None:
+            self.proc.stdin.close()
+            try:
+                await asyncio.wait_for(self.proc.wait(), 10)
+            except asyncio.TimeoutError:
+                self.proc.kill()
+                await self.proc.wait()
+
+
 class Proof:
     def __init__(self, args):
         self.args = args
@@ -161,10 +229,12 @@ class Proof:
             "RDPILOT_DAEMON_EMPTY_GRACE_MS": "3600000",
         })
         if self.fake:
-            self.env.update({"RDPILOT_DAEMON_TEST_CONNECTOR": "1", "RDPILOT_DAEMON_TEST_FRAMES": "1"})
+            self.env.update({"RDPILOT_DAEMON_TEST_CONNECTOR": "1", "RDPILOT_DAEMON_TEST_FRAMES": "1",
+                             "RDPILOT_DAEMON_TEST_CUA": "1"})
         else:
             self.env["RDPILOT_BUNDLE_PATH"] = str(Path(args.bundle).resolve())
         self.e2e = None if self.fake else load_cua_e2e()
+        self.targets = FAKE_TARGETS if self.fake else TARGETS
         self.relays, self.endpoints = {}, {}
         self.daemon = self.viewer = None
         self.urls, self.notices = [], []
@@ -200,13 +270,16 @@ class Proof:
 
     def scan_evidence(self):
         needles = [s.encode() for s in self.secrets()] + ([self.token.encode()] if self.token else [])
+        if self.fake:
+            needles.append(ARGUMENT_MARKER.encode())
         leaks = []
         for path in self.output.rglob("*"):
             if path.is_file():
                 data = path.read_bytes()
                 leaks += [path.name for needle in needles if needle and needle in data]
-        require(not leaks, f"token or credential found in evidence: {sorted(set(leaks))}")
-        self.check("evidence_contains_no_token_or_credentials", files=sum(1 for p in self.output.rglob('*') if p.is_file()))
+        require(not leaks, f"token, credential or argument marker found in evidence: {sorted(set(leaks))}")
+        self.check("evidence_contains_no_token_or_credentials", argument_marker_scanned=self.fake,
+                   files=sum(1 for p in self.output.rglob('*') if p.is_file()))
 
     # --- rdpilot processes --------------------------------------------------
 
@@ -214,7 +287,7 @@ class Proof:
         env = dict(self.env)
         if self.fake:
             # The fake connector ends the frames of host "fake-server-end" after 4 s.
-            host = "fake-server-end" if target == "b" else f"fake-{target}"
+            host = "fake-server-end" if target == FAKE_SERVER_END else f"fake-{target}"
             env.update({"RDPILOT_HOST": host, "RDPILOT_USERNAME": "fake", "RDPILOT_PASSWORD": "fake"})
         else:
             env.update({"RDPILOT_" + key.upper(): str(value) for key, value in self.credentials[target].items()})
@@ -373,15 +446,17 @@ class Proof:
         page = await browser.new_page(viewport={"width": 1600, "height": 1000})
         await page.goto(url)
         require("token=" in page.url, "the token stays in the address bar")
-        state = await self.wait_state(page, lambda s: {x["id"] for x in s["list"]} >= set(TARGETS), "session list", 10)
-        for target in TARGETS:
+        targets = self.targets
+        state = await self.wait_state(page, lambda s: {x["id"] for x in s["list"]} >= set(targets), "session list", 10)
+        for target in targets:
             await page.click(f"button[data-session=\"{target}\"]")
-        state = await self.wait_state(page, lambda s: all(s["sessions"].get(t, {}).get("seq", 0) > 0 for t in TARGETS),
-                                      "first frames of both sessions", 15)
-        await self.screenshot(page, "01-session-list-and-both-sessions.png")
+        state = await self.wait_state(page, lambda s: all(s["sessions"].get(t, {}).get("seq", 0) > 0 for t in targets),
+                                      "first frames of every session", 15)
+        await self.screenshot(page, "01-session-list-and-sessions.png")
         listed = [{k: x.get(k) for k in ("id", "name", "host", "status", "connected_since", "last_activity")} for x in state["list"]]
-        self.check("session_list_and_two_sessions_viewed", via="tailnet" if self.tailnet_url() else "loopback",
-                   sessions=listed, frames={t: state["sessions"][t] for t in TARGETS})
+        self.check("session_list_and_sessions_viewed", via="tailnet" if self.tailnet_url() else "loopback",
+                   sessions=listed, frames={t: {k: state["sessions"][t][k] for k in ("seq", "width", "height", "state")}
+                                            for t in targets})
         return page
 
     async def sample_rate(self, page, target, seconds):
@@ -424,6 +499,15 @@ class Proof:
                 ("POST", "/api/sessions", None, {**bearer, "Content-Length": "0"}, 405),
                 ("authorised", "/api/sessions", None, bearer, 200),
             ]
+            if self.fake:
+                events = "/api/sessions/b/events?after=0"
+                cases += [
+                    ("events no token", events, None, {}, 403),
+                    ("events wrong token", events, None, {"Authorization": "Bearer " + "0" * 64}, 403),
+                    ("events foreign Origin", events, None, {**bearer, "Origin": "http://evil.example"}, 403),
+                    ("events wrong Host", events, "attacker.example", bearer, 403),
+                    ("events authorised", events, None, bearer, 200),
+                ]
             for name, path, host, headers, expected in cases:
                 method = "POST" if name == "POST" else "GET"
                 status, _, _ = http_request(addr, path, host=host, headers=headers, method=method)
@@ -432,6 +516,154 @@ class Proof:
         self.check("unauthorised_requests_rejected_on_every_bound_address", results=results)
         if not self.fake and not self.tailnet_url():
             self.summary["unverified"].append("rejection on the tailnet address (no tailnet address bound)")
+
+    # --- activity strip (fake mode) -------------------------------------------------
+
+    async def strip(self, page, target):
+        return await page.evaluate(STRIP_JS, target)
+
+    async def wait_strip(self, page, target, predicate, what, budget_s):
+        """Wait until `target`'s strip satisfies `predicate`; fail after `budget_s`."""
+        start = time.monotonic()
+        while True:
+            rows = await self.strip(page, target)
+            if predicate(rows):
+                return rows
+            require(time.monotonic() - start < budget_s,
+                    f"{target}: strip did not show {what} within {budget_s} s: {rows}")
+            await asyncio.sleep(0.02)
+
+    def events_request(self, target, after=0):
+        return http_request(self.addr(self.urls[0]), f"/api/sessions/{target}/events?after={after}",
+                            headers={"Authorization": f"Bearer {self.token}"})
+
+    @staticmethod
+    def calls(rows):
+        """(name text, outcome) of call rows, oldest first."""
+        return [(r["text"], r["outcome"]) for r in reversed(rows) if r["kind"] == "call"]
+
+    async def frames_advance(self, page, what):
+        """Every open panel shows a newer frame within the 2 s budget."""
+        before = {t: s["seq"] for t, s in (await self.status(page))["sessions"].items()}
+        start = time.monotonic()
+        state = await self.wait_state(
+            page, lambda s: all(s["sessions"].get(t, {}).get("seq", 0) > seq for t, seq in before.items()),
+            f"new frames on every panel ({what})", CHANGE_BUDGET_MS / 1000)
+        latency = round((time.monotonic() - start) * 1000)
+        require(latency <= CHANGE_BUDGET_MS, f"frames {what}: {latency} ms")
+        return {"panels": sorted(before), "latency_ms": latency,
+                "seq": {t: state["sessions"][t]["seq"] for t in before}}
+
+    async def timed_row(self, page, target, predicate, what):
+        start = time.monotonic()
+        rows = await self.wait_strip(page, target, predicate, what, CHANGE_BUDGET_MS / 1000)
+        return rows, round((time.monotonic() - start) * 1000)
+
+    async def strip_flow(self, page):
+        """Four panels in one tab: Cua calls on c and d, a native verb on a."""
+        timings = {}
+        secret_args = {"text": ARGUMENT_MARKER, "path": f"/tmp/{ARGUMENT_MARKER}"}
+        c, d = await FakeMcp(self, "c").start(), await FakeMcp(self, "d").start()
+        self.endpoints.update({"c": c, "d": d})
+        for target in ("c", "d"):
+            _, timings[f"{target}.cua_attached"] = await self.timed_row(
+                page, target, lambda rows: any("Cua attached" in r["text"] for r in rows), "Cua attached")
+
+        result = await c.request("tools/call", {"name": "echo", "arguments": secret_args})
+        require(not result.get("isError"), "fake echo failed")
+        _, timings["c.ok"] = await self.timed_row(page, "c", lambda rows: self.calls(rows)[-1:] and
+                                                  self.calls(rows)[-1][1] == "ok", "ok call")
+        result = await c.request("tools/call", {"name": "fail", "arguments": secret_args})
+        require(result.get("isError") is True, "fake fail did not fail")
+        _, timings["c.error"] = await self.timed_row(page, "c", lambda rows: len(self.calls(rows)) == 2 and
+                                                     self.calls(rows)[-1][1] == "error", "error call")
+
+        await d.request("tools/call", {"name": "echo", "arguments": secret_args})
+        await d.send({"jsonrpc": "2.0", "id": "d-held", "method": "tools/call",
+                      "params": {"name": "hold", "arguments": secret_args}})
+        _, timings["d.running"] = await self.timed_row(page, "d", lambda rows: [o for _, o in self.calls(rows)] ==
+                                                       ["ok", "running"], "held call running")
+        await d.stop()
+        _, timings["d.no_reply_and_detached"] = await self.timed_row(
+            page, "d", lambda rows: [o for _, o in self.calls(rows)] == ["ok", "no_reply"] and
+            any("Cua detached (" in r["text"] for r in rows), "held call no_reply and detach")
+
+        shot = self.temp / "native.png"
+        await self.cli("screenshot", "--session", "a", "--output", str(shot))
+        _, timings["a.native"] = await self.timed_row(page, "a", lambda rows: self.calls(rows)[-1:] and
+                                                      self.calls(rows)[-1][1] == "ok", "native verb")
+        await self.screenshot(page, "02-four-panels-with-strips.png")
+        self.check_strips(await self.strips(page), "before reopen")
+        frames = await self.frames_advance(page, "four panels")
+        self.check("strip_rows_in_order_within_budget", budget_ms=CHANGE_BUDGET_MS, row_latency_ms=timings,
+                   frames=frames)
+
+        # Close and reopen a panel: its in-flight requests are aborted, and the
+        # reopened panel rebuilds its strip and keeps up with the others.
+        await page.click('button[data-session="c"]')
+        await self.wait_state(page, lambda s: "c" not in s["sessions"], "panel c closed", 5)
+        await page.click('button[data-session="c"]')
+        await self.wait_state(page, lambda s: s["sessions"].get("c", {}).get("seq", 0) > 0, "panel c reopened", 5)
+        panels = await page.evaluate('() => document.querySelectorAll(\'.panel[data-session="c"]\').length')
+        require(panels == 1, f"c: {panels} panels after reopen")
+        await c.request("tools/call", {"name": "echo", "arguments": secret_args})
+        _, reopen_ms = await self.timed_row(page, "c", lambda rows: [o for _, o in self.calls(rows)] ==
+                                            ["ok", "error", "ok"], "call after reopen")
+        strips = await self.strips(page)
+        self.check_strips(strips, "after reopen", c_calls=3)
+        frames = await self.frames_advance(page, "after reopen")
+        await c.stop()
+        await self.screenshot(page, "03-after-reopen.png")
+        self.check("panel_close_and_reopen_keeps_strip_and_frames", row_latency_ms=reopen_ms, frames=frames,
+                   strips={t: [r["text"] for r in rows] for t, rows in strips.items()})
+        self.check_events_route()
+
+    async def strips(self, page):
+        return {t: await self.strip(page, t) for t in self.targets}
+
+    def check_strips(self, strips, when, c_calls=2):
+        names = {t: [r["text"] for r in rows] for t, rows in strips.items()}
+        blob = json.dumps(names)
+        require(ARGUMENT_MARKER not in blob and "/tmp/" not in blob, f"argument value in the strip ({when})")
+        require(self.calls(strips["b"]) == [], f"b: unexpected rows ({when}): {names['b']}")
+        a_calls = self.calls(strips["a"])
+        require([o for _, o in a_calls] == ["ok"] and " screenshot cli ok " in f" {a_calls[0][0]} ",
+                f"a: native row ({when}): {names['a']}")
+        c_outcomes = ["ok", "error", "ok"][:c_calls]
+        require([o for _, o in self.calls(strips["c"])] == c_outcomes and
+                all(" cua " in f" {n} " and n.count("echo") + n.count("fail") == 1 for n, _ in self.calls(strips["c"])),
+                f"c: rows ({when}): {names['c']}")
+        require([o for _, o in self.calls(strips["d"])] == ["ok", "no_reply"], f"d: rows ({when}): {names['d']}")
+        for target in ("a", "b"):
+            require(not any("Cua" in n for n in names[target]), f"{target}: another session's Cua rows ({when})")
+        for target, rows in strips.items():
+            seqs = [r["seq"] for r in rows]
+            require(seqs == sorted(seqs, reverse=True), f"{target}: strip not newest first ({when}): {seqs}")
+
+    def check_events_route(self):
+        """The events route answers at once, per session, without argument values."""
+        results = {}
+        for target in self.targets:
+            start = time.monotonic()
+            status, headers, body = self.events_request(target)
+            elapsed = round((time.monotonic() - start) * 1000)
+            require(status == 200, f"{target}: events HTTP {status}")
+            require(ARGUMENT_MARKER.encode() not in body and b"/tmp/" not in body, f"{target}: argument value in events")
+            page = json.loads(body)
+            require(page["header"]["session"] == target, f"{target}: events of another session")
+            status, _, empty = self.events_request(target, page["latest"])
+            require(status == 200 and json.loads(empty)["events"] == [], f"{target}: events after latest")
+            results[target] = {"events": len(page["events"]), "latest": page["latest"], "elapsed_ms": elapsed}
+            self.write(f"events-{target}.json", json.dumps(page, indent=2))
+        bearer = {"Authorization": f"Bearer {self.token}"}
+        addr = self.addr(self.urls[0])
+        for after in ("x", "-1"):
+            status, _, _ = http_request(addr, f"/api/sessions/a/events?after={after}", headers=bearer)
+            require(status == 400, f"after={after}: HTTP {status}")
+        status, _, _ = http_request(addr, "/api/sessions/a/events", headers={**bearer, "Content-Length": "0"},
+                                    method="POST")
+        require(status == 405, f"POST events: HTTP {status}")
+        self.check("events_route_immediate_and_per_session", sessions=results)
 
     # --- fake mode ---------------------------------------------------------------
 
@@ -453,15 +685,28 @@ class Proof:
         await self.wait_state(page, lambda s: s["sessions"]["a"]["width"] not in (0, first), "resize", 8)
         await self.screenshot(page, "03-resized.png")
         self.check("a.resize_shown")
-        # Session b's frames end 4 s after connect (a server-ended session).
-        await self.wait_state(page, lambda s: s["sessions"]["b"]["state"] == "ended", "ended banner", 10)
+        # A server-ended session: host "fake-server-end" ends its frames 4 s
+        # after connect. Free a panel for it first.
+        end = FAKE_SERVER_END
+        await page.click('button[data-session="b"]')
+        await self.wait_state(page, lambda s: "b" not in s["sessions"], "panel b closed", 5)
+        await self.connect(end)
+        await self.wait_state(page, lambda s: end in {x["id"] for x in s["list"]}, f"{end} listed", 5)
+        await page.click(f'button[data-session="{end}"]')
+        await self.wait_state(page, lambda s: s["sessions"][end]["state"] == "ended", "ended banner", 10)
+        rows = await self.wait_strip(page, end, lambda rows: any("Session ended by the server" in r["text"] for r in rows),
+                                     "session-ended marker", 2)
         await self.screenshot(page, "04-server-ended-banner.png")
-        self.check("b.disconnect_shown", banner="Disconnected (server ended the session)")
+        self.check(f"{end}.disconnect_shown", banner="Disconnected (server ended the session)",
+                   strip=[r["text"] for r in rows if r["kind"] == "marker"])
         await self.cli("disconnect", "--session", "a")
         await self.wait_state(page, lambda s: s["sessions"]["a"]["state"] == "closed", "closed banner", 5)
         await self.wait_state(page, lambda s: "a" not in {x["id"] for x in s["list"]}, "list without a", 5)
         await self.screenshot(page, "05-session-closed-banner.png")
-        self.check("a.close_shown_and_listed")
+        # The page stops asking for a closed session's events.
+        status, _, body = self.events_request("a")
+        require(status == 410 and json.loads(body) == {"state": "closed"}, f"a: events after close HTTP {status}")
+        self.check("a.close_shown_and_listed", events_status=status)
 
     # --- live mode ---------------------------------------------------------------
 
@@ -561,13 +806,14 @@ $f.Controls.Add($t);[Windows.Forms.Application]::Run($f)
             self.daemon = await asyncio.create_subprocess_exec(str(self.bin / "rdpilot-daemon"), env=self.env,
                                                                stdout=daemon_log, stderr=daemon_log)
             await asyncio.sleep(0.3)
-            for target in TARGETS:
+            for target in self.targets:
                 await self.connect(target)
             await self.start_viewer()
             async with async_playwright() as playwright:
                 browser = await playwright.chromium.launch(headless=True)
                 page = await self.open_page(browser)
                 if self.fake:
+                    await self.strip_flow(page)
                     await self.fake_flow(page)
                 else:
                     await self.live_flow(page)
@@ -585,7 +831,7 @@ $f.Controls.Add($t);[Windows.Forms.Application]::Run($f)
             if self.viewer and self.viewer.returncode is None:
                 self.viewer.kill()
                 await self.viewer.wait()
-            for target in TARGETS:
+            for target in self.targets + ((FAKE_SERVER_END,) if self.fake else ()):
                 try:
                     await self.cli("disconnect", "--session", target, timeout=15, allow_failure=True)
                 except (OSError, asyncio.TimeoutError, ValueError, ProofError):

@@ -4,7 +4,9 @@
 //! Routes (GET only, after [`AuthPolicy::check`]):
 //! - `/` — the viewer page (token in `?token=`);
 //! - `/api/sessions` — the session list;
-//! - `/api/sessions/{id}/frame?after=SEQ` — long-poll for a newer frame.
+//! - `/api/sessions/{id}/frame?after=SEQ` — long-poll for a newer frame;
+//! - `/api/sessions/{id}/events?after=SEQ` — the session's retained events
+//!   with `seq > SEQ`, answered immediately (never held open).
 //!
 //! Everything else is 404. No route accepts a body or reaches input, Cua,
 //! transfer, connect or disconnect.
@@ -41,7 +43,7 @@ use tokio::time::Sleep;
 use super::auth::{query_param, AuthPolicy};
 use super::frames::{FrameCache, FrameReply, FRAME_INTERVAL};
 use super::GateGuard;
-use crate::registry::ViewerRegistry;
+use crate::registry::{EventsLookup, ViewerRegistry};
 
 /// The page. `__NONCE__` is replaced per response.
 const PAGE: &str = include_str!("page.html");
@@ -192,7 +194,43 @@ pub(crate) async fn handle(req: Request<Incoming>, state: &ServerState) -> Respo
             .unwrap_or(0);
         return frame(state, &id, after).await;
     }
+    if let Some(id) = path
+        .strip_prefix("/api/sessions/")
+        .and_then(|rest| rest.strip_suffix("/events"))
+    {
+        let Some(id) = percent_decode(id)
+            .filter(|id| !id.contains('/'))
+            .and_then(|id| id.parse::<SessionId>().ok())
+        else {
+            return empty(StatusCode::NOT_FOUND);
+        };
+        let after = match query_param(parts.uri.query(), "after") {
+            None => 0,
+            Some(value) => match value.parse::<u64>() {
+                Ok(after) => after,
+                Err(_) => return empty(StatusCode::BAD_REQUEST),
+            },
+        };
+        return events(state, &id, after);
+    }
     empty(StatusCode::NOT_FOUND)
+}
+
+/// The retained events after `after`: 200 with the page, 204 while the
+/// session is still connecting (no log yet), 410 once it left the registry.
+fn events(state: &ServerState, id: &SessionId, after: u64) -> Response<Body> {
+    match state.registry.events(id) {
+        EventsLookup::Log(log) => match serde_json::to_vec(&log.after(after)) {
+            Ok(body) => response(StatusCode::OK, "application/json", Bytes::from(body)),
+            Err(_) => empty(StatusCode::INTERNAL_SERVER_ERROR),
+        },
+        EventsLookup::Unavailable => empty(StatusCode::NO_CONTENT),
+        EventsLookup::Closed => response(
+            StatusCode::GONE,
+            "application/json",
+            Bytes::from_static(br#"{"state":"closed"}"#),
+        ),
+    }
 }
 
 fn with_security_headers(mut response: Response<Body>) -> Response<Body> {

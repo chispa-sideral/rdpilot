@@ -86,6 +86,8 @@ impl ManagedSession for FramedSession {
 #[derive(Default)]
 struct FramedConnector {
     frames: Mutex<HashMap<String, Arc<SyntheticFrames>>>,
+    /// When set, the next connect waits for this before it completes.
+    hold: Mutex<Option<Arc<tokio::sync::Notify>>>,
 }
 
 impl SessionConnector for FramedConnector {
@@ -98,7 +100,13 @@ impl SessionConnector for FramedConnector {
             .lock()
             .unwrap()
             .insert(cfg.host().to_owned(), Arc::clone(&frames));
-        Box::pin(async move { Ok(Box::new(FramedSession { frames }) as Box<dyn ManagedSession>) })
+        let hold = self.hold.lock().unwrap().take();
+        Box::pin(async move {
+            if let Some(hold) = hold {
+                hold.notified().await;
+            }
+            Ok(Box::new(FramedSession { frames }) as Box<dyn ManagedSession>)
+        })
     }
 }
 
@@ -1194,4 +1202,225 @@ async fn closing_a_session_stops_its_watcher_without_a_marker() {
         1,
         "entry and watcher dropped the log"
     );
+}
+
+// --- Session event log: the events route -----------------------------------
+
+const MARKER: &str = "SECRET-MARKER-7f3a";
+
+fn events_path(id: &str, after: Option<&str>) -> String {
+    match after {
+        Some(after) => format!("/api/sessions/{id}/events?after={after}"),
+        None => format!("/api/sessions/{id}/events"),
+    }
+}
+
+fn json(reply: &Reply) -> serde_json::Value {
+    serde_json::from_slice(&reply.body).unwrap()
+}
+
+fn seqs(page: &serde_json::Value) -> Vec<u64> {
+    page["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["seq"].as_u64().unwrap())
+        .collect()
+}
+
+/// name, Host override, headers, expected status
+type EventsCase<'a> = (&'a str, Option<&'a str>, Vec<(&'a str, &'a str)>, u16);
+
+#[tokio::test]
+async fn events_route_applies_the_same_checks_on_every_bound_address() {
+    let fx = Fixture::new();
+    fx.open("alpha").await;
+    let server = two_address_server(&fx).await;
+    let path = events_path("alpha", Some("0"));
+    for &addr in &server.addrs {
+        let auth = bearer();
+        let own_origin = format!("http://{addr}");
+        let cases: Vec<EventsCase> = vec![
+            ("ok", None, vec![("Authorization", &auth)], 200),
+            (
+                "own origin",
+                None,
+                vec![("Authorization", &auth), ("Origin", &own_origin)],
+                200,
+            ),
+            ("no token", None, vec![], 403),
+            (
+                "wrong token",
+                None,
+                vec![("Authorization", "Bearer 00")],
+                403,
+            ),
+            (
+                "foreign origin",
+                None,
+                vec![("Authorization", &auth), ("Origin", "http://evil.example")],
+                403,
+            ),
+            (
+                "cross-site",
+                None,
+                vec![("Authorization", &auth), ("Sec-Fetch-Site", "cross-site")],
+                403,
+            ),
+            (
+                "rebinding host",
+                Some("attacker.example"),
+                vec![("Authorization", &auth)],
+                403,
+            ),
+        ];
+        for (name, host, headers, expected) in cases {
+            let reply = request(addr, "GET", &path, host, &headers).await;
+            assert_eq!(reply.status, expected, "{name} on {addr}");
+            if expected == 403 {
+                assert!(reply.body.is_empty(), "{name}: rejections carry no detail");
+            }
+        }
+        let token_in_query = format!("{path}&token={TOKEN}");
+        let reply = request(addr, "GET", &token_in_query, None, &[]).await;
+        assert_eq!(reply.status, 403, "token in query only on {addr}");
+        let with_body = [("Authorization", auth.as_str()), ("Content-Length", "0")];
+        for method in ["POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"] {
+            let reply = request(addr, method, &path, None, &with_body).await;
+            assert_eq!(reply.status, 405, "{method} on {addr}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn events_route_returns_only_the_requested_session_after_seq() {
+    use crate::events::{CallOutcome, EventSource};
+    let fx = Fixture::new();
+    let (alpha, _a) = fx.open("alpha").await;
+    let (beta, _b) = fx.open("beta").await;
+    let alpha_log = fx.registry.events(&alpha).unwrap();
+    let beta_log = fx.registry.events(&beta).unwrap();
+    let started = Instant::now();
+    let call = alpha_log.call_started(EventSource::Cua, "click");
+    alpha_log.call_finished(EventSource::Cua, call, "click", CallOutcome::Ok, started);
+    let call = beta_log.call_started(EventSource::Cli, "screenshot");
+    beta_log.call_finished(
+        EventSource::Cli,
+        call,
+        "screenshot",
+        CallOutcome::Error,
+        started,
+    );
+    beta_log.call_started(EventSource::Cli, "mouse");
+    let server = fx.serve_loopback(fast_limits()).await;
+    let addr = server.addr();
+
+    let reply = api(addr, &events_path("alpha", None)).await;
+    assert_eq!(reply.status, 200);
+    assert!(reply
+        .header("content-type")
+        .unwrap()
+        .starts_with("application/json"));
+    let page = json(&reply);
+    assert_eq!(seqs(&page), vec![1, 2]);
+    assert_eq!(page["latest"], 2);
+    assert_eq!(page["header"]["session"], "alpha");
+    assert_eq!(page["events"][0]["name"], "click");
+    assert!(!String::from_utf8_lossy(&reply.body).contains("screenshot"));
+
+    let page = json(&api(addr, &events_path("beta", Some("1"))).await);
+    assert_eq!(seqs(&page), vec![2, 3]);
+    assert_eq!(page["events"][0]["outcome"], "error");
+    assert_eq!(page["header"]["session"], "beta");
+
+    // Nothing newer: an empty page, answered at once rather than held.
+    let begun = Instant::now();
+    let reply = api(addr, &events_path("beta", Some("3"))).await;
+    assert!(begun.elapsed() < fast_limits().long_poll / 3);
+    assert_eq!(reply.status, 200);
+    assert_eq!(seqs(&json(&reply)), Vec::<u64>::new());
+
+    for bad in ["x", "-1", "", "1.5", "99999999999999999999999"] {
+        let reply = api(addr, &events_path("alpha", Some(bad))).await;
+        assert_eq!(reply.status, 400, "after={bad}");
+    }
+    let reply = api(addr, "/api/sessions/alpha/events/extra").await;
+    assert_eq!(reply.status, 404);
+    let reply = api(addr, "/api/sessions/nope/events").await;
+    assert_eq!(reply.status, 410);
+    assert_eq!(json(&reply), serde_json::json!({ "state": "closed" }));
+}
+
+#[tokio::test]
+async fn events_route_is_204_while_connecting_and_410_after_close() {
+    let fx = Fixture::new();
+    let hold = Arc::new(tokio::sync::Notify::new());
+    *fx.connector.hold.lock().unwrap() = Some(Arc::clone(&hold));
+    let server = fx.serve_loopback(fast_limits()).await;
+    let addr = server.addr();
+    let opening = fx.registry.open(
+        Some("slow".into()),
+        "slow".into(),
+        ConnectionConfig::new("slow", "user", "pw"),
+    );
+    let probe = async {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !list_ids(addr).await.contains(&"slow".to_owned()) {
+            assert!(Instant::now() < deadline, "session listed while connecting");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let reply = api(addr, &events_path("slow", Some("0"))).await;
+        hold.notify_one();
+        reply
+    };
+    let (opened, connecting) = tokio::join!(opening, probe);
+    let id = opened.unwrap();
+    assert_eq!(connecting.status, 204);
+    assert!(connecting.body.is_empty());
+
+    let live = api(addr, &events_path("slow", Some("0"))).await;
+    assert_eq!(live.status, 200);
+    fx.registry.close(&id).await.unwrap();
+    let closed = api(addr, &events_path("slow", Some("0"))).await;
+    assert_eq!(closed.status, 410);
+    assert_eq!(json(&closed), serde_json::json!({ "state": "closed" }));
+}
+
+/// Recorded calls carry names only: nothing a caller typed or passed
+/// reaches the events route.
+#[tokio::test]
+async fn events_route_never_carries_arguments_or_the_token() {
+    use crate::events::{CallOutcome, CuaCallTracker};
+    let fx = Fixture::new();
+    let (id, _frames) = fx.open("alpha").await;
+    let log = fx.registry.events(&id).unwrap();
+    let mut tracker = CuaCallTracker::new(Arc::clone(&log));
+    tracker.observe_request(&serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": MARKER,
+        "method": "tools/call",
+        "params": { "name": "type_text", "arguments": { "text": MARKER, "path": "/tmp/x" } },
+    }));
+    tracker.observe_response(&serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": MARKER,
+        "result": { "content": [{ "type": "text", "text": MARKER }] },
+    }));
+    let started = Instant::now();
+    let call = log.call_started(crate::events::EventSource::Cli, "put");
+    log.call_finished(
+        crate::events::EventSource::Cli,
+        call,
+        "put",
+        CallOutcome::Error,
+        started,
+    );
+    let server = fx.serve_loopback(fast_limits()).await;
+    let reply = api(server.addr(), &events_path("alpha", None)).await;
+    let body = String::from_utf8_lossy(&reply.body);
+    assert_eq!(reply.status, 200);
+    assert!(body.contains("type_text") && body.contains("put"));
+    for secret in [MARKER, TOKEN, "/tmp/x", "arguments"] {
+        assert!(!body.contains(secret), "{secret} leaked");
+    }
 }

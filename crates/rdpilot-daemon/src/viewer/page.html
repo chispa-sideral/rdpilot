@@ -19,6 +19,12 @@ canvas { max-width: 100%; height: auto; border: 1px solid #ddd; display: block; 
 .banner { position: absolute; left: 0; right: 0; top: 0; padding: .5rem; background: rgba(160, 0, 0, .85); color: #fff; font-weight: bold; }
 .hidden { display: none; }
 #error { color: #a00; }
+.strip { list-style: none; margin: .25rem 0 0 0; padding: 0; max-height: 12rem; overflow-y: auto; font-size: .8rem; border-top: 1px solid #ddd; }
+.strip li { padding: .1rem 0; border-bottom: 1px solid #eee; white-space: nowrap; }
+.strip span { display: inline-block; margin-right: .5rem; }
+.strip .marker { color: #555; font-style: italic; }
+.strip .outcome-error, .strip .outcome-no_reply { color: #a00; }
+.strip .outcome-running { color: #06c; }
 </style>
 </head>
 <body>
@@ -37,7 +43,7 @@ canvas { max-width: 100%; height: auto; border: 1px solid #ddd; display: block; 
   var params = new URLSearchParams(window.location.search);
   var token = params.get("token");
   // Read-only status for tests and the proof harness. It never holds the token.
-  var status = { sessions: {}, list: [], listUpdatedAt: 0 };
+  var status = { sessions: {}, list: [], listUpdatedAt: 0, stripRows: stripRows };
   window.rdpilotViewer = status;
   var panels = {};
   var errorEl = document.getElementById("error");
@@ -45,6 +51,71 @@ canvas { max-width: 100%; height: auto; border: 1px solid #ddd; display: block; 
   function authHeaders() { return { "Authorization": "Bearer " + token }; }
   function text(el, value) { el.textContent = value == null ? "" : String(value); return el; }
   function cell(row, value) { var td = document.createElement("td"); text(td, value); row.appendChild(td); return td; }
+
+  function pad(n, width) { var v = String(n); while (v.length < width) { v = "0" + v; } return v; }
+  function localTime(at) {
+    var d = new Date(at);
+    if (isNaN(d.getTime())) { return ""; }
+    return pad(d.getHours(), 2) + ":" + pad(d.getMinutes(), 2) + ":" + pad(d.getSeconds(), 2) + "." + pad(d.getMilliseconds(), 3);
+  }
+
+  // The activity strip as rows, newest first. A pure function of the log
+  // header and its events (live or recorded): one row per call, "running"
+  // until its finish is in the events, plus marker rows.
+  function stripRows(header, events) {
+    var finished = {};
+    events.forEach(function (e) { if (e.kind === "call_finished") { finished[e.call] = e; } });
+    var rows = [];
+    events.forEach(function (e) {
+      var row = { seq: e.seq, time: localTime(e.at), source: e.source, kind: "marker" };
+      if (e.kind === "call_started") {
+        var done = finished[e.call];
+        row.kind = "call";
+        row.call = e.call;
+        row.name = e.name;
+        row.outcome = done ? done.outcome : "running";
+        row.duration = done ? done.duration_ms + " ms" : "";
+      } else if (e.kind === "call_finished") {
+        return;
+      } else if (e.kind === "cua_attached") {
+        row.name = "Cua attached";
+      } else if (e.kind === "cua_detached") {
+        row.name = "Cua detached (" + e.reason + ")";
+      } else if (e.kind === "session_ended") {
+        row.name = "Session ended by the server";
+      } else {
+        row.name = "Other event";
+      }
+      rows.push(row);
+    });
+    if (events.length && events[0].seq > 1) {
+      rows.push({ seq: 0, time: "", source: "", kind: "marker", name: "Older events dropped" });
+    }
+    return rows.reverse();
+  }
+
+  function drawStrip(p) {
+    var rows = stripRows(p.header, p.events);
+    while (p.strip.firstChild) { p.strip.removeChild(p.strip.firstChild); }
+    rows.forEach(function (row) {
+      var li = document.createElement("li");
+      li.dataset.kind = row.kind;
+      li.dataset.seq = row.seq;
+      if (row.kind === "call") {
+        li.dataset.call = row.call;
+        li.dataset.outcome = row.outcome;
+      } else {
+        li.className = "marker";
+      }
+      [row.time, row.name, row.source, row.outcome, row.duration].forEach(function (value, i) {
+        if (value == null || value === "") { return; }
+        var span = document.createElement("span");
+        if (i === 3) { span.className = "outcome-" + value; }
+        li.appendChild(text(span, value));
+      });
+      p.strip.appendChild(li);
+    });
+  }
 
   function renderList(sessions) {
     var body = document.getElementById("sessions");
@@ -110,10 +181,21 @@ canvas { max-width: 100%; height: auto; border: 1px solid #ddd; display: block; 
     panel.appendChild(title);
     panel.appendChild(meta);
     panel.appendChild(stage);
+    var strip = document.createElement("ul");
+    strip.className = "strip";
+    panel.appendChild(strip);
     document.getElementById("panels").appendChild(panel);
-    var p = { id: id, el: panel, canvas: canvas, meta: meta, banner: banner, seq: 0, open: true };
+    var p = {
+      id: id, el: panel, canvas: canvas, meta: meta, banner: banner, strip: strip, seq: 0, open: true,
+      // Aborts this panel's in-flight requests when it closes.
+      ctrl: new AbortController(),
+      header: null, latest: 0, events: [], eventsDone: false
+    };
     panels[id] = p;
-    status.sessions[id] = { seq: 0, receivedAt: 0, width: 0, height: 0, state: "waiting" };
+    status.sessions[id] = {
+      seq: 0, receivedAt: 0, width: 0, height: 0, state: "waiting",
+      logId: null, latest: 0, events: []
+    };
     text(meta, "waiting for the first frame");
     pollFrame(p);
   }
@@ -122,6 +204,7 @@ canvas { max-width: 100%; height: auto; border: 1px solid #ddd; display: block; 
     var p = panels[id];
     if (!p) { return; }
     p.open = false;
+    p.ctrl.abort();
     delete panels[id];
     delete status.sessions[id];
     p.el.parentNode.removeChild(p.el);
@@ -136,7 +219,7 @@ canvas { max-width: 100%; height: auto; border: 1px solid #ddd; display: block; 
   function pollFrame(p) {
     if (!p.open) { return; }
     var url = "/api/sessions/" + encodeURIComponent(p.id) + "/frame?after=" + p.seq;
-    fetch(url, { headers: authHeaders(), cache: "no-store" })
+    fetch(url, { headers: authHeaders(), cache: "no-store", signal: p.ctrl.signal })
       .then(function (r) {
         if (r.status === 200) {
           var seq = Number(r.headers.get("X-Frame-Seq"));
@@ -153,7 +236,8 @@ canvas { max-width: 100%; height: auto; border: 1px solid #ddd; display: block; 
               p.canvas.getContext("2d").drawImage(bitmap, 0, 0);
               p.seq = seq;
               var now = Date.now();
-              status.sessions[p.id] = { seq: seq, receivedAt: now, width: width, height: height, state: "live" };
+              var st = status.sessions[p.id];
+              st.seq = seq; st.receivedAt = now; st.width = width; st.height = height; st.state = "live";
               text(p.meta, width + "x" + height + ", frame " + seq + ", " + new Date(now).toLocaleTimeString());
               return true;
             });
@@ -173,9 +257,54 @@ canvas { max-width: 100%; height: auto; border: 1px solid #ddd; display: block; 
       })
       .then(function (again) { if (again) { pollFrame(p); } })
       .catch(function (e) {
+        if (!p.open) { return; }
         text(p.meta, e.message + "; retrying");
         window.setTimeout(function () { pollFrame(p); }, 1000);
       });
+  }
+
+  // Fetch new events for one panel. Answers immediately; never held open.
+  function pollEvents(p) {
+    var after = p.latest;
+    var url = "/api/sessions/" + encodeURIComponent(p.id) + "/events?after=" + after;
+    return fetch(url, { headers: authHeaders(), cache: "no-store", signal: p.ctrl.signal })
+      .then(function (r) {
+        if (!p.open) { return; }
+        if (r.status === 410) { p.eventsDone = true; return; }
+        if (r.status !== 200) { return; }
+        return r.json().then(function (page) {
+          if (!p.open) { return; }
+          if (!p.header || page.header.log_id !== p.header.log_id) {
+            // A new incarnation: start over from its first event.
+            p.header = page.header;
+            p.events = [];
+            p.latest = 0;
+            if (after !== 0) { return; }
+          }
+          page.events.forEach(function (e) { if (e.seq > p.latest) { p.events.push(e); } });
+          if (p.events.length > 200) { p.events = p.events.slice(p.events.length - 200); }
+          p.latest = Math.max(p.latest, page.latest);
+          var st = status.sessions[p.id];
+          st.logId = p.header.log_id; st.latest = p.latest; st.events = p.events.slice();
+          drawStrip(p);
+        });
+      })
+      .catch(function () { /* aborted or unreachable; the next sweep retries */ });
+  }
+
+  // One sweep per tab: every 500 ms, one events request per open panel in
+  // turn, so at most one events request is in flight.
+  function sweep() {
+    var ids = Object.keys(panels);
+    var i = 0;
+    function next() {
+      if (i >= ids.length) { window.setTimeout(sweep, 500); return; }
+      var p = panels[ids[i]];
+      i += 1;
+      if (!p || !p.open || p.eventsDone) { next(); return; }
+      pollEvents(p).then(next, next);
+    }
+    next();
   }
 
   if (!token) {
@@ -183,6 +312,7 @@ canvas { max-width: 100%; height: auto; border: 1px solid #ddd; display: block; 
     return;
   }
   pollList();
+  sweep();
 })();
 </script>
 </body>
