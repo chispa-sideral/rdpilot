@@ -411,7 +411,7 @@ async fn bind_without_tailnet_is_loopback_only() {
     assert!(bound.notices.is_empty());
 }
 
-/// R9: the tailnet address is selected but its bind fails (not present on
+/// The tailnet address is selected but its bind fails (not present on
 /// this host here): the viewer serves on loopback only and says so.
 #[tokio::test]
 async fn tailnet_bind_failure_falls_back_to_loopback_with_a_notice() {
@@ -638,7 +638,7 @@ async fn every_bound_address_rejects_bad_token_origin_and_host() {
     }
 }
 
-/// R2: a top-level navigation to the printed URL from another site (a link
+/// A top-level navigation to the printed URL from another site (a link
 /// in a chat) is allowed; the API stays strict.
 #[tokio::test]
 async fn cross_site_document_navigation_is_allowed_but_api_is_not() {
@@ -1108,7 +1108,7 @@ async fn an_open_viewer_changes_neither_idle_reaping_nor_self_shutdown() {
 
 // --- Structure --------------------------------------------------------------
 
-/// R1: the viewer modules cannot reach control paths. They import only
+/// The viewer modules cannot reach control paths. They import only
 /// `ViewerRegistry`, `FrameLookup` and `ViewFrameSource`.
 #[test]
 fn viewer_modules_never_import_registry_dispatch_or_managed_session() {

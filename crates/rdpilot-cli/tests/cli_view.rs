@@ -414,7 +414,7 @@ fn view_serves_two_sessions_tracks_close_and_stops_on_ctrl_c() {
     });
 }
 
-/// R4: with `rdpilot view` running and a client long-polling one session's
+/// With `rdpilot view` running and a client long-polling one session's
 /// frames, that session is reaped at the same idle deadline as an unwatched
 /// one, and after the registry empties the daemon exits within the grace
 /// period and `rdpilot view` exits with the "daemon exited" message.
