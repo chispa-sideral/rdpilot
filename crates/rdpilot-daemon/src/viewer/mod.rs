@@ -1,4 +1,4 @@
-//! Read-only live viewer (Ticket 560): a small HTTP/1.1 server that shows
+//! Read-only live viewer: a small HTTP/1.1 server that shows
 //! the daemon's own session framebuffers in a browser.
 //!
 //! - Off by default. It starts only on an explicit `ViewerStart` IPC request

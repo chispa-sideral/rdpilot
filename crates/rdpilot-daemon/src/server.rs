@@ -33,8 +33,8 @@ use crate::lifecycle::{self, LifecycleConfig, ShutdownSignal};
 use crate::reconcile::{self, JsonReconciliationSink};
 use crate::registry::{Registry, ViewerRegistry};
 use crate::seams::{
-    BoxFuture, DaemonError, ManagedSession, RealConnector, ReconciliationSink, SessionConnector,
-    ViewFrameSource,
+    BoxFuture, DaemonError, ManagedCua, ManagedSession, RealConnector, ReconciliationSink,
+    SessionConnector, ViewFrameSource,
 };
 use crate::synthetic_frames::SyntheticFrames;
 use crate::viewer::ViewerGate;
@@ -73,6 +73,13 @@ const TEST_FRAMES_ENV: &str = "RDPILOT_DAEMON_TEST_FRAMES";
 /// ends its synthetic frame source 4 s after connect, standing in for an
 /// RDP session that the server ended (logoff, network loss).
 const TEST_FRAMES_SERVER_END_HOST: &str = "fake-server-end";
+
+/// When set (to any value) alongside [`TEST_CONNECTOR_ENV`], every
+/// [`FakeTestSession`] accepts Cua attachments served by [`FakeCua`], an
+/// in-process MCP responder, so `rdpilot-mcp` can drive tool calls offline.
+/// Read only when the fake connector is selected; unreachable by
+/// [`RealConnector`].
+const TEST_CUA_ENV: &str = "RDPILOT_DAEMON_TEST_CUA";
 
 /// The env var overriding [`RunConfig`]'s reconciliation-state sink path
 /// (test injection point -- production always resolves the platform
@@ -177,6 +184,7 @@ async fn run_inner(config: RunConfig) -> Result<(), DaemonError> {
             slow_ms,
             bootstrap_delay_ms,
             frames: std::env::var(TEST_FRAMES_ENV).is_ok(),
+            cua: std::env::var(TEST_CUA_ENV).is_ok(),
         })
     } else {
         Arc::new(RealConnector)
@@ -268,6 +276,8 @@ struct FakeTestSession {
     bootstrap_delay_ms: u64,
     /// Synthetic frames when [`TEST_FRAMES_ENV`] is set.
     frames: Option<Arc<SyntheticFrames>>,
+    /// Serve Cua attachments with [`FakeCua`] when [`TEST_CUA_ENV`] is set.
+    cua: bool,
 }
 
 impl ManagedSession for FakeTestSession {
@@ -286,6 +296,17 @@ impl ManagedSession for FakeTestSession {
 
     fn describe(&self) -> SessionLifecycle {
         SessionLifecycle::Live
+    }
+
+    fn attach_cua(&self) -> BoxFuture<'_, Result<Box<dyn ManagedCua>, DaemonError>> {
+        let cua = self.cua;
+        Box::pin(async move {
+            if cua {
+                Ok(Box::new(FakeCua::new()) as Box<dyn ManagedCua>)
+            } else {
+                Err(DaemonError::Connect("Cua bridge unavailable".into()))
+            }
+        })
     }
 
     // --- Canned operational stubs (Phase 13) --------------------------
@@ -379,6 +400,8 @@ struct FakeTestConnector {
     bootstrap_delay_ms: u64,
     /// See [`TEST_FRAMES_ENV`].
     frames: bool,
+    /// See [`TEST_CUA_ENV`].
+    cua: bool,
 }
 
 impl SessionConnector for FakeTestConnector {
@@ -388,6 +411,7 @@ impl SessionConnector for FakeTestConnector {
     ) -> Pin<Box<dyn Future<Output = Result<Box<dyn ManagedSession>, DaemonError>>>> {
         let slow_ms = self.slow_ms;
         let bootstrap_delay_ms = self.bootstrap_delay_ms;
+        let cua = self.cua;
         let frames = self.frames.then(|| {
             let frames = SyntheticFrames::new();
             frames.spawn_animation();
@@ -407,8 +431,106 @@ impl SessionConnector for FakeTestConnector {
                 slow_ms,
                 bootstrap_delay_ms,
                 frames,
+                cua,
             }) as Box<dyn ManagedSession>)
         })
+    }
+}
+
+/// The fake connector's in-process Cua: answers `initialize`, `tools/list`
+/// and `tools/call` like a minimal MCP server. Tool `fail` answers with
+/// `isError: true`, tool `hold` never answers, any other tool answers `ok`.
+/// Unknown methods get a JSON-RPC error; notifications and responses get
+/// nothing. Replies never echo arguments.
+struct FakeCua {
+    attachment: u64,
+    replies: tokio::sync::mpsc::UnboundedSender<serde_json::Value>,
+    queued: tokio::sync::mpsc::UnboundedReceiver<serde_json::Value>,
+    closed: bool,
+}
+
+impl FakeCua {
+    fn new() -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let (replies, queued) = tokio::sync::mpsc::unbounded_channel();
+        Self {
+            attachment: NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            replies,
+            queued,
+            closed: false,
+        }
+    }
+
+    fn reply(message: &serde_json::Value) -> Option<serde_json::Value> {
+        use serde_json::json;
+        let id = message.get("id")?.clone();
+        let method = message.get("method")?.as_str()?;
+        let params = message.get("params");
+        let result = match method {
+            "initialize" => json!({
+                "protocolVersion": params
+                    .and_then(|p| p.get("protocolVersion"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("2025-06-18"),
+                "capabilities": { "tools": {} },
+                "serverInfo": { "name": "rdpilot-fake-cua", "version": "0" },
+            }),
+            "tools/list" => {
+                let tools = ["echo", "fail", "hold"]
+                    .map(|name| json!({ "name": name, "inputSchema": { "type": "object" } }));
+                json!({ "tools": tools })
+            }
+            "tools/call" => match params.and_then(|p| p.get("name")).and_then(|n| n.as_str()) {
+                Some("hold") => return None,
+                Some("fail") => json!({
+                    "content": [{ "type": "text", "text": "failed" }],
+                    "isError": true,
+                }),
+                _ => json!({ "content": [{ "type": "text", "text": "ok" }] }),
+            },
+            _ => {
+                return Some(json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": { "code": -32601, "message": "method not found" },
+                }))
+            }
+        };
+        Some(json!({ "jsonrpc": "2.0", "id": id, "result": result }))
+    }
+}
+
+impl ManagedCua for FakeCua {
+    fn identity(&self) -> (u64, u64, u64) {
+        (1, 1, self.attachment)
+    }
+
+    fn send(&self, message: serde_json::Value) -> BoxFuture<'_, Result<(), DaemonError>> {
+        let reply = Self::reply(&message);
+        Box::pin(async move {
+            if self.closed {
+                return Err(DaemonError::Connect("Cua attachment closed".into()));
+            }
+            if let Some(reply) = reply {
+                let _ = self.replies.send(reply);
+            }
+            Ok(())
+        })
+    }
+
+    fn recv(&mut self) -> BoxFuture<'_, Result<Option<serde_json::Value>, DaemonError>> {
+        Box::pin(async move {
+            if self.closed {
+                return Ok(None);
+            }
+            Ok(self.queued.recv().await)
+        })
+    }
+
+    fn close(&mut self) -> BoxFuture<'_, Result<(), DaemonError>> {
+        self.closed = true;
+        self.queued.close();
+        Box::pin(async { Ok(()) })
     }
 }
 
@@ -489,6 +611,7 @@ mod tests {
             slow_ms: 0,
             bootstrap_delay_ms: 0,
             frames: false,
+            cua: false,
         });
         let registry = Arc::new(Registry::new(
             connector,
@@ -527,6 +650,7 @@ mod tests {
             slow_ms: 0,
             bootstrap_delay_ms: 0,
             frames: None,
+            cua: false,
         };
         let immediate_bound = Duration::from_millis(50);
 
@@ -563,6 +687,7 @@ mod tests {
             slow_ms: SLOW_MS,
             bootstrap_delay_ms: 0,
             frames: None,
+            cua: false,
         };
         let bound = Duration::from_millis(SLOW_MS);
 
@@ -595,5 +720,72 @@ mod tests {
             start.elapsed() < bound,
             "ping must stay immediate even when slow_ms is set"
         );
+    }
+
+    #[tokio::test]
+    async fn fake_cua_answers_like_a_minimal_mcp_server() {
+        use serde_json::json;
+        let session = FakeTestSession {
+            slow_ms: 0,
+            bootstrap_delay_ms: 0,
+            frames: None,
+            cua: true,
+        };
+        let mut cua = session.attach_cua().await.expect("fake Cua attaches");
+        let call = |id: u64, method: &str, params: serde_json::Value| json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
+        cua.send(call(
+            1,
+            "initialize",
+            json!({ "protocolVersion": "2025-06-18" }),
+        ))
+        .await
+        .unwrap();
+        cua.send(json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }))
+            .await
+            .unwrap();
+        cua.send(call(2, "tools/list", json!({}))).await.unwrap();
+        cua.send(call(3, "tools/call", json!({ "name": "hold" })))
+            .await
+            .unwrap();
+        cua.send(call(
+            4,
+            "tools/call",
+            json!({ "name": "echo", "arguments": { "text": "secret" } }),
+        ))
+        .await
+        .unwrap();
+        cua.send(call(5, "tools/call", json!({ "name": "fail" })))
+            .await
+            .unwrap();
+        cua.send(call(6, "nope", json!({}))).await.unwrap();
+        let mut replies = Vec::new();
+        for _ in 0..5 {
+            replies.push(cua.recv().await.unwrap().unwrap());
+        }
+        let ids: Vec<u64> = replies.iter().map(|r| r["id"].as_u64().unwrap()).collect();
+        assert_eq!(
+            ids,
+            vec![1, 2, 4, 5, 6],
+            "no reply to notifications or hold"
+        );
+        assert_eq!(
+            replies[0]["result"]["serverInfo"]["name"],
+            "rdpilot-fake-cua"
+        );
+        assert_eq!(replies[1]["result"]["tools"].as_array().unwrap().len(), 3);
+        assert!(!replies[2].to_string().contains("secret"));
+        assert_eq!(replies[3]["result"]["isError"], true);
+        assert_eq!(replies[4]["error"]["code"], -32601);
+        cua.close().await.unwrap();
+        assert!(cua.recv().await.unwrap().is_none());
+        assert!(cua.send(call(7, "tools/list", json!({}))).await.is_err());
+
+        let without = FakeTestSession {
+            slow_ms: 0,
+            bootstrap_delay_ms: 0,
+            frames: None,
+            cua: false,
+        };
+        assert!(without.attach_cua().await.is_err());
     }
 }

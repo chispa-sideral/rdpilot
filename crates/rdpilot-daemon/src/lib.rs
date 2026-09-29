@@ -21,6 +21,8 @@
 //!   DAEMON-02). Socket-path resolution and length-prefixed framing were
 //!   relocated into `rdpilot_ipc::transport` (Plan 13-01) so a thin
 //!   CLI/MCP client can share them without depending on this crate.
+//! - `events` — the per-session event log (tool and verb names, outcomes
+//!   and timings; never arguments or results) shown by the live viewer.
 //! - [`dispatch`] — `rdpilot-ipc::Request` -> registry ops -> `WireResponse`
 //!   (Plan 12-04).
 //! - [`reconcile`] — disk-persisted crash-restart reconciliation state
@@ -56,6 +58,7 @@
 mod diagnostics;
 mod dispatch;
 mod error_map;
+mod events;
 mod ipc;
 mod lifecycle;
 mod reconcile;

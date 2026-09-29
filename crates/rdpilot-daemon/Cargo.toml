@@ -30,7 +30,7 @@ thiserror = "2"
 # live current version at plan-execution time. Plan 13-06's CLI addition
 # reuses this exact pin.
 base64 = "0.22.1"
-# Read-only live viewer (Ticket 560): HTTP/1.1 server on explicit loopback and
+# Read-only live viewer: HTTP/1.1 server on explicit loopback and
 # tailnet addresses. hyper, hyper-util, http-body-util, bytes, subtle and
 # getrandom were already resolved in Cargo.lock (via ironrdp-tokio/reqwest and
 # the TLS chain) at these versions; promoting them to direct dependencies adds

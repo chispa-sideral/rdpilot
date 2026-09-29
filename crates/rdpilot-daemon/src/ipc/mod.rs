@@ -33,11 +33,13 @@ pub use unix::{accept_and_authorize, authorize_uid, bind};
 #[cfg(windows)]
 pub use windows::{accept_and_authorize, bind, socket_path};
 
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::diagnostics::{Diagnostics, Stage};
 use crate::dispatch::dispatch_for_ipc;
+use crate::events::{CuaCallTracker, EventKind, EventSource};
 use crate::registry::{Registry, ViewerRegistry};
 use crate::seams::ManagedCua;
 use crate::viewer::{ViewerGate, ViewerParams};
@@ -81,7 +83,7 @@ pub(crate) async fn serve_connection<S>(
         if let Request::CuaAttach { session } = req {
             match tokio::time::timeout(Duration::from_secs(30), registry.attach_cua(&session)).await
             {
-                Ok(Ok((session_incarnation, mut attachment))) => {
+                Ok(Ok((session_incarnation, events, mut attachment))) => {
                     let (bridge_generation, runtime_generation, attachment_id) =
                         attachment.identity();
                     let ack = WireResponse::CuaAttached {
@@ -95,14 +97,30 @@ pub(crate) async fn serve_connection<S>(
                             .await,
                         Ok(Ok(()))
                     ) {
-                        forward_cua(
+                        events.record(
+                            EventSource::Cua,
+                            EventKind::CuaAttached {
+                                attachment: attachment_id,
+                            },
+                        );
+                        let mut tracker = CuaCallTracker::new(Arc::clone(&events));
+                        let reason = forward_cua(
                             &mut stream,
                             attachment.as_mut(),
                             registry,
                             &session,
                             session_incarnation,
+                            &mut tracker,
                         )
                         .await;
+                        tracker.close();
+                        events.record(
+                            EventSource::Cua,
+                            EventKind::CuaDetached {
+                                attachment: attachment_id,
+                                reason: reason.into(),
+                            },
+                        );
                     }
                     let _ = tokio::time::timeout(STREAM_WRITE_TIMEOUT, attachment.close()).await;
                 }
@@ -237,7 +255,8 @@ async fn forward_cua<S: AsyncRead + AsyncWrite + Unpin>(
     registry: &Registry,
     session: &rdpilot_ipc::SessionId,
     incarnation: u64,
-) {
+    tracker: &mut CuaCallTracker,
+) -> &'static str {
     let (mut reader, mut writer) = tokio::io::split(stream);
     let reason = 'stream: loop {
         let incoming = read_frame::<_, CuaStreamFrame>(&mut reader);
@@ -248,6 +267,7 @@ async fn forward_cua<S: AsyncRead + AsyncWrite + Unpin>(
                     match frame {
                         Ok(CuaStreamFrame::Message {message}) => {
                             if !registry.touch_generation(session, incarnation) { break 'stream "target incarnation closed"; }
+                            tracker.observe_request(&message);
                             if !matches!(tokio::time::timeout(STREAM_WRITE_TIMEOUT, attachment.send(message)).await, Ok(Ok(()))) {
                                 break 'stream "Cua input unavailable";
                             }
@@ -260,6 +280,7 @@ async fn forward_cua<S: AsyncRead + AsyncWrite + Unpin>(
                     match output {
                         Ok(Some(message)) => {
                             if !registry.touch_generation(session, incarnation) { break 'stream "target incarnation closed"; }
+                            tracker.observe_response(&message);
                             let frame = CuaStreamFrame::Message { message };
                             if !matches!(tokio::time::timeout(STREAM_WRITE_TIMEOUT, write_frame(&mut writer, &frame)).await, Ok(Ok(()))) {
                                 break 'stream "caller output unavailable";
@@ -281,6 +302,7 @@ async fn forward_cua<S: AsyncRead + AsyncWrite + Unpin>(
         ),
     )
     .await;
+    reason
 }
 
 #[cfg(test)]

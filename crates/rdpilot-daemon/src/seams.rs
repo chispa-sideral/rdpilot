@@ -391,6 +391,12 @@ pub enum SessionEntry {
         /// Passive frame source for the live viewer, captured once at insert
         /// so viewer reads never take the per-session mutex above.
         frame: Option<Arc<dyn ViewFrameSource>>,
+        /// This incarnation's event log (names, outcomes and timings only).
+        /// Recording and reading never take the per-session mutex above.
+        events: Arc<crate::events::SessionEvents>,
+        /// The task that records the server ending the session (only with a
+        /// frame source). Aborted when the entry is removed or dropped.
+        ended_watch: Option<crate::events::WatchTask>,
         /// ISO-8601 wall-clock rendering of `last_activity`. No
         /// operational verb is wired to update activity yet in this phase
         /// (dispatch resolves them to a not-implemented error, Plan

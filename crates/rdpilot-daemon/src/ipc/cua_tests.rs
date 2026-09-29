@@ -96,10 +96,16 @@ impl ManagedSession for FakeSession {
     }
     fn upload_file(
         &self,
-        _: std::path::PathBuf,
+        local: std::path::PathBuf,
         _: String,
     ) -> BoxFuture<'_, Result<rdpilot::TransferOutcome, DaemonError>> {
-        Box::pin(async {
+        Box::pin(async move {
+            if local.to_string_lossy().contains("fail") {
+                return Err(DaemonError::Connect(format!(
+                    "cannot read {}",
+                    local.display()
+                )));
+            }
             Ok(rdpilot::TransferOutcome {
                 bytes_transferred: 0,
                 checksum: String::new(),
@@ -327,6 +333,218 @@ async fn failed_acknowledgement_releases_provisional_attachment() {
             assert_eq!(registry.live_idle_durations().len(), 1);
             let mut fresh = server(registry.clone(), 1024);
             attach(&mut fresh, id).await;
+        })
+        .await;
+}
+
+use crate::events::{CallOutcome, EventKind, EventSource};
+
+const MARKER: &str = "SECRET-MARKER-7f3a";
+
+async fn exchange(client: &mut tokio::io::DuplexStream, message: Value) {
+    write_frame(
+        client,
+        &CuaStreamFrame::Message {
+            message: message.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    let echoed = tokio::time::timeout(
+        Duration::from_secs(2),
+        read_frame::<_, CuaStreamFrame>(client),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(echoed, CuaStreamFrame::Message { message });
+}
+
+async fn wait_for_kind(log: &crate::events::SessionEvents, want: fn(&EventKind) -> bool) {
+    for _ in 0..200 {
+        if log.after(0).events.iter().any(|e| want(&e.kind)) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    panic!("event not recorded");
+}
+
+#[tokio::test]
+async fn cua_stream_records_calls_and_forwards_messages_unchanged() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let registry = Arc::new(Registry::new(
+                Arc::new(Connector),
+                Arc::new(NoopReconciliationSink),
+            ));
+            let id = open(&registry, "rec").await;
+            let log = registry.events(&id).unwrap();
+            assert!(log.after(0).events.is_empty(), "connect records nothing");
+            // A reader that never reads must not slow anything down.
+            let _stalled = log.subscribe();
+            let mut client = server(registry.clone(), 4096);
+            attach(&mut client, id.clone()).await;
+            let _ = read_frame::<_, CuaStreamFrame>(&mut client).await.unwrap();
+            let image = format!("{MARKER}{}", "A".repeat(200_000));
+            exchange(&mut client, json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"type_text","arguments":{"text":MARKER,"path":format!("C:\\{MARKER}.txt")}}})).await;
+            exchange(&mut client, json!({"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"image","data":image}]}})).await;
+            exchange(&mut client, json!({"jsonrpc":"2.0","id":"e","method":"tools/call","params":{"name":"click","arguments":{"x":1}}})).await;
+            exchange(&mut client, json!({"jsonrpc":"2.0","id":"e","error":{"code":-32000,"message":MARKER}})).await;
+            exchange(&mut client, json!({"jsonrpc":"2.0","method":"notifications/progress","params":{"note":MARKER}})).await;
+            exchange(&mut client, json!({"not":"json-rpc","id":[1,2]})).await;
+            exchange(&mut client, json!([{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"batch"}}])).await;
+            exchange(&mut client, json!({"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"wait"}})).await;
+            // Many round trips while the stalled reader holds its receiver.
+            tokio::time::timeout(Duration::from_secs(5), async {
+                for n in 0..60 {
+                    exchange(&mut client, json!({"jsonrpc":"2.0","id":format!("n{n}"),"method":"tools/call","params":{"name":"zoom"}})).await;
+                    exchange(&mut client, json!({"jsonrpc":"2.0","id":format!("n{n}"),"result":{}})).await;
+                }
+            })
+            .await
+            .expect("forwarding stalled");
+            write_frame(&mut client, &CuaStreamFrame::Closed { reason: MARKER.into() })
+                .await
+                .unwrap();
+            assert!(matches!(
+                read_frame::<_, CuaStreamFrame>(&mut client).await.unwrap(),
+                CuaStreamFrame::Closed { .. }
+            ));
+            wait_for_kind(&log, |k| matches!(k, EventKind::CuaDetached { .. })).await;
+
+            let page = log.after(0);
+            let kinds: Vec<&EventKind> = page.events.iter().map(|e| &e.kind).collect();
+            assert!(page.events.iter().all(|e| e.source == EventSource::Cua));
+            assert_eq!(kinds[0], &EventKind::CuaAttached { attachment: 303 });
+            assert!(matches!(kinds[1], EventKind::CallStarted { call: 1, name } if name == "type_text"));
+            assert!(matches!(kinds[2], EventKind::CallFinished { call: 1, outcome: CallOutcome::Ok, .. }));
+            assert!(matches!(kinds[3], EventKind::CallStarted { call: 2, name } if name == "click"));
+            assert!(matches!(kinds[4], EventKind::CallFinished { call: 2, outcome: CallOutcome::Error, .. }));
+            assert!(matches!(kinds[5], EventKind::CallStarted { call: 3, name } if name == "wait"));
+            let n = kinds.len();
+            assert!(matches!(kinds[n - 2], EventKind::CallFinished { call: 3, outcome: CallOutcome::NoReply, .. }));
+            assert_eq!(
+                kinds[n - 1],
+                &EventKind::CuaDetached {
+                    attachment: 303,
+                    reason: "caller closed or malformed frame".into()
+                }
+            );
+            let serialized = serde_json::to_string(&page).unwrap();
+            assert!(!serialized.contains(MARKER));
+            assert!(!serialized.contains("\"e\""), "JSON-RPC ids are never stored");
+        })
+        .await;
+}
+
+async fn native(registry: &Arc<Registry>, request: Request) -> WireResponse {
+    let mut client = server(registry.clone(), 1024);
+    write_frame(&mut client, &request).await.unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        read_frame::<_, WireResponse>(&mut client),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+}
+
+#[tokio::test]
+async fn native_verbs_record_name_outcome_and_duration_only() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let registry = Arc::new(Registry::new(
+                Arc::new(Connector),
+                Arc::new(NoopReconciliationSink),
+            ));
+            let id = open(&registry, "verbs").await;
+            let log = registry.events(&id).unwrap();
+            let session = || id.clone();
+            native(&registry, Request::List {}).await;
+            native(&registry, Request::Ping { session: session() }).await;
+            assert!(
+                log.after(0).events.is_empty(),
+                "list and ping record nothing"
+            );
+
+            native(&registry, Request::Screenshot { session: session() }).await;
+            native(
+                &registry,
+                Request::Mouse {
+                    session: session(),
+                    action: rdpilot_ipc::WireMouseAction::Move { x: 4242, y: 4343 },
+                },
+            )
+            .await;
+            native(
+                &registry,
+                Request::Key {
+                    session: session(),
+                    action: rdpilot_ipc::WireKeyAction::Type(MARKER.into()),
+                },
+            )
+            .await;
+            native(&registry, Request::DesktopSize { session: session() }).await;
+            let failed = native(
+                &registry,
+                Request::Put {
+                    session: session(),
+                    local_path: format!("/tmp/fail-{MARKER}"),
+                    remote_name: MARKER.into(),
+                },
+            )
+            .await;
+            assert!(matches!(failed, WireResponse::Error(e) if e.message.contains(MARKER)));
+            native(
+                &registry,
+                Request::Get {
+                    session: session(),
+                    remote_name: MARKER.into(),
+                    local_path: format!("/tmp/{MARKER}"),
+                },
+            )
+            .await;
+            // An unknown session records nothing anywhere.
+            native(
+                &registry,
+                Request::Screenshot {
+                    session: "missing".parse().unwrap(),
+                },
+            )
+            .await;
+
+            let page = log.after(0);
+            assert!(page.events.iter().all(|e| e.source == EventSource::Cli));
+            let finished: Vec<(String, CallOutcome)> = page
+                .events
+                .iter()
+                .filter_map(|e| match &e.kind {
+                    EventKind::CallFinished { name, outcome, .. } => Some((name.clone(), *outcome)),
+                    _ => None,
+                })
+                .collect();
+            let ok = CallOutcome::Ok;
+            assert_eq!(
+                finished,
+                vec![
+                    ("screenshot".into(), ok),
+                    ("mouse".into(), ok),
+                    ("key".into(), ok),
+                    ("desktop_size".into(), ok),
+                    ("put".into(), CallOutcome::Error),
+                    ("get".into(), ok),
+                ]
+            );
+            assert_eq!(page.events.len(), 12, "one start and one finish per verb");
+            let serialized = serde_json::to_string(&page).unwrap();
+            assert!(!serialized.contains(MARKER));
+            assert!(!serialized.contains("4242") && !serialized.contains("4343"));
+
+            let weak = Arc::downgrade(&log);
+            drop(log);
+            native(&registry, Request::Disconnect { session: session() }).await;
+            assert!(weak.upgrade().is_none(), "disconnect drops the log");
         })
         .await;
 }
