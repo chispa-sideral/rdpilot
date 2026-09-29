@@ -6,47 +6,53 @@
 
 use rdpilot_ipc::{Request, SessionLifecycle, WireResponse};
 
+use rdpilot_config::hosts::expand_password_command;
+
 use crate::cli::{ConnectArgs, SessionArg};
 use crate::connect::{connect_round_trip, round_trip};
 use crate::exit_codes::CliError;
+use crate::password_command;
 use crate::render::{print_json, render_table};
+use crate::verbs::config::resolve_target;
 
-/// `connect [--name] [config flags]` (D-29, SESSION-01).
+/// `connect <target> [-o KEYWORD=VALUE]... [-F FILE] [--name]` (D-29, SESSION-01).
 ///
 /// # Errors
 ///
-/// [`CliError::MissingConfig`] if host/username/password are absent after
-/// file->env->flag resolution; the daemon's own error (typically
-/// `DuplicateSession`) if `Connect` is rejected; or a transport/auto-start
-/// failure.
+/// [`CliError::Config`] for a hosts-file, target, option or PasswordCommand
+/// problem; [`CliError::MissingConfig`] if no `User` or no credential
+/// resolves; the daemon's own error (typically `DuplicateSession`) if
+/// `Connect` is rejected; or a transport/auto-start failure.
 pub async fn connect(args: ConnectArgs, json: bool) -> Result<(), CliError> {
-    let resolved = rdpilot_config::resolve(args.config.into_overrides())
-        .map_err(|e| CliError::MissingConfig(e.to_string()))?;
+    let host = resolve_target(&args.target)?;
+    let label = host.target().to_string();
 
-    let host = resolved.host.ok_or_else(|| {
-        CliError::MissingConfig(
-            "host is required (config file, RDPILOT_HOST, or --host)".to_owned(),
-        )
+    let username = host.user().ok_or_else(|| {
+        CliError::MissingConfig(format!(
+            "no User for {label} (set User in the hosts file, use -o User=..., or rdp://user@host)"
+        ))
     })?;
-    let username = resolved.username.ok_or_else(|| {
-        CliError::MissingConfig(
-            "username is required (config file, RDPILOT_USERNAME, or --username)".to_owned(),
-        )
-    })?;
-    let password = resolved.password.ok_or_else(|| {
-        CliError::MissingConfig(
-            "password is required (config file, RDPILOT_PASSWORD, or --password)".to_owned(),
-        )
-    })?;
+    let password = if let Some(password) = host.password() {
+        password
+    } else if host.password_command().is_some() {
+        let command = expand_password_command(&host, &|k| std::env::var(k).ok())
+            .map_err(|e| CliError::Config(e.to_string()))?;
+        password_command::run(&command, &label, password_command::TIMEOUT).await?
+    } else {
+        return Err(CliError::MissingConfig(format!(
+            "no Password or PasswordCommand for {label}"
+        )));
+    };
 
     let req = Request::Connect {
         name: args.name,
-        host,
-        port: resolved.port,
-        username,
-        password,
-        domain: resolved.domain,
-        accept_invalid_certs: resolved.accept_invalid_certs,
+        host: host.address().to_owned(),
+        port: host.port(),
+        username: username.to_owned(),
+        password: password.expose().to_owned(),
+        domain: host.domain().map(str::to_owned),
+        accept_invalid_certs: host.accept_invalid_certs(),
+        cua_enabled: host.cua_enabled(),
         connect_ack: true,
     };
 

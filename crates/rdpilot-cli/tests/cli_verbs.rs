@@ -56,6 +56,10 @@ fn run_cli(
     let status = Command::new(&bin)
         .args(args)
         .env("XDG_RUNTIME_DIR", xdg_runtime_dir)
+        // Keep a developer\'s real hosts file and config.toml out of the test.
+        .env("XDG_CONFIG_HOME", xdg_runtime_dir.join("config"))
+        .env("HOME", xdg_runtime_dir)
+        .env("APPDATA", xdg_runtime_dir.join("appdata"))
         .env("RDPILOT_DAEMON_SINK_PATH", sink_path)
         .env("RDPILOT_DAEMON_TEST_CONNECTOR", "1")
         // Long enough that neither the idle reaper nor the empty-registry
@@ -97,18 +101,7 @@ fn every_cli_02_verb_round_trips_against_the_canned_fake_session() {
 
     // --- connect (auto-starts the daemon) -> Connected, reserving session id "cli02" ---
     let connect_run = run_cli(
-        &[
-            "connect",
-            "--name",
-            "cli02",
-            "--host",
-            "10.0.0.5",
-            "--username",
-            "u",
-            "--password",
-            "p",
-            "--json",
-        ],
+        &["connect", "--name", "cli02", "rdp://u:p@10.0.0.5", "--json"],
         &xdg_runtime_dir,
         &sink_path,
         &capture_dir,

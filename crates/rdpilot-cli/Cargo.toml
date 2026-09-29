@@ -17,7 +17,7 @@ serde = "1"
 rdpilot-ipc = { path = "../rdpilot-ipc" }
 rdpilot-config = { path = "../rdpilot-config" }
 # `signal`: Ctrl-C ends `rdpilot view`.
-tokio = { version = "1", features = ["rt", "net", "io-util", "macros", "time", "signal"] }
+tokio = { version = "1", features = ["rt", "net", "io-util", "macros", "time", "signal", "process"] }
 serde_json = "1"
 # Screenshot PNG base64-decode on the CLI side (Plan 13-06). Legitimacy gate
 # already satisfied by Plan 13-04 Task 2 (slopcheck [OK], crates.io identity

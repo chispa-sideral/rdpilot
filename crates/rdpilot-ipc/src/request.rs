@@ -12,6 +12,9 @@ pub enum Request {
         password: String,
         domain: Option<String>,
         accept_invalid_certs: bool,
+        /// Deploy the Cua bridge for this session. Required (no default): an
+        /// older daemon would drop it and deploy the bridge for `CuaEnabled no`.
+        cua_enabled: bool,
         #[serde(default)]
         connect_ack: bool,
     },
@@ -109,6 +112,27 @@ mod tests {
         ] {
             assert!(serde_json::from_value::<Request>(serde_json::json!({"op":op})).is_err());
         }
+    }
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn connect_round_trips_cua_enabled_and_requires_it() {
+        let json = serde_json::json!({
+            "op": "Connect", "name": null, "host": "h", "port": null,
+            "username": "u", "password": "p", "domain": null,
+            "accept_invalid_certs": false, "cua_enabled": false,
+        });
+        let req: Request = serde_json::from_value(json.clone()).unwrap();
+        assert!(matches!(
+            req,
+            Request::Connect {
+                cua_enabled: false,
+                ..
+            }
+        ));
+        assert_eq!(serde_json::to_value(&req).unwrap()["cua_enabled"], false);
+        let mut missing = json;
+        missing.as_object_mut().unwrap().remove("cua_enabled");
+        assert!(serde_json::from_value::<Request>(missing).is_err());
     }
     #[test]
     #[allow(clippy::unwrap_used)]

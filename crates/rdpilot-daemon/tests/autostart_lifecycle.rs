@@ -157,6 +157,7 @@ async fn daemon_auto_starts_on_first_connect_and_self_exits_once_the_registry_em
         password: "pw".to_owned(),
         domain: None,
         accept_invalid_certs: false,
+        cua_enabled: false,
         connect_ack: false,
     };
     write_frame(&mut stream, &connect_req)

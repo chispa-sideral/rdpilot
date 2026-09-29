@@ -4,8 +4,6 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
-use crate::config_flags::ConfigFlags;
-
 /// `rdpilot` — a thin CLI client for the `rdpilot-daemon` session registry.
 #[derive(Debug, Parser)]
 #[command(
@@ -59,6 +57,10 @@ pub enum Command {
     #[command(subcommand)]
     File(FileCmd),
 
+    /// Inspect host configuration (`rdpilot config resolve ...`).
+    #[command(subcommand)]
+    Config(ConfigCmd),
+
     /// Start the read-only live viewer for the running daemon and print its
     /// URLs. Runs until Ctrl-C; never starts a daemon.
     View(ViewArgs),
@@ -96,16 +98,42 @@ pub enum SessionCmd {
     Disconnect(SessionArg),
 }
 
-/// Arguments for `connect` (D-29, SESSION-01): an optional caller-supplied
-/// session name plus the layered config-override flags.
+/// Which host to configure, and how: an alias or `rdp://` URL, plus overrides.
+#[derive(Debug, Args)]
+pub struct TargetArgs {
+    /// Host alias from the hosts file, or an `rdp://[domain\\]user[:password]@host[:port]`
+    /// URL (`rdps://` is the same). A password in a URL is visible in `ps` and shell
+    /// history; prefer `PasswordCommand`.
+    pub target: String,
+
+    /// Override a setting, ssh-style (`-o Keyword=value`). Repeatable; the first
+    /// value obtained for a setting wins, so `-o` beats the hosts file.
+    #[arg(short = 'o', long = "option", value_name = "KEYWORD=VALUE")]
+    pub options: Vec<String>,
+
+    /// Read this hosts file instead of the user's (must exist).
+    #[arg(short = 'F', value_name = "FILE")]
+    pub file: Option<PathBuf>,
+}
+
+/// Arguments for `connect` (D-29, SESSION-01): the target, its overrides and
+/// an optional caller-supplied session name.
 #[derive(Debug, Args)]
 pub struct ConnectArgs {
+    #[command(flatten)]
+    pub target: TargetArgs,
+
     /// Caller-supplied session name; omit for an auto-generated id (D-29).
     #[arg(long)]
     pub name: Option<String>,
+}
 
-    #[command(flatten)]
-    pub config: ConfigFlags,
+/// The `config` subcommand family.
+#[derive(Debug, Subcommand)]
+pub enum ConfigCmd {
+    /// Show the settings a target resolves to, with where each came from.
+    /// Never runs a `PasswordCommand` and never prints a password.
+    Resolve(TargetArgs),
 }
 
 /// A required `--session` field on every session-scoped leaf args struct
@@ -308,4 +336,62 @@ pub struct GetArgs {
         help = "Overwrite an existing local destination (without it, a pre-existing --local path is refused)"
     )]
     pub force: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
+        let mut argv = vec!["rdpilot"];
+        argv.extend_from_slice(args);
+        Cli::try_parse_from(argv)
+    }
+
+    #[test]
+    fn connect_takes_a_target_options_and_a_hosts_file() {
+        let cli = parse(&[
+            "connect",
+            "web1",
+            "-o",
+            "Port=3390",
+            "-o",
+            "User=a",
+            "-F",
+            "h.conf",
+            "--name",
+            "n",
+        ])
+        .expect("parses");
+        let Command::Connect(args) = cli.command else {
+            panic!("expected connect");
+        };
+        assert_eq!(args.target.target, "web1");
+        assert_eq!(args.target.options, ["Port=3390", "User=a"]);
+        assert_eq!(args.target.file, Some(PathBuf::from("h.conf")));
+        assert_eq!(args.name.as_deref(), Some("n"));
+    }
+
+    #[test]
+    fn grouped_and_config_forms_parse() {
+        assert!(parse(&["session", "connect", "rdp://u@h"]).is_ok());
+        assert!(parse(&["config", "resolve", "web1", "-o", "CuaEnabled=no"]).is_ok());
+        assert!(parse(&["connect"]).is_err(), "the target is required");
+    }
+
+    #[test]
+    fn removed_connection_flags_are_rejected() {
+        for flag in [
+            &["--host", "h"][..],
+            &["--port", "1"],
+            &["--username", "u"],
+            &["--password", "p"],
+            &["--domain", "d"],
+            &["--accept-invalid-certs"],
+        ] {
+            let mut args = vec!["connect", "web1"];
+            args.extend_from_slice(flag);
+            assert!(parse(&args).is_err(), "{flag:?} must be rejected");
+        }
+    }
 }

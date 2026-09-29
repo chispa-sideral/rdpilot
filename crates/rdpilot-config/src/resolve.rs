@@ -1,14 +1,5 @@
-//! [`resolve`] / [`apply_overrides`] — the file -> env -> flag/MCP-init
-//! layered resolution pipeline (CONFIG-01, D-27).
-//!
-//! `resolve()` builds the file+env layers via the `config` crate
-//! (`Config::builder().add_source(...)`, later sources winning) and then
-//! applies the flag/MCP-init layer as a plain Rust `Option`-based override
-//! pass — deliberately NOT routed through `config::Source`. Flags (Phase
-//! 13's `clap`) and MCP-init params (Phase 14's `rmcp`) already arrive as
-//! typed values; shoehorning already-typed values back through a
-//! textual/map-shaped `Source` trait would re-stringify and re-parse data
-//! that is already correct, for no benefit.
+//! [`resolve`] — the file -> env layered resolution of the daemon-local
+//! settings (`share_root`, `bundle_path`, `[viewer]`).
 
 use std::path::PathBuf;
 
@@ -54,55 +45,18 @@ pub(crate) fn real_file_and_env_builder() -> config::ConfigBuilder<config::build
     )
 }
 
-/// Resolve a [`ResolvedConfig`] from the file -> env -> flag/MCP-init layers
-/// (CONFIG-01), with the highest-precedence layer that sets a value always
-/// winning. `overrides` is the third layer — already-typed values a caller
-/// (Phase 13 CLI / Phase 14 MCP) collected from flags or MCP-init params.
+/// Resolve a [`ResolvedConfig`] from the file -> env layers, env winning.
 ///
 /// # Errors
 ///
 /// Returns [`ConfigError::File`] if the platform config file exists but
 /// cannot be parsed, or if the resulting layered config cannot deserialize
 /// into [`ResolvedConfig`].
-pub fn resolve(overrides: ResolvedConfig) -> Result<ResolvedConfig, ConfigError> {
+pub fn resolve() -> Result<ResolvedConfig, ConfigError> {
     let built = real_file_and_env_builder()
         .build()
         .map_err(|e| ConfigError::file(e.to_string()))?;
-    let base = deserialize_layered(built)?;
-    Ok(apply_overrides(base, overrides))
-}
-
-/// The third layer (flag/MCP-init): override each field of `base` with the
-/// corresponding field of `overrides` only when `overrides` actually sets
-/// it — `None` (or, for `accept_invalid_certs`, `false`) never clobbers a
-/// lower layer's value.
-#[must_use]
-pub fn apply_overrides(mut base: ResolvedConfig, overrides: ResolvedConfig) -> ResolvedConfig {
-    if overrides.host.is_some() {
-        base.host = overrides.host;
-    }
-    if overrides.port.is_some() {
-        base.port = overrides.port;
-    }
-    if overrides.username.is_some() {
-        base.username = overrides.username;
-    }
-    if overrides.password.is_some() {
-        base.password = overrides.password;
-    }
-    if overrides.domain.is_some() {
-        base.domain = overrides.domain;
-    }
-    if overrides.accept_invalid_certs {
-        base.accept_invalid_certs = true;
-    }
-    if overrides.share_root.is_some() {
-        base.share_root = overrides.share_root;
-    }
-    if overrides.bundle_path.is_some() {
-        base.bundle_path = overrides.bundle_path;
-    }
-    base
+    deserialize_layered(built)
 }
 
 /// Fixed subpath appended to the platform data directory for the
@@ -143,19 +97,9 @@ fn default_share_root() -> PathBuf {
     root
 }
 
-/// An all-`None`/`false` [`ResolvedConfig`] — the identity value for
-/// [`apply_overrides`]'s override layer (a caller with nothing to override
-/// passes this). Test-only helper (production callers build their own
-/// `ResolvedConfig` from parsed flags/MCP-init params in Phase 13/14).
 #[cfg(test)]
-fn empty_overrides() -> ResolvedConfig {
+fn empty_config() -> ResolvedConfig {
     ResolvedConfig {
-        host: None,
-        port: None,
-        username: None,
-        password: None,
-        domain: None,
-        accept_invalid_certs: false,
         share_root: None,
         bundle_path: None,
     }
@@ -167,92 +111,45 @@ mod tests {
 
     use super::*;
 
-    /// CONFIG-01: file -> env -> override precedence, deterministic, with
-    /// injected sources (no real home dir / ambient env involved).
+    /// File -> env precedence, with injected sources (no real home dir or
+    /// ambient env involved). Old connection keys and `RDPILOT_HOST` are ignored.
     #[test]
     fn layered_precedence() -> Result<(), Box<dyn std::error::Error>> {
-        let file_layer = File::from_str("host = \"file-host\"\nport = 1", FileFormat::Toml);
+        let file_layer = File::from_str(
+            "share_root = \"/file\"\nhost = \"file-host\"",
+            FileFormat::Toml,
+        );
 
         let mut env_map: HashMap<String, String> = HashMap::new();
+        env_map.insert("RDPILOT_SHARE_ROOT".to_owned(), "/env".to_owned());
         env_map.insert("RDPILOT_HOST".to_owned(), "env-host".to_owned());
 
-        // env beats file: both sources present, env added last.
         let built = Config::builder()
             .add_source(file_layer.clone())
             .add_source(
                 Environment::with_prefix(ENV_PREFIX)
                     .prefix_separator(ENV_PREFIX_SEPARATOR)
                     .separator(ENV_KEY_SEPARATOR)
-                    .source(Some(env_map.clone())),
+                    .source(Some(env_map)),
             )
             .build()?;
         let resolved = deserialize_layered(built)?;
         assert_eq!(
-            resolved.host.as_deref(),
-            Some("env-host"),
+            resolved.share_root.as_deref(),
+            Some("/env"),
             "env must beat file"
         );
-        assert_eq!(
-            resolved.port,
-            Some(1),
-            "port only set by file, must survive"
-        );
 
-        // override wins over env+file.
-        let mut with_override = empty_overrides();
-        with_override.host = Some("flag-host".to_owned());
-        let final_resolved = apply_overrides(resolved.clone(), with_override);
-        assert_eq!(
-            final_resolved.host.as_deref(),
-            Some("flag-host"),
-            "override must beat env"
-        );
-
-        // with no override: env still wins over file.
-        let no_override = apply_overrides(resolved.clone(), empty_overrides());
-        assert_eq!(no_override.host.as_deref(), Some("env-host"));
-
-        // file only (no env source at all): file value survives.
-        let file_only_built = Config::builder().add_source(file_layer).build()?;
-        let file_only = deserialize_layered(file_only_built)?;
-        assert_eq!(file_only.host.as_deref(), Some("file-host"));
-
+        let file_only = deserialize_layered(Config::builder().add_source(file_layer).build()?)?;
+        assert_eq!(file_only.share_root.as_deref(), Some("/file"));
         Ok(())
-    }
-
-    /// `apply_overrides` never clobbers a lower layer with a `None` override.
-    #[test]
-    fn apply_overrides_none_does_not_clobber() {
-        let mut base = empty_overrides();
-        base.host = Some("base-host".to_owned());
-
-        let result = apply_overrides(base, empty_overrides());
-        assert_eq!(result.host.as_deref(), Some("base-host"));
-    }
-
-    /// `apply_overrides` carries `share_root` with the same
-    /// override-wins/absent-never-clobbers semantics as every other field.
-    #[test]
-    fn apply_overrides_share_root_follows_the_same_precedence_rules() {
-        let mut base = empty_overrides();
-        base.share_root = Some("/base/share".to_owned());
-
-        // An override with no share_root set must not clobber the base value.
-        let unchanged = apply_overrides(base.clone(), empty_overrides());
-        assert_eq!(unchanged.share_root.as_deref(), Some("/base/share"));
-
-        // An explicit override wins.
-        let mut with_override = empty_overrides();
-        with_override.share_root = Some("/override/share".to_owned());
-        let overridden = apply_overrides(base, with_override);
-        assert_eq!(overridden.share_root.as_deref(), Some("/override/share"));
     }
 
     /// `share_root_or_default` returns the configured value, verbatim, when
     /// `ResolvedConfig::share_root` is set.
     #[test]
     fn share_root_or_default_returns_the_configured_value_when_set() {
-        let mut cfg = empty_overrides();
+        let mut cfg = empty_config();
         cfg.share_root = Some("/configured/share-root".to_owned());
         assert_eq!(
             share_root_or_default(&cfg),
@@ -265,7 +162,7 @@ mod tests {
     /// path, never a panic.
     #[test]
     fn share_root_or_default_returns_a_nonempty_default_path_when_unset() {
-        let cfg = empty_overrides();
+        let cfg = empty_config();
         let default_path = share_root_or_default(&cfg);
         assert!(
             !default_path.as_os_str().is_empty(),

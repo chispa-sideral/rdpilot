@@ -26,7 +26,26 @@ use directories::BaseDirs;
 /// plaintext password does not become world-readable.
 #[must_use]
 pub fn config_file_path() -> Option<PathBuf> {
-    BaseDirs::new().map(|b| b.config_dir().join("rdpilot").join("config.toml"))
+    config_dir().map(|d| d.join("config.toml"))
+}
+
+/// The directory holding `config.toml` and the `hosts` file:
+/// `<OS config root>/rdpilot`. `None` only when no home directory resolves.
+#[must_use]
+pub fn config_dir() -> Option<PathBuf> {
+    BaseDirs::new().map(|b| b.config_dir().join("rdpilot"))
+}
+
+/// The user's home directory, for `~` in `Include` paths.
+#[must_use]
+pub fn home_dir() -> Option<PathBuf> {
+    BaseDirs::new().map(|b| b.home_dir().to_path_buf())
+}
+
+/// The user's hosts file: `<config dir>/hosts`. rdpilot never creates it.
+#[must_use]
+pub fn hosts_file_path() -> Option<PathBuf> {
+    config_dir().map(|d| d.join("hosts"))
 }
 
 #[cfg(test)]
@@ -77,32 +96,25 @@ mod tests {
             .build()?;
         let resolved: crate::ResolvedConfig = built.try_deserialize()?;
 
-        assert_eq!(resolved.host, None);
-        assert_eq!(resolved.port, None);
-        assert_eq!(resolved.username, None);
-        assert_eq!(resolved.password, None);
-        assert_eq!(resolved.domain, None);
-        assert!(!resolved.accept_invalid_certs);
         assert_eq!(resolved.share_root, None);
         assert_eq!(resolved.bundle_path, None);
         Ok(())
     }
 
-    /// CONFIG-02: the template documents every D-27 key by name, plus the
-    /// Phase-13-added `share_root` and Plan-15-06-added `bundle_path`
-    /// daemon-local operational keys.
     #[test]
-    fn template_documents_every_d27_key() {
-        for key in [
-            "host",
-            "port",
-            "username",
-            "password",
-            "domain",
-            "accept_invalid_certs",
-            "share_root",
-            "bundle_path",
-        ] {
+    fn hosts_file_path_is_next_to_config_toml() {
+        let (Some(hosts), Some(config)) = (hosts_file_path(), config_file_path()) else {
+            return;
+        };
+        assert_eq!(hosts.file_name().and_then(|n| n.to_str()), Some("hosts"));
+        assert_eq!(hosts.parent(), config.parent());
+        let tail: Vec<_> = hosts.iter().rev().take(2).collect();
+        assert_eq!(tail[1], "rdpilot");
+    }
+
+    #[test]
+    fn template_documents_every_key() {
+        for key in ["share_root", "bundle_path", "[viewer]", "hosts"] {
             assert!(
                 crate::CONFIG_TEMPLATE.contains(key),
                 "template must mention key `{key}`"

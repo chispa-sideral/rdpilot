@@ -30,6 +30,9 @@ pub enum CliError {
     /// (e.g. `connect` needs host/username/password after file->env->flag
     /// resolution).
     MissingConfig(String),
+    /// A hosts-file, target, `-o`, permission or PasswordCommand error. Never
+    /// contains a password or PasswordCommand output.
+    Config(String),
     /// The daemon replied with a `WireResponse` variant this verb handler
     /// did not expect.
     Internal(String),
@@ -51,6 +54,7 @@ impl fmt::Display for CliError {
                 "destination already exists (use --force to overwrite): {msg}"
             ),
             CliError::MissingConfig(msg) => write!(f, "missing required configuration: {msg}"),
+            CliError::Config(msg) => write!(f, "configuration error: {msg}"),
             CliError::Internal(msg) => write!(f, "unexpected daemon response: {msg}"),
             CliError::Transport(msg) => write!(f, "transport error: {msg}"),
         }
@@ -83,7 +87,10 @@ fn code_for(err: &CliError) -> u8 {
         CliError::DaemonUnreachable(_) => 3,
         CliError::DaemonIncompatible(_) => 12,
         CliError::NoClobber(_) => 8,
-        CliError::MissingConfig(_) | CliError::Internal(_) | CliError::Transport(_) => 1,
+        CliError::MissingConfig(_)
+        | CliError::Config(_)
+        | CliError::Internal(_)
+        | CliError::Transport(_) => 1,
     }
 }
 
@@ -113,6 +120,7 @@ pub fn code_str_for(err: &CliError) -> String {
         CliError::DaemonIncompatible(_) => "daemon-incompatible".to_owned(),
         CliError::NoClobber(_) => "no-clobber".to_owned(),
         CliError::MissingConfig(_) => "missing-config".to_owned(),
+        CliError::Config(_) => "config".to_owned(),
         CliError::Internal(_) => "internal".to_owned(),
         CliError::Transport(_) => "transport".to_owned(),
     }
@@ -165,6 +173,7 @@ mod tests {
         assert_eq!(code_for(&CliError::DaemonIncompatible(None)), 12);
         assert_eq!(code_for(&CliError::NoClobber("x".to_owned())), 8);
         assert_eq!(code_for(&CliError::MissingConfig("x".to_owned())), 1);
+        assert_eq!(code_for(&CliError::Config("x".to_owned())), 1);
         assert_eq!(code_for(&CliError::Internal("x".to_owned())), 1);
         assert_eq!(code_for(&CliError::Transport("x".to_owned())), 1);
     }
@@ -173,6 +182,14 @@ mod tests {
     fn cli_error_display_never_panics_and_includes_context() {
         let rendered = format!("{}", CliError::MissingConfig("host is required".to_owned()));
         assert!(rendered.contains("host is required"));
+    }
+
+    #[test]
+    fn config_error_display() {
+        assert_eq!(
+            CliError::Config("boom".to_owned()).to_string(),
+            "configuration error: boom"
+        );
     }
 
     #[test]
@@ -218,6 +235,7 @@ mod tests {
             code_str_for(&CliError::MissingConfig("x".to_owned())),
             "missing-config"
         );
+        assert_eq!(code_str_for(&CliError::Config("x".to_owned())), "config");
         assert_eq!(
             code_str_for(&CliError::Internal("x".to_owned())),
             "internal"

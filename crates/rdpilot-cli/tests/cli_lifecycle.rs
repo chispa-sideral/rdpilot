@@ -100,6 +100,10 @@ fn run_cli(
     let status = Command::new(&bin)
         .args(args)
         .env("XDG_RUNTIME_DIR", xdg_runtime_dir)
+        // Keep a developer\'s real hosts file and config.toml out of the test.
+        .env("XDG_CONFIG_HOME", xdg_runtime_dir.join("config"))
+        .env("HOME", xdg_runtime_dir)
+        .env("APPDATA", xdg_runtime_dir.join("appdata"))
         .env("RDPILOT_DAEMON_SINK_PATH", sink_path)
         .env("RDPILOT_DAEMON_TEST_CONNECTOR", "1")
         // Long enough that neither the idle reaper nor the empty-registry
@@ -141,18 +145,7 @@ fn connect_list_disconnect_lifecycle_auto_starts_the_real_daemon() {
 
     // --- connect (auto-starts the daemon) -> Connected ---
     let connect_run = run_cli(
-        &[
-            "connect",
-            "--name",
-            "web",
-            "--host",
-            "10.0.0.5",
-            "--username",
-            "u",
-            "--password",
-            "p",
-            "--json",
-        ],
+        &["connect", "--name", "web", "rdp://u:p@10.0.0.5", "--json"],
         &xdg_runtime_dir,
         &sink_path,
         &capture_dir,

@@ -10,46 +10,24 @@
 
 use serde::Deserialize;
 
-/// The resolved connection configuration, after the file -> env ->
-/// flag/MCP-init layering (CONFIG-01) has been applied.
+/// The resolved daemon-local configuration (`config.toml` and `RDPILOT_*`
+/// environment variables).
 ///
-/// Every field is optional at this layer — an absent key deserializes to
-/// `None`/`false`, never a panic, so a partial (or entirely absent) config
-/// file is always valid input. Deliberately its own owned struct, never
-/// `rdpilot::ConnectionConfig` (Decision 1) — the daemon (Phase 12) converts
-/// this into a `ConnectionConfig` at startup.
+/// Connection settings (host, port, user, credentials, ...) are not here:
+/// they live in the hosts file, see [`crate::hosts`]. Keys for them left in an
+/// old `config.toml`, and `RDPILOT_HOST`-style variables, are ignored.
+///
+/// Every field is optional; an absent key is `None`, so a partial (or
+/// absent) config file is always valid input. Deliberately does not derive
+/// `Serialize`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ResolvedConfig {
-    /// Hostname or IP address of the RDP target.
-    pub host: Option<String>,
-    /// TCP port.
-    pub port: Option<u16>,
-    /// Username for NLA/CredSSP authentication.
-    pub username: Option<String>,
-    /// Password for NLA/CredSSP authentication.
-    ///
-    /// Deliberately never reachable via `Serialize` — this struct does not
-    /// derive it at all (D-31, one layer before the `rdpilot-ipc` wire
-    /// boundary). Any future phase that adds a config-file WRITE path
-    /// (Phase 11 only reads config; no `config init`/write command exists
-    /// yet) MUST set `0600` permissions on Unix when creating the file
-    /// (`std::os::unix::fs::PermissionsExt`) — a world-readable
-    /// `config.toml` would expose this plaintext value to other local
-    /// accounts.
-    #[serde(default)]
-    pub password: Option<String>,
-    /// Optional Windows domain.
-    pub domain: Option<String>,
-    /// When `true`, the server certificate is accepted without validation.
-    #[serde(default)]
-    pub accept_invalid_certs: bool,
     /// Local filesystem path of the daemon-local file-transfer staging root
     /// (`ConnectionConfig::share_root`, D-10.1/FILE-01/FILE-02).
     ///
     /// This is daemon-local operational config, never a wire-transmitted
     /// value from `Request::Connect` (research Pitfall 6) -- a caller
-    /// configures it via `config.toml`/`RDPILOT_SHARE_ROOT`/CLI flag exactly
-    /// like every other `ResolvedConfig` field. `None` (the default) means
+    /// configures it via `config.toml` or `RDPILOT_SHARE_ROOT`. `None` (the default) means
     /// [`crate::share_root_or_default`] falls back to a documented
     /// platform-data-dir default rather than leaving `put`/`get`
     /// unconfigured.
@@ -90,14 +68,12 @@ impl ConfigError {
 mod tests {
     use super::*;
 
-    /// A partial TOML fragment (only `host`/`port` present) deserializes
-    /// without panicking; every absent key becomes `None`/`false`.
+    /// Old connection keys are ignored; absent keys are `None`.
     #[test]
-    fn partial_toml_deserializes_with_absent_keys_as_none() -> Result<(), Box<dyn std::error::Error>>
-    {
+    fn old_connection_keys_are_ignored() -> Result<(), Box<dyn std::error::Error>> {
         let built = config::Config::builder()
             .add_source(config::File::from_str(
-                "host = \"10.0.0.5\"\nport = 3389",
+                "host = \"10.0.0.5\"\nport = 3389\nshare_root = \"/s\"",
                 config::FileFormat::Toml,
             ))
             .build()
@@ -106,13 +82,7 @@ mod tests {
             .try_deserialize()
             .map_err(|e| ConfigError::file(e.to_string()))?;
 
-        assert_eq!(resolved.host.as_deref(), Some("10.0.0.5"));
-        assert_eq!(resolved.port, Some(3389));
-        assert_eq!(resolved.username, None);
-        assert_eq!(resolved.password, None);
-        assert_eq!(resolved.domain, None);
-        assert!(!resolved.accept_invalid_certs);
-        assert_eq!(resolved.share_root, None);
+        assert_eq!(resolved.share_root.as_deref(), Some("/s"));
         assert_eq!(resolved.bundle_path, None);
         Ok(())
     }
