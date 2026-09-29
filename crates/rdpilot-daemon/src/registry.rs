@@ -40,6 +40,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use rdpilot::ConnectionConfig;
 use rdpilot_ipc::{SessionId, SessionLifecycle, SessionStatus};
 
+use crate::events::SessionEvents;
 use crate::seams::{
     BoxFuture, DaemonError, ManagedSession, ReconciliationSink, SessionConnector, SessionEntry,
     ViewFrameSource,
@@ -110,6 +111,18 @@ pub(crate) fn iso8601_from_system_time(t: SystemTime) -> String {
         .map(|d| d.as_secs())
         .unwrap_or(0);
     iso8601_from_unix_seconds(i64::try_from(secs).unwrap_or(i64::MAX))
+}
+
+/// Like [`iso8601_from_system_time`], with milliseconds
+/// (`YYYY-MM-DDTHH:MM:SS.sssZ`), for the session event log.
+pub(crate) fn iso8601_millis_from_system_time(t: SystemTime) -> String {
+    let since = t.duration_since(UNIX_EPOCH).unwrap_or_default();
+    let base = iso8601_from_unix_seconds(i64::try_from(since.as_secs()).unwrap_or(i64::MAX));
+    let millis = since.subsec_millis();
+    match base.strip_suffix('Z') {
+        Some(stem) => format!("{stem}.{millis:03}Z"),
+        None => base,
+    }
 }
 
 /// Pure conversion from Unix seconds (UTC) to an ISO-8601 timestamp string
@@ -257,6 +270,7 @@ impl Registry {
             Ok(session) => {
                 let frame = session.frame_source();
                 let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
+                let events = Arc::new(SessionEvents::new(&id, generation, frame.clone(), None));
                 // A single wall-clock capture shared by the entry's
                 // `connected_since_wall`/`last_activity_wall` and the
                 // reconciliation sink's `record_open` call below — avoids
@@ -279,6 +293,7 @@ impl Registry {
                             last_activity: Instant::now(),
                             cua_leases: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                             frame,
+                            events,
                             last_activity_wall: now_wall.clone(),
                         },
                     );
@@ -466,6 +481,17 @@ impl Registry {
         ))
     }
 
+    /// The event log of live session `id`: a brief outer-lock read that
+    /// takes no per-session lock and does not change activity.
+    pub(crate) fn events(&self, id: &SessionId) -> Option<Arc<SessionEvents>> {
+        #[allow(clippy::expect_used)] // A poisoned registry mutex is unrecoverable.
+        let guard = self.sessions.lock().expect("registry mutex poisoned");
+        match guard.get(id) {
+            Some(SessionEntry::Live { events, .. }) => Some(Arc::clone(events)),
+            _ => None,
+        }
+    }
+
     /// Refresh activity only for the captured incarnation; a replacement name is never touched.
     pub(crate) fn touch_generation(&self, id: &SessionId, expected: u64) -> bool {
         #[allow(clippy::expect_used)]
@@ -565,6 +591,16 @@ pub(crate) enum FrameLookup {
     Closed,
 }
 
+/// The result of a viewer event-log lookup.
+pub(crate) enum EventsLookup {
+    /// A live session's log.
+    Log(Arc<SessionEvents>),
+    /// The session exists but has no log (connecting or orphaned).
+    Unavailable,
+    /// The session is not in the registry.
+    Closed,
+}
+
 /// One session as the live viewer sees it: the credential-free list entry
 /// plus its frame source's ended state.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -601,6 +637,17 @@ impl ViewerRegistry {
     /// The frame source for `id`, read under the registry lock only briefly.
     pub(crate) fn frame_source(&self, id: &SessionId) -> FrameLookup {
         self.inner.frame_source(id)
+    }
+
+    /// The event log for `id`, read under the registry lock only briefly.
+    pub(crate) fn events(&self, id: &SessionId) -> EventsLookup {
+        #[allow(clippy::expect_used)] // A poisoned registry mutex is unrecoverable.
+        let guard = self.inner.sessions.lock().expect("registry mutex poisoned");
+        match guard.get(id) {
+            Some(SessionEntry::Live { events, .. }) => EventsLookup::Log(Arc::clone(events)),
+            Some(_) => EventsLookup::Unavailable,
+            None => EventsLookup::Closed,
+        }
     }
 }
 
@@ -1027,6 +1074,67 @@ mod tests {
             second[0].1 >= first[0].1,
             "elapsed idle duration must not go backwards"
         );
+    }
+
+    #[tokio::test]
+    async fn each_live_session_has_its_own_event_log_dropped_on_close() {
+        let registry = Arc::new(succeeding_registry());
+        let viewer = ViewerRegistry::new(Arc::clone(&registry));
+        let id = registry
+            .open(Some("web".to_owned()), "h".to_owned(), test_cfg())
+            .await
+            .expect("open");
+        let events = registry.events(&id).expect("live session has a log");
+        assert_eq!(events.header().session, "web");
+        assert_eq!(events.header().schema, crate::events::SCHEMA);
+        let weak = Arc::downgrade(&events);
+        drop(events);
+        registry.close(&id).await.expect("close");
+        assert!(
+            weak.upgrade().is_none(),
+            "the log is dropped with the entry"
+        );
+        assert!(registry.events(&id).is_none());
+        assert!(matches!(viewer.events(&id), EventsLookup::Closed));
+    }
+
+    #[tokio::test]
+    async fn a_new_incarnation_gets_a_new_log() {
+        let registry = succeeding_registry();
+        let id = registry
+            .open(Some("web".to_owned()), "h".to_owned(), test_cfg())
+            .await
+            .expect("open");
+        let first = registry.events(&id).expect("log").header().clone();
+        registry.close(&id).await.expect("close");
+        registry
+            .open(Some("web".to_owned()), "h".to_owned(), test_cfg())
+            .await
+            .expect("reopen");
+        let second = registry.events(&id).expect("log").header().clone();
+        assert_ne!(first.log_id, second.log_id);
+        assert_ne!(first.incarnation, second.incarnation);
+    }
+
+    #[tokio::test]
+    async fn reading_and_recording_events_does_not_change_activity() {
+        let registry = Arc::new(succeeding_registry());
+        let viewer = ViewerRegistry::new(Arc::clone(&registry));
+        let id = registry
+            .open(Some("web".to_owned()), "h".to_owned(), test_cfg())
+            .await
+            .expect("open");
+        let before = registry.list()[0].last_activity.clone();
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+        let events = registry.events(&id).expect("log");
+        events.record(
+            crate::events::EventSource::Cli,
+            crate::events::EventKind::SessionEnded,
+        );
+        assert!(matches!(viewer.events(&id), EventsLookup::Log(_)));
+        let idle = registry.live_idle_durations();
+        assert!(idle[0].1 >= std::time::Duration::from_millis(60));
+        assert_eq!(registry.list()[0].last_activity, before);
     }
 
     #[test]
