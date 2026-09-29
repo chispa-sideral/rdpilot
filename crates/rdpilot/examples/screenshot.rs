@@ -104,7 +104,7 @@ fn load_config() -> Result<ConnectionConfig, String> {
 
     if !path.exists() {
         return Err(format!(
-            "{} not found — provision the target with `infra/manage-env.ps1 up` first",
+            "{} not found — create it with the target's connection details first",
             path.display()
         ));
     }
