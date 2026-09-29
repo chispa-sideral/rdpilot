@@ -197,6 +197,31 @@ mod tests {
     }
 
     #[test]
+    fn literal_backslash_domain_matches_percent_encoded() {
+        let lit = url("rdp://CORP\\alice:pw@host");
+        assert_eq!(lit.domain.as_deref(), Some("CORP"));
+        assert_eq!(lit.user.as_deref(), Some("alice"));
+        assert_eq!(lit.password.as_ref().map(Secret::expose), Some("pw"));
+        assert_eq!(lit.host, "host");
+        let enc = url("rdp://CORP%5Calice:pw@host");
+        assert_eq!(lit.domain, enc.domain);
+        assert_eq!(lit.user, enc.user);
+        assert_eq!(
+            lit.password.as_ref().map(Secret::expose),
+            enc.password.as_ref().map(Secret::expose)
+        );
+        assert_eq!(lit.host, enc.host);
+        assert_eq!(lit.port, enc.port);
+
+        let no_domain = url("rdp://\\alice@h");
+        assert!(no_domain.domain.is_none());
+        assert_eq!(no_domain.user.as_deref(), Some("alice"));
+        let no_user = url("rdp://CORP\\@h");
+        assert_eq!(no_user.domain.as_deref(), Some("CORP"));
+        assert!(no_user.user.is_none());
+    }
+
+    #[test]
     fn ipv6_host() {
         let u = url("rdp://u@[fe80::1]:3390");
         assert_eq!(u.host, "fe80::1");

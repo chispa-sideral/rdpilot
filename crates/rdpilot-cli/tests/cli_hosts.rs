@@ -39,6 +39,11 @@ impl Sandbox {
         self.root.join("sessions.json")
     }
 
+    /// The auto-started daemon's diagnostics file, so secret scans cover it.
+    fn diagnostics(&self) -> PathBuf {
+        self.root.join("diag/diagnostics.json")
+    }
+
     /// Write a hosts file (mode 0600) and return its path.
     fn hosts(&self, text: &str) -> PathBuf {
         let path = self.root.join("hosts");
@@ -69,6 +74,7 @@ impl Sandbox {
             .env("HOME", self.root.join("home"))
             .env("APPDATA", self.root.join("home/appdata"))
             .env("RDPILOT_DAEMON_SINK_PATH", self.sink())
+            .env("RDPILOT_DAEMON_DIAGNOSTICS_PATH", self.diagnostics())
             .env("RDPILOT_DAEMON_TEST_CONNECTOR", "1")
             .env("RDPILOT_DAEMON_IDLE_TIMEOUT_MS", "30000")
             .env("RDPILOT_DAEMON_EMPTY_GRACE_MS", "1500")
@@ -90,7 +96,7 @@ impl Sandbox {
         }
     }
 
-    /// Every captured output plus the daemon's sink file.
+    /// Every captured output plus the daemon's sink and diagnostics files.
     fn everything(&self) -> String {
         let mut all = String::new();
         if let Ok(rd) = std::fs::read_dir(self.root.join("capture")) {
@@ -99,6 +105,7 @@ impl Sandbox {
             }
         }
         all.push_str(&std::fs::read_to_string(self.sink()).unwrap_or_default());
+        all.push_str(&std::fs::read_to_string(self.diagnostics()).unwrap_or_default());
         all
     }
 }
@@ -257,6 +264,102 @@ fn url_password_never_reaches_output_or_the_daemon_sink() {
     let _ = sb.run(&["list", "--json"], &[]);
     let _ = sb.run(&["disconnect", "--session", "urlpw"], &[]);
     assert!(!sb.everything().contains("hunter2-url"));
+}
+
+#[test]
+fn option_password_never_reaches_output_or_the_daemon_sink() {
+    let mut sb = Sandbox::new("option-secret");
+    let opt = "Password=hunter2-opt";
+    let run = sb.run(
+        &[
+            "connect",
+            "rdp://u@10.0.0.6",
+            "-o",
+            opt,
+            "--name",
+            "optpw",
+            "--json",
+        ],
+        &[],
+    );
+    assert!(run.status.success(), "{}", run.stderr);
+    let _ = sb.run(&["list", "--json"], &[]);
+
+    let dup = sb.run(
+        &[
+            "connect",
+            "rdp://u@10.0.0.6",
+            "-o",
+            opt,
+            "--name",
+            "optpw",
+            "--json",
+        ],
+        &[],
+    );
+    assert!(!dup.status.success(), "duplicate session name must fail");
+
+    let hosts = sb.hosts("Host lab2\n  HostName 10.0.0.8\n  User u\n");
+    let f = path_str(&hosts).to_owned();
+    let run = sb.run(
+        &[
+            "connect", "lab2", "-F", &f, "-o", opt, "--name", "optpw2", "--json",
+        ],
+        &[],
+    );
+    assert!(run.status.success(), "{}", run.stderr);
+
+    let run = sb.run(
+        &["connect", "rdp://10.0.0.9", "-o", opt, "--name", "optpw3"],
+        &[],
+    );
+    assert_eq!(run.status.code(), Some(1));
+    assert!(run.stderr.contains("no User"), "{}", run.stderr);
+
+    for name in ["optpw", "optpw2"] {
+        let dis = sb.run(&["disconnect", "--session", name], &[]);
+        assert!(dis.status.success(), "{}", dis.stderr);
+    }
+    assert!(!sb.everything().contains("hunter2-opt"));
+}
+
+#[test]
+fn session_name_does_not_select_a_host_block() {
+    let mut sb = Sandbox::new("name-alias");
+    let hosts = sb.hosts(
+        "Host lab\n  HostName 10.0.0.5\n  User u\n  PasswordCommand \"printf pw\"\n\
+         Host decoy\n  HostName 10.9.9.9\n  User d\n  PasswordCommand \"printf pw\"\n",
+    );
+    let f = path_str(&hosts).to_owned();
+    let run = sb.run(
+        &["connect", "lab", "-F", &f, "--name", "decoy", "--json"],
+        &[],
+    );
+    assert!(run.status.success(), "{}", run.stderr);
+    let list = sb.run(&["list", "--json"], &[]);
+    let sessions: serde_json::Value = serde_json::from_str(list.stdout.trim()).expect("json");
+    assert_eq!(sessions[0]["host"], "10.0.0.5");
+    let dis = sb.run(&["disconnect", "--session", "decoy"], &[]);
+    assert!(dis.status.success(), "{}", dis.stderr);
+}
+
+#[test]
+fn session_name_does_not_supply_settings_to_a_url_target() {
+    let mut sb = Sandbox::new("name-url");
+    let hosts = sb.hosts("Host decoy\n  User d\n  PasswordCommand \"printf pw\"\n");
+    let run = sb.run(
+        &[
+            "connect",
+            "rdp://10.0.0.7",
+            "-F",
+            path_str(&hosts),
+            "--name",
+            "decoy",
+        ],
+        &[],
+    );
+    assert_eq!(run.status.code(), Some(1));
+    assert!(run.stderr.contains("no User"), "{}", run.stderr);
 }
 
 #[test]

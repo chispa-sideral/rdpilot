@@ -868,4 +868,36 @@ mod tests {
         fs::write(&p, "Host web\n  Password secret\n").unwrap();
         assert!(e.resolve("web", &[]).is_ok());
     }
+
+    #[test]
+    fn rdp_and_rdps_resolve_to_the_same_settings() {
+        let e = Env::new();
+        e.hosts("Host h.example\n  Port 3391\n  Domain CORP\n  AcceptInvalidCerts yes\n  CuaEnabled no\n");
+        let a = e.resolve("rdp://u:pw@h.example", &[]).unwrap();
+        let b = e.resolve("rdps://u:pw@h.example", &[]).unwrap();
+        // The scheme only changes the redacted display label; the connect
+        // request carries no scheme, so equal settings mean equal requests.
+        assert_eq!(a.rows(), b.rows());
+        assert_eq!(a.address(), b.address());
+        assert_eq!(a.port(), Some(3391));
+        assert_eq!(a.port(), b.port());
+        assert_eq!(a.user(), b.user());
+        assert_eq!(a.domain(), Some("CORP"));
+        assert_eq!(a.domain(), b.domain());
+        assert_eq!(
+            a.password().as_ref().map(Secret::expose),
+            b.password().as_ref().map(Secret::expose)
+        );
+        assert_eq!(a.password_command(), b.password_command());
+        assert!(a.accept_invalid_certs() && b.accept_invalid_certs());
+        assert!(!a.cua_enabled() && !b.cua_enabled());
+
+        let lit = e.resolve("rdp://CORP\\alice:pw@h.example", &[]).unwrap();
+        let enc = e.resolve("rdp://CORP%5Calice:pw@h.example", &[]).unwrap();
+        assert_eq!(lit.domain(), Some("CORP"));
+        assert_eq!(lit.user(), Some("alice"));
+        assert_eq!(src(&lit, "Domain"), "url");
+        assert_eq!(src(&lit, "Domain"), src(&enc, "Domain"));
+        assert_eq!(lit.rows(), enc.rows());
+    }
 }
