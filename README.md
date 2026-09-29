@@ -86,6 +86,28 @@ framebuffer at up to 4 frames per second, its size changes, and a banner when
 the server ends the session or the session is closed. Frames do not show the
 mouse cursor. Frames are not written to disk.
 
+Activity strip. Under each viewed session, a strip lists what was done in that
+session, newest first. Each Cua tool call and each native verb (`screenshot`,
+`mouse`, `key`, `desktop_size`, `put`, `get`) gets one row with:
+
+- the local time it started,
+- the tool or verb name,
+- the source: `cua` (a tool call through `rdpilot-mcp`) or `cli` (a native
+  verb),
+- the outcome: `ok`, `error`, `no_reply` (the attachment closed or the daemon
+  gave up before an answer) or `running` (not finished yet),
+- the duration, which includes any time spent waiting for the session.
+
+Marker rows show when a Cua attachment starts and ends (with the reason), when
+the server ends the session, and when older events were dropped. The strip never
+shows argument values, typed text, file paths, results, images or error text.
+
+The daemon keeps the newest 200 events of each session in memory, from connect
+until the session is closed. It records them whether or not a viewer runs, never
+writes them to disk, and drops them when the session closes. A panel opened
+later shows the retained events. The page asks for new events about twice a
+second; many open tabs can slow updates.
+
 Bind set. Nothing listens until you run `rdpilot view`, and the listener stops
 when the command exits. The viewer binds `127.0.0.1` and, by default, this
 host's Tailscale IPv4 address. It never binds a wildcard, LAN or public address.
