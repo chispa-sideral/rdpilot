@@ -5,7 +5,8 @@
 //! - [`hosts`]: ssh_config-style host configuration (connection settings,
 //!   credentials, `-o` overrides, `rdp://` targets).
 //! - [`resolve`]: the daemon-local settings (`share_root`, `bundle_path`,
-//!   `[viewer]`) from `config.toml` and `RDPILOT_*` environment variables.
+//!   `[viewer]`, `[recording]`) from `config.toml` and `RDPILOT_*`
+//!   environment variables.
 //!
 //! Like `rdpilot-ipc`, this crate deliberately has **zero dependency on
 //! `rdpilot` (or IronRDP)** — preserving the thin-client premise (D-17).
@@ -23,11 +24,16 @@
 
 pub mod hosts;
 mod paths;
+mod recording;
 mod resolve;
 mod resolved;
 mod viewer;
 
 pub use paths::{cache_dir, config_dir, config_file_path, home_dir, hosts_file_path};
+pub use recording::{
+    resolve_recording, HostRecording, RecordTrigger, RecordingConfig, DEFAULT_BUDGET_MIB,
+    DEFAULT_MAX_FPS, MAX_MAX_FPS, MIN_MAX_FPS,
+};
 pub use resolve::{resolve, share_root_or_default};
 pub use resolved::{ConfigError, ResolvedConfig};
 pub use viewer::{resolve_viewer, ViewerBind, ViewerConfig};

@@ -45,3 +45,30 @@
 # several. It must be in 100.64.0.0/10 and present on a local interface.
 # Env: RDPILOT_VIEWER__TAILNET_ADDRESS. Flag: rdpilot view --tailnet-address.
 # tailnet_address = "100.64.0.1"
+
+# Session recording. Off unless switched on here, per host below, per
+# connect (`rdpilot connect --record` / `--no-record`) or on a running session
+# (`rdpilot record start|stop`, or the viewer page). The CLI resolves the
+# switch at connect: --record/--no-record, then the first matching
+# [[recording.hosts]] entry, then `enabled`. The daemon reads dir, max_fps
+# and budget_mib when it starts and when a recording starts.
+# [recording]
+# Record every session by default. Env: RDPILOT_RECORDING__ENABLED.
+# enabled = false
+# Most video frames per second (0.5 to 8). Env: RDPILOT_RECORDING__MAX_FPS.
+# max_fps = 4
+# Where recordings are stored. Default: <local data dir>/rdpilot/recordings
+# (.local/share/rdpilot/recordings in the home directory on Linux,
+# %LOCALAPPDATA%\rdpilot\recordings on Windows). Env: RDPILOT_RECORDING__DIR.
+# dir = "/absolute/path/to/recordings"
+# Space in MiB for recordings that are not marked keep; unkept recordings
+# older than 7 days or beyond this budget are deleted, oldest first. It is
+# also the size cap of one recording. Env: RDPILOT_RECORDING__BUDGET_MIB.
+# budget_mib = 2048
+#
+# Per-host switch, keyed on the target as given to `rdpilot connect` (a
+# hosts-file alias as typed, or the host of an rdp:// URL), matched
+# case-insensitively; the first matching entry wins.
+# [[recording.hosts]]
+# host = "lab-vm"
+# enabled = true
