@@ -2,7 +2,7 @@
 name = "rdpilot-daemon"
 version.workspace = true
 edition.workspace = true
-rust-version = "1.78"
+rust-version = "1.83"
 license.workspace = true
 description = "Long-lived local IPC daemon that owns rdpilot's in-memory session registry (DAEMON-01/02/03/04, SESSION-01/03/04). The only crate legitimately depending on both rdpilot and rdpilot-ipc."
 repository = "https://github.com/marcfargas/rdpilot"
@@ -50,6 +50,11 @@ getrandom = "0.3.4"
 # Windows dependency is windows-sys 0.61 (the line already in Cargo.lock),
 # its Unix dependency libc.
 if-addrs = "0.15.0"
+# Session recording: AV1 video encoded in the daemon. BSD-2-Clause; the same
+# 0.8 node Cargo.lock already resolves through image/ravif. Default features
+# are off so the build needs no nasm; "threading" gives the encoder its own
+# small thread pool. MSRV 1.83.
+rav1e = { version = "0.8.1", default-features = false, features = ["threading"] }
 # Cua bundle download (bundle module). reqwest 0.12.28, rustls 0.23,
 # rustls-native-certs 0.8, semver 1.0.28, sha2 0.11 and flate2 were already
 # resolved in Cargo.lock; the daemon passes reqwest a rustls ClientConfig
@@ -99,4 +104,7 @@ windows-sys = { version = "0.61.2", features = [
 tokio = { version = "1", features = ["test-util"] }
 # DAEMON-01 soak-test RSS baseline/return-to-baseline assertion (Plan 12-03).
 sysinfo = "0.39.6"
+# Reads recording segments back in tests (WebM structure, timestamps, codec
+# private data). Zlib OR MIT OR Apache-2.0; test-only.
+matroska-demuxer = "0.8.1"
 tempfile = "3"
