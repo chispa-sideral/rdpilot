@@ -49,7 +49,7 @@ HERE = Path(__file__).resolve().parent
 LIVE_TARGETS = ("a", "b", "c")
 FAKE_TARGETS = ("a", "b", "c")
 # The live proof waits this long with a still display on a.
-IDLE_S = 125
+IDLE_S = 135
 # A replayed frame must show the typed marker within this time after the
 # typing call finished.
 LEGIBLE_WITHIN_MS = 2000
@@ -154,7 +154,7 @@ class Proof(viewer_proof.Proof):
         result = await self.cli("connect", target, "-F", str(hosts), "--name", target, *flags, target=target,
                                 timeout=self.args.connect_timeout)
         require(result.get("session") == target, f"connect {target}: {result}")
-        if not self.fake:
+        if not self.fake and "CuaEnabled=no" not in flags:
             require(result.get("bridge_live"), f"{target}: Cua bridge not live")
         state = result.get("recording", {})
         if state.get("state") == "on":
@@ -585,10 +585,13 @@ Stop-Process -Name explorer -Force
                    b_start=self.excerpt([b[0]]), b_stop=self.excerpt([b[-1]]))
 
     def idle_check(self, events, idle_from, idle_to):
-        """No video frame between the page annotation and the end of the idle wait."""
+        """No video frame in the still interval: from 10 s after the page
+        annotation (the desktop settles) to the end of the idle wait, at
+        least 2 minutes."""
         note = next(e for e in events if e["kind"] == "annotation" and e["source"] == "viewer")
-        start = note["offset_ms"] + 3000
-        end = start + round((idle_to - idle_from) * 1000) - 6000
+        start = note["offset_ms"] + 10000
+        end = note["offset_ms"] + round((idle_to - idle_from) * 1000) - 3000
+        require(end - start >= 120000, f"a: still interval only {end - start} ms")
         frames = [o for o in self.packet_offsets("a") if start <= o <= end]
         require(not frames, f"a: {len(frames)} frames during the still interval {start}-{end}: {frames[:10]}")
         total = sum(s["bytes"] for s in self.manifest("a")["segments"])
@@ -674,7 +677,8 @@ Stop-Process -Name explorer -Force
             else:
                 await self.connect_with("a")
                 await self.connect_with("b", "--no-record")
-                await self.connect_with("c")
+                # c only has to stay unrecorded: it needs no Cua bridge.
+                await self.connect_with("c", "-o", "CuaEnabled=no")
                 require(set(self.ids) == {"a"}, f"only a records from connect: {self.ids}")
             await self.start_viewer()
             async with async_playwright() as playwright:
@@ -724,6 +728,9 @@ Stop-Process -Name explorer -Force
             for path in (self.output / "daemon.log", self.output / "view.stderr"):
                 if path.exists():
                     path.write_text(self.clean(path.read_text(errors="replace")))
+            # MCP error output is evidence; its transcripts (typed text) are not.
+            for stderr in (self.temp / "mcp").glob("*.stderr"):
+                shutil.copy(stderr, self.output / stderr.name)
             self.save()
             shutil.rmtree(self.temp, ignore_errors=True)
         self.scan_evidence()
