@@ -285,7 +285,7 @@ impl Registry {
             Ok(session) => {
                 let frame = session.frame_source();
                 let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
-                let events = Arc::new(SessionEvents::new(&id, generation, frame.clone(), None));
+                let events = Arc::new(SessionEvents::new(&id, generation, frame.clone()));
                 let ended_watch = frame
                     .clone()
                     .map(|frame| crate::events::watch_session_end(frame, Arc::clone(&events)));
