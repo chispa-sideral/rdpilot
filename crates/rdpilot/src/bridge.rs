@@ -5,7 +5,7 @@ use crate::{
 use ironrdp::core::{ensure_size, impl_as_any, Encode, EncodeResult, WriteCursor};
 use ironrdp::pdu::PduResult;
 use ironrdp_dvc::{DvcEncode, DvcMessage, DvcProcessor};
-use rdpilot_bridge_protocol::{Decoder, Envelope, Message, BUNDLE_ID, CHANNEL_NAME};
+use rdpilot_bridge_protocol::{Decoder, Envelope, Message, CHANNEL_NAME};
 use std::{
     collections::{HashMap, VecDeque},
     sync::{
@@ -39,6 +39,8 @@ struct State {
 }
 pub(crate) struct BridgeShared {
     pub generation: u64,
+    /// Bundle identity sent in Hello and required in Ready.
+    pub bundle_id: String,
     pub bootstrap_started: AtomicBool,
     next: AtomicU64,
     state: Mutex<State>,
@@ -51,11 +53,16 @@ impl std::fmt::Debug for BridgeShared {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BridgeShared")
             .field("generation", &self.generation)
+            .field("bundle_id", &self.bundle_id)
             .finish_non_exhaustive()
     }
 }
 impl BridgeShared {
+    #[cfg(test)]
     pub fn new() -> Self {
+        Self::with_bundle_id(String::new())
+    }
+    pub fn with_bundle_id(bundle_id: String) -> Self {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -64,6 +71,7 @@ impl BridgeShared {
             generation: nanos
                 ^ (u64::from(std::process::id()) << 32)
                 ^ NEXT_GENERATION.fetch_add(1, Ordering::Relaxed),
+            bundle_id,
             bootstrap_started: AtomicBool::new(false),
             next: AtomicU64::new(1),
             state: Mutex::new(State::default()),
@@ -389,7 +397,7 @@ impl DvcProcessor for BridgeProcessor {
             self.shared.generation,
             0,
             Message::Hello {
-                bundle_id: BUNDLE_ID.into(),
+                bundle_id: self.shared.bundle_id.clone(),
             },
         ))
         .map_err(|e| ironrdp::pdu::pdu_other_err!("bridge hello",source:e))
@@ -414,15 +422,22 @@ impl DvcProcessor for BridgeProcessor {
             }
             s.last_rx = Some(tokio::time::Instant::now());
             match &envelope.message {
-                Message::Ready { bundle_id } => {
-                    if bundle_id == BUNDLE_ID {
+                Message::Ready {
+                    bundle_id,
+                    bridge_version,
+                } => {
+                    if *bundle_id == self.shared.bundle_id {
                         s.ready = true;
                         self.shared
                             .bootstrap
                             .record(BootstrapStage::VersionReceived);
+                        tracing::debug!(%bridge_version, "rdpilot-bridge ready");
                     } else {
                         drop(s);
-                        self.shared.invalidate("bridge bundle mismatch");
+                        self.shared.invalidate(&format!(
+                            "rdpilot-bridge {bridge_version} runs bundle {bundle_id}, expected {}",
+                            self.shared.bundle_id
+                        ));
                         continue;
                     }
                 }
@@ -501,6 +516,37 @@ impl Drop for PendingRequest {
 mod tests {
     use super::*;
     use serde_json::json;
+    fn new_shared() -> Arc<BridgeShared> {
+        Arc::new(BridgeShared::with_bundle_id("bundle-under-test".into()))
+    }
+    #[test]
+    fn ready_for_another_bundle_invalidates_the_bridge() {
+        let s = new_shared();
+        let mut p = BridgeProcessor::new(s.clone());
+        deliver(
+            &mut p,
+            Envelope::new(
+                s.generation,
+                0,
+                Message::Ready {
+                    bundle_id: "other".into(),
+                    bridge_version: "9.9.9".into(),
+                },
+            ),
+        );
+        assert!(!s.ready());
+        let failure = s.failure().unwrap();
+        assert!(failure.contains("other") && failure.contains("bundle-under-test"));
+    }
+    #[test]
+    fn frames_of_another_protocol_version_invalidate_the_bridge() {
+        let s = new_shared();
+        let mut p = BridgeProcessor::new(s.clone());
+        let mut e = Envelope::new(s.generation, 0, Message::Pong);
+        e.version += 1;
+        deliver(&mut p, e);
+        assert!(s.failure().unwrap().contains("bridge protocol"));
+    }
     fn peer(shared: Arc<BridgeShared>) -> BridgeProcessor {
         let mut peer = BridgeProcessor::new(shared.clone());
         deliver(
@@ -509,7 +555,8 @@ mod tests {
                 shared.generation,
                 0,
                 Message::Ready {
-                    bundle_id: BUNDLE_ID.into(),
+                    bundle_id: shared.bundle_id.clone(),
+                    bridge_version: "0.0.0-test".into(),
                 },
             ),
         );
@@ -551,8 +598,8 @@ mod tests {
     }
     #[tokio::test]
     async fn stream_preserves_large_unsolicited_messages_and_rejects_cross_target_generation() {
-        let a = Arc::new(BridgeShared::new());
-        let b = Arc::new(BridgeShared::new());
+        let a = new_shared();
+        let b = new_shared();
         let mut pa = peer(a.clone());
         let mut pb = peer(b.clone());
         let (mut ca, _) = attached(a.clone(), &mut pa).await;
@@ -579,7 +626,7 @@ mod tests {
     }
     #[tokio::test]
     async fn busy_detach_and_new_attachment_do_not_replay() {
-        let s = Arc::new(BridgeShared::new());
+        let s = new_shared();
         let mut p = peer(s.clone());
         let (a, _input) = attached(s.clone(), &mut p).await;
         let (tx, _) = mpsc::channel(2);
@@ -599,7 +646,7 @@ mod tests {
     }
     #[tokio::test(start_paused = true)]
     async fn silent_bridge_loss_bounds_receive_and_does_not_stop_native_rdp() {
-        let s = Arc::new(BridgeShared::new());
+        let s = new_shared();
         let mut p = peer(s.clone());
         let (mut a, _) = attached(s.clone(), &mut p).await;
         tokio::time::advance(Duration::from_secs(36)).await;
@@ -614,7 +661,7 @@ mod tests {
     }
     #[tokio::test]
     async fn outgoing_saturation_retires_cua_without_consuming_native_queue() {
-        let s = Arc::new(BridgeShared::new());
+        let s = new_shared();
         let mut p = peer(s.clone());
         let (a, mut native) = attached(s.clone(), &mut p).await;
         for _ in 0..STREAM_DEPTH {
@@ -631,7 +678,7 @@ mod tests {
     }
     #[tokio::test]
     async fn cancelled_control_cleans_pending_and_caller_backpressure_closes_attachment() {
-        let s = Arc::new(BridgeShared::new());
+        let s = new_shared();
         let mut p = peer(s.clone());
         let (a, _) = attached(s.clone(), &mut p).await;
         for _ in 0..=STREAM_DEPTH {

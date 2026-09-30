@@ -722,15 +722,22 @@ impl RdpilotDriveBackend {
         let id = req.device_io_request.file_id;
         if req.initial_query != 0 {
             let entries: Vec<(PathBuf, String, bool)> = match self.open_files.get(&id) {
-                Some(OpenEntry::BundleRoot) => [
-                    "bootstrap.ps1",
-                    "manifest.json",
-                    "cua.zip",
-                    "rdpilot-bridge.exe",
-                ]
-                .into_iter()
-                .map(|name| (self.bridge_path.join(name), name.to_string(), false))
-                .collect(),
+                // Every plain file of the (flat) bundle directory: the bridge,
+                // the Cua archive and the manifest.
+                Some(OpenEntry::BundleRoot) => fs::read_dir(&self.bridge_path)
+                    .map(|entries| {
+                        let mut files: Vec<(PathBuf, String, bool)> = entries
+                            .filter_map(Result::ok)
+                            .filter(|e| e.path().is_file())
+                            .filter_map(|e| {
+                                let name = e.file_name().into_string().ok()?;
+                                Some((e.path(), name, false))
+                            })
+                            .collect();
+                        files.sort_by(|a, b| a.1.cmp(&b.1));
+                        files
+                    })
+                    .unwrap_or_default(),
                 Some(OpenEntry::Root) if self.bridge_path.is_dir() => {
                     vec![(self.bridge_path.clone(), "bundle".into(), true)]
                 }
@@ -1192,20 +1199,20 @@ mod tests {
         let root = write_temp_file(b"");
         fs::remove_file(&root).unwrap();
         fs::create_dir(&root).unwrap();
-        fs::write(root.join("bootstrap.ps1"), b"payload").unwrap();
+        fs::write(root.join("manifest.json"), b"payload").unwrap();
         let mut backend = RdpilotDriveBackend::new(root.clone(), "rdpilot-bridge.exe", None);
         let folder = backend.handle_create(create_req(0, "\\bundle")).unwrap();
         let (status, id) = create_response_fields(&folder[0]);
         assert_eq!(status, NtStatus::SUCCESS);
         assert_eq!(backend.open_files.get(&id), Some(&OpenEntry::BundleRoot));
         let file = backend
-            .handle_create(create_req(0, "\\bundle\\bootstrap.ps1"))
+            .handle_create(create_req(0, "\\bundle\\manifest.json"))
             .unwrap();
         let (status, id) = create_response_fields(&file[0]);
         assert_eq!(status, NtStatus::SUCCESS);
         assert_eq!(
             backend.open_files.get(&id),
-            Some(&OpenEntry::File(root.join("bootstrap.ps1")))
+            Some(&OpenEntry::File(root.join("manifest.json")))
         );
         let bad = backend
             .handle_create(create_req(0, "\\bundle\\..\\outside"))

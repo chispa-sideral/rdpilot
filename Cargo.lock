@@ -152,6 +152,9 @@ name = "arbitrary"
 version = "1.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d036a3c4ab069c7b410a2ce876bd74808d2d0888a82667669f8e783a898bf1"
+dependencies = [
+ "derive_arbitrary",
+]
 
 [[package]]
 name = "arg_enum_proc_macro"
@@ -871,6 +874,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7cd812cc2bc1d69d4764bd80df88b4317eaef9e773c75226407d9bc0876b211c"
 dependencies = [
  "powerfmt",
+]
+
+[[package]]
+name = "derive_arbitrary"
+version = "1.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1e567bd82dcff979e4b03460c307b3cdc9e96fde3d73bed1496d2bc75d9dd62a"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -3020,7 +3034,7 @@ dependencies = [
 
 [[package]]
 name = "rdpilot"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "image",
  "ironrdp",
@@ -3049,8 +3063,9 @@ dependencies = [
 
 [[package]]
 name = "rdpilot-bridge"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
+ "flate2",
  "libc",
  "rdpilot-bridge-protocol",
  "serde_json",
@@ -3058,11 +3073,12 @@ dependencies = [
  "tempfile",
  "tokio",
  "windows-sys 0.61.2",
+ "zip",
 ]
 
 [[package]]
 name = "rdpilot-bridge-protocol"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -3070,7 +3086,7 @@ dependencies = [
 
 [[package]]
 name = "rdpilot-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64",
  "clap",
@@ -3083,7 +3099,7 @@ dependencies = [
 
 [[package]]
 name = "rdpilot-config"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "config",
  "directories",
@@ -3097,11 +3113,12 @@ dependencies = [
 
 [[package]]
 name = "rdpilot-daemon"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64",
  "bytes",
  "directories",
+ "flate2",
  "getrandom 0.3.4",
  "http-body-util",
  "hyper",
@@ -3109,20 +3126,28 @@ dependencies = [
  "if-addrs",
  "libc",
  "rdpilot",
+ "rdpilot-bridge-protocol",
  "rdpilot-config",
  "rdpilot-ipc",
+ "reqwest",
+ "rustls",
+ "rustls-native-certs",
+ "semver",
  "serde",
  "serde_json",
+ "sha2",
  "subtle",
  "sysinfo",
+ "tempfile",
  "thiserror",
  "tokio",
  "windows-sys 0.61.2",
+ "zip",
 ]
 
 [[package]]
 name = "rdpilot-ipc"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "directories",
  "serde",
@@ -3133,7 +3158,7 @@ dependencies = [
 
 [[package]]
 name = "rdpilot-mcp"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "clap",
  "rdpilot-ipc",
@@ -3198,11 +3223,14 @@ dependencies = [
  "log",
  "percent-encoding",
  "pin-project-lite",
+ "rustls",
+ "rustls-pki-types",
  "serde",
  "serde_json",
  "serde_urlencoded",
  "sync_wrapper",
  "tokio",
+ "tokio-rustls",
  "tower",
  "tower-http",
  "tower-service",
@@ -4949,6 +4977,19 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.117",
+]
+
+[[package]]
+name = "zip"
+version = "4.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "caa8cd6af31c3b31c6631b8f483848b91589021b28fffe50adada48d4f4d2ed1"
+dependencies = [
+ "arbitrary",
+ "crc32fast",
+ "flate2",
+ "indexmap",
+ "memchr",
 ]
 
 [[package]]

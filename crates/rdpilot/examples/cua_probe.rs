@@ -1,5 +1,7 @@
 //! RDP-only integration probe. Credentials are read from environment and never printed.
 //! Usage: cargo run -p rdpilot --example cua_probe -- BUNDLE_DIR REQUESTS_JSONL OUTPUT_JSONL
+//! BUNDLE_DIR is a prepared bundle directory (rdpilot-bridge.exe, the Cua archive and
+//! manifest.json), for example a per-connect directory under the daemon's cache.
 //! REQUESTS_JSONL contains native Cua requests; initialize is performed automatically.
 use rdpilot::{ConnectionConfig, Session};
 use serde_json::json;
@@ -18,19 +20,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let output = PathBuf::from(&args[3]);
     let root = output.with_extension("share");
     std::fs::create_dir_all(&root)?;
+    let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(
+        PathBuf::from(&args[1]).join("manifest.json"),
+    )?)?;
+    let bundle_id = manifest["bundle_id"]
+        .as_str()
+        .ok_or("manifest.json has no bundle_id")?
+        .to_owned();
     let mut cfg = ConnectionConfig::new(
         std::env::var("PROBE_HOST")?,
         std::env::var("PROBE_USERNAME")?,
         std::env::var("PROBE_PASSWORD")?,
     )
     .bundle_path(&args[1])
+    .bundle_id(bundle_id)
     .share_root(&root)
     .accept_invalid_certs(std::env::var("PROBE_ACCEPT_INVALID_CERTS").as_deref() == Ok("1"));
     if let Ok(port) = std::env::var("PROBE_PORT") {
         cfg = cfg.port(port.parse()?);
     }
     let session = Session::connect(&cfg).await?;
-    eprintln!("RDP connected; deploying pinned bundle");
+    eprintln!("RDP connected; deploying bundle");
     {
         let deploy = session.deploy_and_launch();
         tokio::pin!(deploy);

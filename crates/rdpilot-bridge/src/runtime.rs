@@ -1,5 +1,6 @@
 use rdpilot_bridge_protocol::{
-    encode, Envelope, Message, BUNDLE_ID, MAX_FRAME_BYTES, PROTOCOL_VERSION, QUEUE_DEPTH,
+    encode, BundleManifest, Envelope, Message, CUA_DRIVER_EXE_NAME, MANIFEST_NAME, MAX_FRAME_BYTES,
+    PROTOCOL_VERSION, QUEUE_DEPTH,
 };
 use serde_json::Value;
 use std::{
@@ -31,6 +32,8 @@ const STDERR_TAIL_BYTES: usize = 8192;
 #[derive(Clone)]
 pub struct Config {
     pub generation: u64,
+    /// Identity of the installed bundle; Hello must name the same bundle.
+    pub bundle_id: String,
     pub executable: PathBuf,
     pub args: Vec<String>,
     pub transfer_root: PathBuf,
@@ -38,10 +41,17 @@ pub struct Config {
     pub request_timeout: Duration,
 }
 impl Config {
+    /// Run the Cua driver installed next to this executable, identified by
+    /// the adjacent manifest.
     pub fn adjacent(generation: u64) -> io::Result<Self> {
-        let executable = std::env::current_exe()?.with_file_name("cua-driver.exe");
+        let exe = std::env::current_exe()?;
+        let executable = exe.with_file_name(CUA_DRIVER_EXE_NAME);
+        let manifest: BundleManifest =
+            serde_json::from_slice(&std::fs::read(exe.with_file_name(MANIFEST_NAME))?)?;
+        manifest.validate().map_err(error)?;
         Ok(Self {
             generation,
+            bundle_id: manifest.bundle_id,
             executable,
             args: vec!["mcp".into(), "--direct".into()],
             transfer_root: std::env::temp_dir().join("rdpilot-transfer-root"),
@@ -111,9 +121,11 @@ pub async fn run(
                     let id = envelope.control_id;
                     match envelope.message {
                         Message::Hello { bundle_id } => {
-                            if bundle_id != BUNDLE_ID { return Err(error("Cua bundle mismatch")); }
+                            if bundle_id != config.bundle_id {
+                                return Err(error(format!("Cua bundle mismatch: installed {}, daemon wants {bundle_id}", config.bundle_id)));
+                            }
                             ready = true;
-                            emit(&output,config.generation,id,Message::Ready {bundle_id:BUNDLE_ID.into()})?;
+                            emit(&output,config.generation,id,Message::Ready {bundle_id:config.bundle_id.clone(),bridge_version:env!("CARGO_PKG_VERSION").into()})?;
                         }
                         Message::Ping if ready => emit(&output,config.generation,id,Message::Pong)?,
                         Message::Open {attachment_id} if ready => {
@@ -425,7 +437,7 @@ mod windows_tests {
         let powershell = PathBuf::from(std::env::var_os("SystemRoot").unwrap())
             .join(r"System32\WindowsPowerShell\v1.0\powershell.exe");
         let config=Config {
-            generation:1, executable:powershell,
+            generation:1, bundle_id:"test".into(), executable:powershell,
             args:vec!["-NoProfile".into(),"-NonInteractive".into(),"-Command".into(),r#"$p=Start-Process -FilePath "$PSHOME\powershell.exe" -ArgumentList '-NoProfile','-Command','Start-Sleep -Seconds 60' -WindowStyle Hidden -PassThru; @{method='pids';params=@($PID,$p.Id)} | ConvertTo-Json -Compress; Start-Sleep -Seconds 60"#.into()],
             transfer_root:std::env::temp_dir(),share_root:std::env::temp_dir(),request_timeout:REQUEST_TIMEOUT,
         };

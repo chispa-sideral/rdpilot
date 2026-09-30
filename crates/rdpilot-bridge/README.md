@@ -1,6 +1,12 @@
 # Windows Cua carrier
 
-`rdpilot-bridge --generation N` opens `RDPILOT_CUA_V1` in its interactive RDP session. It starts only the adjacent, packaged `cua-driver.exe mcp --direct`, with telemetry disabled. Deployment and archive verification belong to the SDK bootstrap.
+The daemon serves `rdpilot-bridge.exe`, the Cua archive and `manifest.json` on `\\tsclient\RDPILOT\bundle`. Windows asks for confirmation before it starts a program from the redirected drive, so the daemon's Run dialog line (`cmd /d /c ...`) copies the served bridge to `%LOCALAPPDATA%\rdpilot\l<generation in base 36>.exe`, starts that copy with `install`, and deletes it when it exits. The bridge has three subcommands:
+
+- `install --generation N [--source DIR]` reads the manifest from the served directory (default `\\tsclient\RDPILOT\bundle`), checks that its own image is the bridge the manifest names, copies and verifies the bridge and the archive, extracts the archive into `%LOCALAPPDATA%\rdpilot\.staging-*`, verifies every extracted file, and publishes `%LOCALAPPDATA%\rdpilot\<bundle id>` with one rename. A verified existing installation is reused. It then starts the installed copy with `run` and exits.
+- `run --generation N` holds the `Local\rdpilot-cua-<generation>` mutex (a repeated launch for the same generation exits quietly), opens `RDPILOT_CUA_V1` in its interactive RDP session, and starts only the adjacent `cua-driver.exe mcp --direct`, with telemetry disabled. Hello must name the bundle id of the adjacent manifest; Ready reports the bridge version.
+- `cleanup` stops this user's processes under `%LOCALAPPDATA%\rdpilot` in the current session and removes `%LOCALAPPDATA%\rdpilot` and `%TEMP%\rdpilot-transfer-root`. Run from inside the installation, it removes everything else at once and leaves a detached `cmd` that deletes the rest after it exits.
+
+The bridge writes nothing outside those two directories: no registry, service, scheduled task, PATH or firewall change. `tests/guest_footprint.rs` checks its source for such APIs.
 
 The protocol crate owns a versioned JSON envelope inside a little-endian u32 length frame. Inner MCP JSON values are opaque; carrier control IDs and Cua request IDs are unrelated. One attachment is permitted per bridge. Attachment IDs must increase within the bridge generation, including after failed starts; delayed closes therefore cannot close a new runtime. A new attachment always creates a new contained process and MCP session. Nothing is replayed.
 

@@ -40,7 +40,7 @@
 /// compatible. The workspace package version is deliberately not the
 /// protocol identity: a long-lived daemon and a newly installed client must
 /// detect different wire contracts.
-pub const IPC_COMPATIBILITY_VERSION: u32 = 4;
+pub const IPC_COMPATIBILITY_VERSION: u32 = 5;
 
 /// Sanitized recovery guidance for a client that reached an incompatible
 /// daemon. It contains no socket, connection, or credential details so the

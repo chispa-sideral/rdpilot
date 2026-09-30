@@ -27,14 +27,15 @@ use std::time::Duration;
 use rdpilot::ConnectionConfig;
 use rdpilot_ipc::SessionLifecycle;
 
+use crate::bundle::{BundleError, BundleRequest, DaemonBundleSource, PreparedBundle};
 use crate::diagnostics::Diagnostics;
 use crate::ipc::ViewerContext;
 use crate::lifecycle::{self, LifecycleConfig, ShutdownSignal};
 use crate::reconcile::{self, JsonReconciliationSink};
 use crate::registry::{Registry, ViewerRegistry};
 use crate::seams::{
-    BoxFuture, DaemonError, ManagedCua, ManagedSession, RealConnector, ReconciliationSink,
-    SessionConnector, ViewFrameSource,
+    BoxFuture, BundleSource, DaemonError, ManagedCua, ManagedSession, RealConnector,
+    ReconciliationSink, SessionConnector, ViewFrameSource,
 };
 use crate::synthetic_frames::SyntheticFrames;
 use crate::viewer::ViewerGate;
@@ -171,7 +172,13 @@ async fn run_inner(config: RunConfig) -> Result<(), DaemonError> {
         })?,
     });
 
-    let connector: Arc<dyn SessionConnector> = if std::env::var(TEST_CONNECTOR_ENV).is_ok() {
+    let fake = std::env::var(TEST_CONNECTOR_ENV).is_ok();
+    let bundles: Arc<dyn BundleSource> = if fake {
+        Arc::new(FakeBundleSource)
+    } else {
+        Arc::new(DaemonBundleSource::from_environment())
+    };
+    let connector: Arc<dyn SessionConnector> = if fake {
         let slow_ms = std::env::var(TEST_SLOW_MS_ENV)
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
@@ -190,10 +197,10 @@ async fn run_inner(config: RunConfig) -> Result<(), DaemonError> {
         Arc::new(RealConnector)
     };
 
-    let registry = Arc::new(Registry::new(
-        connector,
-        sink.clone() as Arc<dyn ReconciliationSink>,
-    ));
+    let registry = Arc::new(
+        Registry::new(connector, sink.clone() as Arc<dyn ReconciliationSink>)
+            .with_bundle_source(bundles),
+    );
     let diagnostics = Diagnostics::from_env().map(Arc::new);
 
     // Startup reconciliation (DAEMON-04): scan + seed BEFORE the accept
@@ -433,6 +440,25 @@ impl SessionConnector for FakeTestConnector {
                 frames,
                 cua,
             }) as Box<dyn ManagedSession>)
+        })
+    }
+}
+
+/// Bundle source paired with [`FakeTestConnector`]: a fixed bundle id and a
+/// directory the fake sessions never read. Never touches the network.
+struct FakeBundleSource;
+
+impl BundleSource for FakeBundleSource {
+    fn prepare(
+        &self,
+        _request: BundleRequest,
+    ) -> BoxFuture<'_, Result<PreparedBundle, BundleError>> {
+        Box::pin(async {
+            Ok(PreparedBundle {
+                dir: std::env::temp_dir().join("rdpilot-fake-bundle"),
+                bundle_id: "fake-bundle".to_owned(),
+                warnings: Vec::new(),
+            })
         })
     }
 }

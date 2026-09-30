@@ -15,6 +15,10 @@ pub enum Request {
         /// Deploy the Cua bridge for this session. Required (no default): an
         /// older daemon would drop it and deploy the bridge for `CuaEnabled no`.
         cua_enabled: bool,
+        /// `CuaVersion`: `latest-dev`, `latest` or an upstream release tag.
+        cua_version: String,
+        /// `CuaAutoDownload`: download missing components.
+        cua_auto_download: bool,
         #[serde(default)]
         connect_ack: bool,
     },
@@ -120,19 +124,27 @@ mod tests {
             "op": "Connect", "name": null, "host": "h", "port": null,
             "username": "u", "password": "p", "domain": null,
             "accept_invalid_certs": false, "cua_enabled": false,
+            "cua_version": "latest-dev", "cua_auto_download": true,
         });
         let req: Request = serde_json::from_value(json.clone()).unwrap();
         assert!(matches!(
             req,
             Request::Connect {
                 cua_enabled: false,
+                cua_auto_download: true,
+                ref cua_version,
                 ..
-            }
+            } if cua_version == "latest-dev"
         ));
         assert_eq!(serde_json::to_value(&req).unwrap()["cua_enabled"], false);
-        let mut missing = json;
-        missing.as_object_mut().unwrap().remove("cua_enabled");
-        assert!(serde_json::from_value::<Request>(missing).is_err());
+        for field in ["cua_enabled", "cua_version", "cua_auto_download"] {
+            let mut missing = json.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(
+                serde_json::from_value::<Request>(missing).is_err(),
+                "{field}"
+            );
+        }
     }
     #[test]
     #[allow(clippy::unwrap_used)]

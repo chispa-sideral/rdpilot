@@ -1,9 +1,9 @@
 [package]
 name = "rdpilot-daemon"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
 rust-version = "1.78"
-license = "LGPL-3.0-or-later"
+license.workspace = true
 description = "Long-lived local IPC daemon that owns rdpilot's in-memory session registry (DAEMON-01/02/03/04, SESSION-01/03/04). The only crate legitimately depending on both rdpilot and rdpilot-ipc."
 repository = "https://github.com/marcfargas/rdpilot"
 
@@ -19,6 +19,7 @@ path = "src/main.rs"
 rdpilot = { path = "../rdpilot" }
 rdpilot-ipc = { path = "../rdpilot-ipc" }
 rdpilot-config = { path = "../rdpilot-config" }
+rdpilot-bridge-protocol = { path = "../rdpilot-bridge-protocol" }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -49,6 +50,20 @@ getrandom = "0.3.4"
 # Windows dependency is windows-sys 0.61 (the line already in Cargo.lock),
 # its Unix dependency libc.
 if-addrs = "0.15.0"
+# Cua bundle download (bundle module). reqwest 0.12.28, rustls 0.23,
+# rustls-native-certs 0.8, semver 1.0.28, sha2 0.11 and flate2 were already
+# resolved in Cargo.lock; the daemon passes reqwest a rustls ClientConfig
+# built with the aws-lc-rs provider the SDK already uses, so no second TLS
+# or crypto provider is enabled. zip is new: crates.io identity
+# github.com/zip-rs/zip2, MIT, default features off (deflate via flate2 only).
+reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls-manual-roots-no-provider", "system-proxy"] }
+rustls = "0.23"
+rustls-native-certs = "0.8.4"
+semver = "1.0.28"
+sha2 = "0.11"
+zip = { version = "4.2.0", default-features = false, features = ["deflate-flate2"] }
+# Selects flate2's pure-Rust (miniz_oxide) backend for zip; already in Cargo.lock.
+flate2 = "1.1.9"
 
 [target.'cfg(unix)'.dependencies]
 # Fallback for effective-uid retrieval if tokio's peer_cred() needs a
@@ -82,3 +97,4 @@ windows-sys = { version = "0.61.2", features = [
 tokio = { version = "1", features = ["test-util"] }
 # DAEMON-01 soak-test RSS baseline/return-to-baseline assertion (Plan 12-03).
 sysinfo = "0.39.6"
+tempfile = "3"

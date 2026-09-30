@@ -15,6 +15,7 @@ mod target;
 use std::fmt;
 
 pub use expand::{expand_password_command, DEFAULT_PORT};
+pub use keywords::validate_cua_version;
 pub use resolve::{resolve_host, HostsInput, ResolvedHost, Row, Setting, Source};
 pub use target::{Target, UrlTarget};
 

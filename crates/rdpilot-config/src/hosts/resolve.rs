@@ -11,7 +11,8 @@ use super::target::Target;
 use super::{HostsError, Secret, DEFAULT_PORT};
 
 /// Built-in default, read after every file.
-const BUILT_IN_DEFAULT: &str = "Host *\n  CuaEnabled yes\n";
+const BUILT_IN_DEFAULT: &str =
+    "Host *\n  CuaEnabled yes\n  CuaVersion latest-dev\n  CuaAutoDownload yes\n";
 /// Deepest `Include` nesting before an error (as in ssh).
 const MAX_INCLUDE_DEPTH: usize = 16;
 
@@ -180,6 +181,19 @@ impl ResolvedHost {
     #[must_use]
     pub fn cua_enabled(&self) -> bool {
         !matches!(self.find("CuaEnabled"), Some(s) if s.value == "no")
+    }
+
+    /// `CuaVersion` (default `latest-dev`).
+    #[must_use]
+    pub fn cua_version(&self) -> &str {
+        self.find("CuaVersion")
+            .map_or("latest-dev", |s| s.value.as_str())
+    }
+
+    /// `CuaAutoDownload` (default yes).
+    #[must_use]
+    pub fn cua_auto_download(&self) -> bool {
+        !matches!(self.find("CuaAutoDownload"), Some(s) if s.value == "no")
     }
 
     /// Every setting that has a value, in keyword-table order.
@@ -569,6 +583,44 @@ mod tests {
         assert!(h.cua_enabled());
         assert!(!h.accept_invalid_certs());
         assert_eq!(src(&h, "CuaEnabled"), "built-in default");
+        assert_eq!(h.cua_version(), "latest-dev");
+        assert!(h.cua_auto_download());
+        assert_eq!(src(&h, "CuaVersion"), "built-in default");
+        assert_eq!(src(&h, "CuaAutoDownload"), "built-in default");
+    }
+
+    #[test]
+    fn cua_version_and_auto_download_overrides() {
+        let e = Env::new();
+        e.hosts("Host pinned\n  CuaVersion cua-driver-rs-v9.8.7\n  CuaAutoDownload no\n");
+        let h = e.resolve("pinned", &[]).unwrap();
+        assert_eq!(h.cua_version(), "cua-driver-rs-v9.8.7");
+        assert!(!h.cua_auto_download());
+        assert!(src(&h, "CuaVersion").ends_with("hosts:2"));
+        let o = e
+            .resolve("pinned", &["CuaVersion=latest", "CuaAutoDownload=yes"])
+            .unwrap();
+        assert_eq!(o.cua_version(), "latest");
+        assert!(o.cua_auto_download());
+        assert_eq!(src(&o, "CuaVersion"), "-o #1");
+        for bad in ["CuaVersion=a/b", "CuaVersion=..\\x", "CuaVersion=a b"] {
+            assert!(e.resolve("web", &[bad]).is_err(), "{bad}");
+        }
+        e.hosts("Host bad\n  CuaVersion ../x\n");
+        let err = e.resolve("bad", &[]).unwrap_err().to_string();
+        assert!(
+            err.contains("hosts:2") && err.contains("CuaVersion"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn bundle_path_is_not_a_hosts_keyword() {
+        let e = Env::new();
+        for o in ["bundle_path=/opt/bundle", "BundlePath=/opt/bundle"] {
+            let err = e.resolve("web", &[o]).unwrap_err().to_string();
+            assert!(err.contains("unknown keyword"), "{o}: {err}");
+        }
     }
 
     #[test]
@@ -845,7 +897,17 @@ mod tests {
         e.hosts("Host web\n  User a\n");
         let rows = e.resolve("web", &[]).unwrap().rows();
         let names: Vec<_> = rows.iter().map(|r| r.keyword).collect();
-        assert_eq!(names, ["HostName", "Port", "User", "CuaEnabled"]);
+        assert_eq!(
+            names,
+            [
+                "HostName",
+                "Port",
+                "User",
+                "CuaEnabled",
+                "CuaVersion",
+                "CuaAutoDownload"
+            ]
+        );
         assert_eq!(rows[1].value, "3389");
         assert!(rows[1].source.starts_with("not set"));
     }

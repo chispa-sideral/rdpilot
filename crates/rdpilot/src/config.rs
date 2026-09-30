@@ -59,6 +59,9 @@ pub struct ConnectionConfig {
     /// behavior. Owned `PathBuf` (D-09 — no third-party type in the public
     /// signature).
     bundle_path: Option<PathBuf>,
+    /// Identity of the bundle in `bundle_path` (its `manifest.json`
+    /// `bundle_id`). The bridge must answer the handshake with the same id.
+    bundle_id: Option<String>,
     /// Local filesystem path of the share root the RDPDR drive backend
     /// serves in addition to the bundle (D-10.1, FILE-01/FILE-02).
     ///
@@ -90,6 +93,7 @@ impl ConnectionConfig {
             height: DEFAULT_HEIGHT,
             accept_invalid_certs: false,
             bundle_path: None,
+            bundle_id: None,
             share_root: None,
         }
     }
@@ -137,6 +141,14 @@ impl ConnectionConfig {
     #[must_use]
     pub fn bundle_path(mut self, path: impl Into<PathBuf>) -> Self {
         self.bundle_path = Some(path.into());
+        self
+    }
+
+    /// Set the identity of the bundle in [`Self::bundle_path`] (builder).
+    /// The bridge handshake must report the same id.
+    #[must_use]
+    pub fn bundle_id(mut self, id: impl Into<String>) -> Self {
+        self.bundle_id = Some(id.into());
         self
     }
 
@@ -207,6 +219,11 @@ impl ConnectionConfig {
         self.bundle_path.as_deref()
     }
 
+    /// Identity of the bundle in [`Self::get_bundle_path`], if set.
+    pub fn get_bundle_id(&self) -> Option<&str> {
+        self.bundle_id.as_deref()
+    }
+
     /// Local filesystem path of the share root the RDPDR drive backend
     /// serves in addition to the bundle, if configured (D-10.1,
     /// FILE-01/FILE-02).
@@ -230,6 +247,7 @@ impl fmt::Debug for ConnectionConfig {
             .field("height", &self.height)
             .field("accept_invalid_certs", &self.accept_invalid_certs)
             .field("bundle_path", &self.bundle_path)
+            .field("bundle_id", &self.bundle_id)
             .field("share_root", &self.share_root)
             .finish()
     }
@@ -256,11 +274,14 @@ mod tests {
 
     #[test]
     fn bundle_path_builder_and_getter_roundtrip() {
-        let cfg = ConnectionConfig::new("h", "u", "p").bundle_path("/tmp/rdpilot-bundle");
+        let cfg = ConnectionConfig::new("h", "u", "p")
+            .bundle_path("/srv/rdpilot-bundle")
+            .bundle_id("cua-driver-rs-v9.9.9-abc");
         assert_eq!(
             cfg.get_bundle_path(),
-            Some(std::path::Path::new("/tmp/rdpilot-bundle"))
+            Some(std::path::Path::new("/srv/rdpilot-bundle"))
         );
+        assert_eq!(cfg.get_bundle_id(), Some("cua-driver-rs-v9.9.9-abc"));
     }
 
     #[test]

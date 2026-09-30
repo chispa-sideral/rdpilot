@@ -26,10 +26,12 @@
 # %APPDATA%\rdpilot\transfer-staging on Windows).
 # share_root = "/var/lib/rdpilot/transfer-staging"
 
-# Directory containing the pinned Cua archive, Windows bridge, and manifest.
-# The daemon stages this payload through RDP; the guest needs no internet access.
-# Unset permits native RDP recovery without deploying Cua.
-# Env: RDPILOT_BUNDLE_PATH
+# Optional, for offline and development use: a local directory holding
+# rdpilot-bridge.exe and/or one Cua archive
+# (cua-driver-rs-<version>-windows-x86_64-binary.zip). A file found here is
+# used instead of downloading it and is trusted without a checksum; a missing
+# one is downloaded (unless CuaAutoDownload is no). Unset: both are downloaded
+# and verified automatically. It cannot be set per connect.
 # bundle_path = "/absolute/path/to/rdpilot-bundle"
 
 # Read-only live viewer (`rdpilot view`). Nothing listens until you run

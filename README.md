@@ -10,21 +10,17 @@ MCP caller ⇄ rdpilot-mcp --session NAME ⇄ local daemon ⇄ RDP dynamic chann
                                                      ⇄ bridge ⇄ Cua MCP
 ```
 
-No guest network port, Python, Node installation or internet access is required.
-The guest runs the pinned upstream Windows x64 bundle and our small Rust bridge.
-The agent and its reasoning remain on the caller's machine.
+No guest network port, Python, Node installation, administrator right or
+internet access is required. The rdpilot host downloads the upstream Windows x64
+Cua driver and our small Rust bridge, verifies them and copies them to the guest
+over RDP. The agent and its reasoning remain on the caller's machine.
 
 ## Build and use
 
-Build local binaries with `cargo build --workspace`. Build the guest bridge for
-`x86_64-pc-windows-msvc` on Windows or with cargo-xwin. Package the original Cua
-0.28.2 archive (downloaded only on the build machine):
+Build local binaries with `cargo build --workspace` (`scripts/install-local.sh`
+installs the three binaries together, preserving the daemon's sibling lookup).
 
 ```sh
-python3 scripts/package-cua.py \
-  --bridge path/to/rdpilot-bridge.exe \
-  --bin-dir target/debug --output dist
-export RDPILOT_BUNDLE_PATH="$PWD/dist/bundle"
 rdpilot session connect --help
 # Connect to a host from your hosts file (or an rdp:// URL), then bind one MCP
 # process to the name:
@@ -32,10 +28,8 @@ rdpilot connect my-host --name NAME
 rdpilot-mcp --session NAME
 ```
 
-`scripts/install-local.sh` installs the three local binaries together, preserving
-the daemon's sibling lookup. Set `RDPILOT_BUNDLE_SRC` to stage an existing bundle.
-Use `--archive ZIP` to package an already downloaded archive without build-time
-network access. `--bundle-only` builds a guest payload for development probes.
+A connect with `CuaEnabled yes` (the default) gets the Cua bundle automatically
+(see [Cua bundle](#cua-bundle)). There is nothing to package or configure.
 
 The MCP endpoint forwards upstream initialize, tools, results, images, requests
 and notifications unchanged. It requires an existing named RDP connection. One
@@ -81,7 +75,8 @@ only negations never matches. As in ssh, the target host is lowercased and
 patterns are matched as written, so write patterns in lower case: `Host DevBox`
 never matches. The **first value obtained for each setting wins**: rdpilot reads
 the URL, then `-o` options in order, then the hosts file top to bottom, then the
-built-in default (`Host *` / `CuaEnabled yes`). Lines before the first `Host`
+built-in default (`Host *` with `CuaEnabled yes`, `CuaVersion latest-dev`,
+`CuaAutoDownload yes`). Lines before the first `Host`
 apply to every host. `Include PATH` (globs allowed, sorted, `~` and paths
 relative to the hosts file's directory) reads more files; a pattern that matches
 nothing is skipped, cycles and nesting deeper than 16 are errors, and an
@@ -98,6 +93,8 @@ work; quote values that contain spaces. Booleans accept only `yes` and `no`.
 | `PasswordCommand` | Shell command whose stdout is the password (see below). |
 | `AcceptInvalidCerts` | Accept any server certificate (`yes`/`no`, default `no`). |
 | `CuaEnabled` | `no` = native RDP only: no bridge is deployed and `put`/`get` and Cua are unavailable. Default `yes`. |
+| `CuaVersion` | Cua driver release: `latest-dev` (newest, nightlies included), `latest` (newest non-nightly) or an upstream tag. Default `latest-dev`. |
+| `CuaAutoDownload` | `no` = use only cached or `bundle_path` files, never download. Default `yes`. |
 | `Include` | Read more files. |
 
 `Password` and `PasswordCommand` share one slot, so whichever is obtained first
@@ -136,20 +133,89 @@ it (`PasswordCommand "printenv MY_SECRET"`). `%%` yields one literal `%`:
 `PasswordCommand "printf %%s hunter"` runs `printf %s hunter`, and on Windows `PasswordCommand "cmd /c echo 100%%"`
 runs `cmd /c echo 100%`.
 
-## Runtime and packaging
+## Cua bundle
 
-The package contains the original signed upstream ZIP, bridge, manifest, bootstrap
-script and notices. Deployment verifies the ZIP, bridge and extracted file hashes,
-publishes a versioned user-local directory, and launches adjacent
-`cua-driver.exe mcp --direct` with telemetry disabled. Upstream signatures stay
-unchanged. Hash verification is separate from Windows Authenticode trust.
+A Cua-enabled connect needs two guest files. The daemon gets both before the RDP
+logon:
 
-Development bridges are **unsigned**. Release signing is a separate publisher
-step: sign the built bridge with your Authenticode signing service before passing
-it to the packager, then verify with `Get-AuthenticodeSignature` on Windows. This
-repository does not provide signing credentials or claim a fully signed release.
-The packager hashes final signed bytes. See `packaging/notices` for licenses and
-versioned upstream source/build references.
+- **rdpilot-bridge.exe** comes from this project's GitHub release whose tag is
+  `v<rdpilot version>`, checked against that release's `SHA256SUMS`. A
+  development build (a version with no published release) uses
+  `rdpilot-bridge.exe` from `bundle_path` when there is one, else the newest
+  published release; the connect then warns that the bridge version differs.
+- **The Cua driver** is the upstream `cua-driver-rs-<version>-windows-x86_64-binary.zip`
+  from the trycua/cua GitHub releases, checked against that release's
+  `checksums.txt`. `CuaVersion` selects it: `latest-dev` (default: the newest
+  release, nightlies included), `latest` (the newest non-nightly release) or an
+  upstream tag such as `cua-driver-rs-v<version>` or
+  `nightly-cua-driver-rs-v<version>`. Releases are ordered by version number,
+  not by GitHub's latest or pre-release flags.
+
+Only the rdpilot host needs network access. Set `-o CuaVersion=<tag>` to pin a
+driver release, for example when a new upstream release breaks.
+
+**Cache.** Verified files stay in `$XDG_CACHE_HOME/rdpilot` (else
+`~/.cache/rdpilot`) on Linux, `~/Library/Caches/rdpilot` on macOS and
+`%LOCALAPPDATA%\rdpilot\cache` on Windows, one directory per component, version
+and architecture. Every file is hashed again before use. The answer for
+`latest-dev` and `latest` is reused for one hour. You can delete the cache at any
+time.
+
+**Offline.** When GitHub cannot be reached, a verified cached copy of the
+requested version is used. For `latest-dev` and `latest` the newest cached
+version of that channel is used, with a warning. `CuaAutoDownload no` never
+downloads: it uses only the cache and `bundle_path`. The daemon honours
+`HTTPS_PROXY`, `HTTP_PROXY` and `NO_PROXY`, read when it starts.
+
+**bundle_path.** For offline and development use, set `bundle_path` in the
+daemon's `config.toml` to a local directory that holds `rdpilot-bridge.exe`, a Cua archive
+(`cua-driver-rs-<version>-windows-x86_64-binary.zip`), or both. A file found there
+is used instead of downloading and is trusted without a checksum; a missing one
+is downloaded. An archive there fixes the Cua version and overrides
+`CuaVersion` (with a warning when they differ). `bundle_path` cannot be set per
+connect. To test a bridge built from source, build it for
+`x86_64-pc-windows-msvc` (on Windows, or with cargo-xwin) and put the exe in that
+directory.
+
+**Fail closed.** If Cua is enabled and a component cannot be obtained or
+verified, `rdpilot connect` fails before the RDP logon. The error names the
+component, version, architecture and cause (offline, checksum failure, no
+matching release, unsupported archive layout, missing path) and the fixes:
+`-o CuaEnabled=no` for a native-only session, `-o CuaVersion=<tag>`, a
+`bundle_path`, or network access.
+
+**Trust.** Each file is checked against a checksum file from the same GitHub
+release, so the check detects damaged or mixed-up downloads, not a compromised
+release. rdpilot compiles in no hash table and no Cua version. The Cua driver is
+downloaded from upstream under its own licence; rdpilot does not redistribute
+it. Development bridges and the released bridge are not Authenticode-signed.
+
+**Guest footprint.** The daemon serves the bridge, the archive and a manifest on
+the RDP drive `\\tsclient\RDPILOT\bundle`. Windows asks for confirmation before
+it starts a program from that drive, so the daemon types a `cmd /d /c` line
+into the Run dialog that copies the served bridge to
+`%LOCALAPPDATA%\rdpilot\l<generation in base 36>.exe`, starts that copy with
+`install --generation <generation>`, and deletes the copy when it exits. The
+bridge checks its own image and every served file against the manifest,
+extracts the archive, installs into
+`%LOCALAPPDATA%\rdpilot\<bundle id>`, starts `cua-driver.exe mcp --direct`
+there with telemetry disabled, and contains it in a kill-on-close job. It writes
+nothing else: no registry, service, scheduled task, PATH or firewall change
+(Windows itself records the Run dialog history). File transfer uses
+`%TEMP%\rdpilot-transfer-root`. To remove everything, run
+`"%LOCALAPPDATA%\rdpilot\<bundle id>\rdpilot-bridge.exe" cleanup` in the guest
+session; it stops this user's rdpilot processes in that session and removes
+`%LOCALAPPDATA%\rdpilot` and `%TEMP%\rdpilot-transfer-root`. The manual
+equivalent, after the rdpilot sessions are closed, is
+`rmdir /s /q "%LOCALAPPDATA%\rdpilot"` and
+`rmdir /s /q "%TEMP%\rdpilot-transfer-root"`.
+
+**Releases.** Set `[workspace.package] version` in `Cargo.toml`, merge, then
+push the tag `v<version>` on that develop commit. The release workflow builds
+`rdpilot-bridge.exe`, checks that the tag matches the version, and publishes the
+exe with `SHA256SUMS`.
+
+## Runtime
 
 Frames are bounded at 16 MiB, with bounded queues and pipe/write/request deadlines.
 A crash, stalled tool, transport loss or slow caller closes its attachment and
@@ -246,7 +312,7 @@ printed loopback URL on your machine (the Host check needs the same port):
 ssh -L PORT:127.0.0.1:PORT user@daemon-host
 ```
 
-Upgrade note: this release changes the IPC compatibility version to 4. After
+Upgrade note: this release changes the IPC compatibility version to 5. After
 you upgrade, restart `rdpilot-daemon` (this ends its live sessions). Until then,
 the CLI and MCP adapter report the daemon compatibility mismatch message.
 
@@ -274,8 +340,9 @@ stall and RDP reconnect isolation. It provisions nothing and keeps credentials
 out of evidence. `--windows-job-test EXE` also runs the bridge's Windows test
 executable through the same RDP-only path.
 
-`cargo run -p rdpilot --example cua_probe -- BUNDLE REQUESTS.jsonl OUTPUT.jsonl`
-connects, deploys via RDPDR, initializes native MCP, runs supplied JSON-RPC requests,
+`cargo run -p rdpilot --example cua_probe -- BUNDLE_DIR REQUESTS.jsonl OUTPUT.jsonl`
+takes a prepared bundle directory (for example one under the cache's `bundles`
+directory), connects, deploys via RDPDR, initializes native MCP, runs supplied JSON-RPC requests,
 and captures a native recovery screenshot. It reads `PROBE_HOST`,
 `PROBE_PORT`, `PROBE_USERNAME`, `PROBE_PASSWORD` and optional
 `PROBE_ACCEPT_INVALID_CERTS=1` (example-only variables, not rdpilot configuration). Live verification also needs two independently

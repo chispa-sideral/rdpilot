@@ -29,5 +29,6 @@ windows-bridge:
     cargo build -p rdpilot-bridge --target x86_64-pc-windows-msvc
 
 # No machine provisioning: run the native Cua probe against caller-supplied RDP env.
+# `bundle` is a prepared bundle directory (bridge, Cua archive, manifest.json).
 cua-probe bundle requests output:
     cargo run -p rdpilot --example cua_probe -- "{{bundle}}" "{{requests}}" "{{output}}"

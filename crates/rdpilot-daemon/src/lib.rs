@@ -55,6 +55,7 @@
 // individually `#[allow]`d and fully covered by the crate-wide `#![deny]`.
 #![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used))]
 
+mod bundle;
 mod diagnostics;
 mod dispatch;
 mod error_map;

@@ -28,6 +28,8 @@ const RUN_DIALOG_SETTLE: Duration = Duration::from_secs(2);
 const SESSION_SETTLE: Duration = Duration::from_secs(10);
 const TYPE_CHUNK_LEN: usize = 1;
 const TYPE_CHUNK_GAP: Duration = Duration::from_millis(150);
+const NATIVE_ONLY_PING: &str =
+    "native-only session (CuaEnabled no): there is no rdpilot-bridge to ping";
 pub struct Session {
     thread: Option<JoinHandle<Result<()>>>,
     input_tx: mpsc::Sender<RdpInputEvent>,
@@ -37,6 +39,9 @@ pub struct Session {
     bridge: Arc<BridgeShared>,
     next_req_id: AtomicU64,
     share_root: Option<PathBuf>,
+    /// False for a native-only session (no bundle configured): there is no
+    /// bridge to reach.
+    cua: bool,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransferOutcome {
@@ -126,6 +131,7 @@ impl Session {
             bridge,
             next_req_id: AtomicU64::new(1),
             share_root: cfg.get_share_root().map(Path::to_path_buf),
+            cua: cfg.get_bundle_path().is_some(),
         })
     }
 
@@ -299,6 +305,9 @@ impl Session {
         self.bridge.attach(self.input_tx.clone()).await
     }
     pub async fn ping(&self) -> Result<Duration> {
+        if !self.cua {
+            return Err(Error::Session(NATIVE_ONLY_PING.to_owned()));
+        }
         let started = std::time::Instant::now();
         match self
             .bridge
@@ -309,7 +318,9 @@ impl Session {
             _ => Err(Error::dvc("unexpected ping response")),
         }
     }
-    /// Start the shipped, hash-verified bundle over RDPDR. One launch per generation.
+    /// Launch a local copy of the served bridge (`install`, which verifies
+    /// and installs the bundle, then starts the installed copy) through the
+    /// Run dialog; see [`bridge_launch_command`]. One launch per generation.
     pub async fn deploy_and_launch(&self) -> Result<Duration> {
         if self.bridge.ready() {
             return self.ping().await;
@@ -337,13 +348,15 @@ impl Session {
             }
         }
         Err(Error::bootstrap(format!(
-            "Cua bundle did not become ready; stages={}",
+            "rdpilot-bridge did not start (possible security prompt in the guest, or a bridge \
+             that does not speak bridge protocol {}); stages={}",
+            rdpilot_bridge_protocol::PROTOCOL_VERSION,
             self.bootstrap_summary()
         )))
     }
     async fn inject_bootstrap(&self) -> Result<()> {
         // Retrying before Ready does not replay MCP. The guest generation mutex
-        // makes repeated script invocations no-ops while their owner is alive.
+        // makes repeated launches no-ops while their owner is alive.
         self.bridge
             .bootstrap
             .record(BootstrapStage::LaunchInputAttempted);
@@ -352,10 +365,7 @@ impl Session {
         tokio::time::sleep(RUN_DIALOG_SETTLE).await;
         self.send_key(KeyAction::Combo(vec![Key::Ctrl, Key::A]))
             .await?;
-        let command = format!(
-            r#"powershell.exe -NoProfile -ExecutionPolicy Bypass -File "\\tsclient\RDPILOT\bundle\bootstrap.ps1" -Generation {}"#,
-            self.bridge.generation
-        );
+        let command = bridge_launch_command(self.bridge.generation);
         for chunk in chunk_str(&command, TYPE_CHUNK_LEN) {
             self.send_key(KeyAction::Type(chunk)).await?;
             tokio::time::sleep(TYPE_CHUNK_GAP).await;
@@ -477,6 +487,60 @@ impl Drop for StagedFile {
     }
 }
 
+/// The directory the daemon serves the bundle in, as the guest sees it.
+const SERVED_BUNDLE_DIR: &str = r"\\tsclient\RDPILOT\bundle";
+
+/// The longest line [`bridge_launch_command`] may produce. The Run dialog
+/// keeps only the first 259 characters (`MAX_PATH - 1`) of what is typed; a
+/// cut line leaves a `(` open, and cmd then runs nothing. 240 leaves a margin
+/// below that limit for every `u64` generation.
+const RUN_LINE_LIMIT: usize = 240;
+
+/// Name of the local launcher copy for `generation`: `l` and the generation
+/// in base 36, padded to 13 digits (the width of `u64::MAX`). The mapping is
+/// one-to-one, so every generation has its own name, and every name has the
+/// same length, starts with a letter, holds only `[0-9a-z]` and is never a
+/// reserved device name.
+fn launcher_name(generation: u64) -> String {
+    const DIGITS: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    let mut digits = [b'0'; 13];
+    let mut rest = generation;
+    for digit in digits.iter_mut().rev() {
+        *digit = DIGITS[(rest % 36) as usize];
+        rest /= 36;
+    }
+    let digits: String = digits.iter().map(|&b| char::from(b)).collect();
+    format!("l{digits}.exe")
+}
+
+/// What the Run dialog receives. Windows asks for confirmation before it
+/// starts an executable from the redirected drive, so `cmd` first copies the
+/// served bridge into `%LOCALAPPDATA%\rdpilot\` under [`launcher_name`],
+/// starts that local copy with `install --generation <generation>` (which
+/// verifies the served bundle and its own image against the manifest,
+/// installs, starts the installed copy and exits), then deletes the copy. The
+/// name is unique per generation, so concurrent connects of the same user do
+/// not share a launcher; a retried launch for the same generation fails at
+/// `copy` while the first launcher still runs. A copy left by an interrupted
+/// launch is inside `%LOCALAPPDATA%\rdpilot`, which `cleanup` removes. `&&`
+/// chains stop at the first failure, so nothing runs from an unexpected
+/// directory. Only `%LOCALAPPDATA%` can contain spaces; it is quoted, and
+/// every other token is a fixed name or a number. The line is at most
+/// [`RUN_LINE_LIMIT`] characters long.
+fn bridge_launch_command(generation: u64) -> String {
+    let launcher = launcher_name(generation);
+    let line = format!(
+        r#"cmd /d /c cd /d "%LOCALAPPDATA%" && (md rdpilot 2>nul & cd rdpilot) && copy /y {SERVED_BUNDLE_DIR}\{exe} {launcher} && (.\{launcher} install --generation {generation} & del {launcher})"#,
+        exe = rdpilot_bridge_protocol::BRIDGE_EXE_NAME,
+    );
+    debug_assert!(
+        line.len() <= RUN_LINE_LIMIT,
+        "{} > {RUN_LINE_LIMIT}",
+        line.len()
+    );
+    line
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -492,9 +556,133 @@ mod tests {
                 bridge: Arc::new(BridgeShared::new()),
                 next_req_id: AtomicU64::new(1),
                 share_root: None,
+                cua: true,
             },
             rx,
         )
+    }
+    #[tokio::test]
+    async fn ping_on_a_native_only_session_says_so_at_once() {
+        let (mut s, mut rx) = session();
+        s.cua = false;
+        let started = std::time::Instant::now();
+        let error = s.ping().await.unwrap_err();
+        assert!(started.elapsed() < Duration::from_millis(100));
+        assert!(error.to_string().contains("native-only session"), "{error}");
+        // Nothing was sent towards the guest.
+        assert!(rx.try_recv().is_err());
+    }
+    #[test]
+    fn launch_command_copies_the_served_bridge_and_starts_the_local_copy() {
+        assert_eq!(
+            bridge_launch_command(42),
+            r#"cmd /d /c cd /d "%LOCALAPPDATA%" && (md rdpilot 2>nul & cd rdpilot) && copy /y \\tsclient\RDPILOT\bundle\rdpilot-bridge.exe l0000000000016.exe && (.\l0000000000016.exe install --generation 42 & del l0000000000016.exe)"#
+        );
+    }
+
+    #[test]
+    fn launch_command_never_starts_an_executable_from_the_redirected_drive() {
+        let command = bridge_launch_command(7);
+        assert!(!command.to_lowercase().contains("powershell"));
+        // The only reference to the drive is the copy source.
+        assert_eq!(command.matches(r"\\tsclient").count(), 1);
+        assert!(command.contains(r"copy /y \\tsclient\RDPILOT\bundle\rdpilot-bridge.exe "));
+        // The started image is the local copy in %LOCALAPPDATA%\rdpilot.
+        assert!(command.contains(r"&& (.\l0000000000007.exe install --generation 7 "));
+        assert!(command.contains(r#"cd /d "%LOCALAPPDATA%" && (md rdpilot 2>nul & cd rdpilot) &&"#));
+    }
+
+    #[test]
+    fn launch_command_fits_the_run_dialog_for_every_generation() {
+        // The longest generation gives the longest line.
+        let longest = bridge_launch_command(u64::MAX);
+        assert!(
+            longest.len() <= RUN_LINE_LIMIT,
+            "{} characters: {longest}",
+            longest.len()
+        );
+        // The Run dialog keeps 259 characters (MAX_PATH - 1).
+        const { assert!(RUN_LINE_LIMIT < 259) };
+        for generation in [0, 1, 1_801_369_873_856_485_411, u64::MAX - 1] {
+            assert!(bridge_launch_command(generation).len() <= longest.len());
+        }
+        assert!(longest.is_ascii());
+    }
+
+    #[test]
+    fn launch_command_passes_the_full_generation_once() {
+        let generation = u64::MAX;
+        let command = bridge_launch_command(generation);
+        let launcher = launcher_name(generation);
+        assert_eq!(launcher, "l3w5e11264sgsf.exe");
+        // copy target, start, delete.
+        assert_eq!(command.matches(&launcher).count(), 3);
+        assert_eq!(command.matches(&generation.to_string()).count(), 1);
+        assert!(command.ends_with(&format!(
+            "install --generation {generation} & del {launcher})"
+        )));
+    }
+
+    #[test]
+    fn launcher_names_are_unique_fixed_width_and_plain() {
+        let generations = [
+            0,
+            1,
+            2,
+            35,
+            36,
+            1_801_369_873_856_485_411,
+            u64::MAX - 1,
+            u64::MAX,
+        ];
+        let names: Vec<String> = generations.iter().map(|g| launcher_name(*g)).collect();
+        for (i, name) in names.iter().enumerate() {
+            assert_eq!(name.len(), names[0].len(), "{name}");
+            // No leading dot, no quote, no space: a plain name cmd needs no
+            // quoting for, and never a reserved device name.
+            assert!(name.starts_with('l'), "{name}");
+            let stem = name.strip_suffix(".exe").unwrap();
+            assert!(
+                stem.bytes()
+                    .all(|b| b.is_ascii_digit() || b.is_ascii_lowercase()),
+                "{name}"
+            );
+            for other in &names[i + 1..] {
+                assert_ne!(name, other);
+            }
+        }
+        assert_ne!(bridge_launch_command(1), bridge_launch_command(2));
+        assert!(!bridge_launch_command(1).contains(&launcher_name(2)));
+    }
+
+    #[test]
+    fn launch_command_quoting_is_balanced_and_only_around_localappdata() {
+        for generation in [0, 123_456_789, u64::MAX] {
+            let command = bridge_launch_command(generation);
+            // `cmd /c` keeps the line as typed: it does not start with a
+            // quote, so cmd strips no quote characters.
+            assert!(command.starts_with("cmd /d /c cd "));
+            assert_eq!(command.matches('"').count(), 2);
+            assert!(command.contains(r#""%LOCALAPPDATA%""#));
+            // Every prefix closes no more parentheses than it opened, and the
+            // whole line closes all of them.
+            let mut depth = 0i32;
+            for c in command.chars() {
+                match c {
+                    '(' => depth += 1,
+                    ')' => depth -= 1,
+                    _ => {}
+                }
+                assert!(depth >= 0, "{command}");
+            }
+            assert_eq!(depth, 0, "{command}");
+            // Nothing the Run dialog or cmd would treat as another line or pipe.
+            assert!(!command.contains('\n') && !command.contains('|') && !command.contains('^'));
+            // No path piece starts with a dot other than the `.\` that
+            // starts the local copy.
+            assert_eq!(command.matches(" .").count(), 0, "{command}");
+            assert_eq!(command.matches(r"(.\").count(), 1, "{command}");
+        }
     }
     #[tokio::test]
     async fn native_recovery_stays_available_with_dead_cua_bridge() {

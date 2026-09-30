@@ -1,8 +1,9 @@
 # rdpilot-mcp
 
-`rdpilot-mcp --session NAME` exposes the pinned Cua Driver's native MCP over
-stdio for one existing RDP connection. Connect first with `rdpilot connect
-TARGET --name NAME`. The daemon must have a configured `bundle_path`.
+`rdpilot-mcp --session NAME` exposes the Cua Driver's native MCP over stdio for
+one existing RDP connection. Connect first with `rdpilot connect TARGET --name
+NAME` (with `CuaEnabled yes`, the default); the daemon downloads and deploys the
+Cua bundle during that connect, so no `bundle_path` is needed.
 
 The endpoint forwards initialization, tool schemas, requests, responses,
 notifications and image content unchanged. It has no desktop tool adapters,

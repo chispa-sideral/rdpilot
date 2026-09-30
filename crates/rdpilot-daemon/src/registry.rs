@@ -42,8 +42,8 @@ use rdpilot_ipc::{SessionId, SessionLifecycle, SessionStatus};
 
 use crate::events::SessionEvents;
 use crate::seams::{
-    BoxFuture, DaemonError, ManagedSession, ReconciliationSink, SessionConnector, SessionEntry,
-    ViewFrameSource,
+    BoxFuture, BundleSource, DaemonError, ManagedSession, NoBundleSource, ReconciliationSink,
+    SessionConnector, SessionEntry, ViewFrameSource,
 };
 
 /// Word lists for [`generate_auto_id`] (D-29: short, human-legible
@@ -161,6 +161,7 @@ pub struct Registry {
     sessions: Mutex<HashMap<SessionId, SessionEntry>>,
     connector: Arc<dyn SessionConnector>,
     sink: Arc<dyn ReconciliationSink>,
+    bundles: Arc<dyn BundleSource>,
     next_generation: AtomicU64,
 }
 
@@ -182,8 +183,22 @@ impl Registry {
             sessions: Mutex::new(HashMap::new()),
             connector,
             sink,
+            bundles: Arc::new(NoBundleSource),
             next_generation: AtomicU64::new(1),
         }
+    }
+
+    /// Use `bundles` for Cua-enabled connects (builder). Without it every
+    /// Cua-enabled connect fails closed.
+    #[must_use]
+    pub(crate) fn with_bundle_source(mut self, bundles: Arc<dyn BundleSource>) -> Self {
+        self.bundles = bundles;
+        self
+    }
+
+    /// The source of Cua bundles.
+    pub(crate) fn bundle_source(&self) -> &dyn BundleSource {
+        self.bundles.as_ref()
     }
 
     /// Atomically claim `id` as a `Connecting` placeholder.

@@ -4,7 +4,9 @@ use rdpilot_bridge::{
     runtime::{read_json, run, Config},
     transfer,
 };
-use rdpilot_bridge_protocol::{Envelope, Message, BUNDLE_ID, MAX_FRAME_BYTES, QUEUE_DEPTH};
+use rdpilot_bridge_protocol::{Envelope, Message, MAX_FRAME_BYTES, QUEUE_DEPTH};
+
+const BUNDLE: &str = "bundle-under-test";
 use serde_json::{json, Value};
 use std::{path::PathBuf, time::Duration};
 use tokio::{sync::mpsc, time::timeout};
@@ -26,6 +28,7 @@ impl Fixture {
         let (tx, output) = mpsc::channel(QUEUE_DEPTH);
         let config = Config {
             generation: 7,
+            bundle_id: BUNDLE.into(),
             executable: PathBuf::from("python3"),
             args: vec!["-u".into(), path.to_string_lossy().into()],
             transfer_root: temp.path().join("root"),
@@ -42,7 +45,7 @@ impl Fixture {
             attachment: 11,
         };
         f.send(Message::Hello {
-            bundle_id: BUNDLE_ID.into(),
+            bundle_id: BUNDLE.into(),
         })
         .await;
         assert!(matches!(f.next().await, Message::Ready { .. }));
@@ -378,4 +381,37 @@ async fn concurrent_targets_do_not_share_child_streams() {
     drop(a.input);
     a.task.await.unwrap().unwrap();
     b.close().await;
+}
+
+#[tokio::test]
+async fn hello_for_another_bundle_stops_the_bridge() {
+    let temp = tempfile::tempdir().unwrap();
+    let (input, rx) = mpsc::channel(QUEUE_DEPTH);
+    let (tx, _output) = mpsc::channel(QUEUE_DEPTH);
+    let config = Config {
+        generation: 7,
+        bundle_id: BUNDLE.into(),
+        executable: PathBuf::from("python3"),
+        args: Vec::new(),
+        transfer_root: temp.path().join("root"),
+        share_root: temp.path().join("share"),
+        request_timeout: Duration::from_millis(500),
+    };
+    let task = tokio::spawn(run(config, rx, tx));
+    input
+        .send(Envelope::new(
+            7,
+            1,
+            Message::Hello {
+                bundle_id: "another-bundle".into(),
+            },
+        ))
+        .await
+        .unwrap();
+    let err = timeout(Duration::from_secs(5), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert!(err.to_string().contains("another-bundle"), "{err}");
 }

@@ -78,6 +78,7 @@ fn code_for(err: &CliError) -> u8 {
             WireErrorCode::PathTraversal => 5,
             WireErrorCode::ChecksumMismatch => 6,
             WireErrorCode::DuplicateSession => 7,
+            WireErrorCode::BundleUnavailable => 9,
             // `Internal`, the client-only `DaemonUnreachable` wire variant
             // (never actually produced by the daemon — see
             // `CliError::DaemonUnreachable` for the real client-side path),
@@ -144,6 +145,7 @@ mod tests {
         assert_eq!(code_for(&wire(WireErrorCode::PathTraversal)), 5);
         assert_eq!(code_for(&wire(WireErrorCode::ChecksumMismatch)), 6);
         assert_eq!(code_for(&wire(WireErrorCode::DuplicateSession)), 7);
+        assert_eq!(code_for(&wire(WireErrorCode::BundleUnavailable)), 9);
         assert_eq!(code_for(&wire(WireErrorCode::Internal)), 1);
     }
 
@@ -157,6 +159,7 @@ mod tests {
             WireErrorCode::PathTraversal,
             WireErrorCode::ChecksumMismatch,
             WireErrorCode::DuplicateSession,
+            WireErrorCode::BundleUnavailable,
         ]
         .map(|code| code_for(&wire(code)));
         let unique: std::collections::HashSet<u8> = codes.iter().copied().collect();
@@ -213,6 +216,10 @@ mod tests {
         assert_eq!(
             code_str_for(&wire(WireErrorCode::DuplicateSession)),
             "duplicate-session"
+        );
+        assert_eq!(
+            code_str_for(&wire(WireErrorCode::BundleUnavailable)),
+            "bundle-unavailable"
         );
         assert_eq!(code_str_for(&wire(WireErrorCode::Internal)), "internal");
     }

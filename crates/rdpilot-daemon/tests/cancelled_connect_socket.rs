@@ -75,6 +75,8 @@ fn request(name: &str) -> Request {
         domain: None,
         accept_invalid_certs: false,
         cua_enabled: false,
+        cua_version: "latest-dev".to_owned(),
+        cua_auto_download: true,
         connect_ack: true,
     }
 }

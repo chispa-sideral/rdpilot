@@ -65,6 +65,11 @@ pub enum WireErrorCode {
     /// SESSION-04). Produced by the registry's atomic-insert collision path
     /// (Plan 12-03). Wire string: `duplicate-session`.
     DuplicateSession,
+    /// A `Connect` with Cua enabled failed before the RDP logon because the
+    /// rdpilot-bridge or the Cua driver could not be obtained or verified
+    /// (daemon-only concept). The message names the component, version,
+    /// architecture, cause and fixes. Wire string: `bundle-unavailable`.
+    BundleUnavailable,
 }
 
 #[cfg(test)]
@@ -81,6 +86,7 @@ mod tests {
             (WireErrorCode::ChecksumMismatch, "\"checksum-mismatch\""),
             (WireErrorCode::Internal, "\"internal\""),
             (WireErrorCode::DuplicateSession, "\"duplicate-session\""),
+            (WireErrorCode::BundleUnavailable, "\"bundle-unavailable\""),
         ];
         for (code, expected) in cases {
             let json = serde_json::to_string(&code)?;
@@ -99,6 +105,7 @@ mod tests {
             "\"checksum-mismatch\"",
             "\"internal\"",
             "\"duplicate-session\"",
+            "\"bundle-unavailable\"",
         ] {
             let code: WireErrorCode = serde_json::from_str(json)?;
             let round_tripped = serde_json::to_string(&code)?;

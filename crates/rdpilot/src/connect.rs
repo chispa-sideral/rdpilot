@@ -58,7 +58,7 @@ use crate::error::{Error, Result};
 /// filename [`crate::session::Session::deploy_and_launch`]'s in-band copy
 /// command references (D-5.1). Defined once here so the announced name and
 /// the launch command can never drift apart.
-pub(crate) const BRIDGE_EXE_NAME: &str = "rdpilot-bridge.exe";
+pub(crate) use rdpilot_bridge_protocol::BRIDGE_EXE_NAME;
 
 /// The framed transport over the TLS-upgraded, type-erased async stream.
 ///
@@ -113,7 +113,9 @@ pub(crate) async fn connect(
     // shared correlation state (pending oneshot map + handshake); one clone is
     // moved into the processor here, the other is returned below so
     // `Session::connect` can drive `Session::ping()` against the same state.
-    let bridge = std::sync::Arc::new(crate::bridge::BridgeShared::new());
+    let bridge = std::sync::Arc::new(crate::bridge::BridgeShared::with_bundle_id(
+        cfg.get_bundle_id().unwrap_or_default().to_owned(),
+    ));
     let drdynvc = DrdynvcClient::new()
         .with_dynamic_channel(crate::bridge::BridgeProcessor::new(bridge.clone()));
     connector = connector.with_static_channel(drdynvc);

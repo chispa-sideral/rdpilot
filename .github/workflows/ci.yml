@@ -40,4 +40,4 @@ jobs:
         run: ./scripts/ci/run-windows-dacl.ps1
 
       - name: Windows bridge and containment tests
-        run: cargo test -p rdpilot-bridge --lib
+        run: cargo test -p rdpilot-bridge --lib --tests
