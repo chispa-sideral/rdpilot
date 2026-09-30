@@ -37,12 +37,15 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
 
+mod cua_gate;
+
 use crate::diagnostics::{Diagnostics, Stage};
 use crate::dispatch::dispatch_for_ipc;
 use crate::events::{CuaCallTracker, EventKind, EventSource};
 use crate::registry::{Registry, ViewerRegistry};
 use crate::seams::ManagedCua;
 use crate::viewer::{ViewerGate, ViewerParams};
+use cua_gate::{CuaGate, Inbound};
 use rdpilot_ipc::transport::{read_frame, write_frame};
 use rdpilot_ipc::{CuaStreamFrame, Request, ViewerToken, WireResponse, WireViewerBind};
 
@@ -87,7 +90,7 @@ pub(crate) async fn serve_connection<S>(
                 Ok(Ok(crate::registry::CuaAttach {
                     generation: session_incarnation,
                     events,
-                    control: _,
+                    control,
                     mut attachment,
                 })) => {
                     let (bridge_generation, runtime_generation, attachment_id) =
@@ -110,6 +113,7 @@ pub(crate) async fn serve_connection<S>(
                             },
                         );
                         let mut tracker = CuaCallTracker::new(Arc::clone(&events));
+                        let mut gate = CuaGate::new(control);
                         let reason = forward_cua(
                             &mut stream,
                             attachment.as_mut(),
@@ -117,8 +121,11 @@ pub(crate) async fn serve_connection<S>(
                             &session,
                             session_incarnation,
                             &mut tracker,
+                            &mut gate,
                         )
                         .await;
+                        // Unanswered acting calls no longer hold up a take.
+                        drop(gate);
                         tracker.close();
                         events.record(
                             EventSource::Cua,
@@ -262,6 +269,7 @@ async fn forward_cua<S: AsyncRead + AsyncWrite + Unpin>(
     session: &rdpilot_ipc::SessionId,
     incarnation: u64,
     tracker: &mut CuaCallTracker,
+    gate: &mut CuaGate,
 ) -> &'static str {
     let (mut reader, mut writer) = tokio::io::split(stream);
     let reason = 'stream: loop {
@@ -273,9 +281,27 @@ async fn forward_cua<S: AsyncRead + AsyncWrite + Unpin>(
                     match frame {
                         Ok(CuaStreamFrame::Message {message}) => {
                             if !registry.touch_generation(session, incarnation) { break 'stream "target incarnation closed"; }
-                            tracker.observe_request(&message);
-                            if !matches!(tokio::time::timeout(STREAM_WRITE_TIMEOUT, attachment.send(message)).await, Ok(Ok(()))) {
-                                break 'stream "Cua input unavailable";
+                            let (inbound, transition) = gate.inbound(message);
+                            if let Some(transition) = transition {
+                                // Releases reach the session before the call does.
+                                gate.control().discharge(transition).await;
+                            }
+                            match inbound {
+                                Inbound::Forward(message) => {
+                                    tracker.observe_request(&message);
+                                    if !matches!(tokio::time::timeout(STREAM_WRITE_TIMEOUT, attachment.send(message)).await, Ok(Ok(()))) {
+                                        break 'stream "Cua input unavailable";
+                                    }
+                                }
+                                Inbound::Answer { request, reply } => {
+                                    tracker.observe_request(&request);
+                                    tracker.observe_response(&reply);
+                                    let frame = CuaStreamFrame::Message { message: reply };
+                                    if !matches!(tokio::time::timeout(STREAM_WRITE_TIMEOUT, write_frame(&mut writer, &frame)).await, Ok(Ok(()))) {
+                                        break 'stream "caller output unavailable";
+                                    }
+                                }
+                                Inbound::Drop => {}
                             }
                         }
                         Ok(CuaStreamFrame::Closed {..}) | Err(_) => break 'stream "caller closed or malformed frame",
@@ -284,8 +310,9 @@ async fn forward_cua<S: AsyncRead + AsyncWrite + Unpin>(
                 }
                 output = attachment.recv() => {
                     match output {
-                        Ok(Some(message)) => {
+                        Ok(Some(mut message)) => {
                             if !registry.touch_generation(session, incarnation) { break 'stream "target incarnation closed"; }
+                            gate.outbound(&mut message);
                             tracker.observe_response(&message);
                             let frame = CuaStreamFrame::Message { message };
                             if !matches!(tokio::time::timeout(STREAM_WRITE_TIMEOUT, write_frame(&mut writer, &frame)).await, Ok(Ok(()))) {

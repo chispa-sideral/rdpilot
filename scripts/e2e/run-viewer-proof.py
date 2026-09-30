@@ -184,7 +184,7 @@ class FakeMcp:
                                                    "clientInfo": {"name": "rdpilot-viewer-proof", "version": "1"}})
         require("serverInfo" in result, f"{self.target}: fake Cua initialize")
         await self.send({"jsonrpc": "2.0", "method": "notifications/initialized"})
-        require(len((await self.request("tools/list", {}))["tools"]) == 3, f"{self.target}: fake Cua tools")
+        require(len((await self.request("tools/list", {}))["tools"]) == 4, f"{self.target}: fake Cua tools")
         return self
 
     async def send(self, message):

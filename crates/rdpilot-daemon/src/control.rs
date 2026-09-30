@@ -455,16 +455,22 @@ impl SessionControl {
         }
     }
 
-    /// Admit one acting Cua call. Under agent control the call is counted
-    /// in flight. Under a human lease it is refused unless `takeover`: then
-    /// the lease ends and the call is counted, in the same critical
-    /// section. The returned transition must be discharged before the call
-    /// is forwarded.
+    /// Admit acting Cua calls, of which `count` expect an answer. Under
+    /// agent control those are counted in flight. Under a human lease they
+    /// are refused unless `takeover`: then the lease ends and they are
+    /// counted, in the same critical section, so a take can neither slip
+    /// between the check and the count nor take the lease back before they
+    /// are forwarded. The returned transition must be discharged before the
+    /// calls are forwarded.
     ///
     /// # Errors
     ///
     /// [`Refusal`] with the MCP message while a human holds the lease.
-    pub(crate) fn admit_cua(&self, takeover: bool) -> Result<Option<Transition>, Refusal> {
+    pub(crate) fn admit_cua(
+        &self,
+        count: usize,
+        takeover: bool,
+    ) -> Result<Option<Transition>, Refusal> {
         let mut state = self.state();
         let transition = match &state.lease {
             None => None,
@@ -475,7 +481,7 @@ impl SessionControl {
             }
             Some(_) => self.agent_takeover_locked(&mut state, EventSource::Cua),
         };
-        state.inflight += 1;
+        state.inflight += count;
         Ok(transition)
     }
 

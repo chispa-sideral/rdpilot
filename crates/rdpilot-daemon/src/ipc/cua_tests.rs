@@ -601,3 +601,81 @@ async fn cua_forwarding_is_unchanged_while_recording() {
         })
         .await;
 }
+
+/// Through the real stream: under a human lease an acting call is answered
+/// locally and never reaches Cua (the fake attachment echoes what it gets),
+/// a read-only call reaches Cua, and the same acting call with
+/// `"takeover": true` ends the lease and reaches Cua without `takeover`.
+/// The refused call is recorded as an error in the activity log.
+#[tokio::test]
+async fn the_stream_gates_acting_calls_under_a_human_lease() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let registry = Arc::new(Registry::new(
+                Arc::new(Connector),
+                Arc::new(NoopReconciliationSink),
+            ));
+            let id = open(&registry, "notepad").await;
+            let control = registry.control(&id).unwrap();
+            control
+                .take("100.64.0.5".parse().unwrap(), async {})
+                .await
+                .unwrap();
+            let mut client = server(registry.clone(), 4096);
+            attach(&mut client, id.clone()).await;
+            let _ = read_frame::<_, CuaStreamFrame>(&mut client).await.unwrap();
+            let call = |id: u64, name: &str, args: Value| CuaStreamFrame::Message {
+                message: json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":name,"arguments":args}}),
+            };
+            write_frame(&mut client, &call(1, "type_text", json!({"text":"a"})))
+                .await
+                .unwrap();
+            let CuaStreamFrame::Message { message: refused } =
+                read_frame::<_, CuaStreamFrame>(&mut client).await.unwrap()
+            else {
+                panic!("expected a message");
+            };
+            assert_eq!(refused["id"], 1);
+            assert_eq!(refused["result"]["isError"], true);
+            assert!(refused.get("method").is_none(), "not the echo");
+            write_frame(&mut client, &call(2, "list_windows", json!({})))
+                .await
+                .unwrap();
+            let CuaStreamFrame::Message { message: echoed } =
+                read_frame::<_, CuaStreamFrame>(&mut client).await.unwrap()
+            else {
+                panic!("expected a message");
+            };
+            assert_eq!(echoed["params"]["name"], "list_windows", "reached Cua");
+            write_frame(
+                &mut client,
+                &call(3, "type_text", json!({"text":"a","takeover":true})),
+            )
+            .await
+            .unwrap();
+            let CuaStreamFrame::Message { message: echoed } =
+                read_frame::<_, CuaStreamFrame>(&mut client).await.unwrap()
+            else {
+                panic!("expected a message");
+            };
+            assert_eq!(echoed["id"], 3);
+            assert_eq!(echoed["params"]["arguments"], json!({"text":"a"}));
+            assert!(control.check_agent().is_ok());
+            let events = registry.events(&id).unwrap().after(0).events;
+            let refused = events
+                .iter()
+                .find_map(|e| match &e.kind {
+                    crate::events::EventKind::CallFinished { name, outcome, .. }
+                        if name == "type_text" =>
+                    {
+                        Some(*outcome)
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(refused, crate::events::CallOutcome::Error);
+            assert!(events.iter().any(|e| e.source == crate::events::EventSource::Cua
+                && matches!(e.kind, crate::events::EventKind::ControlTakenOver { .. })));
+        })
+        .await;
+}

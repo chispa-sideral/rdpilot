@@ -314,7 +314,7 @@ async fn heartbeat_loss_and_idle_timeout_expire_only_granted_leases() {
 async fn cua_admission_and_take_interleave_deterministically() {
     let f = Arc::new(fixture());
     // 1. Admitted first: the take waits for it.
-    assert!(f.control.admit_cua(false).unwrap().is_none());
+    assert!(f.control.admit_cua(1, false).unwrap().is_none());
     assert_eq!(f.control.inflight(), 1);
     let taking = {
         let f = Arc::clone(&f);
@@ -323,7 +323,7 @@ async fn cua_admission_and_take_interleave_deterministically() {
     tokio::task::yield_now().await;
     assert!(f.control.human_active(), "the take is marked at once");
     // 2. Marked first: a new acting call is refused, not counted.
-    let refusal = f.control.admit_cua(false).unwrap_err();
+    let refusal = f.control.admit_cua(1, false).unwrap_err();
     assert!(refusal
         .mcp_message
         .starts_with("session \"web\" is controlled by human viewer 100.64.0.7 since "));
@@ -353,13 +353,13 @@ async fn cua_admission_and_take_interleave_deterministically() {
 #[tokio::test(start_paused = true)]
 async fn cua_takeover_during_a_pending_take_displaces_it() {
     let f = Arc::new(fixture());
-    assert!(f.control.admit_cua(false).unwrap().is_none());
+    assert!(f.control.admit_cua(1, false).unwrap().is_none());
     let taking = {
         let f = Arc::clone(&f);
         tokio::spawn(async move { f.control.take(tab(8), async {}).await })
     };
     tokio::task::yield_now().await;
-    let transition = f.control.admit_cua(true).unwrap();
+    let transition = f.control.admit_cua(1, true).unwrap();
     assert!(transition.is_some());
     assert_eq!(f.control.inflight(), 2);
     f.control.cua_finished(2);
@@ -373,7 +373,7 @@ async fn cua_takeover_during_a_pending_take_displaces_it() {
 #[tokio::test(start_paused = true)]
 async fn a_take_gives_up_after_its_bound_and_leaves_the_agent_in_control() {
     let f = fixture();
-    assert!(f.control.admit_cua(false).unwrap().is_none());
+    assert!(f.control.admit_cua(1, false).unwrap().is_none());
     let result = f
         .control
         .take_within(tab(9), async {}, Duration::from_secs(10))

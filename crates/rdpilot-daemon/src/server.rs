@@ -576,7 +576,9 @@ impl BundleSource for FakeBundleSource {
 /// The fake connector's in-process Cua: answers `initialize`, `tools/list`
 /// and `tools/call` like a minimal MCP server. Tool `fail` answers with
 /// `isError: true`, tool `hold` never answers, any other tool answers `ok`.
-/// Unknown methods get a JSON-RPC error; notifications and responses get
+/// `list_windows` is its one read-only tool. A call whose arguments still
+/// carry `takeover` answers `isError` "takeover reached Cua" (the daemon
+/// must strip it). Unknown methods get a JSON-RPC error; notifications and responses get
 /// nothing. Replies never echo arguments.
 struct FakeCua {
     attachment: u64,
@@ -612,9 +614,20 @@ impl FakeCua {
                 "serverInfo": { "name": "rdpilot-fake-cua", "version": "0" },
             }),
             "tools/list" => {
-                let tools = ["echo", "fail", "hold"]
+                let tools = ["echo", "fail", "hold", "list_windows"]
                     .map(|name| json!({ "name": name, "inputSchema": { "type": "object" } }));
                 json!({ "tools": tools })
+            }
+            "tools/call"
+                if params
+                    .and_then(|p| p.get("arguments"))
+                    .and_then(|a| a.get("takeover"))
+                    .is_some() =>
+            {
+                json!({
+                    "content": [{ "type": "text", "text": "takeover reached Cua" }],
+                    "isError": true,
+                })
             }
             "tools/call" => match params.and_then(|p| p.get("name")).and_then(|n| n.as_str()) {
                 Some("hold") => return None,
@@ -912,7 +925,7 @@ mod tests {
             replies[0]["result"]["serverInfo"]["name"],
             "rdpilot-fake-cua"
         );
-        assert_eq!(replies[1]["result"]["tools"].as_array().unwrap().len(), 3);
+        assert_eq!(replies[1]["result"]["tools"].as_array().unwrap().len(), 4);
         assert!(!replies[2].to_string().contains("secret"));
         assert_eq!(replies[3]["result"]["isError"], true);
         assert_eq!(replies[4]["error"]["code"], -32601);
