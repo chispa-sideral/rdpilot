@@ -227,9 +227,11 @@ computer use is unsupported; signed binaries do not imply elevated automation.
 
 ## Live viewer
 
-`rdpilot view` shows the daemon's live sessions in a browser. The viewer is
-read-only: it sends no input, Cua call, file transfer, connect or disconnect,
-and it does not change session activity, idle reaping or daemon self-shutdown.
+`rdpilot view` shows the daemon's live sessions in a browser. The viewer sends
+no input, Cua call, file transfer, connect or disconnect, and it does not change
+session activity, idle reaping or daemon self-shutdown. Its only actions are the
+recording controls: start and stop recording, annotate, and keep recordings
+(see [Session recording](#session-recording)).
 
 ```sh
 rdpilot connect my-host --name work   # the viewer needs a running daemon
@@ -241,7 +243,8 @@ bound address and runs until Ctrl-C. Open a URL, then select **View** for one or
 more sessions (at most 4 per tab). The page shows each session's current RDP
 framebuffer at up to 4 frames per second, its size changes, and a banner when
 the server ends the session or the session is closed. Frames do not show the
-mouse cursor. Frames are not written to disk.
+mouse cursor. The viewer writes nothing to disk; only a recording, when it is
+on for a session, writes that session's frames.
 
 Activity strip. Under each viewed session, a strip lists what was done in that
 session, newest first. Each Cua tool call and each native verb (`screenshot`,
@@ -312,9 +315,138 @@ printed loopback URL on your machine (the Host check needs the same port):
 ssh -L PORT:127.0.0.1:PORT user@daemon-host
 ```
 
-Upgrade note: this release changes the IPC compatibility version to 5. After
+Upgrade note: this release changes the IPC compatibility version to 6. After
 you upgrade, restart `rdpilot-daemon` (this ends its live sessions). Until then,
 the CLI and MCP adapter report the daemon compatibility mismatch message.
+
+## Session recording
+
+The daemon can record a session: its video and its session events (the
+activity strip's events, recording lifecycle and annotations) go to an
+owner-only directory. Recording is off unless you switch it on.
+
+Switching. For each session the most specific setting wins:
+
+1. `rdpilot connect TARGET --record` or `--no-record`.
+2. The first `[[recording.hosts]]` entry in `config.toml` whose `host` is the
+   target as you give it to `connect`: a hosts-file alias as typed, or the host
+   of an `rdp://` URL. The match ignores ASCII case.
+3. `[recording] enabled` (`RDPILOT_RECORDING__ENABLED`). Default: `false`.
+
+```toml
+[recording]
+enabled = false
+[[recording.hosts]]
+host = "lab-vm"
+enabled = true
+```
+
+On a connected session, `rdpilot record start --session NAME` starts a new
+recording from that moment and `rdpilot record stop --session NAME` stops it;
+the session continues. A session can have several recordings. A start on a
+recording session, or a stop on a session that is not recording, changes
+nothing and says so. The viewer's live panel has the same Start/Stop control.
+These actions do not change `config.toml`. `rdpilot list` and the viewer show
+the active recording of each session.
+
+The CLI resolves the switch at `connect`. The daemon reads `dir`, `max_fps` and
+`budget_mib` when it starts and when a recording starts. The manifest and
+`rdpilot recording list` show the address the daemon connected to.
+
+Annotations. `rdpilot annotate --session NAME TEXT`, or the annotation input
+in the viewer's live panel, adds a note with its time and source to the active
+recording. Text is at most 4 KiB. When the session is not recording, the
+command and the viewer refuse and write nothing.
+
+Location. Recordings go to `<local data dir>/rdpilot/recordings/`
+(`.local/share/rdpilot/recordings` in the home directory on Linux,
+`%LOCALAPPDATA%\rdpilot\recordings` on Windows, so that roaming profiles do
+not copy them). Set `[recording] dir` (`RDPILOT_RECORDING__DIR`) to change it.
+Directories are `0700` and files `0600` on Unix; on Windows each recording
+directory has a protected DACL that allows only your user.
+
+Format 1. Each recording is one directory `<id>/`, where `<id>` is
+`YYYYMMDDTHHMMSSZ-` plus 8 hex digits (UTC start):
+
+- `manifest.json`: format version, session id and name, host, UTC start and
+  end, end reason, rdpilot version, how the recording started, settings,
+  codec (`av1`) and container (`webm`), the event log's id, the closed
+  segments (file, start and end on the recording timeline, frames, bytes,
+  size) and, after stop, the recorder's figures (`stats`). Written atomically.
+- `events.jsonl`: one JSON event per line, append-only. Each event has
+  `seq` (from 1), `at` (UTC, milliseconds), `offset_ms` (milliseconds on the
+  recording timeline, which is the video's clock), `frame_seq`, `source`
+  (`cua`, `cli`, `viewer` or `daemon`) and `kind` with its fields. Kinds: the
+  activity strip's `call_started`, `call_finished`, `cua_attached`,
+  `cua_detached`, `session_ended`, and `recording_started`,
+  `recording_stopped`, `session_closed`, `desktop_resized`, `segment_started`,
+  `segment_closed`, `frames_dropped`, `events_lost`, `video_stopped`,
+  `annotation`. Readers ignore unknown fields and kinds, and a partial last
+  line.
+- `keep`: an empty file when the recording is kept.
+- `segments/NNNNNN.webm`: AV1 video in WebM, each segment self-contained and
+  closed. A segment starts at the first display change after the previous one
+  closed and closes 60 s after its first frame, at a desktop resize, at stop
+  and at the size cap. The segment being written is `NNNNNN.webm.part`; it is
+  not playable until it closes, so the last minute of an active recording is
+  not yet in the replay.
+
+Play a segment outside rdpilot with a browser, `mpv` or `ffplay`. There is no
+single-file export. A segment's timestamps start at its `start_offset_ms` on
+the recording timeline.
+
+Video. The recorder encodes a frame only when the display changed, at most
+`max_fps` (`RDPILOT_RECORDING__MAX_FPS`, default 4, 0.5 to 8) frames per
+second. A still display adds no video. Each frame keeps the time it was
+captured. The encoder (rav1e, AV1, constant quantizer 130, speed 10) runs in
+the daemon on a thread of its own with two encoder threads; on Linux these
+threads run at nice 10, so RDP, IPC and viewer work comes first. No external
+program runs.
+
+Cost. On a 1920x1080 desktop (8-core host, measured on an idle and a loaded
+host), one changed frame costs about 0.3 s of encoder time (0.5 CPU s), and
+text-only changes cost about 0.16 s. The encoder returns a frame's data only
+after four more changes or when the segment closes, so a single call can take
+up to about 0.9 s. When the screen changes faster than the encoder keeps up,
+for example on a busy or small host, the recorder encodes fewer than `max_fps`
+frames per second: the newest captured display state replaces an older one
+that was not encoded yet, and the log records the skipped states as
+`frames_dropped`. Producers never wait for the recorder. The manifest's
+`stats` shows the encoder time per frame, the time frames waited for the
+encoder, the frames held until a segment closed and dropped frames.
+
+Retention. At daemon start and when a recording starts, the daemon deletes
+recordings that are not kept and not active: first those older than 7 days,
+then the oldest while the total of unkept recordings (active ones included)
+is more than `budget_mib` (`RDPILOT_RECORDING__BUDGET_MIB`, default 2048 MiB).
+Kept recordings are never deleted and do not count toward the budget. When
+kept recordings alone use more than the budget, the daemon logs a warning, and
+`rdpilot recording list` and the viewer show it; nothing is deleted. One
+recording that reaches the budget by itself stops its video (`video_stopped`)
+and continues to record events.
+
+Keep. `rdpilot recording keep ID` and `rdpilot recording unkeep ID`, or the
+Keep toggle in the viewer's recordings list and replay view, set or clear the
+mark. `rdpilot recording list` shows each recording's id, session, host, UTC
+start, duration, size, whether it is active and kept, and the kept and unkept
+totals. An unmarked recording is subject to the next pruning pass. To delete a
+recording by hand, remove its directory when it is not active.
+
+Replay. In `rdpilot view`, select **Recordings**, then **Open**. The replay
+view has the live panel's layout: the video, the activity strip up to the
+playback position, and a logs pane with every recorded event and its UTC time.
+Play, pause, seek on the timeline, choose the speed, and read the UTC time of
+the shown frame. Select an event in the strip or the logs to seek to it.
+Between segments the last frame stays on screen. Replay needs Chrome or
+Firefox; Safari plays AV1 only on some hardware.
+
+What is recorded: the screen as the RDP session shows it, without the mouse
+cursor, and the events above. What is not recorded: audio, tool arguments
+(names and values), typed text, key sequences, coordinates, file paths, tool
+results, images, error text, daemon log lines and credentials. Screen contents
+are recorded as they are and can show secrets typed or displayed in the guest.
+Anyone with a viewer URL can start and stop recordings, annotate and keep
+recordings, and replay them.
 
 ## Migration and tests
 
@@ -332,6 +464,9 @@ Cua integration harness; upstream tool schema behavior is Cua's responsibility.
 Run `python3 scripts/e2e/run-viewer-proof.py --help` for the live viewer proof.
 Its `--fake` mode runs offline against the fake connector; its live mode needs a
 small CrabBox Azure Windows lease with two Windows users and release builds.
+`python3 scripts/e2e/run-recording-proof.py --help` describes the session
+recording proof: `--fake` runs offline (it needs `ffmpeg`, `ffprobe` and
+Playwright Chromium and Firefox); live mode needs three Windows users.
 
 Run `python3 scripts/e2e/run-cua-e2e.py --help` for the focused live suite.
 It uses the shipped CLI, daemon and MCP adapter with two independent Windows
