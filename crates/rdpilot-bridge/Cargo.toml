@@ -9,9 +9,13 @@ rdpilot-bridge-protocol = { path = "../rdpilot-bridge-protocol" }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
 sha2 = "0.11"
+# Cua archive extraction in the guest: deflate via flate2 only.
+zip = { version = "4.2.0", default-features = false, features = ["deflate-flate2"] }
+# Selects flate2's pure-Rust (miniz_oxide) backend for zip; already in Cargo.lock.
+flate2 = "1.1.9"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_RemoteDesktop", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_Security", "Win32_System_IO", "Win32_Storage_FileSystem"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_RemoteDesktop", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_Security", "Win32_System_IO", "Win32_Storage_FileSystem", "Win32_System_Diagnostics_ToolHelp"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

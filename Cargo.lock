@@ -3065,6 +3065,7 @@ dependencies = [
 name = "rdpilot-bridge"
 version = "0.2.0"
 dependencies = [
+ "flate2",
  "libc",
  "rdpilot-bridge-protocol",
  "serde_json",
@@ -3072,6 +3073,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "windows-sys 0.61.2",
+ "zip",
 ]
 
 [[package]]
@@ -3116,6 +3118,7 @@ dependencies = [
  "base64",
  "bytes",
  "directories",
+ "flate2",
  "getrandom 0.3.4",
  "http-body-util",
  "hyper",

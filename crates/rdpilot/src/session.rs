@@ -309,7 +309,9 @@ impl Session {
             _ => Err(Error::dvc("unexpected ping response")),
         }
     }
-    /// Start the shipped, hash-verified bundle over RDPDR. One launch per generation.
+    /// Launch the served bridge (`install`, which verifies and installs the
+    /// bundle, then starts the installed copy) through the Run dialog. One
+    /// launch per generation.
     pub async fn deploy_and_launch(&self) -> Result<Duration> {
         if self.bridge.ready() {
             return self.ping().await;
@@ -337,13 +339,15 @@ impl Session {
             }
         }
         Err(Error::bootstrap(format!(
-            "Cua bundle did not become ready; stages={}",
+            "rdpilot-bridge did not start (possible security prompt in the guest, or a bridge \
+             that does not speak bridge protocol {}); stages={}",
+            rdpilot_bridge_protocol::PROTOCOL_VERSION,
             self.bootstrap_summary()
         )))
     }
     async fn inject_bootstrap(&self) -> Result<()> {
         // Retrying before Ready does not replay MCP. The guest generation mutex
-        // makes repeated script invocations no-ops while their owner is alive.
+        // makes repeated launches no-ops while their owner is alive.
         self.bridge
             .bootstrap
             .record(BootstrapStage::LaunchInputAttempted);
@@ -352,10 +356,7 @@ impl Session {
         tokio::time::sleep(RUN_DIALOG_SETTLE).await;
         self.send_key(KeyAction::Combo(vec![Key::Ctrl, Key::A]))
             .await?;
-        let command = format!(
-            r#"powershell.exe -NoProfile -ExecutionPolicy Bypass -File "\\tsclient\RDPILOT\bundle\bootstrap.ps1" -Generation {}"#,
-            self.bridge.generation
-        );
+        let command = bridge_launch_command(self.bridge.generation);
         for chunk in chunk_str(&command, TYPE_CHUNK_LEN) {
             self.send_key(KeyAction::Type(chunk)).await?;
             tokio::time::sleep(TYPE_CHUNK_GAP).await;
@@ -477,6 +478,15 @@ impl Drop for StagedFile {
     }
 }
 
+/// What the Run dialog receives: start the bridge served on the RDPILOT
+/// drive with `install`.
+fn bridge_launch_command(generation: u64) -> String {
+    format!(
+        r#""\\tsclient\RDPILOT\bundle\{}" install --generation {generation}"#,
+        rdpilot_bridge_protocol::BRIDGE_EXE_NAME
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -495,6 +505,16 @@ mod tests {
             },
             rx,
         )
+    }
+    #[test]
+    fn launch_command_starts_the_served_bridge_without_powershell() {
+        assert_eq!(
+            bridge_launch_command(42),
+            r#""\\tsclient\RDPILOT\bundle\rdpilot-bridge.exe" install --generation 42"#
+        );
+        assert!(!bridge_launch_command(1)
+            .to_lowercase()
+            .contains("powershell"));
     }
     #[tokio::test]
     async fn native_recovery_stays_available_with_dead_cua_bridge() {
