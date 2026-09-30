@@ -23,9 +23,6 @@ CARGO_ROOT="$HOME/.cargo"
 CONFIG_DIR="$HOME/.config/rdpilot"
 CONFIG_FILE="$CONFIG_DIR/config.toml"
 
-BUNDLE_SRC="${RDPILOT_BUNDLE_SRC:-$REPO_ROOT/dist/bundle}"
-BUNDLE_DEST="${XDG_DATA_HOME:-$HOME/.local/share}/rdpilot/bundle"
-
 # Ensure the install destination is on PATH for this script's own smoke
 # test below, regardless of whether the invoking shell already sourced
 # `~/.cargo/env` (e.g. non-login/non-interactive shells).
@@ -121,14 +118,7 @@ stop_rdpilot_daemon
 
 cargo install --path "$REPO_ROOT/crates/rdpilot-mcp" --root "$CARGO_ROOT"
 
-echo "==> Staging optional offline Cua bundle"
-if [ -f "$BUNDLE_SRC/manifest.json" ]; then
-  mkdir -p "$BUNDLE_DEST"
-  cp -R "$BUNDLE_SRC/." "$BUNDLE_DEST/"
-  echo "Set RDPILOT_BUNDLE_PATH=$BUNDLE_DEST (or bundle_path in config.toml)."
-else
-  echo "No bundle at $BUNDLE_SRC. Build one with scripts/package-cua.py."
-fi
+# The daemon downloads the Cua bundle on demand; nothing is staged here.
 mkdir -p "$CONFIG_DIR"
 chmod 700 "$CONFIG_DIR"
 if [ ! -f "$CONFIG_FILE" ]; then

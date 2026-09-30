@@ -19,7 +19,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Ok(port) = std::env::var("PROBE_PORT") {
         cfg = cfg.port(port.parse()?);
     }
-    if let Ok(bundle) = std::env::var("RDPILOT_BUNDLE_PATH") {
+    // Optional: serve a directory on the RDPILOT drive (no bridge launch).
+    if let Ok(bundle) = std::env::var("PROBE_BUNDLE_DIR") {
         cfg = cfg.bundle_path(bundle);
     }
     let s = Session::connect(&cfg).await?;

@@ -15,7 +15,11 @@ users; release builds, as users install them):
   export RDPILOT_VIEW_B_HOST=... RDPILOT_VIEW_B_USERNAME=... RDPILOT_VIEW_B_PASSWORD=...
   # optional: RDPILOT_VIEW_{A,B}_PORT, RDPILOT_VIEW_{A,B}_DOMAIN
   uv run --with playwright python3 scripts/e2e/run-viewer-proof.py \
-    --bin-dir target/release --bundle /path/bundle --output /private/viewer-live-proof
+    --bin-dir target/release --output /private/viewer-live-proof
+
+In live mode the daemon starts with an empty cache under the run's temporary
+directory and downloads the bridge and the Cua driver; --bundle DIR sets its
+bundle_path instead (for example a bridge built from this source).
 
 Credentials come only from the environment and reach rdpilot only through
 subprocess environment, never arguments or evidence. The viewer token is
@@ -255,7 +259,10 @@ class Proof:
             self.env.update({"RDPILOT_DAEMON_TEST_CONNECTOR": "1", "RDPILOT_DAEMON_TEST_FRAMES": "1",
                              "RDPILOT_DAEMON_TEST_CUA": "1"})
         else:
-            self.env["RDPILOT_BUNDLE_PATH"] = str(Path(args.bundle).resolve())
+            (self.temp / "cache").mkdir(mode=0o700, exist_ok=True)
+            self.env["XDG_CACHE_HOME"] = str(self.temp / "cache")
+            if args.bundle:
+                self.env["RDPILOT_BUNDLE_PATH"] = str(Path(args.bundle).resolve())
         self.e2e = None if self.fake else load_cua_e2e()
         self.targets = FAKE_TARGETS if self.fake else TARGETS
         self.relays, self.endpoints = {}, {}
@@ -1016,7 +1023,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--fake", action="store_true", help="offline run against the fake connector")
     parser.add_argument("--bin-dir", required=True, help="directory with rdpilot, rdpilot-daemon, rdpilot-mcp")
-    parser.add_argument("--bundle", help="Cua bundle directory (live mode)")
+    parser.add_argument("--bundle", help="live mode: daemon bundle_path directory (default: download into a fresh cache)")
     parser.add_argument("--output", required=True, help="new evidence directory; must not already exist")
     parser.add_argument("--bind", choices=["loopback", "loopback+tailnet"],
                         help="viewer bind set (default: the viewer's default, loopback+tailnet)")
@@ -1027,8 +1034,6 @@ def main():
     parser.add_argument("--connect-timeout", type=int, default=600)
     args = parser.parse_args()
     if not args.fake:
-        if not args.bundle:
-            parser.error("live mode needs --bundle")
         if "debug" in Path(args.bin_dir).resolve().parts and not args.allow_debug:
             parser.error("live mode needs release binaries (cargo build --release --workspace)")
     if args.marker_region:

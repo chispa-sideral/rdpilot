@@ -3,8 +3,13 @@
 
 Build rdpilot-cli, rdpilot-daemon, rdpilot-mcp first. Example:
   python scripts/e2e/run-cua-e2e.py --bin-dir target/debug \
-    --bundle /path/bundle --credentials-a /private/a.json \
+    --credentials-a /private/a.json \
     --credentials-b /private/b.json --output /private/live-proof
+
+The daemon starts with an empty cache under the run's temporary directory and
+downloads the bridge and the Cua driver. --bundle DIR sets the daemon's
+bundle_path instead (for example a directory holding only a bridge built from
+this source, for a build that has no release).
 
 Credentials JSON: host, port, username, password (optional domain). They are
 passed only through subprocess environment, never arguments or evidence.
@@ -216,15 +221,17 @@ class Run:
         self.token = uuid.uuid4().hex[:12]
         self.temp = Path(tempfile.mkdtemp(prefix="rdpilot-cua-"))
         self.env = {k: v for k, v in os.environ.items() if not k.startswith("RDPILOT_") and k != "RUST_LOG"}
-        for directory in ("runtime", "config", "share"):
+        for directory in ("runtime", "config", "share", "cache"):
             (self.temp / directory).mkdir(mode=0o700)
         self.env.update({
             "XDG_RUNTIME_DIR": str(self.temp / "runtime"), "XDG_CONFIG_HOME": str(self.temp / "config"),
-            "RDPILOT_BUNDLE_PATH": str(Path(args.bundle).resolve()), "RDPILOT_SHARE_ROOT": str(self.temp / "share"),
+            "XDG_CACHE_HOME": str(self.temp / "cache"), "RDPILOT_SHARE_ROOT": str(self.temp / "share"),
             "RDPILOT_DAEMON_SINK_PATH": str(self.temp / "sessions.json"),
             "RDPILOT_DAEMON_IDLE_TIMEOUT_MS": "3600000", "RDPILOT_DAEMON_EMPTY_GRACE_MS": "3600000",
             "RDPILOT_DAEMON_DIAGNOSTICS_PATH": str(self.output / "daemon-stages.jsonl"),
         })
+        if args.bundle:
+            self.env["RDPILOT_BUNDLE_PATH"] = str(Path(args.bundle).resolve())
         self.credentials = {"a": json.loads(Path(args.credentials_a).read_text()), "b": json.loads(Path(args.credentials_b).read_text())}
         self.relays, self.endpoints, self.metadata = {}, {}, {}
         self.checks = []
@@ -592,7 +599,7 @@ $text=& $exe 'runtime::windows_tests::job_closes_root_and_descendant_created_aft
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--bin-dir", required=True)
-    parser.add_argument("--bundle", required=True)
+    parser.add_argument("--bundle", help="daemon bundle_path directory (default: download into a fresh cache)")
     parser.add_argument("--credentials-a", required=True)
     parser.add_argument("--credentials-b", required=True)
     parser.add_argument("--output", required=True, help="new evidence directory; must not already exist")

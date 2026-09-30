@@ -37,9 +37,12 @@ arguments; the lessons below are what `--help` does not tell you.
    front of it.
    Done when both users log on and the password file exists only on tmpfs.
 
-3. **Build.** `cargo build --release --workspace`, plus the offline Cua bundle
-   (`scripts/package-cua.py`; `scripts/install-local.sh` stages it and prints
-   its path). Timing checks need release builds: a debug PNG encode of a
+3. **Build.** `cargo build --release --workspace`. The daemon downloads the Cua
+   driver and the bridge itself into a fresh cache for each harness run. Only
+   when the build's version has no published release yet, build
+   `rdpilot-bridge.exe` for `x86_64-pc-windows-msvc` and pass a directory that
+   holds it with `--bundle` (it becomes the daemon's `bundle_path`; Cua still
+   downloads). Timing checks need release builds: a debug PNG encode of a
    1920x1080 frame takes about 1 s, release 8-14 ms. `run-viewer-proof.py`
    refuses a `debug` bin dir in live mode unless `--allow-debug`.
    Done when `target/release` holds `rdpilot`, `rdpilot-daemon` and
@@ -47,8 +50,8 @@ arguments; the lessons below are what `--help` does not tell you.
 
 4. **Run the harness** on the tailnet host, with a new evidence directory
    outside the repository (the harness creates it owner-only; it holds guest
-   screen content). Allow for the first connect: it deploys the Cua bundle
-   over RDPDR (default `--connect-timeout 600`).
+   screen content). Allow for the first connect: it downloads the Cua bundle
+   and deploys it over RDPDR (default `--connect-timeout 600`).
    Done when the harness prints every check as passed, exits 0, and
    `summary.json` has `status: passed` and an `unverified` list you can
    explain.
