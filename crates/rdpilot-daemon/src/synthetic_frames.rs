@@ -126,6 +126,10 @@ impl ViewFrameSource for SyntheticFrames {
         })
     }
 
+    fn geometry(&self) -> Option<(u32, u32)> {
+        self.lock().frame.as_ref().map(|(w, h, _)| (*w, *h))
+    }
+
     fn capture(&self) -> Option<(u64, Screenshot)> {
         let slot = self.lock();
         let (w, h, rgba) = slot.frame.clone()?;

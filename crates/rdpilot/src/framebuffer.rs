@@ -130,6 +130,13 @@ impl SharedFrame {
         self.inner.lock().frame.clone()
     }
 
+    /// The latest frame size without copying pixels (`(0, 0)` before the
+    /// first frame).
+    pub(crate) fn size(&self) -> (u32, u32) {
+        let guard = self.inner.lock();
+        (guard.frame.width, guard.frame.height)
+    }
+
     /// Mark the frame source as ended (session loop returned, or the session
     /// was closed or dropped). Idempotent; wakes every waiting observer once.
     pub(crate) fn mark_ended(&self) {
@@ -197,6 +204,13 @@ impl FrameWatch {
             Err(_) => self.status(),
         };
         observed
+    }
+
+    /// The current frame size, or `None` before the first frame.
+    #[must_use]
+    pub fn geometry(&self) -> Option<(u32, u32)> {
+        let guard = self.inner.lock();
+        (!guard.frame.is_empty()).then_some((guard.frame.width, guard.frame.height))
     }
 
     /// Copy the latest frame together with its sequence number, or `None`

@@ -34,7 +34,7 @@ pub struct Session {
     thread: Option<JoinHandle<Result<()>>>,
     input_tx: mpsc::Sender<RdpInputEvent>,
     frame: SharedFrame,
-    input_db: Mutex<Database>,
+    input_db: Arc<Mutex<Database>>,
     desktop_size: (u32, u32),
     bridge: Arc<BridgeShared>,
     next_req_id: AtomicU64,
@@ -126,7 +126,7 @@ impl Session {
             thread: Some(thread),
             input_tx,
             frame,
-            input_db: Mutex::new(Database::new()),
+            input_db: Arc::new(Mutex::new(Database::new())),
             desktop_size,
             bridge,
             next_req_id: AtomicU64::new(1),
@@ -146,6 +146,21 @@ impl Session {
     #[must_use]
     pub fn frame_watch(&self) -> FrameWatch {
         self.frame.watch()
+    }
+
+    /// A `Send` input path for a daemon-side human viewer. It applies raw
+    /// events through the same input state as [`Session::send_mouse`] and
+    /// [`Session::send_key`], so pressed keys and buttons stay consistent
+    /// between the two. It holds no session lock and does not keep the
+    /// session alive: after close, sending fails.
+    #[must_use]
+    pub fn input_handle(&self) -> InputHandle {
+        InputHandle {
+            tx: self.input_tx.clone(),
+            db: Arc::clone(&self.input_db),
+            frame: self.frame.clone(),
+            bridge: Arc::clone(&self.bridge),
+        }
     }
 
     fn check_bounds(&self, action: &MouseAction) -> Result<()> {
@@ -291,6 +306,65 @@ impl Session {
         }
     }
 }
+
+/// See [`Session::input_handle`].
+#[derive(Clone)]
+pub struct InputHandle {
+    tx: mpsc::Sender<RdpInputEvent>,
+    db: Arc<Mutex<Database>>,
+    frame: SharedFrame,
+    bridge: Arc<BridgeShared>,
+}
+
+impl std::fmt::Debug for InputHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InputHandle").finish_non_exhaustive()
+    }
+}
+
+impl InputHandle {
+    /// Apply `events` in order and hand the result to the session loop.
+    /// Pointer moves outside the current frame are refused.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::CoordinateOutOfBounds`] for a move outside the frame (or
+    /// before the first frame); [`Error::Session`] when the session's input
+    /// channel is closed.
+    pub async fn send(&self, events: Vec<crate::RawInput>) -> Result<()> {
+        let (w, h) = self.frame.size();
+        for event in &events {
+            if let crate::RawInput::PointerMove { x, y } = *event {
+                let (x, y) = (u32::from(x), u32::from(y));
+                if x >= w || y >= h {
+                    return Err(Error::coordinate_out_of_bounds(x, y, w, h));
+                }
+            }
+        }
+        let ops = crate::input::raw_operations(&events);
+        let fast_path: Vec<FastPathInputEvent> = {
+            let mut db = self
+                .db
+                .lock()
+                .map_err(|_| Error::Session("input state lock poisoned".to_owned()))?;
+            db.apply(ops).into_iter().collect()
+        };
+        if fast_path.is_empty() {
+            return Ok(());
+        }
+        self.tx
+            .send(RdpInputEvent::FastPath(fast_path))
+            .await
+            .map_err(|_| {
+                Error::Session(
+                    self.bridge
+                        .failure()
+                        .unwrap_or_else(|| "input channel closed".to_owned()),
+                )
+            })
+    }
+}
+
 impl Drop for Session {
     fn drop(&mut self) {
         self.frame.mark_ended();
@@ -551,7 +625,7 @@ mod tests {
                 thread: None,
                 input_tx: tx,
                 frame: SharedFrame::new(),
-                input_db: Mutex::new(Database::new()),
+                input_db: Arc::new(Mutex::new(Database::new())),
                 desktop_size: (100, 100),
                 bridge: Arc::new(BridgeShared::new()),
                 next_req_id: AtomicU64::new(1),
@@ -745,5 +819,66 @@ mod tests {
         assert!(!watch.status().ended);
         drop(s);
         assert!(watch.status().ended);
+    }
+
+    #[tokio::test]
+    async fn input_handle_applies_through_the_shared_input_state_and_checks_bounds() {
+        use crate::{PointerButton, RawInput};
+        let (s, mut rx) = session();
+        let handle = s.input_handle();
+        // No frame yet: pointer moves are out of bounds and send nothing.
+        assert!(handle
+            .send(vec![RawInput::PointerMove { x: 0, y: 0 }])
+            .await
+            .is_err());
+        s.frame.write(10, 10, vec![0; 400]);
+        assert!(handle
+            .send(vec![RawInput::PointerMove { x: 10, y: 0 }])
+            .await
+            .is_err());
+        assert!(rx.try_recv().is_err());
+        handle
+            .send(vec![
+                RawInput::PointerMove { x: 9, y: 9 },
+                RawInput::Button {
+                    button: PointerButton::Left,
+                    down: true,
+                },
+                RawInput::Key {
+                    code: 0x2A,
+                    extended: false,
+                    down: true,
+                },
+            ])
+            .await
+            .unwrap();
+        assert!(matches!(rx.try_recv(), Ok(RdpInputEvent::FastPath(events)) if events.len() == 3));
+        // The agent's input state sees the human's pressed Shift: a release
+        // through the handle emits, a second one is a no-op.
+        assert!(s
+            .input_db
+            .lock()
+            .unwrap()
+            .is_key_pressed(ironrdp_input::Scancode::from_u8(false, 0x2A)));
+        let release = RawInput::Key {
+            code: 0x2A,
+            extended: false,
+            down: false,
+        };
+        handle.send(vec![release]).await.unwrap();
+        assert!(matches!(rx.try_recv(), Ok(RdpInputEvent::FastPath(events)) if events.len() == 1));
+        handle.send(vec![release]).await.unwrap();
+        assert!(rx.try_recv().is_err(), "nothing to release twice");
+        drop(rx);
+        assert!(
+            handle.send(vec![release]).await.is_ok(),
+            "no-op sends nothing"
+        );
+        let press = RawInput::Key {
+            code: 0x1E,
+            extended: false,
+            down: true,
+        };
+        assert!(handle.send(vec![press]).await.is_err(), "closed channel");
     }
 }

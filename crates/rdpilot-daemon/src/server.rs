@@ -88,6 +88,13 @@ const TEST_FRAMES_STILL_HOST: &str = "fake-still";
 /// [`RealConnector`].
 const TEST_CUA_ENV: &str = "RDPILOT_DAEMON_TEST_CUA";
 
+/// When set (to a file path) alongside [`TEST_CONNECTOR_ENV`], every
+/// [`FakeTestSession`] accepts human viewer input and appends one JSON line
+/// of counts per batch to that file: events taken so far and keys or
+/// buttons held now. Never key codes or coordinates. Read only when the fake
+/// connector is selected; unreachable by [`RealConnector`].
+const TEST_INPUT_LOG_ENV: &str = "RDPILOT_DAEMON_TEST_INPUT_LOG";
+
 /// The env var overriding [`RunConfig`]'s reconciliation-state sink path
 /// (test injection point -- production always resolves the platform
 /// cache-dir default via [`JsonReconciliationSink::new`]).
@@ -198,6 +205,7 @@ async fn run_inner(config: RunConfig) -> Result<(), DaemonError> {
             bootstrap_delay_ms,
             frames: std::env::var(TEST_FRAMES_ENV).is_ok(),
             cua: std::env::var(TEST_CUA_ENV).is_ok(),
+            input_log: std::env::var_os(TEST_INPUT_LOG_ENV).map(PathBuf::from),
         })
     } else {
         Arc::new(RealConnector)
@@ -308,6 +316,59 @@ struct FakeTestSession {
     frames: Option<Arc<SyntheticFrames>>,
     /// Serve Cua attachments with [`FakeCua`] when [`TEST_CUA_ENV`] is set.
     cua: bool,
+    /// Counting human input sink when [`TEST_INPUT_LOG_ENV`] is set.
+    input: Option<Arc<CountingInput>>,
+}
+
+/// The fake connector's human input sink: counts only.
+struct CountingInput {
+    log: PathBuf,
+    state: std::sync::Mutex<InputCounts>,
+}
+
+/// Events taken so far, and the keys or buttons held now.
+type InputCounts = (u64, std::collections::BTreeSet<crate::control::Held>);
+
+impl crate::seams::HumanInput for CountingInput {
+    fn send(
+        &self,
+        events: Vec<crate::control::HumanEvent>,
+    ) -> crate::seams::SendFuture<'_, Result<(), DaemonError>> {
+        use crate::control::{Held, HumanEvent};
+        let line = {
+            let mut state = match self.state.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            for event in &events {
+                state.0 += 1;
+                let (held, down) = match *event {
+                    HumanEvent::Key {
+                        code,
+                        extended,
+                        down,
+                    } => (Held::Key { code, extended }, down),
+                    HumanEvent::Button { button, down } => (Held::Button(button), down),
+                    HumanEvent::Move { .. } | HumanEvent::Wheel { .. } => continue,
+                };
+                if down {
+                    state.1.insert(held);
+                } else {
+                    state.1.remove(&held);
+                }
+            }
+            serde_json::json!({ "events": state.0, "held": state.1.len() }).to_string()
+        };
+        Box::pin(async move {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&self.log)
+                .map_err(|e| DaemonError::Io(e.to_string()))?;
+            writeln!(file, "{line}").map_err(|e| DaemonError::Io(e.to_string()))
+        })
+    }
 }
 
 impl ManagedSession for FakeTestSession {
@@ -326,6 +387,12 @@ impl ManagedSession for FakeTestSession {
 
     fn describe(&self) -> SessionLifecycle {
         SessionLifecycle::Live
+    }
+
+    fn human_input(&self) -> Option<Arc<dyn crate::seams::HumanInput>> {
+        self.input
+            .as_ref()
+            .map(|input| Arc::clone(input) as Arc<dyn crate::seams::HumanInput>)
     }
 
     fn attach_cua(&self) -> BoxFuture<'_, Result<Box<dyn ManagedCua>, DaemonError>> {
@@ -432,6 +499,8 @@ struct FakeTestConnector {
     frames: bool,
     /// See [`TEST_CUA_ENV`].
     cua: bool,
+    /// See [`TEST_INPUT_LOG_ENV`].
+    input_log: Option<PathBuf>,
 }
 
 impl SessionConnector for FakeTestConnector {
@@ -442,6 +511,12 @@ impl SessionConnector for FakeTestConnector {
         let slow_ms = self.slow_ms;
         let bootstrap_delay_ms = self.bootstrap_delay_ms;
         let cua = self.cua;
+        let input = self.input_log.clone().map(|log| {
+            Arc::new(CountingInput {
+                log,
+                state: std::sync::Mutex::default(),
+            })
+        });
         let frames = self.frames.then(|| {
             let frames = SyntheticFrames::new();
             if cfg.host() == TEST_FRAMES_STILL_HOST {
@@ -473,6 +548,7 @@ impl SessionConnector for FakeTestConnector {
                 bootstrap_delay_ms,
                 frames,
                 cua,
+                input,
             }) as Box<dyn ManagedSession>)
         })
     }
@@ -672,6 +748,7 @@ mod tests {
             bootstrap_delay_ms: 0,
             frames: false,
             cua: false,
+            input_log: None,
         });
         let registry = Arc::new(Registry::new(
             connector,
@@ -711,6 +788,7 @@ mod tests {
             bootstrap_delay_ms: 0,
             frames: None,
             cua: false,
+            input: None,
         };
         let immediate_bound = Duration::from_millis(50);
 
@@ -748,6 +826,7 @@ mod tests {
             bootstrap_delay_ms: 0,
             frames: None,
             cua: false,
+            input: None,
         };
         let bound = Duration::from_millis(SLOW_MS);
 
@@ -790,6 +869,7 @@ mod tests {
             bootstrap_delay_ms: 0,
             frames: None,
             cua: true,
+            input: None,
         };
         let mut cua = session.attach_cua().await.expect("fake Cua attaches");
         let call = |id: u64, method: &str, params: serde_json::Value| json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
@@ -845,7 +925,36 @@ mod tests {
             bootstrap_delay_ms: 0,
             frames: None,
             cua: false,
+            input: None,
         };
         assert!(without.attach_cua().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn fake_input_logs_counts_only() {
+        use crate::control::HumanEvent;
+        use crate::seams::HumanInput;
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("input.jsonl");
+        let input = CountingInput {
+            log: log.clone(),
+            state: std::sync::Mutex::default(),
+        };
+        let key = |down| HumanEvent::Key {
+            code: 0x2A,
+            extended: false,
+            down,
+        };
+        input
+            .send(vec![HumanEvent::Move { x: 777, y: 555 }, key(true)])
+            .await
+            .unwrap();
+        input.send(vec![key(false)]).await.unwrap();
+        let text = std::fs::read_to_string(&log).unwrap();
+        assert_eq!(
+            text,
+            "{\"events\":2,\"held\":1}\n{\"events\":3,\"held\":0}\n"
+        );
+        assert!(!text.contains("777") && !text.contains("42"));
     }
 }

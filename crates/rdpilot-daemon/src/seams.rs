@@ -218,6 +218,51 @@ impl ViewFrameSource for rdpilot::FrameWatch {
     fn capture(&self) -> Option<(u64, rdpilot::Screenshot)> {
         rdpilot::FrameWatch::capture(self)
     }
+    fn geometry(&self) -> Option<(u32, u32)> {
+        rdpilot::FrameWatch::geometry(self)
+    }
+}
+
+impl HumanInput for rdpilot::InputHandle {
+    fn send(
+        &self,
+        events: Vec<crate::control::HumanEvent>,
+    ) -> SendFuture<'_, Result<(), DaemonError>> {
+        let raw = events.into_iter().map(raw_input).collect();
+        Box::pin(async move {
+            rdpilot::InputHandle::send(self, raw)
+                .await
+                .map_err(DaemonError::Sdk)
+        })
+    }
+}
+
+/// The SDK form of a human input event.
+fn raw_input(event: crate::control::HumanEvent) -> rdpilot::RawInput {
+    use crate::control::{HumanEvent, PointerButton};
+    match event {
+        HumanEvent::Move { x, y } => rdpilot::RawInput::PointerMove { x, y },
+        HumanEvent::Button { button, down } => rdpilot::RawInput::Button {
+            button: match button {
+                PointerButton::Left => rdpilot::PointerButton::Left,
+                PointerButton::Middle => rdpilot::PointerButton::Middle,
+                PointerButton::Right => rdpilot::PointerButton::Right,
+                PointerButton::X1 => rdpilot::PointerButton::X1,
+                PointerButton::X2 => rdpilot::PointerButton::X2,
+            },
+            down,
+        },
+        HumanEvent::Wheel { vertical, units } => rdpilot::RawInput::Wheel { vertical, units },
+        HumanEvent::Key {
+            code,
+            extended,
+            down,
+        } => rdpilot::RawInput::Key {
+            code,
+            extended,
+            down,
+        },
+    }
 }
 
 impl ManagedSession for Session {
@@ -292,6 +337,10 @@ impl ManagedSession for Session {
 
     fn frame_source(&self) -> Option<Arc<dyn ViewFrameSource>> {
         Some(Arc::new(self.frame_watch()))
+    }
+
+    fn human_input(&self) -> Option<Arc<dyn HumanInput>> {
+        Some(Arc::new(self.input_handle()))
     }
 }
 
