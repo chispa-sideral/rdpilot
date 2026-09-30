@@ -490,23 +490,55 @@ impl Drop for StagedFile {
 /// The directory the daemon serves the bundle in, as the guest sees it.
 const SERVED_BUNDLE_DIR: &str = r"\\tsclient\RDPILOT\bundle";
 
+/// The longest line [`bridge_launch_command`] may produce. The Run dialog
+/// keeps only the first 259 characters (`MAX_PATH - 1`) of what is typed; a
+/// cut line leaves a `(` open, and cmd then runs nothing. 240 leaves a margin
+/// below that limit for every `u64` generation.
+const RUN_LINE_LIMIT: usize = 240;
+
+/// Name of the local launcher copy for `generation`: `l` and the generation
+/// in base 36, padded to 13 digits (the width of `u64::MAX`). The mapping is
+/// one-to-one, so every generation has its own name, and every name has the
+/// same length, starts with a letter, holds only `[0-9a-z]` and is never a
+/// reserved device name.
+fn launcher_name(generation: u64) -> String {
+    const DIGITS: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    let mut digits = [b'0'; 13];
+    let mut rest = generation;
+    for digit in digits.iter_mut().rev() {
+        *digit = DIGITS[(rest % 36) as usize];
+        rest /= 36;
+    }
+    let digits: String = digits.iter().map(|&b| char::from(b)).collect();
+    format!("l{digits}.exe")
+}
+
 /// What the Run dialog receives. Windows asks for confirmation before it
 /// starts an executable from the redirected drive, so `cmd` first copies the
-/// served bridge into `%LOCALAPPDATA%\rdpilot\launch-<generation>.exe`,
-/// starts that local copy with `install` (which verifies the served bundle and
-/// its own image against the manifest, installs, starts the installed copy
-/// and exits), then deletes the copy. The name is unique per generation, so
-/// concurrent connects of the same user do not share a launcher; a retried
-/// launch for the same generation fails at `copy` while the first launcher
-/// still runs. `&&` chains stop at the first failure, so nothing runs from an
-/// unexpected directory. Only `%LOCALAPPDATA%` can contain spaces; it is
-/// quoted, and every other token is a fixed name or a number.
+/// served bridge into `%LOCALAPPDATA%\rdpilot\` under [`launcher_name`],
+/// starts that local copy with `install --generation <generation>` (which
+/// verifies the served bundle and its own image against the manifest,
+/// installs, starts the installed copy and exits), then deletes the copy. The
+/// name is unique per generation, so concurrent connects of the same user do
+/// not share a launcher; a retried launch for the same generation fails at
+/// `copy` while the first launcher still runs. A copy left by an interrupted
+/// launch is inside `%LOCALAPPDATA%\rdpilot`, which `cleanup` removes. `&&`
+/// chains stop at the first failure, so nothing runs from an unexpected
+/// directory. Only `%LOCALAPPDATA%` can contain spaces; it is quoted, and
+/// every other token is a fixed name or a number. The line is at most
+/// [`RUN_LINE_LIMIT`] characters long.
 fn bridge_launch_command(generation: u64) -> String {
-    let launcher = format!("launch-{generation}.exe");
-    format!(
+    let launcher = launcher_name(generation);
+    let line = format!(
         r#"cmd /d /c cd /d "%LOCALAPPDATA%" && (md rdpilot 2>nul & cd rdpilot) && copy /y {SERVED_BUNDLE_DIR}\{exe} {launcher} && (.\{launcher} install --generation {generation} & del {launcher})"#,
         exe = rdpilot_bridge_protocol::BRIDGE_EXE_NAME,
-    )
+    );
+    debug_assert!(
+        line.len() <= RUN_LINE_LIMIT,
+        "{} > {RUN_LINE_LIMIT}",
+        line.len()
+    );
+    line
 }
 
 #[cfg(test)]
@@ -544,7 +576,7 @@ mod tests {
     fn launch_command_copies_the_served_bridge_and_starts_the_local_copy() {
         assert_eq!(
             bridge_launch_command(42),
-            r#"cmd /d /c cd /d "%LOCALAPPDATA%" && (md rdpilot 2>nul & cd rdpilot) && copy /y \\tsclient\RDPILOT\bundle\rdpilot-bridge.exe launch-42.exe && (.\launch-42.exe install --generation 42 & del launch-42.exe)"#
+            r#"cmd /d /c cd /d "%LOCALAPPDATA%" && (md rdpilot 2>nul & cd rdpilot) && copy /y \\tsclient\RDPILOT\bundle\rdpilot-bridge.exe l0000000000016.exe && (.\l0000000000016.exe install --generation 42 & del l0000000000016.exe)"#
         );
     }
 
@@ -556,35 +588,101 @@ mod tests {
         assert_eq!(command.matches(r"\\tsclient").count(), 1);
         assert!(command.contains(r"copy /y \\tsclient\RDPILOT\bundle\rdpilot-bridge.exe "));
         // The started image is the local copy in %LOCALAPPDATA%\rdpilot.
-        assert!(command.contains(r"&& (.\launch-7.exe install --generation 7 "));
+        assert!(command.contains(r"&& (.\l0000000000007.exe install --generation 7 "));
         assert!(command.contains(r#"cd /d "%LOCALAPPDATA%" && (md rdpilot 2>nul & cd rdpilot) &&"#));
     }
 
     #[test]
-    fn launch_command_is_unique_per_generation_and_uses_its_full_value() {
+    fn launch_command_fits_the_run_dialog_for_every_generation() {
+        // The longest generation gives the longest line.
+        let longest = bridge_launch_command(u64::MAX);
+        assert!(
+            longest.len() <= RUN_LINE_LIMIT,
+            "{} characters: {longest}",
+            longest.len()
+        );
+        // The Run dialog keeps 259 characters (MAX_PATH - 1).
+        const { assert!(RUN_LINE_LIMIT < 259) };
+        for generation in [0, 1, 1_801_369_873_856_485_411, u64::MAX - 1] {
+            assert!(bridge_launch_command(generation).len() <= longest.len());
+        }
+        assert!(longest.is_ascii());
+    }
+
+    #[test]
+    fn launch_command_passes_the_full_generation_once() {
         let generation = u64::MAX;
         let command = bridge_launch_command(generation);
-        let launcher = format!("launch-{generation}.exe");
+        let launcher = launcher_name(generation);
+        assert_eq!(launcher, "l3w5e11264sgsf.exe");
         // copy target, start, delete.
         assert_eq!(command.matches(&launcher).count(), 3);
+        assert_eq!(command.matches(&generation.to_string()).count(), 1);
         assert!(command.ends_with(&format!(
             "install --generation {generation} & del {launcher})"
         )));
+    }
+
+    #[test]
+    fn launcher_names_are_unique_fixed_width_and_plain() {
+        let generations = [
+            0,
+            1,
+            2,
+            35,
+            36,
+            1_801_369_873_856_485_411,
+            u64::MAX - 1,
+            u64::MAX,
+        ];
+        let names: Vec<String> = generations.iter().map(|g| launcher_name(*g)).collect();
+        for (i, name) in names.iter().enumerate() {
+            assert_eq!(name.len(), names[0].len(), "{name}");
+            // No leading dot, no quote, no space: a plain name cmd needs no
+            // quoting for, and never a reserved device name.
+            assert!(name.starts_with('l'), "{name}");
+            let stem = name.strip_suffix(".exe").unwrap();
+            assert!(
+                stem.bytes()
+                    .all(|b| b.is_ascii_digit() || b.is_ascii_lowercase()),
+                "{name}"
+            );
+            for other in &names[i + 1..] {
+                assert_ne!(name, other);
+            }
+        }
         assert_ne!(bridge_launch_command(1), bridge_launch_command(2));
-        assert!(!bridge_launch_command(1).contains("launch-2.exe"));
+        assert!(!bridge_launch_command(1).contains(&launcher_name(2)));
     }
 
     #[test]
     fn launch_command_quoting_is_balanced_and_only_around_localappdata() {
-        let command = bridge_launch_command(123_456_789);
-        // `cmd /c` keeps the line as typed: it does not start with a quote,
-        // so cmd strips no quote characters.
-        assert!(command.starts_with("cmd /d /c cd "));
-        assert_eq!(command.matches('"').count(), 2);
-        assert!(command.contains(r#""%LOCALAPPDATA%""#));
-        assert_eq!(command.matches('(').count(), command.matches(')').count());
-        // Nothing the Run dialog or cmd would treat as another line or pipe.
-        assert!(!command.contains('\n') && !command.contains('|') && !command.contains('^'));
+        for generation in [0, 123_456_789, u64::MAX] {
+            let command = bridge_launch_command(generation);
+            // `cmd /c` keeps the line as typed: it does not start with a
+            // quote, so cmd strips no quote characters.
+            assert!(command.starts_with("cmd /d /c cd "));
+            assert_eq!(command.matches('"').count(), 2);
+            assert!(command.contains(r#""%LOCALAPPDATA%""#));
+            // Every prefix closes no more parentheses than it opened, and the
+            // whole line closes all of them.
+            let mut depth = 0i32;
+            for c in command.chars() {
+                match c {
+                    '(' => depth += 1,
+                    ')' => depth -= 1,
+                    _ => {}
+                }
+                assert!(depth >= 0, "{command}");
+            }
+            assert_eq!(depth, 0, "{command}");
+            // Nothing the Run dialog or cmd would treat as another line or pipe.
+            assert!(!command.contains('\n') && !command.contains('|') && !command.contains('^'));
+            // No path piece starts with a dot other than the `.\` that
+            // starts the local copy.
+            assert_eq!(command.matches(" .").count(), 0, "{command}");
+            assert_eq!(command.matches(r"(.\").count(), 1, "{command}");
+        }
     }
     #[tokio::test]
     async fn native_recovery_stays_available_with_dead_cua_bridge() {

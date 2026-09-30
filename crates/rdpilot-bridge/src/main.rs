@@ -2,7 +2,7 @@
 //! image is the bridge the served manifest names, verify and install the
 //! served bundle under `%LOCALAPPDATA%\rdpilot`, then start the installed
 //! copy with `run` and exit. The daemon starts it from a local copy
-//! (`%LOCALAPPDATA%\rdpilot\launch-<generation>.exe`), never from the
+//! (`%LOCALAPPDATA%\rdpilot\l<generation in base 36>.exe`), never from the
 //! redirected drive.
 //!
 //! `rdpilot-bridge run --generation N`: carry the Cua MCP stream for one RDP

@@ -194,7 +194,7 @@ it. Development bridges and the released bridge are not Authenticode-signed.
 the RDP drive `\\tsclient\RDPILOT\bundle`. Windows asks for confirmation before
 it starts a program from that drive, so the daemon types a `cmd /d /c` line
 into the Run dialog that copies the served bridge to
-`%LOCALAPPDATA%\rdpilot\launch-<generation>.exe`, starts that copy with
+`%LOCALAPPDATA%\rdpilot\l<generation in base 36>.exe`, starts that copy with
 `install --generation <generation>`, and deletes the copy when it exits. The
 bridge checks its own image and every served file against the manifest,
 extracts the archive, installs into

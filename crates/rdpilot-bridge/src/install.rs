@@ -344,7 +344,7 @@ mod tests {
     fn the_launcher_must_be_the_bridge_the_manifest_names() {
         let b = standard();
         let local = tempfile::tempdir().unwrap();
-        let launcher = local.path().join("launch-7.exe");
+        let launcher = local.path().join("l0000000000007.exe");
         fs::copy(b.source.path().join(BRIDGE_EXE_NAME), &launcher).unwrap();
         verify_image(b.source.path(), &launcher).unwrap();
         fs::write(&launcher, b"MZ other").unwrap();
