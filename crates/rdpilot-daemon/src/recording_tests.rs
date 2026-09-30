@@ -119,6 +119,10 @@ impl Drop for Fx {
 }
 
 fn fx(tag: &str) -> Fx {
+    fx_with(tag, FakeFactory::default())
+}
+
+fn fx_with(tag: &str, factory: FakeFactory) -> Fx {
     let root = crate::recording::store::tests::temp_root(tag);
     let service = RecordingService::fixed(
         StorageSettings {
@@ -126,7 +130,7 @@ fn fx(tag: &str) -> Fx {
             max_fps: 8.0,
             budget_bytes: 1 << 30,
         },
-        Arc::new(FakeFactory::default()),
+        Arc::new(factory),
         60_000,
     );
     let connector = Arc::new(Connector::default());
@@ -789,4 +793,89 @@ async fn startup_finalizes_leftovers() {
         .unwrap();
     let m = crate::recording::store::Store::read_manifest(&dir).unwrap();
     assert_eq!(m.end_reason.as_deref(), Some("daemon_lost"));
+}
+
+/// The manifest of `dir` once its recorder finished it (at most 10 s).
+async fn finished_manifest(dir: &Path) -> crate::recording::manifest::Manifest {
+    for _ in 0..100 {
+        let manifest = crate::recording::store::Store::read_manifest(dir).unwrap();
+        if manifest.finished() {
+            return manifest;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("recording {} did not finish", dir.display());
+}
+
+fn listed(response: WireResponse, id: &str) -> rdpilot_ipc::WireRecording {
+    let WireResponse::Recordings { recordings, .. } = response else {
+        panic!("expected Recordings");
+    };
+    recordings
+        .into_iter()
+        .find(|r| r.id == id)
+        .expect("recording is listed")
+}
+
+/// A stopped recording whose recorder is still closing its last segment
+/// stays active: another start does not treat it as left open by an
+/// earlier daemon, and the list shows it as active with its duration.
+#[tokio::test]
+async fn a_start_during_another_recordings_close_keeps_its_segment() {
+    let fx = fx_with(
+        "rec-close-race",
+        FakeFactory {
+            delay: Duration::from_millis(1500),
+            ..FakeFactory::default()
+        },
+    );
+    fx.connect("one", "h", Some(WireRecordTrigger::ConnectFlag))
+        .await;
+    fx.connect("two", "h", None).await;
+    let frames = Arc::clone(&fx.connector.frames.lock().unwrap()[0]);
+    frames.paint(41);
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    frames.paint(81);
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    // The slow encoder is still busy with the first frame.
+    let (first, _) = changed(
+        &fx.run(Request::RecordStop {
+            session: sid("one"),
+        })
+        .await,
+    );
+    let first = first.unwrap();
+    let closing = listed(fx.run(Request::RecordingList {}).await, &first);
+    assert!(closing.active, "closing recording listed {closing:?}");
+    assert!(
+        closing.duration_ms > 0,
+        "closing recording listed {closing:?}"
+    );
+    let (second, started) = changed(
+        &fx.run(Request::RecordStart {
+            session: sid("two"),
+        })
+        .await,
+    );
+    assert!(started && second.is_some());
+    let dir = fx.recordings_root().join(&first);
+    let manifest = finished_manifest(&dir).await;
+    assert_eq!(manifest.end_reason.as_deref(), Some("requested"));
+    assert_eq!(manifest.segments.len(), 1, "kinds {:?}", kinds(&dir));
+    assert!(dir
+        .join("segments")
+        .join(&manifest.segments[0].file)
+        .is_file());
+    let kinds = kinds(&dir);
+    assert!(kinds.iter().any(|k| k == "segment_closed"), "{kinds:?}");
+    assert!(!kinds.iter().any(|k| k == "video_stopped"), "{kinds:?}");
+    let closed = listed(fx.run(Request::RecordingList {}).await, &first);
+    assert!(!closed.active);
+    assert_eq!(closed.duration_ms, manifest.duration_ms.unwrap());
+    assert!(closed.bytes > manifest.segments[0].bytes);
+    fx.run(Request::RecordStop {
+        session: sid("two"),
+    })
+    .await;
+    finished_manifest(&fx.recordings_root().join(second.unwrap())).await;
 }

@@ -108,14 +108,44 @@ impl Active {
     }
 }
 
+/// A stopped recording whose recorder thread can still be closing its last
+/// segment and manifest.
+struct Closing {
+    id: String,
+    thread: RecorderThread,
+    started: Instant,
+    stopped: Instant,
+}
+
+impl Closing {
+    fn running(&self) -> bool {
+        !self.thread.handle.is_finished()
+    }
+}
+
 #[derive(Default)]
 struct State {
     /// By session log id.
     active: HashMap<String, Active>,
     /// Session logs whose recording is being set up.
     starting: HashSet<String>,
-    /// Finished recorder threads, joined at shutdown.
-    finished: Vec<RecorderThread>,
+    /// Stopped recordings; the running ones are still being written. Their
+    /// threads are joined at shutdown.
+    closing: Vec<Closing>,
+}
+
+impl State {
+    /// Move a stopped recording's thread to `closing`.
+    fn close(&mut self, active: Active) {
+        if let Some(thread) = active.thread {
+            self.closing.push(Closing {
+                id: active.id,
+                thread,
+                started: active.started,
+                stopped: Instant::now(),
+            });
+        }
+    }
 }
 
 /// The daemon's recording service.
@@ -185,16 +215,30 @@ impl RecordingService {
         }
     }
 
-    /// Recording ids that are being written.
-    fn active_ids(&self) -> HashSet<String> {
-        self.state().active.values().map(|a| a.id.clone()).collect()
+    /// Recording ids that are being written: the active ones and the
+    /// stopped ones whose recorder is still closing.
+    fn writing_ids(&self) -> HashSet<String> {
+        let state = self.state();
+        state
+            .active
+            .values()
+            .map(|a| a.id.clone())
+            .chain(
+                state
+                    .closing
+                    .iter()
+                    .filter(|c| c.running())
+                    .map(|c| c.id.clone()),
+            )
+            .collect()
     }
 
     /// Drop entries whose recorder stopped on its own (a write failure),
-    /// detaching their sinks.
+    /// detaching their sinks, and forget closed recorders.
     fn reap(&self) {
         let dead: Vec<Active> = {
             let mut state = self.state();
+            state.closing.retain(Closing::running);
             let keys: Vec<String> = state
                 .active
                 .iter()
@@ -205,7 +249,7 @@ impl RecordingService {
                 .filter_map(|k| state.active.remove(&k))
                 .collect()
         };
-        for mut active in dead {
+        for active in dead {
             let _ = active.stop_capture.send(true);
             if let Some(events) = active.events.upgrade() {
                 events.detach_sink(
@@ -215,9 +259,7 @@ impl RecordingService {
                     },
                 );
             }
-            if let Some(thread) = active.thread.take() {
-                self.state().finished.push(thread);
-            }
+            self.state().close(active);
         }
     }
 
@@ -230,14 +272,17 @@ impl RecordingService {
             .map(|a| a.id.clone())
     }
 
-    /// At daemon start: finish recordings an earlier daemon left open, then
-    /// prune. Blocking: run it off the IPC thread.
+    /// At daemon start, before the daemon accepts requests: finish
+    /// recordings an earlier daemon left open, then prune. Only here: after
+    /// it, every unfinished recording belongs to this daemon, also while
+    /// its recorder is still closing it. Blocking: run it off the IPC
+    /// thread.
     pub(crate) fn startup(&self) {
         let Ok(settings) = self.settings() else {
             return;
         };
         let store = Store::new(settings.root);
-        let active = self.active_ids();
+        let active = self.writing_ids();
         store.finalize_leftovers(&active);
         let report = store.prune(
             store::unix_ms(SystemTime::now()),
@@ -334,7 +379,7 @@ impl RecordingService {
             clock,
             start_offset,
         };
-        let active_ids = self.active_ids();
+        let writing = self.writing_ids();
         let factory = Arc::clone(&self.factory);
         let segment_ms = self.segment_ms;
         let storage = settings.clone();
@@ -342,11 +387,10 @@ impl RecordingService {
             check_off_ipc_thread();
             let store = Store::new(storage.root.clone());
             store.ensure_root()?;
-            store.finalize_leftovers(&active_ids);
             let report = store.prune(
                 store::unix_ms(SystemTime::now()),
                 storage.budget_bytes,
-                &active_ids,
+                &writing,
             );
             warn_kept_over_budget(&report);
             let dir = store.create_recording(&manifest.id)?;
@@ -411,9 +455,7 @@ impl RecordingService {
         let _ = active.stop_capture.send(true);
         events.detach_sink(source, EventKind::RecordingStopped { reason });
         let id = active.id.clone();
-        if let Some(thread) = active.thread {
-            self.state().finished.push(thread);
-        }
+        self.state().close(active);
         Some(id)
     }
 
@@ -472,19 +514,24 @@ impl RecordingService {
         check_off_ipc_thread();
         let settings = self.settings()?;
         let store = Store::new(settings.root);
-        let (active, started): (HashSet<String>, HashMap<String, Instant>) = {
+        // A recording still being closed is listed as active, with its
+        // duration up to the stop, until its recorder finished the manifest.
+        let (active, durations): (HashSet<String>, HashMap<String, Duration>) = {
             let state = self.state();
+            let closing = state.closing.iter().filter(|c| c.running());
             (
                 state
                     .active
                     .values()
                     .filter(|a| a.alive())
                     .map(|a| a.id.clone())
+                    .chain(closing.clone().map(|c| c.id.clone()))
                     .collect(),
                 state
                     .active
                     .values()
-                    .map(|a| (a.id.clone(), a.started))
+                    .map(|a| (a.id.clone(), a.started.elapsed()))
+                    .chain(closing.map(|c| (c.id.clone(), c.stopped - c.started)))
                     .collect(),
             )
         };
@@ -501,9 +548,9 @@ impl RecordingService {
                 listing.unkept_bytes += scanned.bytes;
             }
             let duration_ms = if is_active {
-                started.get(&m.id).map_or(0, |s| {
-                    u64::try_from(s.elapsed().as_millis()).unwrap_or(u64::MAX)
-                })
+                durations
+                    .get(&m.id)
+                    .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
             } else {
                 m.duration_ms.unwrap_or(0)
             };
@@ -561,7 +608,7 @@ impl RecordingService {
             }
             threads.extend(active.thread.take());
         }
-        threads.append(&mut self.state().finished);
+        threads.extend(self.state().closing.drain(..).map(|c| c.thread));
         let join = tokio::task::spawn_blocking(move || {
             for thread in threads {
                 let _ = thread.handle.join();
