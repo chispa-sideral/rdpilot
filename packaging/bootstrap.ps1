@@ -2,7 +2,7 @@ param([Parameter(Mandatory=$true)][UInt64]$Generation)
 $ErrorActionPreference = 'Stop'
 $source = '\\tsclient\RDPILOT\bundle'
 $manifest = Get-Content -LiteralPath "$source\manifest.json" -Raw | ConvertFrom-Json
-if ($manifest.bundle_id -ne 'cua-driver-rs-v0.28.2') { throw 'Unsupported bundle' }
+if ($manifest.bundle_id -notmatch '^[A-Za-z0-9_-][A-Za-z0-9._-]{0,127}$') { throw 'Unsupported bundle' }
 $base = Join-Path $env:LOCALAPPDATA 'rdpilot'
 New-Item -ItemType Directory -Force -Path $base | Out-Null
 # Named mutex prevents duplicate launch of the SAME session generation. A different
@@ -32,6 +32,7 @@ try {
             Assert-Hash "$stage\rdpilot-bridge.exe" $manifest.bridge_sha256
             Expand-Archive -LiteralPath "$stage\cua.zip" -DestinationPath $stage
             foreach ($entry in $manifest.files.PSObject.Properties) { Assert-Hash (Join-Path $stage $entry.Name) $entry.Value }
+            Copy-Item -LiteralPath "$source\manifest.json" -Destination "$stage\manifest.json"
             Copy-Item -LiteralPath "$source\manifest.json" -Destination "$stage\complete.json"
             # Directory publication is atomic. Concurrent installations either use
             # the already verified winner or fail, never overwrite running binaries.
