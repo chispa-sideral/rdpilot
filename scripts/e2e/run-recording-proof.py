@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Proof run for session recording (record, annotate, keep, replay).
+r"""Proof run for session recording (record, annotate, keep, replay).
 
 Fake mode (offline, no Windows; fake connector with synthetic frames and a
 fake Cua; needs ffmpeg, ffprobe and Playwright Chromium and Firefox):
@@ -25,6 +25,13 @@ and its recording is started from the viewer page, c is not recorded (live)
 or shows one change and then a still display (fake). Viewer actions go
 through the page UI in a headless browser: Start recording, the annotation
 input and the Keep toggle.
+
+Live setup (before the first logon of the three users): the taskbar clock
+must be hidden for them, or its minute tick is a display change in the
+still interval. For example, as an administrator on the guest, load
+C:\Users\Default\NTUSER.DAT and set
+Software\Microsoft\Windows\CurrentVersion\Policies\Explorer HideClock=1
+(REG_DWORD) in it, so every new profile starts without the clock.
 
 Credentials come only from the environment and reach rdpilot only through
 subprocess environment. Recordings are written to the temp directory and
@@ -498,23 +505,11 @@ class Proof(viewer_proof.Proof):
             finally:
                 await browser.close()
 
-    async def live_setup(self, target):
-        """Hide the taskbar clock for this user (a clock tick is a display
-        change) and restart the shell."""
-        script = r"""
-New-Item -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Policies\Explorer' -Force | Out-Null
-Set-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Policies\Explorer' -Name HideClock -Value 1 -Type DWord
-Stop-Process -Name explorer -Force
-"""
-        await self.endpoints[target].tool("launch_app", self.e2e.powershell(script))
-        await asyncio.sleep(8)
-
     async def live_flow(self, browser):
         e2e = self.e2e
         page = await self.open_viewer_page(browser)
         for target in ("a", "b"):
             self.endpoints[target] = await e2e.Mcp(viewer_proof.McpRun(self), target).start()
-        await self.live_setup("a")
         # a: Notepad, the typed marker, a failing call.
         await self.endpoints["a"].tool("launch_app", {"path": r"C:\Windows\System32\notepad.exe"})
         window = await self.find_window("a", "Notepad")
