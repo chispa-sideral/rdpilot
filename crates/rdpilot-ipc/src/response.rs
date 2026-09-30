@@ -65,6 +65,10 @@ pub enum WireResponse {
         connect_ack_required: bool,
         #[serde(default)]
         bridge_live: bool,
+        /// Notes for the user, for example a bridge version that differs
+        /// from the daemon or an offline fallback to a cached Cua version.
+        #[serde(default)]
+        warnings: Vec<String>,
     },
     Screenshot {
         png_base64: String,

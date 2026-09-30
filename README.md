@@ -81,7 +81,8 @@ only negations never matches. As in ssh, the target host is lowercased and
 patterns are matched as written, so write patterns in lower case: `Host DevBox`
 never matches. The **first value obtained for each setting wins**: rdpilot reads
 the URL, then `-o` options in order, then the hosts file top to bottom, then the
-built-in default (`Host *` / `CuaEnabled yes`). Lines before the first `Host`
+built-in default (`Host *` with `CuaEnabled yes`, `CuaVersion latest-dev`,
+`CuaAutoDownload yes`). Lines before the first `Host`
 apply to every host. `Include PATH` (globs allowed, sorted, `~` and paths
 relative to the hosts file's directory) reads more files; a pattern that matches
 nothing is skipped, cycles and nesting deeper than 16 are errors, and an
@@ -98,6 +99,8 @@ work; quote values that contain spaces. Booleans accept only `yes` and `no`.
 | `PasswordCommand` | Shell command whose stdout is the password (see below). |
 | `AcceptInvalidCerts` | Accept any server certificate (`yes`/`no`, default `no`). |
 | `CuaEnabled` | `no` = native RDP only: no bridge is deployed and `put`/`get` and Cua are unavailable. Default `yes`. |
+| `CuaVersion` | Cua driver release: `latest-dev` (newest, nightlies included), `latest` (newest non-nightly) or an upstream tag. Default `latest-dev`. |
+| `CuaAutoDownload` | `no` = use only cached or `bundle_path` files, never download. Default `yes`. |
 | `Include` | Read more files. |
 
 `Password` and `PasswordCommand` share one slot, so whichever is obtained first
@@ -246,7 +249,7 @@ printed loopback URL on your machine (the Host check needs the same port):
 ssh -L PORT:127.0.0.1:PORT user@daemon-host
 ```
 
-Upgrade note: this release changes the IPC compatibility version to 4. After
+Upgrade note: this release changes the IPC compatibility version to 5. After
 you upgrade, restart `rdpilot-daemon` (this ends its live sessions). Until then,
 the CLI and MCP adapter report the daemon compatibility mismatch message.
 

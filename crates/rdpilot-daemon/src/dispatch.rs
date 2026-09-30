@@ -67,6 +67,8 @@ pub(crate) struct ConnectFields {
     pub(crate) domain: Option<String>,
     pub(crate) accept_invalid_certs: bool,
     pub(crate) cua_enabled: bool,
+    pub(crate) cua_version: String,
+    pub(crate) cua_auto_download: bool,
     pub(crate) connect_ack: bool,
 }
 
@@ -88,6 +90,8 @@ pub(crate) async fn dispatch_connect(
         domain,
         accept_invalid_certs,
         cua_enabled,
+        cua_version: _,
+        cua_auto_download: _,
         connect_ack,
     } = fields;
     let mut cfg = ConnectionConfig::new(host.clone(), username, password)
@@ -185,6 +189,7 @@ pub(crate) async fn dispatch_connect(
             session,
             connect_ack_required: connect_ack,
             bridge_live: bridge_configured,
+            warnings: Vec::new(),
         },
         connect_lease: Some(lease),
     }
@@ -214,6 +219,8 @@ pub(crate) async fn dispatch_for_ipc(
             domain,
             accept_invalid_certs,
             cua_enabled,
+            cua_version,
+            cua_auto_download,
             connect_ack,
         } => {
             return dispatch_connect(
@@ -227,6 +234,8 @@ pub(crate) async fn dispatch_for_ipc(
                     domain,
                     accept_invalid_certs,
                     cua_enabled,
+                    cua_version,
+                    cua_auto_download,
                     connect_ack,
                 },
                 diagnostics,
@@ -647,6 +656,8 @@ mod tests {
             domain: None,
             accept_invalid_certs: false,
             cua_enabled,
+            cua_version: "latest-dev".to_owned(),
+            cua_auto_download: true,
             connect_ack: false,
         }
     }
@@ -727,6 +738,8 @@ mod tests {
             domain: None,
             accept_invalid_certs: false,
             cua_enabled: true,
+            cua_version: "latest-dev".to_owned(),
+            cua_auto_download: true,
             connect_ack: false,
         }
     }

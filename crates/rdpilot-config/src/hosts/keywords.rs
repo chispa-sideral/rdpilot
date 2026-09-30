@@ -14,6 +14,8 @@ pub(crate) enum Kind {
     Command,
     /// One or more glob patterns naming files to read.
     Include,
+    /// `latest-dev`, `latest`, or an upstream Cua release tag.
+    CuaVersion,
 }
 
 /// A setting slot: the first value obtained for a slot wins. Keywords that
@@ -27,6 +29,8 @@ pub(crate) enum Slot {
     Credential,
     AcceptInvalidCerts,
     CuaEnabled,
+    CuaVersion,
+    CuaAutoDownload,
     Include,
 }
 
@@ -91,6 +95,18 @@ pub(crate) const KEYWORDS: &[Keyword] = &[
         secret: false,
     },
     Keyword {
+        name: "CuaVersion",
+        kind: Kind::CuaVersion,
+        slot: Slot::CuaVersion,
+        secret: false,
+    },
+    Keyword {
+        name: "CuaAutoDownload",
+        kind: Kind::YesNo,
+        slot: Slot::CuaAutoDownload,
+        secret: false,
+    },
+    Keyword {
         name: "Include",
         kind: Kind::Include,
         slot: Slot::Include,
@@ -133,5 +149,25 @@ pub(crate) fn validate(kw: &Keyword, value: &str) -> Result<String, String> {
             "no" => Ok("no".to_owned()),
             _ => Err(format!("{} must be yes or no", kw.name)),
         },
+        Kind::CuaVersion => validate_cua_version(value)
+            .map(str::to_owned)
+            .map_err(|e| format!("{}: {e}", kw.name)),
+    }
+}
+
+/// `latest-dev`, `latest`, or a release tag of 1-128 characters from
+/// `A-Z a-z 0-9 . _ -`.
+pub fn validate_cua_version(value: &str) -> Result<&str, String> {
+    let ok = !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
+    if ok {
+        Ok(value)
+    } else {
+        Err(format!(
+            "{value:?} is not latest-dev, latest or a release tag (letters, digits, '.', '_', '-')"
+        ))
     }
 }

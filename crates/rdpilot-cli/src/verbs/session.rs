@@ -53,6 +53,8 @@ pub async fn connect(args: ConnectArgs, json: bool) -> Result<(), CliError> {
         domain: host.domain().map(str::to_owned),
         accept_invalid_certs: host.accept_invalid_certs(),
         cua_enabled: host.cua_enabled(),
+        cua_version: host.cua_version().to_owned(),
+        cua_auto_download: host.cua_auto_download(),
         connect_ack: true,
     };
 
@@ -60,8 +62,12 @@ pub async fn connect(args: ConnectArgs, json: bool) -> Result<(), CliError> {
         WireResponse::Connected {
             session,
             bridge_live,
+            warnings,
             ..
         } => {
+            for warning in &warnings {
+                eprintln!("warning: {warning}");
+            }
             if json {
                 print_json(
                     &serde_json::json!({ "session": session.as_str(), "bridge_live": bridge_live }),
