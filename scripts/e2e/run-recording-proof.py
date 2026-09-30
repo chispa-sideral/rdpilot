@@ -526,6 +526,10 @@ class Proof(viewer_proof.Proof):
         await self.cli("annotate", "--session", "a", "note from the CLI")
         await self.open_panel(page, "a")
         await self.annotate_from_page(page, "a", "note from the page")
+        # Close a's live panel for the long still interval: a headless tab
+        # decoding full-HD frames for minutes can run out of memory.
+        await page.click('button[data-session="a"]')
+        await self.wait_state(page, lambda s: "a" not in s["sessions"], "panel a closed", 10)
         idle_from = time.time()
         await asyncio.sleep(IDLE_S)
         idle_to = time.time()
