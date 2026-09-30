@@ -75,6 +75,7 @@ pub(crate) async fn serve_connection<S>(
         if let Request::ViewerStart {
             bind,
             tailnet_address,
+            ..
         } = req
         {
             hold_viewer(&mut stream, viewer, bind, tailnet_address).await;
@@ -83,7 +84,12 @@ pub(crate) async fn serve_connection<S>(
         if let Request::CuaAttach { session } = req {
             match tokio::time::timeout(Duration::from_secs(30), registry.attach_cua(&session)).await
             {
-                Ok(Ok((session_incarnation, events, mut attachment))) => {
+                Ok(Ok(crate::registry::CuaAttach {
+                    generation: session_incarnation,
+                    events,
+                    control: _,
+                    mut attachment,
+                })) => {
                     let (bridge_generation, runtime_generation, attachment_id) =
                         attachment.identity();
                     let ack = WireResponse::CuaAttached {

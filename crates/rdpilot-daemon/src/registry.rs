@@ -40,6 +40,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use rdpilot::ConnectionConfig;
 use rdpilot_ipc::{SessionId, SessionLifecycle, SessionStatus};
 
+use crate::control::{EndReason, SessionControl};
 use crate::events::{CloseReason, EventSource, RecordingTrigger, SessionEvents};
 use crate::recording::{RecordingService, Target};
 use crate::seams::{
@@ -338,9 +339,20 @@ impl Registry {
                 let frame = session.frame_source();
                 let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
                 let events = Arc::new(SessionEvents::new(&id, generation, frame.clone()));
-                let ended_watch = frame
-                    .clone()
-                    .map(|frame| crate::events::watch_session_end(frame, Arc::clone(&events)));
+                let control = Arc::new(SessionControl::new(
+                    id.as_str(),
+                    generation,
+                    Arc::clone(&events),
+                    frame.clone(),
+                    session.human_input(),
+                ));
+                let ended_watch = frame.clone().map(|frame| {
+                    crate::events::watch_session_end(
+                        frame,
+                        Arc::clone(&events),
+                        Arc::clone(&control),
+                    )
+                });
                 // A single wall-clock capture shared by the entry's
                 // `connected_since_wall`/`last_activity_wall` and the
                 // reconciliation sink's `record_open` call below — avoids
@@ -365,6 +377,7 @@ impl Registry {
                             frame,
                             events,
                             ended_watch,
+                            control,
                             last_activity_wall: now_wall.clone(),
                         },
                     );
@@ -429,11 +442,13 @@ impl Registry {
                 session,
                 ended_watch,
                 events,
+                control,
                 ..
             }) => {
                 // Our own close is not a server-side end: stop the watcher
                 // before the session loop is told to stop.
                 drop(ended_watch);
+                end_lease(&control, EndReason::SessionEnded).await;
                 self.recordings.session_closed(&events, reason);
                 // Take the SIZED `Box` out of the `Option` (never the
                 // unsized `dyn ManagedSession` itself, which does not
@@ -499,12 +514,14 @@ impl Registry {
             session,
             ended_watch,
             events,
+            control,
             ..
         }) = entry
         else {
             return Ok(false);
         };
         drop(ended_watch);
+        end_lease(&control, EndReason::SessionEnded).await;
         self.recordings
             .session_closed(&events, CloseReason::ConnectAborted);
         if let Some(session) = session.lock().await.take() {
@@ -558,15 +575,124 @@ impl Registry {
         }
     }
 
+    /// Like [`Registry::call`], for agent input (native Mouse and Key): after
+    /// the per-session lock is taken, the call is refused while a human
+    /// viewer holds (or is taking) the control lease. Checking under the
+    /// per-session lock is what orders it with a human take, which marks
+    /// the lease first and then waits for this lock.
+    ///
+    /// # Errors
+    ///
+    /// As for [`Registry::call`], plus [`DaemonError::HumanControl`].
+    pub(crate) async fn call_acting<T>(
+        &self,
+        id: &SessionId,
+        op: impl for<'a> FnOnce(&'a dyn ManagedSession) -> BoxFuture<'a, Result<T, DaemonError>>,
+    ) -> Result<T, DaemonError> {
+        let (entry, control) = {
+            #[allow(clippy::expect_used)] // A poisoned registry mutex is unrecoverable.
+            let guard = self.sessions.lock().expect("registry mutex poisoned");
+            match guard.get(id) {
+                Some(SessionEntry::Live {
+                    session, control, ..
+                }) => (Arc::clone(session), Arc::clone(control)),
+                Some(SessionEntry::Connecting { .. }) => {
+                    return Err(DaemonError::StillConnecting(id.as_str().to_owned()));
+                }
+                Some(SessionEntry::Orphaned { .. }) | None => {
+                    return Err(DaemonError::SessionNotFound(id.as_str().to_owned()));
+                }
+            }
+        };
+        let guard = entry.lock().await;
+        control.check_agent()?;
+        match guard.as_deref() {
+            Some(session) => op(session).await,
+            None => Err(DaemonError::SessionNotFound(id.as_str().to_owned())),
+        }
+    }
+
+    /// The control lease of live session `id`.
+    pub(crate) fn control(&self, id: &SessionId) -> Option<Arc<SessionControl>> {
+        #[allow(clippy::expect_used)] // A poisoned registry mutex is unrecoverable.
+        let guard = self.sessions.lock().expect("registry mutex poisoned");
+        match guard.get(id) {
+            Some(SessionEntry::Live { control, .. }) => Some(Arc::clone(control)),
+            _ => None,
+        }
+    }
+
+    /// Every live session's control lease.
+    pub(crate) fn controls(&self) -> Vec<Arc<SessionControl>> {
+        #[allow(clippy::expect_used)] // A poisoned registry mutex is unrecoverable.
+        let guard = self.sessions.lock().expect("registry mutex poisoned");
+        guard
+            .values()
+            .filter_map(|entry| match entry {
+                SessionEntry::Live { control, .. } => Some(Arc::clone(control)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// End every human lease for `reason`, with its releases (viewer stop,
+    /// daemon exit).
+    pub(crate) async fn end_all_leases(&self, reason: EndReason) {
+        for control in self.controls() {
+            end_lease(&control, reason).await;
+        }
+    }
+
+    /// The agent takes control of `id` back from any human viewer
+    /// (`rdpilot takeover`). Returns the previous controller and whether
+    /// anything changed.
+    ///
+    /// # Errors
+    ///
+    /// [`DaemonError::SessionNotFound`] or [`DaemonError::StillConnecting`].
+    pub(crate) async fn takeover(
+        &self,
+        id: &SessionId,
+        source: EventSource,
+    ) -> Result<(rdpilot_ipc::WireController, bool), DaemonError> {
+        let control = {
+            #[allow(clippy::expect_used)] // A poisoned registry mutex is unrecoverable.
+            let guard = self.sessions.lock().expect("registry mutex poisoned");
+            match guard.get(id) {
+                Some(SessionEntry::Live { control, .. }) => Arc::clone(control),
+                Some(SessionEntry::Connecting { .. }) => {
+                    return Err(DaemonError::StillConnecting(id.as_str().to_owned()));
+                }
+                _ => return Err(DaemonError::SessionNotFound(id.as_str().to_owned())),
+            }
+        };
+        let (previous, transition) = control.agent_takeover(source);
+        let changed = transition.is_some();
+        if let Some(transition) = transition {
+            control.discharge(transition).await;
+        }
+        Ok((previous, changed))
+    }
+
+    /// The per-session lock of `id` plus its control, for a human take: the
+    /// take waits on the lock to let an in-flight native operation finish.
+    pub(crate) fn take_parts(&self, id: &SessionId) -> Option<(SessionSlot, Arc<SessionControl>)> {
+        #[allow(clippy::expect_used)] // A poisoned registry mutex is unrecoverable.
+        let guard = self.sessions.lock().expect("registry mutex poisoned");
+        match guard.get(id) {
+            Some(SessionEntry::Live {
+                session, control, ..
+            }) => Some((Arc::clone(session), Arc::clone(control))),
+            _ => None,
+        }
+    }
+
     /// Capture the incarnation and acquire a stream under one short session lease.
     /// Neither the global registry lock nor the per-session lock escapes this call.
     /// Also returns the session's event log, so the stream records without
     /// touching the registry per message.
-    pub(crate) async fn attach_cua(
-        &self,
-        id: &SessionId,
-    ) -> Result<(u64, Arc<SessionEvents>, Box<dyn crate::seams::ManagedCua>), DaemonError> {
-        let (generation, entry, cua_leases, events) = {
+    pub(crate) async fn attach_cua(&self, id: &SessionId) -> Result<CuaAttach, DaemonError> {
+        let (generation, entry, cua_leases, events, control) = {
             #[allow(clippy::expect_used)]
             let guard = self.sessions.lock().expect("registry mutex poisoned");
             match guard.get(id) {
@@ -575,12 +701,14 @@ impl Registry {
                     session,
                     cua_leases,
                     events,
+                    control,
                     ..
                 }) => (
                     *generation,
                     Arc::clone(session),
                     Arc::clone(cua_leases),
                     Arc::clone(events),
+                    Arc::clone(control),
                 ),
                 Some(SessionEntry::Connecting { .. }) => {
                     return Err(DaemonError::StillConnecting(id.as_str().into()))
@@ -594,14 +722,15 @@ impl Registry {
             .ok_or_else(|| DaemonError::SessionNotFound(id.as_str().into()))?;
         let attachment = session.attach_cua().await?;
         cua_leases.fetch_add(1, Ordering::Relaxed);
-        Ok((
+        Ok(CuaAttach {
             generation,
             events,
-            Box::new(CuaLease {
+            control,
+            attachment: Box::new(CuaLease {
                 inner: attachment,
                 active: cua_leases,
             }),
-        ))
+        })
     }
 
     /// The event log of live session `id`: a brief outer-lock read that
@@ -703,13 +832,39 @@ impl Registry {
                 SessionEntry::Live {
                     last_activity,
                     cua_leases,
+                    control,
                     ..
-                } => (cua_leases.load(Ordering::Relaxed) == 0)
-                    .then(|| (id.clone(), last_activity.elapsed())),
+                } => (cua_leases.load(Ordering::Relaxed) == 0 && !control.human_active()).then(
+                    || {
+                        // Human input and lease ends count as activity.
+                        let latest = control
+                            .human_activity()
+                            .map_or(*last_activity, |(at, _)| at.max(*last_activity));
+                        (id.clone(), latest.elapsed())
+                    },
+                ),
                 SessionEntry::Connecting { .. } | SessionEntry::Orphaned { .. } => None,
             })
             .collect()
     }
+}
+
+/// The per-session lock around a live session.
+pub(crate) type SessionSlot = Arc<tokio::sync::Mutex<Option<Box<dyn ManagedSession>>>>;
+
+/// End `control`'s human lease (if any) for `reason` and send its releases.
+pub(crate) async fn end_lease(control: &SessionControl, reason: EndReason) {
+    if let Some(transition) = control.end_human(reason) {
+        control.discharge(transition).await;
+    }
+}
+
+/// What [`Registry::attach_cua`] hands the IPC stream.
+pub(crate) struct CuaAttach {
+    pub(crate) generation: u64,
+    pub(crate) events: Arc<SessionEvents>,
+    pub(crate) control: Arc<SessionControl>,
+    pub(crate) attachment: Box<dyn crate::seams::ManagedCua>,
 }
 
 /// The result of a viewer frame-source lookup.

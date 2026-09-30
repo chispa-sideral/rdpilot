@@ -56,6 +56,45 @@ pub struct SessionStatus {
     /// The id of the session's active recording, if it is recording.
     #[serde(default)]
     pub recording: Option<String>,
+    /// Who controls the session's input: the agent (default) or a human
+    /// viewer tab. `None` for sessions that cannot take input (connecting,
+    /// orphaned).
+    #[serde(default)]
+    pub controller: Option<WireController>,
+}
+
+/// Who may send input to a session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WireControllerKind {
+    /// Any rdpilot client acting through the daemon (native verbs, Cua).
+    Agent,
+    /// One live viewer tab holding the control lease.
+    Human,
+}
+
+/// The current controller of a session. For a human viewer, `address` is
+/// the client address its tab connects from and `since` the UTC time it
+/// took control (`YYYY-MM-DDTHH:MM:SSZ`). Never carries a lease id.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WireController {
+    pub kind: WireControllerKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub address: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since: Option<String>,
+}
+
+impl WireController {
+    /// The agent controller.
+    #[must_use]
+    pub fn agent() -> Self {
+        WireController {
+            kind: WireControllerKind::Agent,
+            address: None,
+            since: None,
+        }
+    }
 }
 
 /// Whether the session records after a connect. A recording failure never
@@ -153,6 +192,12 @@ pub enum WireResponse {
         budget_bytes: u64,
         kept_over_budget: bool,
     },
+    /// The result of `Takeover`: the controller before the request, and
+    /// whether control changed (`false` when the agent already controlled).
+    TakenOver {
+        previous: WireController,
+        changed: bool,
+    },
     Error(WireError),
 }
 
@@ -232,9 +277,11 @@ mod recording_tests {
             connected_since: None,
             last_activity: None,
             recording: Some("x".into()),
+            controller: None,
         });
         assert_eq!(status.id, "a");
         assert_eq!(status.recording, None);
+        assert_eq!(status.controller, None);
     }
 
     #[test]
@@ -259,5 +306,30 @@ mod recording_tests {
         let json = serde_json::to_string(&response).unwrap_or_default();
         let back: WireResponse = serde_json::from_str(&json).unwrap_or(WireResponse::Ack);
         assert!(matches!(back, WireResponse::Recordings { recordings, .. } if recordings[0].kept));
+    }
+}
+
+#[cfg(test)]
+mod control_tests {
+    use super::*;
+
+    #[test]
+    fn controller_and_taken_over_round_trip() {
+        let agent = serde_json::to_value(WireController::agent()).unwrap_or_default();
+        assert_eq!(agent, serde_json::json!({"kind": "agent"}));
+        let human = WireController {
+            kind: WireControllerKind::Human,
+            address: Some("127.0.0.1".into()),
+            since: Some("2026-01-01T00:00:00Z".into()),
+        };
+        let response = WireResponse::TakenOver {
+            previous: human.clone(),
+            changed: true,
+        };
+        let json = serde_json::to_string(&response).unwrap_or_default();
+        let back: WireResponse = serde_json::from_str(&json).unwrap_or(WireResponse::Ack);
+        assert!(
+            matches!(back, WireResponse::TakenOver { previous, changed: true } if previous == human)
+        );
     }
 }

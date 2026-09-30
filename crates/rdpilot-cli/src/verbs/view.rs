@@ -43,6 +43,8 @@ pub async fn view(args: ViewArgs, json: bool) -> Result<(), CliError> {
         Request::ViewerStart {
             bind,
             tailnet_address,
+            read_only: false,
+            idle_timeout_secs: None,
         },
     )
     .await?;

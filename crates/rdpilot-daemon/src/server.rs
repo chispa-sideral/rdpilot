@@ -274,6 +274,11 @@ async fn run_inner(config: RunConfig) -> Result<(), DaemonError> {
     // `shutdown` this loop just observed, so they are already unwinding.
     let _ = reaper_handle.await;
     let _ = watcher_handle.await;
+    // Return control to the agent, with held-key releases, before the
+    // recordings close so the lease end is in them.
+    registry
+        .end_all_leases(crate::control::EndReason::DaemonStopped)
+        .await;
     recordings.shutdown().await;
 
     if let Ok(path) = crate::ipc::socket_path() {

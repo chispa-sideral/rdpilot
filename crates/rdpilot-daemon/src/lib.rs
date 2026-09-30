@@ -59,6 +59,7 @@
 #![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used))]
 
 mod bundle;
+mod control;
 mod diagnostics;
 mod dispatch;
 mod error_map;
@@ -79,11 +80,12 @@ mod viewer_tests;
 #[cfg(windows)]
 mod win_acl;
 
+pub use control::{HumanEvent, PointerButton, SessionControl};
 pub use reconcile::{scan_orphans, seed_into, JsonReconciliationSink, ReconciliationRecord};
 pub use registry::Registry;
 pub use seams::{
-    DaemonError, ManagedCua, ManagedSession, ReconciliationSink, SessionConnector, SessionEntry,
-    ViewFrameSource,
+    DaemonError, HumanInput, ManagedCua, ManagedSession, ReconciliationSink, SessionConnector,
+    SessionEntry, ViewFrameSource,
 };
 pub use server::{run, RunConfig};
 

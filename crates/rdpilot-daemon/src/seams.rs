@@ -165,6 +165,25 @@ pub trait ManagedSession: Send + 'static {
     fn frame_source(&self) -> Option<Arc<dyn ViewFrameSource>> {
         None
     }
+
+    /// The session's input path for a human viewer holding the control
+    /// lease, captured once at insert like [`ManagedSession::frame_source`].
+    /// The default (`None`) keeps existing fake sessions source-compatible.
+    fn human_input(&self) -> Option<Arc<dyn HumanInput>> {
+        None
+    }
+}
+
+/// Sends human input events to one session without the per-session lock
+/// and without the IPC `LocalSet`. Implementations apply them through the
+/// same input state as the agent's native input.
+pub trait HumanInput: Send + Sync + 'static {
+    /// Send `events` in order; resolves once the session's input channel
+    /// took them.
+    fn send(
+        &self,
+        events: Vec<crate::control::HumanEvent>,
+    ) -> SendFuture<'_, Result<(), DaemonError>>;
 }
 
 /// A future that is `Send`, for frame-source waits run on the daemon's
@@ -183,6 +202,10 @@ pub trait ViewFrameSource: Send + Sync + 'static {
     fn changed(&self, after_seq: u64) -> SendFuture<'_, rdpilot::FrameStatus>;
     /// Copy the latest frame with its sequence number (`None` before the first frame).
     fn capture(&self) -> Option<(u64, rdpilot::Screenshot)>;
+    /// The current frame size (`None` before the first frame).
+    fn geometry(&self) -> Option<(u32, u32)> {
+        self.capture().map(|(_, shot)| (shot.width, shot.height))
+    }
 }
 
 impl ViewFrameSource for rdpilot::FrameWatch {
@@ -397,6 +420,8 @@ pub enum SessionEntry {
         /// The task that records the server ending the session (only with a
         /// frame source). Aborted when the entry is removed or dropped.
         ended_watch: Option<crate::events::WatchTask>,
+        /// Who may send input: the agent, or a human viewer's lease.
+        control: Arc<crate::control::SessionControl>,
         /// ISO-8601 wall-clock rendering of `last_activity`. No
         /// operational verb is wired to update activity yet in this phase
         /// (dispatch resolves them to a not-implemented error, Plan
@@ -440,23 +465,36 @@ impl SessionEntry {
                 connected_since: None,
                 last_activity: None,
                 recording: None,
+                controller: None,
             },
             SessionEntry::Live {
                 status,
                 name,
                 host,
                 connected_since_wall,
+                last_activity,
                 last_activity_wall,
+                control,
                 ..
-            } => SessionStatus {
-                id: id.as_str().to_owned(),
-                name: name.clone(),
-                host: host.clone(),
-                status: *status,
-                connected_since: Some(connected_since_wall.clone()),
-                last_activity: Some(last_activity_wall.clone()),
-                recording: None,
-            },
+            } => {
+                // Human activity counts as session activity.
+                let last_activity = match control.human_activity() {
+                    Some((at, wall)) if at > *last_activity => {
+                        crate::registry::iso8601_from_system_time(wall)
+                    }
+                    _ => last_activity_wall.clone(),
+                };
+                SessionStatus {
+                    id: id.as_str().to_owned(),
+                    name: name.clone(),
+                    host: host.clone(),
+                    status: *status,
+                    connected_since: Some(connected_since_wall.clone()),
+                    last_activity: Some(last_activity),
+                    recording: None,
+                    controller: Some(control.controller()),
+                }
+            }
             SessionEntry::Orphaned {
                 host,
                 connected_since,
@@ -468,6 +506,7 @@ impl SessionEntry {
                 connected_since: Some(connected_since.clone()),
                 last_activity: None,
                 recording: None,
+                controller: None,
             },
         }
     }
@@ -524,6 +563,15 @@ pub enum DaemonError {
     /// architecture, cause and fixes.
     #[error("{0}")]
     Bundle(String),
+    /// Agent input was refused because a human viewer holds the session's
+    /// control lease. `since` is the UTC time it took control (ISO-8601).
+    /// The message names the holder and the takeover command.
+    #[error("{}", crate::control::cli_refusal(session, address, since))]
+    HumanControl {
+        session: String,
+        address: String,
+        since: String,
+    },
 }
 
 /// Supplies the verified bundle directory a Cua-enabled connect serves.
@@ -623,6 +671,11 @@ mod tests {
             DaemonError::Io("disk full".to_owned()),
             DaemonError::Config("bad toml".to_owned()),
             DaemonError::Recording("session is not recording".to_owned()),
+            DaemonError::HumanControl {
+                session: "brave-otter".to_owned(),
+                address: "127.0.0.1".to_owned(),
+                since: "2026-01-01T14:02:07Z".to_owned(),
+            },
         ];
         for err in cases {
             let rendered = format!("{err}");

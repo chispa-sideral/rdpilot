@@ -35,6 +35,10 @@ pub enum Command {
     Screenshot(ScreenshotArgs),
     /// Disconnect a named/identified session (flat: `rdpilot disconnect ...`).
     Disconnect(SessionArg),
+    /// Take control of a session back from a human viewer (flat:
+    /// `rdpilot takeover ...`). Releases the viewer's held keys; succeeds
+    /// without change when the agent already controls.
+    Takeover(SessionArg),
 
     /// Session lifecycle verbs, grouped (`rdpilot session connect|list|disconnect ...`).
     #[command(subcommand)]
@@ -144,6 +148,8 @@ pub enum SessionCmd {
     List,
     /// Disconnect a named/identified session.
     Disconnect(SessionArg),
+    /// Take control of a session back from a human viewer.
+    Takeover(SessionArg),
 }
 
 /// Which host to configure, and how: an alias or `rdp://` URL, plus overrides.

@@ -205,6 +205,53 @@ fn connect_list_disconnect_lifecycle_auto_starts_the_real_daemon() {
         "the caller-supplied name must round-trip"
     );
     assert_eq!(entry["host"].as_str(), Some("10.0.0.5"));
+    assert_eq!(
+        entry["controller"]["kind"].as_str(),
+        Some("agent"),
+        "the agent controls by default"
+    );
+
+    // --- the table shows the CONTROL column ---
+    let table_run = run_cli(&["list"], &xdg_runtime_dir, &sink_path, &capture_dir, 10);
+    assert!(table_run.status.success(), "stderr={}", table_run.stderr);
+    let header = table_run.stdout.lines().next().unwrap_or_default();
+    assert!(header.contains("control"), "{header}");
+    assert!(table_run.stdout.contains("agent"), "{}", table_run.stdout);
+
+    // --- takeover under agent control -> no change, both spellings ---
+    for (index, args) in [
+        (11, vec!["takeover", "--session", "web"]),
+        (12, vec!["session", "takeover", "--session", "web"]),
+    ] {
+        let run = run_cli(&args, &xdg_runtime_dir, &sink_path, &capture_dir, index);
+        assert!(run.status.success(), "stderr={}", run.stderr);
+        assert_eq!(
+            run.stdout.trim(),
+            "the agent already controls web; nothing changed"
+        );
+    }
+    let json_run = run_cli(
+        &["takeover", "--session", "web", "--json"],
+        &xdg_runtime_dir,
+        &sink_path,
+        &capture_dir,
+        13,
+    );
+    let json: serde_json::Value =
+        serde_json::from_str(json_run.stdout.trim()).expect("takeover --json");
+    assert_eq!(json["changed"], false);
+    assert_eq!(json["previous"]["kind"], "agent");
+
+    // --- takeover of an unknown session -> SessionNotFound, exit 2 ---
+    let unknown = run_cli(
+        &["takeover", "--session", "ghost"],
+        &xdg_runtime_dir,
+        &sink_path,
+        &capture_dir,
+        14,
+    );
+    assert_eq!(unknown.status.code(), Some(2), "stderr={}", unknown.stderr);
+    assert!(unknown.stderr.contains("ghost"), "{}", unknown.stderr);
 
     // --- disconnect -> success ---
     let disconnect_run = run_cli(
