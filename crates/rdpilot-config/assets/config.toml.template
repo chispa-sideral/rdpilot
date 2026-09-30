@@ -34,8 +34,9 @@
 # and verified automatically. It cannot be set per connect.
 # bundle_path = "/absolute/path/to/rdpilot-bundle"
 
-# Read-only live viewer (`rdpilot view`). Nothing listens until you run
-# `rdpilot view`; it stops when that command exits.
+# Live viewer (`rdpilot view`). Nothing listens until you run
+# `rdpilot view`; it stops when that command exits. Its URL grants keyboard
+# and mouse control of every session through Takeover, unless read-only.
 # [viewer]
 # Bind set: "loopback+tailnet" (default) binds 127.0.0.1 and this host's
 # Tailscale address; "loopback" binds 127.0.0.1 only. No other address is
@@ -45,6 +46,13 @@
 # several. It must be in 100.64.0.0/10 and present on a local interface.
 # Env: RDPILOT_VIEWER__TAILNET_ADDRESS. Flag: rdpilot view --tailnet-address.
 # tailnet_address = "100.64.0.1"
+# Serve without Takeover and without any write route (control, input and the
+# recording controls). Env: RDPILOT_VIEWER__READ_ONLY. Flag: rdpilot view
+# --read-only.
+# read_only = false
+# Seconds without human input after which a viewer's control lease ends and
+# control returns to the agent. Env: RDPILOT_VIEWER__IDLE_TIMEOUT.
+# idle_timeout = 300
 
 # Session recording. Off unless switched on here, per host below, per
 # connect (`rdpilot connect --record` / `--no-record`) or on a running session

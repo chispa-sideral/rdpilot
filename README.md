@@ -32,7 +32,8 @@ A connect with `CuaEnabled yes` (the default) gets the Cua bundle automatically
 (see [Cua bundle](#cua-bundle)). There is nothing to package or configure.
 
 The MCP endpoint forwards upstream initialize, tools, results, images, requests
-and notifications unchanged. It requires an existing named RDP connection. One
+and notifications unchanged, except for the optional `takeover` argument that
+the daemon adds to acting tools (see [Takeover](#takeover)). It requires an existing named RDP connection. One
 active Cua attachment per target is permitted; a second receives a busy error.
 A Cua session label is application data, not RDP target selection.
 
@@ -227,11 +228,14 @@ computer use is unsupported; signed binaries do not imply elevated automation.
 
 ## Live viewer
 
-`rdpilot view` shows the daemon's live sessions in a browser. The viewer sends
-no input, Cua call, file transfer, connect or disconnect, and it does not change
-session activity, idle reaping or daemon self-shutdown. Its only actions are the
-recording controls: start and stop recording, annotate, and keep recordings
-(see [Session recording](#session-recording)).
+`rdpilot view` shows the daemon's live sessions in a browser. A viewer tab
+sends keyboard and mouse input to a session only after you select
+**Takeover** in that session's panel (see [Takeover](#takeover)). The viewer
+never sends a Cua call, file transfer, connect or disconnect. Viewing does not
+change session activity, idle reaping or daemon self-shutdown. The other
+actions are the recording controls: start and stop recording, annotate, and
+keep recordings (see [Session recording](#session-recording)).
+`rdpilot view --read-only` removes Takeover and every write route.
 
 ```sh
 rdpilot connect my-host --name work   # the viewer needs a running daemon
@@ -259,7 +263,8 @@ session, newest first. Each Cua tool call and each native verb (`screenshot`,
 - the duration, which includes any time spent waiting for the session.
 
 Marker rows show when a Cua attachment starts and ends (with the reason), when
-the server ends the session, and when older events were dropped. The strip never
+the server ends the session, when control changes (with who and why), and when
+older events were dropped. The strip never
 shows argument values, typed text, file paths, results, images or error text.
 
 The daemon keeps the newest 200 events of each session in memory, from connect
@@ -290,7 +295,9 @@ Access boundary:
 - Requests with a foreign `Origin` or an unexpected `Host` are refused. Use the
   printed IP URL; a MagicDNS name is refused by the Host check.
 - There is no TLS. On the tailnet, WireGuard encrypts the traffic. Anyone with a
-  URL and network access to its address can view all sessions of this daemon.
+  URL and network access to its address can view all sessions of this daemon
+  and, unless the viewer is read-only, take control of their keyboard and
+  mouse.
 - The token stays in the address bar, so a reload or a bookmark keeps working
   until the viewer restarts. Treat the URL as a secret. Browsers allow about 6
   connections per origin across all tabs; use one or two tabs.
@@ -300,8 +307,9 @@ of its sessions in memory. The HTTP server parses requests from any peer that
 can reach a bound address (for example, any tailnet peer that the tailnet ACL
 allows) before it checks the token, and heavy viewer traffic uses daemon
 resources. The token gives access to screen contents, which can show secrets
-typed or displayed in the guest. Use `--bind loopback` when you do not need
-remote viewing.
+typed or displayed in the guest, and to the Takeover control. Use `--bind
+loopback` when you do not need remote viewing, and `--read-only` when you do
+not need control.
 
 Lifetime: `rdpilot view` never starts a daemon. When the daemon exits, the
 viewer stops and the command exits. The daemon exits about 30 s after its last
@@ -315,9 +323,141 @@ printed loopback URL on your machine (the Host check needs the same port):
 ssh -L PORT:127.0.0.1:PORT user@daemon-host
 ```
 
-Upgrade note: this release changes the IPC compatibility version to 6. After
-you upgrade, restart `rdpilot-daemon` (this ends its live sessions). Until then,
-the CLI and MCP adapter report the daemon compatibility mismatch message.
+Upgrade note: this release changes the IPC compatibility version to 7. Install
+`rdpilot`, `rdpilot-daemon` and `rdpilot-mcp` together, then restart
+`rdpilot-daemon` (this ends its live sessions). Until then, the CLI and MCP
+adapter report the daemon compatibility mismatch message.
+
+### Takeover
+
+Each session has exactly one controller at a time:
+
+- **The agent** (the default): every rdpilot client that acts through the
+  daemon, that is native CLI verbs and Cua tool calls through `rdpilot-mcp`.
+- **One human viewer tab** that holds the session's control lease. There are
+  no accounts: other viewers and the agent see it as "human viewer" plus the
+  address its tab connects from and the time it took control.
+
+Takeover is immediate and needs no confirmation from the current controller.
+
+In the viewer. Each session panel has a **Takeover** button. It takes the
+lease from the agent or from another tab; the button then reads **Release**,
+the panel gets an orange frame, and the canvas sends the tab's pointer moves,
+buttons, wheel and keys to the session. **Release** returns control to the
+agent. The panel always shows the current controller. Opening the page or a
+panel never takes the lease. Keys go as physical key positions (Set-1
+scancodes): letters, digits, punctuation, Enter, Backspace, Tab, Escape,
+arrows, navigation keys, F1 to F12 and Ctrl, Alt and Shift combinations.
+Keys the browser keeps for itself (for example Ctrl+Alt+Del, the Windows key,
+Ctrl+W) do not reach the session. Clipboard, file drop and IME input are not
+sent.
+
+A human take from the agent waits up to 10 seconds for an agent operation
+that is already running and never interrupts it. This includes a long native
+operation such as a file `put` or `get`: when the operation does not end in
+time, the take is refused with "an agent operation is still running ...; try
+again", and the agent keeps control.
+
+When a tab loses the lease, it shows why within about a second ("Taken over
+by the agent", "Taken over by human viewer ADDRESS", "Ended after N minutes
+without input", "Ended: no heartbeat", "Ended: the viewer stopped", "Session
+ended"), stops sending input, and the button reads Takeover again. Input it
+sends after that is refused and never applied.
+
+A human lease ends on Release, on a takeover by the agent or another tab, when
+the tab closes or stops sending its heartbeat (5 seconds), after the idle
+timeout without input (default 300 seconds), when the viewer stops, when the
+session ends, and when the daemon exits. Every end except a takeover by
+another tab returns control to the agent. Set the idle timeout with
+`[viewer] idle_timeout` (seconds) or `RDPILOT_VIEWER__IDLE_TIMEOUT`. A
+session under a human lease is not idle-reaped; human input and the end of a
+lease count as session activity.
+
+On every change of controller and every end, the daemon sends a release for
+each key and button that the human holder pressed and did not release, before
+the next controller acts. Losing focus or visibility releases them too (the
+lease stays). Input events name the lease, the session incarnation and the
+frame size they were aimed at; the daemon drops (and counts) events of an old
+lease, pointer events aimed at an old frame size, and events for an older
+session with the same name.
+
+Agent takeover. The agent takes control back immediately, through its own
+surface:
+
+- MCP: every acting Cua tool has an optional boolean argument `takeover`
+  (default `false`). The daemon adds it to those tools in `tools/list`
+  results and removes it from every call before Cua sees it. A call with
+  `"takeover": true` ends any human lease (with its key releases) and then
+  runs. Takeover through MCP therefore needs the MCP host's permission for
+  that acting tool, and the argument is visible in the call.
+- CLI: `rdpilot takeover --session NAME` (also `rdpilot session takeover`)
+  ends any human lease and reports the previous controller. It succeeds
+  without change when the agent already controls.
+
+While a human holds the lease, agent input fails fast and is not applied:
+
+- An acting Cua call returns an error result (`isError: true`):
+  `session "notepad" is controlled by human viewer 100.101.102.103 since
+  14:02:07 UTC; wait and retry, or repeat this call with "takeover": true to
+  take control`.
+- Native `rdpilot input ...` (Mouse, Key) fails with exit code 10 and the
+  wire error code `human-control` (with the holder's kind, address and since
+  time as fields): `... wait and retry, or take over with: rdpilot takeover
+  --session notepad`. The command works as printed.
+
+An agent that gets this error waits and retries, or takes over only when its
+instructions allow it to take control away from a human. Screenshots, the
+session list, desktop size, transfers, recording actions and read-only Cua
+tools keep working during a human lease.
+
+Read-only Cua tools (never refused, no `takeover` argument):
+`check_for_update`, `check_permissions`, `clipboard_read`,
+`debug_window_info`, `get_accessibility_tree`, `get_agent_cursor_state`,
+`get_browser_state`, `get_config`, `get_cursor_position`,
+`get_desktop_state`, `get_recording_state`, `get_screen_size`,
+`get_session`, `get_session_state`, `get_window_state`, `list_apps`,
+`list_sessions`, `list_windows`, `parse_visual_regions`, `screenshot`,
+`verify_state`, `zoom`. This list comes from the Cua driver's `readOnlyHint`
+annotations (version 0.30.5). Every other tool is acting, for example
+`click`, `type_text`, `press_key`, `hotkey`, `scroll`, `drag`, `launch_app`,
+`set_value` and `browser_*`. A tool that a later Cua adds counts as acting
+until it is added to the list.
+
+JSON-RPC batches: each call in a batch is checked. A batch that contains a
+refused acting call is answered by the daemon as a whole and is not
+forwarded; its read-only calls get the error "batch not forwarded because it
+contains calls refused under human control; send read-only calls
+separately". Current MCP clients do not send batches.
+
+Status and events. `rdpilot list` has a `control` column (`agent`, or `human
+ADDRESS since HH:MM:SS UTC`), and `rdpilot list --json` has a `controller`
+field. MCP has no status tool: an MCP agent sees the controller in the
+refusal message. Each change goes into the session's event log, the activity
+strip and a recording of the session: `control_taken` (by a human from the
+agent), `control_taken_over` (from whom, by whom), `control_released` and
+`control_ended` (with the reason `heartbeat_lost`, `idle_timeout`,
+`viewer_stopped`, `session_ended` or `daemon_stopped`). The source is
+`viewer`, `cua` (the MCP argument), `cli` (`rdpilot takeover`) or `daemon`.
+Events and the daemon log hold controller descriptors only, never a token, a
+lease id, keys, text or coordinates.
+
+Security. While the viewer runs, its URL grants full keyboard and mouse
+control of every session of the daemon, on loopback and on the tailnet
+address. That equals an interactive desktop login as each session's Windows
+user. Anyone with the URL can displace the agent or another viewer at any
+time, and the agent can displace a human; a human working in a session can be
+interrupted with no warning other than the loss notice. The control and input
+routes also require an exact same-origin `Origin`, a JSON body of at most 8
+KiB and a per-session request rate, and they reach only the lease and input of
+the session in the path. Agent takeover exists only on the daemon's local
+IPC endpoint, never over HTTP. Treat the URL as a secret, or run the viewer
+read-only.
+
+Read-only viewer. `rdpilot view --read-only`, `[viewer] read_only = true` or
+`RDPILOT_VIEWER__READ_ONLY=true` serves the viewer without Takeover and
+without every write route: control, input and also the recording controls
+(start, stop, annotate, keep) answer 404 on every bound address. Use `rdpilot
+record` and `rdpilot recording` for recordings instead.
 
 ## Session recording
 
