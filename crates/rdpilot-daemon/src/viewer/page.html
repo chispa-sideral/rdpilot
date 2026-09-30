@@ -694,6 +694,8 @@ video { max-width: 100%; height: auto; border: 1px solid #ddd; display: block; b
         v.playbackRate = r.speed;
         if (playIt) { v.play().catch(function () {}); } else { v.pause(); }
         r.switching = false;
+        // draw() does not run while paused: publish the applied segment here.
+        status.replay.segment = r.segment;
         status.replay.video_loaded = true;
       };
       if (r.segment !== s.n) {
