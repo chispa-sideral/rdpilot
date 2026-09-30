@@ -147,6 +147,8 @@ mod tests {
         assert_eq!(code_for(&wire(WireErrorCode::DuplicateSession)), 7);
         assert_eq!(code_for(&wire(WireErrorCode::BundleUnavailable)), 9);
         assert_eq!(code_for(&wire(WireErrorCode::Internal)), 1);
+        assert_eq!(code_for(&wire(WireErrorCode::Recording)), 1);
+        assert_eq!(code_str_for(&wire(WireErrorCode::Recording)), "recording");
     }
 
     /// Every wire error class maps to a DISTINCT exit code (D-28) — a

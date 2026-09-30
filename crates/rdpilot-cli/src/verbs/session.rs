@@ -4,7 +4,7 @@
 //! the auto-started daemon, and render the SPECIFIC response variant it
 //! expects (table by default, `--json` opt-in).
 
-use rdpilot_ipc::{Request, SessionLifecycle, WireResponse};
+use rdpilot_ipc::{Request, SessionLifecycle, WireRecordTrigger, WireRecordingState, WireResponse};
 
 use rdpilot_config::hosts::expand_password_command;
 
@@ -26,6 +26,15 @@ use crate::verbs::config::resolve_target;
 pub async fn connect(args: ConnectArgs, json: bool) -> Result<(), CliError> {
     let host = resolve_target(&args.target)?;
     let label = host.target().to_string();
+    // The switch is keyed on the target as given (alias or URL host).
+    let record = rdpilot_config::resolve_recording()
+        .map_err(|e| CliError::Config(e.to_string()))?
+        .switch_for(host.target().name(), args.record_flag())
+        .map(|trigger| match trigger {
+            rdpilot_config::RecordTrigger::GlobalConfig => WireRecordTrigger::GlobalConfig,
+            rdpilot_config::RecordTrigger::HostConfig => WireRecordTrigger::HostConfig,
+            rdpilot_config::RecordTrigger::ConnectFlag => WireRecordTrigger::ConnectFlag,
+        });
 
     let username = host.user().ok_or_else(|| {
         CliError::MissingConfig(format!(
@@ -56,13 +65,14 @@ pub async fn connect(args: ConnectArgs, json: bool) -> Result<(), CliError> {
         cua_version: host.cua_version().to_owned(),
         cua_auto_download: host.cua_auto_download(),
         connect_ack: true,
-        record: None,
+        record,
     };
 
     match connect_round_trip(req).await? {
         WireResponse::Connected {
             session,
             bridge_live,
+            recording,
             warnings,
             ..
         } => {
@@ -70,11 +80,27 @@ pub async fn connect(args: ConnectArgs, json: bool) -> Result<(), CliError> {
                 eprintln!("warning: {warning}");
             }
             if json {
-                print_json(
-                    &serde_json::json!({ "session": session.as_str(), "bridge_live": bridge_live }),
-                )
+                let recording = match &recording {
+                    WireRecordingState::Off => serde_json::json!({ "state": "off" }),
+                    WireRecordingState::On { id } => serde_json::json!({ "state": "on", "id": id }),
+                    WireRecordingState::Failed { reason } => {
+                        serde_json::json!({ "state": "failed", "reason": reason })
+                    }
+                };
+                print_json(&serde_json::json!({
+                    "session": session.as_str(),
+                    "bridge_live": bridge_live,
+                    "recording": recording,
+                }))
             } else {
                 println!("{}", connect_status_message(session.as_str(), bridge_live));
+                match recording {
+                    WireRecordingState::Off => {}
+                    WireRecordingState::On { id } => println!("recording: on ({id})"),
+                    WireRecordingState::Failed { reason } => {
+                        eprintln!("recording could not start: {reason}");
+                    }
+                }
                 Ok(())
             }
         }
@@ -110,13 +136,14 @@ pub async fn list(json: bool) -> Result<(), CliError> {
             if json {
                 print_json(&sessions)
             } else {
-                const HEADERS: [&str; 6] = [
+                const HEADERS: [&str; 7] = [
                     "id",
                     "name",
                     "host",
                     "status",
                     "connected-since",
                     "last-activity",
+                    "recording",
                 ];
                 let rows: Vec<Vec<String>> = sessions
                     .iter()
@@ -128,6 +155,7 @@ pub async fn list(json: bool) -> Result<(), CliError> {
                             lifecycle_str(s.status).to_owned(),
                             s.connected_since.clone().unwrap_or_default(),
                             s.last_activity.clone().unwrap_or_default(),
+                            s.recording.clone().unwrap_or_else(|| "-".to_owned()),
                         ]
                     })
                     .collect();

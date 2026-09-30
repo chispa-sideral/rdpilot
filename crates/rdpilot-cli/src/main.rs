@@ -18,7 +18,9 @@ mod verbs;
 
 use clap::Parser;
 
-use cli::{Cli, Command, ConfigCmd, FileCmd, InputCmd, PerceiveCmd, SessionCmd};
+use cli::{
+    Cli, Command, ConfigCmd, FileCmd, InputCmd, PerceiveCmd, RecordCmd, RecordingCmd, SessionCmd,
+};
 use exit_codes::{code_str_for, exit_code_for, CliError};
 
 #[tokio::main(flavor = "current_thread")]
@@ -77,5 +79,13 @@ async fn dispatch(command: Command, json: bool) -> Result<(), CliError> {
         }
         Command::Config(ConfigCmd::Resolve(args)) => verbs::config::resolve(args, json),
         Command::View(args) => verbs::view::view(args, json).await,
+        Command::Record(RecordCmd::Start(args)) => verbs::record::start(args, json).await,
+        Command::Record(RecordCmd::Stop(args)) => verbs::record::stop(args, json).await,
+        Command::Annotate(args) => verbs::record::annotate(args, json).await,
+        Command::Recording(RecordingCmd::List) => verbs::record::list(json).await,
+        Command::Recording(RecordingCmd::Keep(args)) => verbs::record::keep(args, true, json).await,
+        Command::Recording(RecordingCmd::Unkeep(args)) => {
+            verbs::record::keep(args, false, json).await
+        }
     }
 }
