@@ -17,7 +17,7 @@
 //!   accept-loop `select!` could hit.
 //! - [`idle_reaper`] periodically closes `Live` sessions whose
 //!   `last_activity` has exceeded `idle_timeout`, ALWAYS via the awaited
-//!   `Registry::close` (DAEMON-01 discipline -- never a bare removal).
+//!   `Registry::close_idle` (never a bare removal).
 //! - [`empty_watcher`] periodically checks whether the registry is empty;
 //!   on finding it empty, it sleeps `empty_grace` and re-checks -- if the
 //!   registry gained a session during the grace window, the watcher loops
@@ -209,7 +209,7 @@ pub async fn idle_reaper(registry: Arc<Registry>, cfg: LifecycleConfig, shutdown
                     // this close call -- that race is benign (the session
                     // is gone either way), so the close error is not
                     // treated as fatal to the reaper loop.
-                    let _ = registry.close(&id).await;
+                    let _ = registry.close_idle(&id).await;
                 }
             }
             () = shutdown.wait() => return,

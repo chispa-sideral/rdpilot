@@ -67,6 +67,8 @@ mod ipc;
 mod lifecycle;
 mod reconcile;
 mod recording;
+#[cfg(test)]
+mod recording_tests;
 mod registry;
 mod seams;
 mod server;

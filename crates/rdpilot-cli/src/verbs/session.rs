@@ -56,6 +56,7 @@ pub async fn connect(args: ConnectArgs, json: bool) -> Result<(), CliError> {
         cua_version: host.cua_version().to_owned(),
         cua_auto_download: host.cua_auto_download(),
         connect_ack: true,
+        record: None,
     };
 
     match connect_round_trip(req).await? {

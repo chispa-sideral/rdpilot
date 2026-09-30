@@ -25,12 +25,13 @@ use base64::Engine as _;
 use rdpilot::ConnectionConfig;
 use rdpilot_ipc::{
     Request, TransferOutcome as WireTransferOutcome, WireButton, WireKey, WireKeyAction,
-    WireMouseAction, WireResponse, IPC_COMPATIBILITY_VERSION,
+    WireMouseAction, WireRecordTrigger, WireRecordingState, WireResponse,
+    IPC_COMPATIBILITY_VERSION,
 };
 
 use crate::bundle::{Arch, BundleRequest};
 use crate::diagnostics::{Diagnostics, Stage};
-use crate::events::CliCall;
+use crate::events::{CliCall, EventSource, RecordingTrigger, StopReason};
 use crate::registry::{ConnectLease, Registry};
 use crate::seams::{BundleSource, DaemonError};
 
@@ -71,6 +72,16 @@ pub(crate) struct ConnectFields {
     pub(crate) cua_version: String,
     pub(crate) cua_auto_download: bool,
     pub(crate) connect_ack: bool,
+    pub(crate) record: Option<RecordingTrigger>,
+}
+
+/// The daemon's trigger for a wire trigger.
+fn trigger(record: WireRecordTrigger) -> RecordingTrigger {
+    match record {
+        WireRecordTrigger::GlobalConfig => RecordingTrigger::Config,
+        WireRecordTrigger::HostConfig => RecordingTrigger::Host,
+        WireRecordTrigger::ConnectFlag => RecordingTrigger::ConnectFlag,
+    }
 }
 
 /// Open a session. With `cua_enabled`, `bundles` must supply a verified
@@ -95,6 +106,7 @@ pub(crate) async fn dispatch_connect(
         cua_version,
         cua_auto_download,
         connect_ack,
+        record,
     } = fields;
     let mut cfg = ConnectionConfig::new(host.clone(), username, password)
         .accept_invalid_certs(accept_invalid_certs);
@@ -151,8 +163,8 @@ pub(crate) async fn dispatch_connect(
     } else {
         false
     };
-    let lease = match registry.open_tracked(name, host, cfg).await {
-        Ok(lease) => lease,
+    let (lease, recording) = match registry.open_tracked(name, host, cfg, record).await {
+        Ok(opened) => opened,
         Err(e) => {
             return DispatchOutcome {
                 response: WireResponse::Error(e.into()),
@@ -202,6 +214,11 @@ pub(crate) async fn dispatch_connect(
             session,
             connect_ack_required: connect_ack,
             bridge_live: bridge_configured,
+            recording: match recording {
+                None => WireRecordingState::Off,
+                Some(Ok(id)) => WireRecordingState::On { id },
+                Some(Err(reason)) => WireRecordingState::Failed { reason },
+            },
             warnings,
         },
         connect_lease: Some(lease),
@@ -235,6 +252,7 @@ pub(crate) async fn dispatch_for_ipc(
             cua_version,
             cua_auto_download,
             connect_ack,
+            record,
         } => {
             return dispatch_connect(
                 registry,
@@ -250,6 +268,7 @@ pub(crate) async fn dispatch_for_ipc(
                     cua_version,
                     cua_auto_download,
                     connect_ack,
+                    record: record.map(trigger),
                 },
                 diagnostics,
                 registry.bundle_source(),
@@ -343,6 +362,15 @@ pub(crate) async fn dispatch_for_ipc(
         Request::ViewerStart { .. } => WireResponse::Error(
             DaemonError::Connect("ViewerStart requires a held IPC connection".into()).into(),
         ),
+        Request::RecordStart { session } => {
+            record_start(registry, &session, RecordingTrigger::Cli, EventSource::Cli).await
+        }
+        Request::RecordStop { session } => record_stop(registry, &session, EventSource::Cli),
+        Request::Annotate { session, text } => {
+            annotate(registry, &session, &text, EventSource::Cli)
+        }
+        Request::RecordingList {} => recording_list(registry).await,
+        Request::RecordingKeep { id, keep } => recording_keep(registry, id, keep).await,
     };
     if let Some(call) = cli_call {
         call.finish(!matches!(response, WireResponse::Error(_)));
@@ -350,6 +378,118 @@ pub(crate) async fn dispatch_for_ipc(
     DispatchOutcome {
         response,
         connect_lease: None,
+    }
+}
+
+/// Start recording `session` now. Takes only the registry's brief outer
+/// lock; never a per-session lock or an activity change.
+pub(crate) async fn record_start(
+    registry: &Registry,
+    session: &rdpilot_ipc::SessionId,
+    trigger: RecordingTrigger,
+    source: EventSource,
+) -> WireResponse {
+    let target = match registry.recording_target(session) {
+        Ok(target) => target,
+        Err(e) => return WireResponse::Error(e.into()),
+    };
+    match registry.recordings().start(target, trigger, source).await {
+        Ok(started) => WireResponse::RecordingChanged {
+            message: if started.changed {
+                format!("recording started ({})", started.id)
+            } else {
+                format!("already recording ({}); nothing changed", started.id)
+            },
+            id: Some(started.id),
+            changed: started.changed,
+        },
+        Err(reason) => WireResponse::Error(DaemonError::Recording(reason).into()),
+    }
+}
+
+/// Stop the recording of `session`; the session continues.
+pub(crate) fn record_stop(
+    registry: &Registry,
+    session: &rdpilot_ipc::SessionId,
+    source: EventSource,
+) -> WireResponse {
+    let target = match registry.recording_target(session) {
+        Ok(target) => target,
+        Err(e) => return WireResponse::Error(e.into()),
+    };
+    match registry
+        .recordings()
+        .stop(&target.events, source, StopReason::Requested)
+    {
+        Some(id) => WireResponse::RecordingChanged {
+            message: format!("recording stopped ({id})"),
+            id: Some(id),
+            changed: true,
+        },
+        None => WireResponse::RecordingChanged {
+            id: None,
+            changed: false,
+            message: "session is not recording; nothing changed".into(),
+        },
+    }
+}
+
+/// Add an annotation to the active recording of `session`.
+pub(crate) fn annotate(
+    registry: &Registry,
+    session: &rdpilot_ipc::SessionId,
+    text: &str,
+    source: EventSource,
+) -> WireResponse {
+    let target = match registry.recording_target(session) {
+        Ok(target) => target,
+        Err(e) => return WireResponse::Error(e.into()),
+    };
+    match registry.recordings().annotate(&target.events, source, text) {
+        Ok(id) => WireResponse::RecordingChanged {
+            message: format!("annotation added to {id}"),
+            id: Some(id),
+            changed: true,
+        },
+        Err(reason) => WireResponse::Error(DaemonError::Recording(reason).into()),
+    }
+}
+
+/// The recordings on disk (read on a blocking thread).
+pub(crate) async fn recording_list(registry: &Registry) -> WireResponse {
+    let recordings = std::sync::Arc::clone(registry.recordings());
+    match tokio::task::spawn_blocking(move || recordings.list()).await {
+        Ok(Ok(listing)) => WireResponse::Recordings {
+            recordings: listing.recordings,
+            kept_bytes: listing.kept_bytes,
+            unkept_bytes: listing.unkept_bytes,
+            budget_bytes: listing.budget_bytes,
+            kept_over_budget: listing.kept_over_budget,
+        },
+        Ok(Err(reason)) => WireResponse::Error(DaemonError::Recording(reason).into()),
+        Err(_) => {
+            WireResponse::Error(DaemonError::Recording("recording list failed".into()).into())
+        }
+    }
+}
+
+/// Mark or unmark a recording keep (written on a blocking thread).
+pub(crate) async fn recording_keep(registry: &Registry, id: String, keep: bool) -> WireResponse {
+    let recordings = std::sync::Arc::clone(registry.recordings());
+    let for_task = id.clone();
+    match tokio::task::spawn_blocking(move || recordings.keep(&for_task, keep)).await {
+        Ok(Ok(changed)) => WireResponse::RecordingChanged {
+            message: match (keep, changed) {
+                (true, true) => format!("{id} marked keep"),
+                (false, true) => format!("{id} no longer kept"),
+                (true, false) => format!("{id} is already kept; nothing changed"),
+                (false, false) => format!("{id} is not kept; nothing changed"),
+            },
+            id: Some(id),
+            changed,
+        },
+        Ok(Err(reason)) => WireResponse::Error(DaemonError::Recording(reason).into()),
+        Err(_) => WireResponse::Error(DaemonError::Recording("keep failed".into()).into()),
     }
 }
 
@@ -660,6 +800,7 @@ mod tests {
             cua_version: "latest-dev".to_owned(),
             cua_auto_download: true,
             connect_ack: false,
+            record: None,
         }
     }
 
@@ -802,6 +943,7 @@ mod tests {
             cua_version: "latest-dev".to_owned(),
             cua_auto_download: true,
             connect_ack: false,
+            record: None,
         }
     }
 

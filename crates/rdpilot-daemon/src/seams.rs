@@ -439,6 +439,7 @@ impl SessionEntry {
                 status: SessionLifecycle::Connecting,
                 connected_since: None,
                 last_activity: None,
+                recording: None,
             },
             SessionEntry::Live {
                 status,
@@ -454,6 +455,7 @@ impl SessionEntry {
                 status: *status,
                 connected_since: Some(connected_since_wall.clone()),
                 last_activity: Some(last_activity_wall.clone()),
+                recording: None,
             },
             SessionEntry::Orphaned {
                 host,
@@ -465,6 +467,7 @@ impl SessionEntry {
                 status: SessionLifecycle::Orphaned,
                 connected_since: Some(connected_since.clone()),
                 last_activity: None,
+                recording: None,
             },
         }
     }
@@ -512,6 +515,10 @@ pub enum DaemonError {
     /// password field).
     #[error("config resolution failed: {0}")]
     Config(String),
+    /// A recording action that cannot be done (not recording, bad
+    /// annotation, busy, unknown recording id, recording unavailable).
+    #[error("{0}")]
+    Recording(String),
     /// A Cua-enabled connect could not obtain its bundle (fails closed
     /// before the RDP logon). The message names the component, version,
     /// architecture, cause and fixes.
@@ -615,6 +622,7 @@ mod tests {
             DaemonError::Connect("host unreachable".to_owned()),
             DaemonError::Io("disk full".to_owned()),
             DaemonError::Config("bad toml".to_owned()),
+            DaemonError::Recording("session is not recording".to_owned()),
         ];
         for err in cases {
             let rendered = format!("{err}");

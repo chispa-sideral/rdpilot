@@ -161,6 +161,7 @@ async fn daemon_auto_starts_on_first_connect_and_self_exits_once_the_registry_em
         cua_version: "latest-dev".to_owned(),
         cua_auto_download: true,
         connect_ack: false,
+        record: None,
     };
     write_frame(&mut stream, &connect_req)
         .await

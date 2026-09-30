@@ -303,7 +303,6 @@ impl SessionClock {
 /// Receives every event in order while attached, including events later
 /// dropped from the in-memory ring and the recording-only events. Called
 /// under the log's mutex: it must not block (use a bounded queue).
-#[allow(dead_code)] // The recording service attaches sinks.
 pub trait EventSink: Send + Sync {
     /// Offer one event; `false` when the sink could not take it.
     fn on_event(&self, header: &LogHeader, event: &SessionEvent) -> bool;
@@ -438,7 +437,6 @@ impl SessionEvents {
     /// # Errors
     ///
     /// The unchanged `sink` when a sink is already attached.
-    #[allow(dead_code)] // The recording service calls it.
     pub(crate) fn attach_sink(
         &self,
         sink: Box<dyn EventSink>,
@@ -458,7 +456,6 @@ impl SessionEvents {
 
     /// Detach the sink, handing it `(source, kind)` stamped now as its final
     /// event (never lost). Returns that event, or `None` without a sink.
-    #[allow(dead_code)] // The recording service calls it.
     pub(crate) fn detach_sink(&self, source: EventSource, kind: EventKind) -> Option<SessionEvent> {
         let frame_seq = self.frame_seq();
         let mut ring = self.ring();
@@ -471,7 +468,6 @@ impl SessionEvents {
     /// Give a recording-only event to the attached sink only: it does not
     /// enter the ring, takes no sequence number and leaves `latest`
     /// unchanged. `false` when no sink is attached or it could not take it.
-    #[allow(dead_code)] // The recording service calls it.
     pub(crate) fn record_detached(&self, source: EventSource, kind: EventKind) -> bool {
         let frame_seq = self.frame_seq();
         let ring = self.ring();

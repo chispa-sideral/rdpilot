@@ -53,6 +53,45 @@ pub struct SessionStatus {
     pub connected_since: Option<String>,
     /// ISO-8601 timestamp of the last observed activity, if known.
     pub last_activity: Option<String>,
+    /// The id of the session's active recording, if it is recording.
+    #[serde(default)]
+    pub recording: Option<String>,
+}
+
+/// Whether the session records after a connect. A recording failure never
+/// fails the connect.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WireRecordingState {
+    /// Not recording.
+    #[default]
+    Off,
+    /// Recording under this id.
+    On { id: String },
+    /// Recording was asked for and could not start.
+    Failed { reason: String },
+}
+
+/// One recording on disk.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WireRecording {
+    pub id: String,
+    /// The session id.
+    pub session: String,
+    /// The session name, when one was given.
+    #[serde(default)]
+    pub session_name: Option<String>,
+    /// The address the daemon connected to.
+    pub host: String,
+    /// UTC start (`YYYY-MM-DDTHH:MM:SS.sssZ`).
+    pub started_at: String,
+    /// Length so far (active) or in total.
+    pub duration_ms: u64,
+    /// Bytes on disk.
+    pub bytes: u64,
+    /// Still being written.
+    pub active: bool,
+    /// Marked keep: never pruned, not counted in the budget.
+    pub kept: bool,
 }
 
 /// Responses never contain connection credentials. Cua messages use a separate stream.
@@ -65,6 +104,8 @@ pub enum WireResponse {
         connect_ack_required: bool,
         #[serde(default)]
         bridge_live: bool,
+        #[serde(default)]
+        recording: WireRecordingState,
         /// Notes for the user, for example a bridge version that differs
         /// from the daemon or an offline fallback to a cached Cua version.
         #[serde(default)]
@@ -95,6 +136,22 @@ pub enum WireResponse {
         addresses: Vec<String>,
         token: ViewerToken,
         notices: Vec<String>,
+    },
+    /// A recording action's result. `changed` is `false` when there was
+    /// nothing to do (already recording, not recording, mark unchanged).
+    RecordingChanged {
+        id: Option<String>,
+        changed: bool,
+        message: String,
+    },
+    /// The recordings on disk, oldest first, with the kept and unkept
+    /// totals and the budget.
+    Recordings {
+        recordings: Vec<WireRecording>,
+        kept_bytes: u64,
+        unkept_bytes: u64,
+        budget_bytes: u64,
+        kept_over_budget: bool,
     },
     Error(WireError),
 }
@@ -128,5 +185,79 @@ mod viewer_tests {
         assert!(json.contains(&token));
         let back: WireResponse = serde_json::from_str(&json).unwrap_or(WireResponse::Ack);
         assert!(matches!(back, WireResponse::ViewerStarted { token: t, .. } if t.0 == token));
+    }
+}
+
+#[cfg(test)]
+mod recording_tests {
+    use super::*;
+
+    #[test]
+    fn connected_defaults_to_not_recording_and_round_trips_states() {
+        let old = serde_json::json!({"Connected": {"session": "web"}});
+        let back: WireResponse = serde_json::from_value(old).unwrap_or(WireResponse::Ack);
+        assert!(matches!(
+            back,
+            WireResponse::Connected {
+                recording: WireRecordingState::Off,
+                ..
+            }
+        ));
+        for state in [
+            WireRecordingState::On {
+                id: "20260101T000000Z-0123abcd".into(),
+            },
+            WireRecordingState::Failed {
+                reason: "disk full".into(),
+            },
+        ] {
+            let json = serde_json::to_value(&state).unwrap_or_default();
+            let back: WireRecordingState =
+                serde_json::from_value(json).unwrap_or(WireRecordingState::Off);
+            assert_eq!(back, state);
+        }
+    }
+
+    #[test]
+    fn session_status_recording_is_optional_on_the_wire() {
+        let json = serde_json::json!({
+            "id": "a", "name": null, "host": "h", "status": "Live",
+            "connected_since": null, "last_activity": null,
+        });
+        let status: SessionStatus = serde_json::from_value(json).unwrap_or(SessionStatus {
+            id: String::new(),
+            name: None,
+            host: String::new(),
+            status: SessionLifecycle::Disconnected,
+            connected_since: None,
+            last_activity: None,
+            recording: Some("x".into()),
+        });
+        assert_eq!(status.id, "a");
+        assert_eq!(status.recording, None);
+    }
+
+    #[test]
+    fn recordings_round_trip() {
+        let response = WireResponse::Recordings {
+            recordings: vec![WireRecording {
+                id: "20260101T000000Z-0123abcd".into(),
+                session: "web".into(),
+                session_name: Some("web".into()),
+                host: "10.0.0.5".into(),
+                started_at: "2026-01-01T00:00:00.000Z".into(),
+                duration_ms: 5,
+                bytes: 10,
+                active: false,
+                kept: true,
+            }],
+            kept_bytes: 10,
+            unkept_bytes: 0,
+            budget_bytes: 20,
+            kept_over_budget: false,
+        };
+        let json = serde_json::to_string(&response).unwrap_or_default();
+        let back: WireResponse = serde_json::from_str(&json).unwrap_or(WireResponse::Ack);
+        assert!(matches!(back, WireResponse::Recordings { recordings, .. } if recordings[0].kept));
     }
 }
