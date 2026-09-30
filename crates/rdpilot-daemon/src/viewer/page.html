@@ -681,14 +681,16 @@ video { max-width: 100%; height: auto; border: 1px solid #ddd; display: block; b
     return replay.loading[s.n];
   }
 
-  // Show segment `s` at `seconds` into it.
+  // Show segment `s` at `seconds` into it. Only the latest call applies: a
+  // segment download that finishes after a later seek is ignored.
   function show(s, seconds, playIt) {
     var r = replay;
+    var ticket = r.showTicket = (r.showTicket || 0) + 1;
     return blobFor(s).then(function (url) {
-      if (r !== replay || r.closed) { return; }
+      if (r !== replay || r.closed || ticket !== r.showTicket) { return; }
       var v = r.video;
       var apply = function () {
-        if (r !== replay) { return; }
+        if (r !== replay || ticket !== r.showTicket) { return; }
         var max = isFinite(v.duration) ? Math.max(0, v.duration - 0.001) : seconds;
         v.currentTime = Math.min(seconds, max);
         v.playbackRate = r.speed;
@@ -704,6 +706,9 @@ video { max-width: 100%; height: auto; border: 1px solid #ddd; display: block; b
         v.src = url;
         v.addEventListener("loadedmetadata", apply, { once: true });
         v.load();
+      } else if (v.readyState < 1) {
+        // The same segment is still loading: apply once its metadata is in.
+        v.addEventListener("loadedmetadata", apply, { once: true });
       } else {
         apply();
       }

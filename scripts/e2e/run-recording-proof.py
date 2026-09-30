@@ -416,6 +416,35 @@ class Proof(viewer_proof.Proof):
             out.append({"segment": number, "position_ms": ms, "video_ms": round(seg["start_offset_ms"] + st["video_time"] * 1000)})
         return out
 
+    async def stale_download_check(self, browser_name, page):
+        """While paused, a seek into a segment not yet downloaded followed at
+        once by a seek back into the shown segment keeps the shown segment
+        when the download finishes later."""
+        segs = self.manifest("a")["segments"]
+        require(len(segs) >= 2, f"a: {len(segs)} segment(s), the fake run needs 2")
+        first, second = (int(s["file"].split(".")[0]) for s in segs[:2])
+        ms = [s["start_offset_ms"] + min(300, (s["end_offset_ms"] - s["start_offset_ms"]) // 2) for s in segs[:2]]
+        await self.open_replay(page, self.ids["a"])
+        await self.seek_timeline(page, ms[0])
+        await self.wait_replay(page, lambda s: s["segment"] == first and s["video_loaded"] and s["video_time"] is not None,
+                               "first segment shown")
+        count_js = "(n) => performance.getEntriesByType('resource').filter((e) => e.name.endsWith('/segments/' + n)).length"
+        before = await page.evaluate(count_js, second)
+        await page.evaluate("""([later, back]) => { const t = document.querySelector('.panel.replay .timeline');
+            t.value = String(later); t.dispatchEvent(new Event('input'));
+            t.value = String(back); t.dispatchEvent(new Event('input')); }""", [ms[1], ms[0]])
+        deadline = time.monotonic() + 10
+        while await page.evaluate(count_js, second) <= before:
+            require(time.monotonic() < deadline, f"{browser_name}: segment {second} was not downloaded")
+            await asyncio.sleep(0.05)
+        await asyncio.sleep(1.0)
+        st = await self.replay_state(page)
+        require(st["position_ms"] == ms[0] and st["segment"] == first and st["video_time"] is not None and
+                abs(segs[0]["start_offset_ms"] + st["video_time"] * 1000 - ms[0]) <= FRAME_INTERVAL_MS,
+                f"{browser_name}: a late download of segment {second} replaced the shown segment: {st}")
+        return {"downloaded_late": second, "shown": first, "position_ms": ms[0],
+                "video_ms": round(segs[0]["start_offset_ms"] + st["video_time"] * 1000)}
+
     async def strip_cases(self, browser_name, page):
         """The recording-only kinds never enter the strip, a call finished
         before the recording started shows no row, a call running at stop
@@ -540,7 +569,9 @@ class Proof(viewer_proof.Proof):
                 require(kept == "kept", f"{name}: a not marked kept")
                 selections = await self.replay_checks(name, page, "a", self.events("a"))
                 strips = await self.strip_cases(name, page)
-                self.check(f"{name}.replay", version=browser.version, selections=selections, strips=strips)
+                stale = await self.stale_download_check(name, page)
+                self.check(f"{name}.replay", version=browser.version, selections=selections, strips=strips,
+                           stale_download=stale)
             finally:
                 await browser.close()
 
