@@ -3020,7 +3020,7 @@ dependencies = [
 
 [[package]]
 name = "rdpilot"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "image",
  "ironrdp",
@@ -3049,7 +3049,7 @@ dependencies = [
 
 [[package]]
 name = "rdpilot-bridge"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "libc",
  "rdpilot-bridge-protocol",
@@ -3062,7 +3062,7 @@ dependencies = [
 
 [[package]]
 name = "rdpilot-bridge-protocol"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -3070,7 +3070,7 @@ dependencies = [
 
 [[package]]
 name = "rdpilot-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64",
  "clap",
@@ -3083,7 +3083,7 @@ dependencies = [
 
 [[package]]
 name = "rdpilot-config"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "config",
  "directories",
@@ -3097,7 +3097,7 @@ dependencies = [
 
 [[package]]
 name = "rdpilot-daemon"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64",
  "bytes",
@@ -3122,7 +3122,7 @@ dependencies = [
 
 [[package]]
 name = "rdpilot-ipc"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "directories",
  "serde",
@@ -3133,7 +3133,7 @@ dependencies = [
 
 [[package]]
 name = "rdpilot-mcp"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "clap",
  "rdpilot-ipc",

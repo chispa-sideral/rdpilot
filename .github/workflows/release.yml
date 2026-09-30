@@ -1,0 +1,81 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  bridge:
+    name: Publish rdpilot-bridge.exe
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    defaults:
+      run:
+        shell: bash
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Check that the tag matches the workspace version
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "rdpilot-bridge") | .version')
+          if [ "v${version}" != "${TAG}" ]; then
+            echo "tag ${TAG} does not match workspace version ${version}" >&2
+            exit 1
+          fi
+
+      - name: Check that the tagged commit is on develop
+        run: |
+          git fetch --no-tags origin develop
+          git merge-base --is-ancestor "${GITHUB_SHA}" FETCH_HEAD
+
+      - name: Build rdpilot-bridge.exe
+        run: cargo build -p rdpilot-bridge --release --locked --target x86_64-pc-windows-msvc
+
+      - name: Write SHA256SUMS
+        run: |
+          mkdir -p dist
+          cp target/x86_64-pc-windows-msvc/release/rdpilot-bridge.exe dist/
+          cd dist
+          hash=$(sha256sum -b rdpilot-bridge.exe | cut -d' ' -f1 | tr 'A-F' 'a-f')
+          printf '%s  rdpilot-bridge.exe\n' "${hash}" > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Create a draft release with both assets
+        run: |
+          gh release create "${TAG}" dist/rdpilot-bridge.exe dist/SHA256SUMS \
+            --repo "${GITHUB_REPOSITORY}" \
+            --draft \
+            --verify-tag \
+            --title "rdpilot ${TAG}" \
+            --notes "rdpilot-bridge.exe for x86_64 Windows guests and its SHA256SUMS."
+
+      - name: Verify the uploaded assets
+        run: |
+          mkdir -p check
+          gh release download "${TAG}" --repo "${GITHUB_REPOSITORY}" --dir check \
+            --pattern rdpilot-bridge.exe --pattern SHA256SUMS
+          cmp dist/SHA256SUMS check/SHA256SUMS
+          (cd check && sha256sum -c SHA256SUMS)
+
+      - name: Publish the release
+        run: |
+          gh release edit "${TAG}" --repo "${GITHUB_REPOSITORY}" \
+            --draft=false --prerelease=false --latest
