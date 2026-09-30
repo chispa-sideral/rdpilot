@@ -91,6 +91,8 @@ windows-sys = { version = "0.61.2", features = [
     # SECURITY_DESCRIPTOR_REVISION lives here, not Win32_Security, in
     # windows-sys 0.61.2 (live-VM-confirmed correction, Plan 15-05).
     "Win32_System_SystemServices",
+    # CreateDirectoryW with an owner-only DACL for recording directories.
+    "Win32_Storage_FileSystem",
 ] }
 
 [dev-dependencies]

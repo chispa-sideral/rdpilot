@@ -399,3 +399,210 @@ fn a_same_account_connection_is_accepted_through_the_present_dacl() {
         println!("[PASS] {name}: a same-account connection was accepted through the present, non-null, owner-scoped DACL");
     });
 }
+
+/// The string SID of a security identifier.
+fn sid_string(sid: windows_sys::Win32::Security::PSID) -> Option<String> {
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
+    let mut out: windows_sys::core::PWSTR = std::ptr::null_mut();
+    if unsafe { ConvertSidToStringSidW(sid, &mut out) } == 0 || out.is_null() {
+        return None;
+    }
+    let mut len = 0;
+    while unsafe { *out.add(len) } != 0 {
+        len += 1;
+    }
+    let value = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(out, len) });
+    unsafe { LocalFree(out.cast()) };
+    Some(value)
+}
+
+/// The DACL of `path`: whether it is protected, and each ACE's flags and
+/// string SID.
+fn dacl_of(path: &std::path::Path) -> (bool, Vec<(u8, String)>) {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
+    use windows_sys::Win32::Security::{
+        AclSizeInformation, GetAce, GetAclInformation, GetSecurityDescriptorControl,
+        ACCESS_ALLOWED_ACE, ACL, ACL_SIZE_INFORMATION, DACL_SECURITY_INFORMATION,
+        PSECURITY_DESCRIPTOR, SE_DACL_PROTECTED,
+    };
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut dacl: *mut ACL = std::ptr::null_mut();
+    let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    let status = unsafe {
+        GetNamedSecurityInfoW(
+            wide.as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut dacl,
+            std::ptr::null_mut(),
+            &mut sd,
+        )
+    };
+    assert_eq!(
+        status,
+        0,
+        "GetNamedSecurityInfoW failed for {}",
+        path.display()
+    );
+    assert!(!dacl.is_null(), "{} has a null DACL", path.display());
+    let mut control = 0_u16;
+    let mut revision = 0_u32;
+    assert!(unsafe { GetSecurityDescriptorControl(sd, &mut control, &mut revision) } != 0);
+    let mut size = ACL_SIZE_INFORMATION::default();
+    assert!(
+        unsafe {
+            GetAclInformation(
+                dacl,
+                std::ptr::addr_of_mut!(size).cast(),
+                std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+                AclSizeInformation,
+            )
+        } != 0
+    );
+    let mut aces = Vec::new();
+    for index in 0..size.AceCount {
+        let mut ace: *mut core::ffi::c_void = std::ptr::null_mut();
+        assert!(unsafe { GetAce(dacl, index, &mut ace) } != 0);
+        let ace = ace.cast::<ACCESS_ALLOWED_ACE>();
+        let flags = unsafe { (*ace).Header.AceFlags };
+        let sid = unsafe { std::ptr::addr_of_mut!((*ace).SidStart) }.cast();
+        aces.push((flags, sid_string(sid).unwrap_or_default()));
+    }
+    unsafe { LocalFree(sd.cast()) };
+    (control & SE_DACL_PROTECTED != 0, aces)
+}
+
+/// The current user's string SID, from `whoami /user`.
+fn current_user_sid() -> String {
+    let output = Command::new("whoami")
+        .args(["/user", "/fo", "csv", "/nh"])
+        .output()
+        .expect("whoami runs");
+    let text = String::from_utf8_lossy(&output.stdout);
+    text.trim()
+        .rsplit(',')
+        .next()
+        .unwrap_or_default()
+        .trim_matches('"')
+        .to_owned()
+}
+
+/// Recording storage: the root and each recording directory get a
+/// protected DACL with one ACE for the current user, inherited by the files
+/// inside, and a second local account cannot open a recording file.
+#[test]
+#[ignore = "requires RDPILOT_LIVE=1, a Windows host, RDPILOT_SECOND_WINDOWS_ACCOUNT, and RDPILOT_SECOND_WINDOWS_PASSWORD"]
+fn recording_storage_is_owner_only() {
+    use windows_sys::Win32::Security::INHERITED_ACE;
+    let name = "recording_storage_is_owner_only";
+    if !armed() {
+        println!("[SKIP] {name}: {LIVE_ENV} unset");
+        return;
+    }
+    let root =
+        PathBuf::from(r"C:\Windows\Temp").join(format!("rdpilot-rec-dacl-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    rdpilot_daemon::create_private_recording_dir(&root).expect("root");
+    let recording = root.join("20260101T000000Z-0123abcd");
+    rdpilot_daemon::create_private_recording_dir(&recording).expect("recording dir");
+    let file = recording.join("manifest.json");
+    rdpilot_daemon::create_private_recording_file(&file).expect("recording file");
+    std::fs::write(&file, b"{}").expect("the owner can write");
+
+    let me = current_user_sid();
+    assert!(
+        me.starts_with("S-1-"),
+        "[FAIL] {name}: could not read the current SID"
+    );
+    for dir in [&root, &recording] {
+        let (protected, aces) = dacl_of(dir);
+        assert!(
+            protected,
+            "[FAIL] {name}: {} DACL must be protected",
+            dir.display()
+        );
+        assert_eq!(
+            aces.len(),
+            1,
+            "[FAIL] {name}: {} must have one ACE: {aces:?}",
+            dir.display()
+        );
+        assert_eq!(
+            aces[0].1, me,
+            "[FAIL] {name}: the ACE must be the current user's"
+        );
+    }
+    let (_, aces) = dacl_of(&file);
+    assert_eq!(
+        aces.len(),
+        1,
+        "[FAIL] {name}: the file must have one ACE: {aces:?}"
+    );
+    assert_eq!(aces[0].1, me);
+    assert!(
+        u32::from(aces[0].0) & INHERITED_ACE != 0,
+        "[FAIL] {name}: the file ACE must be inherited"
+    );
+
+    if let (Ok(second_account), Ok(second_password)) = (
+        std::env::var(SECOND_ACCOUNT_ENV),
+        std::env::var(SECOND_ACCOUNT_PASSWORD_ENV),
+    ) {
+        let shared_temp = PathBuf::from(r"C:\Windows\Temp");
+        let result_path = shared_temp.join("rdpilot-rec-dacl-probe-result.txt");
+        let inner_script_path = shared_temp.join("rdpilot-rec-dacl-probe-inner.ps1");
+        cleanup_probe_artifacts(&result_path, &inner_script_path);
+        let inner_script = format!(
+            "$out = 'unexpected-error'
+try {{ $s = [System.IO.File]::OpenRead('{file}'); $s.Dispose(); $out = 'opened' }}
+catch [System.UnauthorizedAccessException] {{ $out = 'denied' }}
+catch {{ $out = 'unexpected-error' }}
+[System.IO.File]::WriteAllText('{result}', $out)
+",
+            file = file.display(),
+            result = result_path.display(),
+        );
+        std::fs::write(&inner_script_path, inner_script).expect("probe script");
+        std::fs::write(&result_path, "").expect("probe result");
+        for (path, grant) in [(&inner_script_path, "(RX)"), (&result_path, "(M)")] {
+            let granted = Command::new("icacls")
+                .args([
+                    path.to_str().expect("utf-8 path"),
+                    "/grant",
+                    &format!("{second_account}:{grant}"),
+                ])
+                .output();
+            assert!(
+                matches!(granted, Ok(o) if o.status.success()),
+                "[FAIL] {name}: icacls grant"
+            );
+        }
+        let probe =
+            launch_cross_account_probe(&second_account, &second_password, &inner_script_path)
+                .expect("probe launches");
+        let completion = probe.wait_terminate_inspect_close();
+        let (classification, _, _) = probe_observation(&result_path);
+        cleanup_probe_artifacts(&result_path, &inner_script_path);
+        assert!(
+            matches!(completion, Ok(0)),
+            "[FAIL] {name}: probe did not complete"
+        );
+        assert_eq!(
+            classification, "denied",
+            "[FAIL] {name}: a second account must not open a recording file"
+        );
+    } else {
+        println!("[SKIP] {name}: cross-account part needs {SECOND_ACCOUNT_ENV}");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+    println!("[PASS] {name}: recording storage is owner-only");
+}
