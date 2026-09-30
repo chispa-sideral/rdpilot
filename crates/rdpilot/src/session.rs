@@ -28,6 +28,8 @@ const RUN_DIALOG_SETTLE: Duration = Duration::from_secs(2);
 const SESSION_SETTLE: Duration = Duration::from_secs(10);
 const TYPE_CHUNK_LEN: usize = 1;
 const TYPE_CHUNK_GAP: Duration = Duration::from_millis(150);
+const NATIVE_ONLY_PING: &str =
+    "native-only session (CuaEnabled no): there is no rdpilot-bridge to ping";
 pub struct Session {
     thread: Option<JoinHandle<Result<()>>>,
     input_tx: mpsc::Sender<RdpInputEvent>,
@@ -37,6 +39,9 @@ pub struct Session {
     bridge: Arc<BridgeShared>,
     next_req_id: AtomicU64,
     share_root: Option<PathBuf>,
+    /// False for a native-only session (no bundle configured): there is no
+    /// bridge to reach.
+    cua: bool,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransferOutcome {
@@ -126,6 +131,7 @@ impl Session {
             bridge,
             next_req_id: AtomicU64::new(1),
             share_root: cfg.get_share_root().map(Path::to_path_buf),
+            cua: cfg.get_bundle_path().is_some(),
         })
     }
 
@@ -299,6 +305,9 @@ impl Session {
         self.bridge.attach(self.input_tx.clone()).await
     }
     pub async fn ping(&self) -> Result<Duration> {
+        if !self.cua {
+            return Err(Error::Session(NATIVE_ONLY_PING.to_owned()));
+        }
         let started = std::time::Instant::now();
         match self
             .bridge
@@ -515,9 +524,21 @@ mod tests {
                 bridge: Arc::new(BridgeShared::new()),
                 next_req_id: AtomicU64::new(1),
                 share_root: None,
+                cua: true,
             },
             rx,
         )
+    }
+    #[tokio::test]
+    async fn ping_on_a_native_only_session_says_so_at_once() {
+        let (mut s, mut rx) = session();
+        s.cua = false;
+        let started = std::time::Instant::now();
+        let error = s.ping().await.unwrap_err();
+        assert!(started.elapsed() < Duration::from_millis(100));
+        assert!(error.to_string().contains("native-only session"), "{error}");
+        // Nothing was sent towards the guest.
+        assert!(rx.try_recv().is_err());
     }
     #[test]
     fn launch_command_copies_the_served_bridge_and_starts_the_local_copy() {

@@ -60,7 +60,7 @@ impl From<DaemonError> for WireError {
             DaemonError::Connect(_) => WireErrorCode::Internal,
             DaemonError::Io(_) => WireErrorCode::Internal,
             DaemonError::Config(_) => WireErrorCode::Internal,
-            DaemonError::Bundle(_) => WireErrorCode::Internal,
+            DaemonError::Bundle(_) => WireErrorCode::BundleUnavailable,
             // No trailing wildcard: `DaemonError` is defined in THIS
             // crate, so — unlike `wire_code_for_sdk_error`'s match on the
             // externally-`#[non_exhaustive]` `rdpilot::Error` above — the

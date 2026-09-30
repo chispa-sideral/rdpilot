@@ -765,7 +765,8 @@ mod tests {
         assert_eq!(run.connects, 0, "the RDP connector must never be called");
         assert_eq!(run.deploys, 0);
         match run.response {
-            WireResponse::Error(WireError { message, .. }) => {
+            WireResponse::Error(WireError { code, message }) => {
+                assert_eq!(code, WireErrorCode::BundleUnavailable);
                 assert!(
                     message.contains("Cua driver latest-dev (x86_64)"),
                     "{message}"
