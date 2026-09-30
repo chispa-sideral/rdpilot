@@ -188,6 +188,15 @@ class Proof(viewer_proof.Proof):
             require(time.monotonic() < deadline, f"recordings still active: {active}")
             await asyncio.sleep(0.5)
 
+    async def wait_segments(self, target, count, timeout=15):
+        deadline = time.monotonic() + timeout
+        while True:
+            started = [e for e in self.events(target) if e["kind"] == "segment_started"]
+            if len(started) >= count:
+                return
+            require(time.monotonic() < deadline, f"{target}: {len(started)} segment(s) after {timeout} s, want {count}")
+            await asyncio.sleep(0.2)
+
     def rec_dir(self, target):
         return self.recordings_dir / self.ids[target]
 
@@ -351,6 +360,8 @@ class Proof(viewer_proof.Proof):
         require(t1["position_ms"] > t0["position_ms"] + 500, f"{browser_name}: position did not advance: {t0['position_ms']} -> {t1['position_ms']}")
         require(t1["video_error"] is None, f"{browser_name}: video error {t1['video_error']}")
         await page.click(".panel.replay .play")  # pause
+        await self.wait_replay(page, lambda s: not s["playing"] and s["video_paused"], "paused")
+        crossings = await self.paused_segment_seeks(browser_name, page, target, segs)
         # Selecting each call_finished and annotation seeks to its offset.
         picks = [e for e in events if e["kind"] in ("call_finished", "annotation")]
         results = []
@@ -383,7 +394,27 @@ class Proof(viewer_proof.Proof):
             results.append({"seq": e["seq"], "kind": e["kind"], "offset_ms": e["offset_ms"], "video_ms": video_ms,
                             "strip_rows": len(rows)})
         await self.screenshot(page, f"{browser_name}-{target}-replay.png")
-        return results
+        return {"events": results, "paused_segment_seeks": crossings}
+
+    async def paused_segment_seeks(self, browser_name, page, target, segs):
+        """While paused, a seek into another segment shows that segment and
+        reports it in the page's replay status: forward into the second
+        segment, then back into the first."""
+        if len(segs) < 2:
+            require(not self.fake, f"{target}: {len(segs)} segment(s), the fake run needs 2")
+            return []
+        out = []
+        for seg in (segs[1], segs[0]):
+            number = int(seg["file"].split(".")[0])
+            ms = seg["start_offset_ms"] + min(300, (seg["end_offset_ms"] - seg["start_offset_ms"]) // 2)
+            await self.seek_timeline(page, ms)
+            st = await self.wait_replay(
+                page, lambda s: s["position_ms"] == ms and s["segment"] == number and s["video_time"] is not None and
+                abs(seg["start_offset_ms"] + s["video_time"] * 1000 - ms) <= FRAME_INTERVAL_MS,
+                f"paused seek into segment {number} at {ms}")
+            require(not st["playing"] and st["video_paused"], f"{browser_name}: a paused seek started playback: {st}")
+            out.append({"segment": number, "position_ms": ms, "video_ms": round(seg["start_offset_ms"] + st["video_time"] * 1000)})
+        return out
 
     async def strip_cases(self, browser_name, page):
         """The recording-only kinds never enter the strip, a call finished
@@ -444,6 +475,9 @@ class Proof(viewer_proof.Proof):
         await asyncio.sleep(0.5)
         await self.cli("recording", "keep", self.ids["a"])
         await self.screenshot(page, "01-live-panels-with-recording-controls.png")
+        # The synthetic display resizes every 3 s: a has a second segment for
+        # the paused cross-segment seek in the replay.
+        await self.wait_segments("a", 2)
         await self.cli("disconnect", "--session", "a")
         await a_mcp.stop()
         # c: one change, then a still display.
