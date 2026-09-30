@@ -35,7 +35,7 @@ impl std::str::FromStr for ViewerBind {
 }
 
 /// The resolved `[viewer]` settings.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct ViewerConfig {
     /// Bind set. Default: loopback plus tailnet.
     #[serde(default)]
@@ -43,6 +43,28 @@ pub struct ViewerConfig {
     /// Explicit Tailscale IPv4 address (skips automatic detection).
     #[serde(default)]
     pub tailnet_address: Option<Ipv4Addr>,
+    /// Serve without the Takeover control and every write route.
+    #[serde(default)]
+    pub read_only: bool,
+    /// Seconds without human input after which a viewer's control lease
+    /// ends and control returns to the agent. Default 300.
+    #[serde(default = "default_idle_timeout")]
+    pub idle_timeout: u64,
+}
+
+impl Default for ViewerConfig {
+    fn default() -> Self {
+        ViewerConfig {
+            bind: ViewerBind::default(),
+            tailnet_address: None,
+            read_only: false,
+            idle_timeout: default_idle_timeout(),
+        }
+    }
+}
+
+fn default_idle_timeout() -> u64 {
+    300
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -98,6 +120,32 @@ mod tests {
         assert_eq!(cfg, ViewerConfig::default());
         assert_eq!(cfg.bind, ViewerBind::LoopbackAndTailnet);
         assert_eq!(cfg.tailnet_address, None);
+        assert!(!cfg.read_only);
+        assert_eq!(cfg.idle_timeout, 300);
+        Ok(())
+    }
+
+    #[test]
+    fn read_only_and_idle_timeout_resolve_from_file_then_env(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let file = File::from_str(
+            "[viewer]\nread_only = true\nidle_timeout = 60",
+            FileFormat::Toml,
+        );
+        let from_file = deserialize_viewer(Config::builder().add_source(file.clone()).build()?)?;
+        assert!(from_file.read_only);
+        assert_eq!(from_file.idle_timeout, 60);
+        let with_env = deserialize_viewer(
+            Config::builder()
+                .add_source(file)
+                .add_source(env(&[
+                    ("RDPILOT_VIEWER__READ_ONLY", "false"),
+                    ("RDPILOT_VIEWER__IDLE_TIMEOUT", "120"),
+                ]))
+                .build()?,
+        )?;
+        assert!(!with_env.read_only);
+        assert_eq!(with_env.idle_timeout, 120);
         Ok(())
     }
 

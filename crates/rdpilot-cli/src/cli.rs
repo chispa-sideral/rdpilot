@@ -131,6 +131,10 @@ pub struct ViewArgs {
     /// several (must be in 100.64.0.0/10 and present on this host).
     #[arg(long = "tailnet-address")]
     pub tailnet_address: Option<std::net::Ipv4Addr>,
+    /// Serve without the Takeover button and without any write route:
+    /// nobody can take control or change recordings through this viewer.
+    #[arg(long = "read-only")]
+    pub read_only: bool,
 }
 
 fn parse_viewer_bind(value: &str) -> Result<rdpilot_config::ViewerBind, String> {

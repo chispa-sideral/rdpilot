@@ -121,6 +121,26 @@ impl AuthPolicy {
     }
 }
 
+impl AuthPolicy {
+    /// The extra check of the control and input routes, after
+    /// [`AuthPolicy::check`]: an `Origin` is required and must be this
+    /// viewer's own origin, and `Sec-Fetch-Site`, when present, must be
+    /// `same-origin`. A missing or foreign Origin is a bare 403.
+    pub(crate) fn check_control(&self, parts: &Parts) -> Result<(), StatusCode> {
+        let origin = header_str(parts, header::ORIGIN).ok_or(StatusCode::FORBIDDEN)?;
+        let own = origin
+            .strip_prefix("http://")
+            .is_some_and(|authority| self.authority_allowed(authority));
+        if !own {
+            return Err(StatusCode::FORBIDDEN);
+        }
+        match header_str(parts, "sec-fetch-site") {
+            None | Some("same-origin") => Ok(()),
+            Some(_) => Err(StatusCode::FORBIDDEN),
+        }
+    }
+}
+
 fn header_str(parts: &Parts, name: impl header::AsHeaderName) -> Option<&str> {
     parts.headers.get(name).and_then(|v| v.to_str().ok())
 }

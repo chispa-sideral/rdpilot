@@ -40,7 +40,9 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use rdpilot::ConnectionConfig;
 use rdpilot_ipc::{SessionId, SessionLifecycle, SessionStatus};
 
-use crate::control::{EndReason, SessionControl};
+use crate::control::{
+    EndReason, Grant, HumanEvent, InputError, InputReport, NotHeld, SessionControl, TakeError,
+};
 use crate::events::{CloseReason, EventSource, RecordingTrigger, SessionEvents};
 use crate::recording::{RecordingService, Target};
 use crate::seams::{
@@ -915,6 +917,8 @@ pub(crate) struct ViewerSession {
     pub(crate) ended: bool,
     /// `true` when frames can be requested for this session.
     pub(crate) frames: bool,
+    /// `true` when a viewer tab can take control and send input.
+    pub(crate) input: bool,
 }
 
 /// The only registry surface the live viewer receives.
@@ -993,6 +997,117 @@ impl ViewerRegistry {
     }
 }
 
+/// Why a viewer control request was refused.
+#[derive(Debug)]
+pub(crate) enum ControlRefusal {
+    /// The session is not live, or it has no input path.
+    NoSession,
+    /// The request names a lease that is not current.
+    NotHeld(NotHeld),
+    /// A take could not complete.
+    Take(TakeError),
+    /// The session's input channel did not take input in time.
+    Unavailable,
+}
+
+/// The only control surface the live viewer receives: human lease
+/// operations and human input for one session at a time. It cannot reach
+/// Cua, file transfer, connect, disconnect, native agent input, or another
+/// session, and it cannot perform an agent takeover.
+#[derive(Clone)]
+pub(crate) struct ViewerControl {
+    inner: Arc<Registry>,
+}
+
+impl ViewerControl {
+    pub(crate) fn new(registry: Arc<Registry>) -> Self {
+        ViewerControl { inner: registry }
+    }
+
+    fn control(&self, id: &SessionId) -> Result<Arc<SessionControl>, ControlRefusal> {
+        self.inner
+            .control(id)
+            .filter(|control| control.has_input())
+            .ok_or(ControlRefusal::NoSession)
+    }
+
+    /// Take the lease of `id` for a tab at `address`. The take waits for
+    /// the per-session lock, so an in-flight native agent operation ends
+    /// first.
+    pub(crate) async fn take(
+        &self,
+        id: &SessionId,
+        address: std::net::IpAddr,
+    ) -> Result<(Grant, Option<(u32, u32)>), ControlRefusal> {
+        let (slot, control) = self
+            .inner
+            .take_parts(id)
+            .filter(|(_, control)| control.has_input())
+            .ok_or(ControlRefusal::NoSession)?;
+        let agent_idle = async move {
+            drop(slot.lock().await);
+        };
+        let grant = control
+            .take(address, agent_idle)
+            .await
+            .map_err(ControlRefusal::Take)?;
+        Ok((grant, control.geometry()))
+    }
+
+    /// The holder's heartbeat.
+    pub(crate) fn heartbeat(&self, id: &SessionId, lease: &str) -> Result<(), ControlRefusal> {
+        self.control(id)?
+            .heartbeat(lease)
+            .map_err(ControlRefusal::NotHeld)
+    }
+
+    /// The holder's page lost focus: release what it holds.
+    pub(crate) async fn blur(&self, id: &SessionId, lease: &str) -> Result<(), ControlRefusal> {
+        let control = self.control(id)?;
+        let transition = control.blur(lease).map_err(ControlRefusal::NotHeld)?;
+        control.discharge(transition).await;
+        Ok(())
+    }
+
+    /// The holder releases control to the agent.
+    pub(crate) async fn release(&self, id: &SessionId, lease: &str) -> Result<(), ControlRefusal> {
+        let control = self.control(id)?;
+        let transition = control.release(lease).map_err(ControlRefusal::NotHeld)?;
+        control.discharge(transition).await;
+        Ok(())
+    }
+
+    /// Apply the holder's input.
+    pub(crate) async fn input(
+        &self,
+        id: &SessionId,
+        lease: &str,
+        generation: u64,
+        geometry: (u32, u32),
+        events: Vec<HumanEvent>,
+    ) -> Result<InputReport, ControlRefusal> {
+        self.control(id)?
+            .input(lease, generation, geometry, events)
+            .await
+            .map_err(|InputError::Unavailable| ControlRefusal::Unavailable)
+    }
+
+    /// End leases whose heartbeat or input stopped.
+    pub(crate) async fn sweep(&self, idle_timeout: std::time::Duration) {
+        let now = Instant::now();
+        for control in self.inner.controls() {
+            if let Some(transition) = control.expire(now, idle_timeout) {
+                control.discharge(transition).await;
+            }
+        }
+    }
+
+    /// End every human lease (the viewer stopped).
+    pub(crate) async fn end_all(&self) {
+        self.inner.end_all_leases(EndReason::ViewerStopped).await;
+    }
+}
+
 impl Registry {
     fn viewer_sessions(&self) -> Vec<ViewerSession> {
         #[allow(clippy::expect_used)] // A poisoned registry mutex is unrecoverable.
@@ -1006,10 +1121,13 @@ impl Registry {
                     } => (frame.status().ended, true),
                     _ => (false, false),
                 };
+                let input =
+                    matches!(entry, SessionEntry::Live { control, .. } if control.has_input());
                 ViewerSession {
                     status: self.status_of(id, entry),
                     ended,
                     frames,
+                    input,
                 }
             })
             .collect()

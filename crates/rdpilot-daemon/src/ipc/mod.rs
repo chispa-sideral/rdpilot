@@ -42,7 +42,7 @@ mod cua_gate;
 use crate::diagnostics::{Diagnostics, Stage};
 use crate::dispatch::dispatch_for_ipc;
 use crate::events::{CuaCallTracker, EventKind, EventSource};
-use crate::registry::{Registry, ViewerRegistry};
+use crate::registry::{Registry, ViewerControl, ViewerRegistry};
 use crate::seams::ManagedCua;
 use crate::viewer::{ViewerGate, ViewerParams};
 use cua_gate::{CuaGate, Inbound};
@@ -78,10 +78,19 @@ pub(crate) async fn serve_connection<S>(
         if let Request::ViewerStart {
             bind,
             tailnet_address,
-            ..
+            read_only,
+            idle_timeout_secs,
         } = req
         {
-            hold_viewer(&mut stream, viewer, bind, tailnet_address).await;
+            let options = ViewerOptions {
+                bind,
+                tailnet_address,
+                read_only,
+                idle_timeout: idle_timeout_secs
+                    .filter(|secs| *secs > 0)
+                    .map_or(crate::control::DEFAULT_IDLE_TIMEOUT, Duration::from_secs),
+            };
+            hold_viewer(&mut stream, viewer, options).await;
             return;
         }
         if let Request::CuaAttach { session } = req {
@@ -208,7 +217,16 @@ const STREAM_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 #[derive(Clone)]
 pub(crate) struct ViewerContext {
     pub(crate) registry: ViewerRegistry,
+    pub(crate) control: ViewerControl,
     pub(crate) gate: ViewerGate,
+}
+
+/// What `rdpilot view` asked for.
+struct ViewerOptions {
+    bind: WireViewerBind,
+    tailnet_address: Option<String>,
+    read_only: bool,
+    idle_timeout: Duration,
 }
 
 /// Start the viewer, answer `ViewerStarted`, then keep it running until the
@@ -217,9 +235,14 @@ pub(crate) struct ViewerContext {
 async fn hold_viewer<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     viewer: Option<&ViewerContext>,
-    bind: WireViewerBind,
-    tailnet_address: Option<String>,
+    options: ViewerOptions,
 ) {
+    let ViewerOptions {
+        bind,
+        tailnet_address,
+        read_only,
+        idle_timeout,
+    } = options;
     let refuse =
         |message: String| WireResponse::Error(crate::seams::DaemonError::Connect(message).into());
     let started = match (viewer, tailnet_address.as_deref().map(str::parse)) {
@@ -229,8 +252,10 @@ async fn hold_viewer<S: AsyncRead + AsyncWrite + Unpin>(
             let params = ViewerParams {
                 bind,
                 tailnet_override: parsed.and_then(Result::ok),
+                read_only,
+                idle_timeout,
             };
-            crate::viewer::start(ctx.registry.clone(), &ctx.gate, params)
+            crate::viewer::start(ctx.registry.clone(), ctx.control.clone(), &ctx.gate, params)
                 .await
                 .map_err(refuse)
         }
@@ -258,6 +283,10 @@ async fn hold_viewer<S: AsyncRead + AsyncWrite + Unpin>(
     // sends nothing more; EOF (Ctrl-C, terminal closed) or any frame ends it.
     let _ = read_frame::<_, serde_json::Value>(stream).await;
     drop(started.handle);
+    // Every human lease ends with the viewer; control returns to the agent.
+    if let Some(ctx) = viewer {
+        ctx.control.end_all().await;
+    }
 }
 
 /// Preserve a partially read IPC frame while forwarding spontaneous Cua output.

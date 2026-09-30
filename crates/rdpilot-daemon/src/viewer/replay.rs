@@ -28,7 +28,7 @@ use crate::registry::{Refusal, ViewerRegistry};
 /// Largest accepted request body.
 pub(crate) const MAX_BODY: usize = 8 * 1024;
 
-fn json(status: StatusCode, value: &serde_json::Value) -> Response<Body> {
+pub(crate) fn json(status: StatusCode, value: &serde_json::Value) -> Response<Body> {
     match serde_json::to_vec(value) {
         Ok(body) => response(status, "application/json", Bytes::from(body)),
         Err(_) => empty(StatusCode::INTERNAL_SERVER_ERROR),

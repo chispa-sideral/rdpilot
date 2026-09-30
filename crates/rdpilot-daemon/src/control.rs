@@ -23,10 +23,6 @@
 //!   coordinates) is never logged or recorded.
 //! - The std mutex is never held across an `.await`.
 
-// The human side (take, heartbeat, input) is reached through the viewer's
-// control routes.
-#![allow(dead_code)]
-
 use std::collections::{BTreeSet, VecDeque};
 use std::future::Future;
 use std::net::IpAddr;
@@ -382,9 +378,9 @@ impl SessionControl {
         }
     }
 
-    /// The session incarnation this control belongs to.
-    pub(crate) fn generation(&self) -> u64 {
-        self.generation
+    /// The current frame size (`None` without frames).
+    pub(crate) fn geometry(&self) -> Option<(u32, u32)> {
+        self.frame.as_ref().and_then(|frame| frame.geometry())
     }
 
     /// Whether the session can take human input.
@@ -642,11 +638,18 @@ impl SessionControl {
             return Ok(self.grant(&lease));
         }
 
+        // A take abandoned while it waits (the tab went away) is undone.
+        let mut pending = PendingTake {
+            control: self,
+            id: &id,
+            armed: true,
+        };
         let settled = tokio::time::timeout(bound, async {
             agent_idle.await;
             self.wait_settled().await;
         })
         .await;
+        pending.armed = false;
 
         let mut state = self.state();
         let ours = matches!(&state.lease, Some(current) if current.id == id);
@@ -838,6 +841,25 @@ impl SessionControl {
             }
         }
         Ok(report)
+    }
+}
+
+/// Undoes a pending take when its future is dropped mid-wait.
+struct PendingTake<'a> {
+    control: &'a SessionControl,
+    id: &'a str,
+    armed: bool,
+}
+
+impl Drop for PendingTake<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let mut state = self.control.state();
+        if matches!(&state.lease, Some(lease) if lease.id == self.id && !lease.granted) {
+            state.lease = None;
+        }
     }
 }
 

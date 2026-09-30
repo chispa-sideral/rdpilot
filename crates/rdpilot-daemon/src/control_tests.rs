@@ -409,6 +409,21 @@ async fn a_take_waits_for_the_per_session_lock() {
     assert!(taking.await.unwrap().is_ok());
 }
 
+#[tokio::test(start_paused = true)]
+async fn an_abandoned_take_is_undone() {
+    let f = Arc::new(fixture());
+    assert!(f.control.admit_cua(1, false).unwrap().is_none());
+    let taking = {
+        let f = Arc::clone(&f);
+        tokio::spawn(async move { f.control.take(tab(9), async {}).await })
+    };
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(f.control.check_agent().is_err());
+    taking.abort();
+    let _ = taking.await;
+    assert!(f.control.check_agent().is_ok(), "the agent controls again");
+}
+
 /// Requests naming a lease that is not current never change control.
 #[tokio::test]
 async fn non_holder_requests_are_refused_and_change_nothing() {

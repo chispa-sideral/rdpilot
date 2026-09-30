@@ -1,4 +1,4 @@
-//! `view` — start the read-only live viewer and keep it running.
+//! `view` — start the live viewer and keep it running.
 //!
 //! Connects to an already-running daemon (never starts one), validates its
 //! compatibility identity, sends `ViewerStart`, prints one URL per bound
@@ -16,7 +16,14 @@ use crate::render::print_json;
 
 /// The access-boundary line printed with the URLs.
 const BOUNDARY: &str = "Anyone with one of these URLs and network access to its address can \
-view the sessions (read-only). Keep the URLs private. Press Ctrl-C to stop the viewer.";
+view every session of this daemon and take control of its keyboard and mouse, displacing the \
+agent or another viewer. Keep the URLs private, or use --read-only. Press Ctrl-C to stop the \
+viewer.";
+
+/// The access-boundary line of a read-only viewer.
+const BOUNDARY_READ_ONLY: &str = "Anyone with one of these URLs and network access to its \
+address can view the sessions (read-only: no takeover, no recording changes). Keep the URLs \
+private. Press Ctrl-C to stop the viewer.";
 
 /// `view [--bind] [--tailnet-address]`.
 ///
@@ -36,6 +43,7 @@ pub async fn view(args: ViewArgs, json: bool) -> Result<(), CliError> {
         .tailnet_address
         .or(config.tailnet_address)
         .map(|a| a.to_string());
+    let read_only = args.read_only || config.read_only;
 
     let mut stream = open_existing_stream().await?;
     let response = verified_request(
@@ -43,8 +51,8 @@ pub async fn view(args: ViewArgs, json: bool) -> Result<(), CliError> {
         Request::ViewerStart {
             bind,
             tailnet_address,
-            read_only: false,
-            idle_timeout_secs: None,
+            read_only,
+            idle_timeout_secs: Some(config.idle_timeout),
         },
     )
     .await?;
@@ -69,16 +77,25 @@ pub async fn view(args: ViewArgs, json: bool) -> Result<(), CliError> {
     };
 
     if json {
-        print_json(&serde_json::json!({ "urls": urls, "notices": notices }))?;
+        print_json(&serde_json::json!({
+            "urls": urls,
+            "notices": notices,
+            "read_only": read_only,
+        }))?;
     } else {
-        println!("rdpilot live viewer (read-only) is running. Open one of:");
+        let (mode, boundary) = if read_only {
+            (" (read-only)", BOUNDARY_READ_ONLY)
+        } else {
+            ("", BOUNDARY)
+        };
+        println!("rdpilot live viewer{mode} is running. Open one of:");
         for url in &urls {
             println!("  {url}");
         }
         for notice in &notices {
             println!("notice: {notice}");
         }
-        println!("{BOUNDARY}");
+        println!("{boundary}");
     }
 
     // Hold the connection until Ctrl-C or daemon exit. The daemon sends

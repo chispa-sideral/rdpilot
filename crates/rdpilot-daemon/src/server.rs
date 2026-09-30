@@ -248,6 +248,7 @@ async fn run_inner(config: RunConfig) -> Result<(), DaemonError> {
     // The live viewer sees only this facade (list + passive frame lookup).
     let viewer = ViewerContext {
         registry: ViewerRegistry::new(Arc::clone(&registry)),
+        control: crate::registry::ViewerControl::new(Arc::clone(&registry)),
         gate: ViewerGate::default(),
     };
 

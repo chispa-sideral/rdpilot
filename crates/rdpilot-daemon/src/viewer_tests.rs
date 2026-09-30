@@ -35,6 +35,21 @@ const TOKEN: &str = "5ec2e7a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c
 /// A fake session whose frame source is a [`SyntheticFrames`] the test feeds.
 struct FramedSession {
     frames: Arc<SyntheticFrames>,
+    input: Arc<InputLog>,
+}
+
+/// Records human input events in order.
+#[derive(Default)]
+struct InputLog(Mutex<Vec<crate::control::HumanEvent>>);
+
+impl crate::seams::HumanInput for InputLog {
+    fn send(
+        &self,
+        events: Vec<crate::control::HumanEvent>,
+    ) -> crate::seams::SendFuture<'_, Result<(), DaemonError>> {
+        self.0.lock().unwrap().extend(events);
+        Box::pin(async { Ok(()) })
+    }
 }
 
 impl ManagedSession for FramedSession {
@@ -80,12 +95,16 @@ impl ManagedSession for FramedSession {
     fn frame_source(&self) -> Option<Arc<dyn ViewFrameSource>> {
         Some(Arc::clone(&self.frames) as Arc<dyn ViewFrameSource>)
     }
+    fn human_input(&self) -> Option<Arc<dyn crate::seams::HumanInput>> {
+        Some(Arc::clone(&self.input) as Arc<dyn crate::seams::HumanInput>)
+    }
 }
 
 /// Connects [`FramedSession`]s and remembers each one's frames by host.
 #[derive(Default)]
 struct FramedConnector {
     frames: Mutex<HashMap<String, Arc<SyntheticFrames>>>,
+    inputs: Mutex<HashMap<String, Arc<InputLog>>>,
     /// When set, the next connect waits for this before it completes.
     hold: Mutex<Option<Arc<tokio::sync::Notify>>>,
 }
@@ -100,12 +119,17 @@ impl SessionConnector for FramedConnector {
             .lock()
             .unwrap()
             .insert(cfg.host().to_owned(), Arc::clone(&frames));
+        let input = Arc::new(InputLog::default());
+        self.inputs
+            .lock()
+            .unwrap()
+            .insert(cfg.host().to_owned(), Arc::clone(&input));
         let hold = self.hold.lock().unwrap().take();
         Box::pin(async move {
             if let Some(hold) = hold {
                 hold.notified().await;
             }
-            Ok(Box::new(FramedSession { frames }) as Box<dyn ManagedSession>)
+            Ok(Box::new(FramedSession { frames, input }) as Box<dyn ManagedSession>)
         })
     }
 }
@@ -449,18 +473,30 @@ async fn start_binds_loopback_only_and_allows_one_viewer() {
     let params = ViewerParams {
         bind: WireViewerBind::Loopback,
         tailnet_override: None,
+        read_only: false,
+        idle_timeout: Duration::from_secs(300),
     };
-    let started = crate::viewer::start(fx.viewer_registry(), &gate, params)
-        .await
-        .unwrap();
+    let started = crate::viewer::start(
+        fx.viewer_registry(),
+        ViewerControl::new(Arc::clone(&fx.registry)),
+        &gate,
+        params,
+    )
+    .await
+    .unwrap();
     assert_eq!(started.addresses.len(), 1);
     assert!(started.addresses[0].starts_with("http://127.0.0.1:"));
     let token = started.token.expose().to_owned();
     assert_eq!(token.len(), 64);
     assert!(!format!("{:?}", started.token).contains(&token));
-    assert!(crate::viewer::start(fx.viewer_registry(), &gate, params)
-        .await
-        .is_err());
+    assert!(crate::viewer::start(
+        fx.viewer_registry(),
+        ViewerControl::new(Arc::clone(&fx.registry)),
+        &gate,
+        params,
+    )
+    .await
+    .is_err());
     let addr: SocketAddr = started.addresses[0]
         .trim_start_matches("http://")
         .trim_end_matches('/')
@@ -470,7 +506,13 @@ async fn start_binds_loopback_only_and_allows_one_viewer() {
     // Stopped: the port closes and the gate reopens.
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert!(TcpStream::connect(addr).await.is_err());
-    let again = crate::viewer::start(fx.viewer_registry(), &gate, params).await;
+    let again = crate::viewer::start(
+        fx.viewer_registry(),
+        ViewerControl::new(Arc::clone(&fx.registry)),
+        &gate,
+        params,
+    )
+    .await;
     assert!(again.is_ok());
 }
 
@@ -694,7 +736,7 @@ async fn cross_site_document_navigation_is_allowed_but_api_is_not() {
 /// No route reaches input, Cua, transfer, connect or disconnect; the
 /// session routes and the page take GET only.
 #[tokio::test]
-async fn no_write_or_control_route_exists() {
+async fn no_route_reaches_native_agent_input_cua_transfer_or_lifecycle() {
     let fx = Fixture::new();
     let (id, _frames) = fx.open("alpha").await;
     let server = fx.serve_loopback(fast_limits()).await;
@@ -713,7 +755,6 @@ async fn no_write_or_control_route_exists() {
         }
     }
     for verb in [
-        "input",
         "mouse",
         "key",
         "type",
@@ -1130,6 +1171,7 @@ fn viewer_modules_never_import_registry_dispatch_or_managed_session() {
         ("frames.rs", include_str!("viewer/frames.rs")),
         ("http.rs", include_str!("viewer/http.rs")),
         ("replay.rs", include_str!("viewer/replay.rs")),
+        ("control.rs", include_str!("viewer/control.rs")),
         ("page.html", include_str!("viewer/page.html")),
     ];
     for (name, source) in sources {
@@ -1147,6 +1189,9 @@ fn viewer_modules_never_import_registry_dispatch_or_managed_session() {
             "SessionConnector",
             "Request::",
             "rdpilot::Session",
+            "agent_takeover",
+            "admit_cua",
+            "call_acting",
         ] {
             assert!(!code.contains(forbidden), "{name} mentions {forbidden}");
         }
@@ -1965,4 +2010,557 @@ async fn viewer_actions_keep_and_list_without_touching_activity() {
     .await;
     assert_eq!(body_json(&unkept)["changed"], true);
     assert_eq!(fx.registry.list()[0].last_activity, before);
+}
+
+// --- Control lease and human input -----------------------------------------
+
+use crate::registry::ViewerControl;
+use crate::viewer::RateLimits;
+
+impl Fixture {
+    /// Serve with the control routes on the given listeners.
+    fn serve_control(
+        &self,
+        listeners: Vec<TcpListener>,
+        idle: Duration,
+        rates: RateLimits,
+        read_only: bool,
+    ) -> Server {
+        let addrs: Vec<SocketAddr> = listeners.iter().map(|l| l.local_addr().unwrap()).collect();
+        let policy = AuthPolicy::new(Token::from_test_value(TOKEN), &addrs);
+        let state = ServerState::new(self.viewer_registry(), policy, fast_limits());
+        let state = if read_only {
+            state.read_only()
+        } else {
+            state
+                .with_control(ViewerControl::new(Arc::clone(&self.registry)), idle)
+                .with_rate_limits(rates)
+        };
+        let state = Arc::new(state);
+        let handle = serve(listeners, Arc::clone(&state), None);
+        Server {
+            addrs,
+            state,
+            _handle: handle,
+        }
+    }
+
+    async fn control_server(&self) -> Server {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        self.serve_control(
+            vec![listener],
+            Duration::from_secs(300),
+            RateLimits::default(),
+            false,
+        )
+    }
+
+    fn input_log(&self, name: &str) -> Vec<crate::control::HumanEvent> {
+        self.connector.inputs.lock().unwrap()[name]
+            .0
+            .lock()
+            .unwrap()
+            .clone()
+    }
+}
+
+/// POST JSON to a control route with the viewer's own Origin.
+async fn control_post(addr: SocketAddr, path: &str, body: serde_json::Value) -> Reply {
+    let auth = bearer();
+    let origin = format!("http://{addr}");
+    send(
+        addr,
+        "POST",
+        path,
+        &[
+            ("Authorization", &auth),
+            ("Content-Type", "application/json"),
+            ("Origin", &origin),
+            ("Sec-Fetch-Site", "same-origin"),
+        ],
+        body.to_string().as_bytes(),
+    )
+    .await
+}
+
+async fn action(addr: SocketAddr, id: &str, action: &str, lease: &str) -> Reply {
+    control_post(
+        addr,
+        &format!("/api/sessions/{id}/control"),
+        serde_json::json!({ "action": action, "lease": lease }),
+    )
+    .await
+}
+
+struct Held {
+    lease: String,
+    generation: u64,
+    width: u64,
+    height: u64,
+}
+
+async fn take(addr: SocketAddr, id: &str) -> Held {
+    let reply = action(addr, id, "take", "").await;
+    assert_eq!(
+        reply.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&reply.body)
+    );
+    let body = body_json(&reply);
+    assert_eq!(body["controller"]["kind"], "human");
+    assert_eq!(body["controller"]["address"], "127.0.0.1");
+    Held {
+        lease: body["lease"].as_str().unwrap().to_owned(),
+        generation: body["generation"].as_u64().unwrap(),
+        width: body["width"].as_u64().unwrap(),
+        height: body["height"].as_u64().unwrap(),
+    }
+}
+
+async fn send_input(addr: SocketAddr, id: &str, held: &Held, events: serde_json::Value) -> Reply {
+    control_post(
+        addr,
+        &format!("/api/sessions/{id}/input"),
+        serde_json::json!({
+            "lease": held.lease,
+            "generation": held.generation,
+            "width": held.width,
+            "height": held.height,
+            "events": events,
+        }),
+    )
+    .await
+}
+
+fn shift(down: bool) -> serde_json::Value {
+    serde_json::json!({ "type": "key", "code": 0x2A, "extended": false, "down": down })
+}
+
+fn control_kinds(fx: &Fixture, id: &SessionId) -> Vec<(crate::events::EventSource, String)> {
+    fx.registry
+        .events(id)
+        .unwrap()
+        .after(0)
+        .events
+        .into_iter()
+        .filter_map(|e| {
+            let kind = serde_json::to_value(&e.kind).unwrap()["kind"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            kind.starts_with("control_").then_some((e.source, kind))
+        })
+        .collect()
+}
+
+async fn wait_frame(frames: &SyntheticFrames) {
+    frames.publish_solid(64, 48, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tab_takes_types_moves_releases_and_sees_why_it_lost_the_lease() {
+    let fx = Fixture::new();
+    let (id, frames) = fx.open("alpha").await;
+    wait_frame(&frames).await;
+    let server = fx.control_server().await;
+    let addr = server.addr();
+
+    // Opening the page and reading never take the lease.
+    assert_eq!(
+        request(addr, "GET", &format!("/?token={TOKEN}"), None, &[])
+            .await
+            .status,
+        200
+    );
+    let list = body_json(&api(addr, "/api/sessions").await);
+    assert_eq!(list["control"], true);
+    assert_eq!(list["idle_timeout_secs"], 300);
+    assert_eq!(list["sessions"][0]["controller"]["kind"], "agent");
+    assert_eq!(list["sessions"][0]["input"], true);
+    assert!(fx.registry.control(&id).unwrap().check_agent().is_ok());
+
+    // Tab 1 takes from the agent and types.
+    let one = take(addr, "alpha").await;
+    assert_eq!((one.width, one.height), (64, 48));
+    let reply = send_input(
+        addr,
+        "alpha",
+        &one,
+        serde_json::json!([{ "type": "move", "x": 5, "y": 6 }, shift(true)]),
+    )
+    .await;
+    assert_eq!(reply.status, 200);
+    assert_eq!(body_json(&reply)["applied"], 2);
+    assert!(fx.registry.control(&id).unwrap().check_agent().is_err());
+
+    // Tab 2 takes over: tab 1's held Shift is released first.
+    let two = take(addr, "alpha").await;
+    let log = fx.input_log("alpha");
+    assert_eq!(
+        log.last(),
+        Some(&crate::control::HumanEvent::Key {
+            code: 0x2A,
+            extended: false,
+            down: false
+        })
+    );
+    let reply = action(addr, "alpha", "heartbeat", &one.lease).await;
+    assert_eq!(reply.status, 409);
+    assert_eq!(
+        body_json(&reply)["lost"],
+        serde_json::json!({"by": {"kind": "human", "address": "127.0.0.1"}})
+    );
+    let before = fx.input_log("alpha").len();
+    let reply = send_input(addr, "alpha", &one, serde_json::json!([shift(true)])).await;
+    assert_eq!(reply.status, 409);
+    assert_eq!(body_json(&reply)["dropped"]["stale"], 1);
+    assert_eq!(fx.input_log("alpha").len(), before, "never applied");
+
+    // Tab 1 cannot release, blur or otherwise change tab 2's lease.
+    for verb in ["release", "blur", "heartbeat"] {
+        assert_eq!(action(addr, "alpha", verb, &one.lease).await.status, 409);
+    }
+    assert_eq!(
+        action(addr, "alpha", "heartbeat", &two.lease).await.status,
+        200
+    );
+    // No HTTP action performs an agent takeover.
+    assert_eq!(
+        action(addr, "alpha", "takeover", &two.lease).await.status,
+        400
+    );
+
+    // Release returns control to the agent.
+    let reply = action(addr, "alpha", "release", &two.lease).await;
+    assert_eq!(reply.status, 200);
+    assert!(fx.registry.control(&id).unwrap().check_agent().is_ok());
+    let reply = action(addr, "alpha", "heartbeat", &two.lease).await;
+    assert_eq!(
+        body_json(&reply)["lost"],
+        serde_json::json!({"reason": "released"})
+    );
+
+    // Viewer stop ends the lease with its reason.
+    let three = take(addr, "alpha").await;
+    ViewerControl::new(Arc::clone(&fx.registry)).end_all().await;
+    let reply = action(addr, "alpha", "heartbeat", &three.lease).await;
+    assert_eq!(
+        body_json(&reply)["lost"],
+        serde_json::json!({"reason": "viewer_stopped"})
+    );
+
+    assert_eq!(
+        control_kinds(&fx, &id),
+        vec![
+            (crate::events::EventSource::Viewer, "control_taken".into()),
+            (
+                crate::events::EventSource::Viewer,
+                "control_taken_over".into()
+            ),
+            (
+                crate::events::EventSource::Viewer,
+                "control_released".into()
+            ),
+            (crate::events::EventSource::Viewer, "control_taken".into()),
+            (crate::events::EventSource::Daemon, "control_ended".into()),
+        ]
+    );
+
+    // Session end: the lease ends and later requests find no session.
+    let four = take(addr, "alpha").await;
+    fx.registry.close(&id).await.unwrap();
+    assert_eq!(
+        action(addr, "alpha", "heartbeat", &four.lease).await.status,
+        404
+    );
+    assert_eq!(
+        send_input(addr, "alpha", &four, serde_json::json!([shift(true)]))
+            .await
+            .status,
+        404
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_idle_timeout_ends_a_lease_that_keeps_heartbeating() {
+    let fx = Fixture::new();
+    let (id, frames) = fx.open("alpha").await;
+    wait_frame(&frames).await;
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let server = fx.serve_control(
+        vec![listener],
+        Duration::from_secs(1),
+        RateLimits::default(),
+        false,
+    );
+    let addr = server.addr();
+    let held = take(addr, "alpha").await;
+    let mut lost = serde_json::Value::Null;
+    for _ in 0..20 {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let reply = action(addr, "alpha", "heartbeat", &held.lease).await;
+        if reply.status == 409 {
+            lost = body_json(&reply)["lost"].clone();
+            break;
+        }
+    }
+    assert_eq!(lost, serde_json::json!({"reason": "idle_timeout"}));
+    assert!(fx.registry.control(&id).unwrap().check_agent().is_ok());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn input_is_fenced_by_lease_geometry_generation_and_session() {
+    let fx = Fixture::new();
+    let (_a, frames) = fx.open("alpha").await;
+    wait_frame(&frames).await;
+    let (_b, bravo_frames) = fx.open("bravo").await;
+    wait_frame(&bravo_frames).await;
+    let server = fx.control_server().await;
+    let addr = server.addr();
+    let held = take(addr, "alpha").await;
+
+    // A lease on alpha never allows input to bravo.
+    let reply = send_input(addr, "bravo", &held, serde_json::json!([shift(true)])).await;
+    assert_eq!(reply.status, 409);
+    assert_eq!(body_json(&reply)["lost"], serde_json::Value::Null);
+    assert!(fx.input_log("bravo").is_empty());
+
+    // After a size change, pointer events aimed at the old size drop.
+    frames.publish_solid(96, 64, 2);
+    let reply = send_input(
+        addr,
+        "alpha",
+        &held,
+        serde_json::json!([{ "type": "move", "x": 1, "y": 1 }, shift(true), shift(false)]),
+    )
+    .await;
+    assert_eq!(reply.status, 200);
+    let body = body_json(&reply);
+    assert_eq!(body["dropped"]["geometry"], 1);
+    assert_eq!(body["applied"], 2);
+
+    // Reconnect under the same name: the old generation's events drop.
+    fx.registry.close(&"alpha".parse().unwrap()).await.unwrap();
+    let (_a2, frames) = fx.open("alpha").await;
+    wait_frame(&frames).await;
+    let reply = send_input(addr, "alpha", &held, serde_json::json!([shift(true)])).await;
+    assert_eq!(reply.status, 409);
+    assert_eq!(body_json(&reply)["dropped"]["generation"], 1);
+    assert!(
+        fx.input_log("alpha").is_empty(),
+        "the new incarnation got nothing"
+    );
+
+    // Too many events in one request.
+    let many: Vec<serde_json::Value> = (0..65).map(|_| shift(false)).collect();
+    let held = take(addr, "alpha").await;
+    assert_eq!(
+        send_input(addr, "alpha", &held, serde_json::Value::Array(many))
+            .await
+            .status,
+        413
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn read_only_serves_no_write_route_on_any_address() {
+    let fx = Fixture::new();
+    fx.open("alpha").await;
+    let mut listeners = vec![TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap()];
+    if cfg!(target_os = "linux") {
+        let port = listeners[0].local_addr().unwrap().port();
+        listeners.push(
+            TcpListener::bind((Ipv4Addr::new(127, 0, 0, 2), port))
+                .await
+                .unwrap(),
+        );
+    }
+    let server = fx.serve_control(
+        listeners,
+        Duration::from_secs(300),
+        RateLimits::default(),
+        true,
+    );
+    for &addr in &server.addrs {
+        for path in [
+            "/api/sessions/alpha/control",
+            "/api/sessions/alpha/input",
+            "/api/sessions/alpha/recording",
+            "/api/sessions/alpha/annotations",
+            "/api/recordings/20260101T000000Z-0123abcd/keep",
+        ] {
+            let reply = control_post(addr, path, serde_json::json!({"action": "take"})).await;
+            assert_eq!(reply.status, 404, "{path} on {addr}");
+        }
+        let list = body_json(&api(addr, "/api/sessions").await);
+        assert_eq!(list["control"], false);
+        assert_eq!(list["writes"], false);
+    }
+    assert!(fx
+        .registry
+        .control(&"alpha".parse().unwrap())
+        .unwrap()
+        .check_agent()
+        .is_ok());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn control_routes_require_same_origin_json_token_host_size_and_rate() {
+    let fx = Fixture::new();
+    let (id, frames) = fx.open("alpha").await;
+    wait_frame(&frames).await;
+    let mut listeners = vec![TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap()];
+    if cfg!(target_os = "linux") {
+        let port = listeners[0].local_addr().unwrap().port();
+        listeners.push(
+            TcpListener::bind((Ipv4Addr::new(127, 0, 0, 2), port))
+                .await
+                .unwrap(),
+        );
+    }
+    let server = fx.serve_control(
+        listeners,
+        Duration::from_secs(300),
+        RateLimits {
+            events: 400.0,
+            actions: 20.0,
+        },
+        false,
+    );
+    let body = br#"{"action":"take"}"#;
+    for &addr in &server.addrs {
+        let auth = bearer();
+        let own = format!("http://{addr}");
+        for path in ["/api/sessions/alpha/control", "/api/sessions/alpha/input"] {
+            for (name, headers, expected) in [
+                (
+                    "missing origin",
+                    vec![
+                        ("Authorization", auth.as_str()),
+                        ("Content-Type", "application/json"),
+                    ],
+                    403,
+                ),
+                (
+                    "foreign origin",
+                    vec![
+                        ("Authorization", auth.as_str()),
+                        ("Content-Type", "application/json"),
+                        ("Origin", "http://evil.example"),
+                    ],
+                    403,
+                ),
+                (
+                    "same-site not same-origin",
+                    vec![
+                        ("Authorization", auth.as_str()),
+                        ("Content-Type", "application/json"),
+                        ("Origin", own.as_str()),
+                        ("Sec-Fetch-Site", "same-site"),
+                    ],
+                    403,
+                ),
+                (
+                    "form post",
+                    vec![
+                        ("Authorization", auth.as_str()),
+                        ("Content-Type", "text/plain"),
+                        ("Origin", own.as_str()),
+                    ],
+                    415,
+                ),
+                (
+                    "bad token",
+                    vec![
+                        ("Authorization", "Bearer 00"),
+                        ("Content-Type", "application/json"),
+                        ("Origin", own.as_str()),
+                    ],
+                    403,
+                ),
+            ] {
+                let reply = send(addr, "POST", path, &headers, body).await;
+                assert_eq!(reply.status, expected, "{name}: {path} on {addr}");
+            }
+            // Unexpected Host.
+            let reply = request(
+                addr,
+                "POST",
+                path,
+                Some("attacker.example"),
+                &[
+                    ("Authorization", auth.as_str()),
+                    ("Origin", own.as_str()),
+                    ("Content-Length", "0"),
+                ],
+            )
+            .await;
+            assert_eq!(reply.status, 403);
+            // Oversize body.
+            let big = vec![b' '; 9 * 1024];
+            let reply = send(
+                addr,
+                "POST",
+                path,
+                &[
+                    ("Authorization", auth.as_str()),
+                    ("Content-Type", "application/json"),
+                    ("Origin", own.as_str()),
+                ],
+                &big,
+            )
+            .await;
+            assert_eq!(reply.status, 413);
+        }
+    }
+    assert!(
+        fx.registry.control(&id).unwrap().check_agent().is_ok(),
+        "nothing was taken"
+    );
+    // Excess rate: 20 actions per second per session.
+    let addr = server.addr();
+    let mut statuses = Vec::new();
+    for _ in 0..30 {
+        statuses.push(action(addr, "alpha", "heartbeat", "x").await.status);
+    }
+    assert!(statuses.contains(&429), "{statuses:?}");
+}
+
+/// Marker scan: a key code, coordinates, the lease id and the token never
+/// appear in the event log, in the session list or in an error body.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn no_token_lease_key_or_coordinate_reaches_events_or_responses() {
+    let fx = Fixture::new();
+    let (id, frames) = fx.open("alpha").await;
+    frames.publish_solid(640, 480, 1);
+    let server = fx.control_server().await;
+    let addr = server.addr();
+    let held = take(addr, "alpha").await;
+    let marker = serde_json::json!([
+        { "type": "move", "x": 537, "y": 419 },
+        { "type": "key", "code": 0x5E, "extended": true, "down": true },
+        { "type": "key", "code": 0x5E, "extended": true, "down": false },
+    ]);
+    assert_eq!(send_input(addr, "alpha", &held, marker).await.status, 200);
+    let _ = action(addr, "alpha", "release", &held.lease).await;
+    let stale = send_input(addr, "alpha", &held, serde_json::json!([shift(true)])).await;
+    let events = serde_json::to_string(&fx.registry.events(&id).unwrap().after(0)).unwrap();
+    let list = String::from_utf8_lossy(&api(addr, "/api/sessions").await.body).into_owned();
+    let stale = String::from_utf8_lossy(&stale.body).into_owned();
+    for text in [&events, &list, &stale] {
+        // Input fields and secrets; numbers alone could match timestamps
+        // or random ids, so the keys that would carry them are checked.
+        for marker in [
+            "\"x\"",
+            "\"y\"",
+            "\"code\"",
+            "\"extended\"",
+            "\"lease\"",
+            TOKEN,
+            held.lease.as_str(),
+        ] {
+            assert!(!text.contains(marker), "{marker} leaked: {text}");
+        }
+    }
 }
