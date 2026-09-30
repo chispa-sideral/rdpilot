@@ -51,7 +51,7 @@ struct ViewerLayer {
     viewer: ViewerConfig,
 }
 
-fn deserialize_viewer(built: Config) -> Result<ViewerConfig, ConfigError> {
+pub(crate) fn deserialize_viewer(built: Config) -> Result<ViewerConfig, ConfigError> {
     built
         .try_deserialize::<ViewerLayer>()
         .map(|layer| layer.viewer)

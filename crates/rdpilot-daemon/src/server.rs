@@ -32,6 +32,7 @@ use crate::diagnostics::Diagnostics;
 use crate::ipc::ViewerContext;
 use crate::lifecycle::{self, LifecycleConfig, ShutdownSignal};
 use crate::reconcile::{self, JsonReconciliationSink};
+use crate::recording::RecordingService;
 use crate::registry::{Registry, ViewerRegistry};
 use crate::seams::{
     BoxFuture, BundleSource, DaemonError, ManagedCua, ManagedSession, RealConnector,
@@ -74,6 +75,11 @@ const TEST_FRAMES_ENV: &str = "RDPILOT_DAEMON_TEST_FRAMES";
 /// ends its synthetic frame source 4 s after connect, standing in for an
 /// RDP session that the server ended (logoff, network loss).
 const TEST_FRAMES_SERVER_END_HOST: &str = "fake-server-end";
+
+/// Fake-connector-only host value: a fake session connected with this host
+/// shows one frame at connect and one changed frame 1 s later, then keeps
+/// its display unchanged (a still desktop for recording tests).
+const TEST_FRAMES_STILL_HOST: &str = "fake-still";
 
 /// When set (to any value) alongside [`TEST_CONNECTOR_ENV`], every
 /// [`FakeTestSession`] accepts Cua attachments served by [`FakeCua`], an
@@ -197,11 +203,22 @@ async fn run_inner(config: RunConfig) -> Result<(), DaemonError> {
         Arc::new(RealConnector)
     };
 
+    let recordings = RecordingService::from_config();
     let registry = Arc::new(
-        Registry::new(connector, sink.clone() as Arc<dyn ReconciliationSink>)
-            .with_bundle_source(bundles),
+        Registry::with_recordings(
+            connector,
+            sink.clone() as Arc<dyn ReconciliationSink>,
+            Arc::clone(&recordings),
+        )
+        .with_bundle_source(bundles),
     );
     let diagnostics = Diagnostics::from_env().map(Arc::new);
+    // Finish recordings an earlier daemon left open and prune, off the IPC
+    // thread; a failure is logged by the service and never stops the daemon.
+    {
+        let recordings = Arc::clone(&recordings);
+        let _ = tokio::task::spawn_blocking(move || recordings.startup()).await;
+    }
 
     // Startup reconciliation (DAEMON-04): scan + seed BEFORE the accept
     // loop below, so any leftover orphan from a crashed predecessor is
@@ -257,6 +274,7 @@ async fn run_inner(config: RunConfig) -> Result<(), DaemonError> {
     // `shutdown` this loop just observed, so they are already unwinding.
     let _ = reaper_handle.await;
     let _ = watcher_handle.await;
+    recordings.shutdown().await;
 
     if let Ok(path) = crate::ipc::socket_path() {
         let _ = std::fs::remove_file(&path);
@@ -421,6 +439,17 @@ impl SessionConnector for FakeTestConnector {
         let cua = self.cua;
         let frames = self.frames.then(|| {
             let frames = SyntheticFrames::new();
+            if cfg.host() == TEST_FRAMES_STILL_HOST {
+                frames.publish_solid(64, 48, 1);
+                let weak = Arc::downgrade(&frames);
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    if let Some(frames) = weak.upgrade() {
+                        frames.publish_solid(64, 48, 2);
+                    }
+                });
+                return frames;
+            }
             frames.spawn_animation();
             if cfg.host() == TEST_FRAMES_SERVER_END_HOST {
                 let weak = Arc::downgrade(&frames);

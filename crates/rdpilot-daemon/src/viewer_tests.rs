@@ -691,8 +691,8 @@ async fn cross_site_document_navigation_is_allowed_but_api_is_not() {
     );
 }
 
-/// No route reaches input, Cua, transfer, connect or disconnect, and no
-/// method other than GET is served.
+/// No route reaches input, Cua, transfer, connect or disconnect; the
+/// session routes and the page take GET only.
 #[tokio::test]
 async fn no_write_or_control_route_exists() {
     let fx = Fixture::new();
@@ -766,6 +766,9 @@ async fn document_is_self_contained_with_a_per_response_nonce() {
     assert!(!body.contains("__NONCE__"));
     assert!(csp.contains("default-src 'none'") && csp.contains("frame-ancestors 'none'"));
     assert!(csp.contains("connect-src 'self'"));
+    // Replay plays segments from Blob URLs only; nothing broader.
+    assert!(csp.contains("media-src blob:;"));
+    assert_eq!(csp.matches("media-src").count(), 1);
     // No external fetch: no absolute resource URL at all.
     assert!(!body.contains("http://") && !body.contains("https://") && !body.contains("src=\"//"));
     // The page does not embed the token.
@@ -1126,6 +1129,7 @@ fn viewer_modules_never_import_registry_dispatch_or_managed_session() {
         ("auth.rs", include_str!("viewer/auth.rs")),
         ("frames.rs", include_str!("viewer/frames.rs")),
         ("http.rs", include_str!("viewer/http.rs")),
+        ("replay.rs", include_str!("viewer/replay.rs")),
         ("page.html", include_str!("viewer/page.html")),
     ];
     for (name, source) in sources {
@@ -1423,4 +1427,542 @@ async fn events_route_never_carries_arguments_or_the_token() {
     for secret in [MARKER, TOKEN, "/tmp/x", "arguments"] {
         assert!(!body.contains(secret), "{secret} leaked");
     }
+}
+
+// --- Recording routes -------------------------------------------------------
+
+impl Fixture {
+    /// A fixture whose registry records into a temporary root.
+    fn recording(tag: &str) -> (Self, RecRoot) {
+        let root = crate::recording::store::tests::temp_root(tag);
+        let service = crate::recording::RecordingService::fixed(
+            crate::recording::StorageSettings {
+                root: root.clone(),
+                max_fps: 4.0,
+                budget_bytes: 1 << 20,
+            },
+            Arc::new(crate::recording::encoder::tests::FakeFactory::default()),
+            60_000,
+        );
+        let connector = Arc::new(FramedConnector::default());
+        let registry = Arc::new(Registry::with_recordings(
+            Arc::clone(&connector) as Arc<dyn SessionConnector>,
+            Arc::new(NoopReconciliationSink),
+            service,
+        ));
+        (
+            Fixture {
+                registry,
+                connector,
+            },
+            RecRoot(root),
+        )
+    }
+}
+
+/// Removes the recordings root at the end of a test.
+struct RecRoot(std::path::PathBuf);
+
+impl Drop for RecRoot {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Send one request with a body (`Connection: close`).
+async fn send(
+    addr: SocketAddr,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: &[u8],
+) -> Reply {
+    let mut extra: Vec<(&str, String)> =
+        headers.iter().map(|(k, v)| (*k, (*v).to_owned())).collect();
+    extra.push(("Content-Length", body.len().to_string()));
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let mut head = format!("{method} {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n");
+    for (k, v) in &extra {
+        head.push_str(&format!("{k}: {v}\r\n"));
+    }
+    head.push_str("\r\n");
+    stream.write_all(head.as_bytes()).await.unwrap();
+    stream.write_all(body).await.unwrap();
+    let mut raw = Vec::new();
+    tokio::time::timeout(Duration::from_secs(20), stream.read_to_end(&mut raw))
+        .await
+        .expect("reply within 20 s")
+        .unwrap();
+    let split = raw.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+    let head = String::from_utf8_lossy(&raw[..split]).into_owned();
+    let mut lines = head.split("\r\n");
+    let status = lines
+        .next()
+        .unwrap()
+        .split(' ')
+        .nth(1)
+        .unwrap()
+        .parse()
+        .unwrap();
+    let headers = lines
+        .filter_map(|l| l.split_once(':'))
+        .map(|(k, v)| (k.trim().to_owned(), v.trim().to_owned()))
+        .collect();
+    Reply {
+        status,
+        headers,
+        body: raw[split + 4..].to_vec(),
+    }
+}
+
+async fn post_json(addr: SocketAddr, path: &str, body: serde_json::Value) -> Reply {
+    let auth = bearer();
+    send(
+        addr,
+        "POST",
+        path,
+        &[
+            ("Authorization", &auth),
+            ("Content-Type", "application/json"),
+        ],
+        body.to_string().as_bytes(),
+    )
+    .await
+}
+
+fn body_json(reply: &Reply) -> serde_json::Value {
+    serde_json::from_slice(&reply.body).unwrap_or_default()
+}
+
+/// Record `alpha` from the viewer with a few frames, stop, and return the
+/// recording id.
+async fn viewer_recording(fx: &Fixture, addr: SocketAddr) -> String {
+    let (_id, frames) = fx.open("alpha").await;
+    let started = post_json(
+        addr,
+        "/api/sessions/alpha/recording",
+        serde_json::json!({"action":"start"}),
+    )
+    .await;
+    assert_eq!(started.status, 200, "{:?}", body_json(&started));
+    let rid = body_json(&started)["id"].as_str().unwrap().to_owned();
+    for tick in 0..3 {
+        frames.publish_solid(16, 16, tick);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    let note = post_json(
+        addr,
+        "/api/sessions/alpha/annotations",
+        serde_json::json!({"text":"from the page"}),
+    )
+    .await;
+    assert_eq!(note.status, 200);
+    let stopped = post_json(
+        addr,
+        "/api/sessions/alpha/recording",
+        serde_json::json!({"action":"stop"}),
+    )
+    .await;
+    assert_eq!(stopped.status, 200);
+    assert_eq!(body_json(&stopped)["changed"], true);
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    rid
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recording_routes_apply_every_check_on_every_bound_address() {
+    let (fx, _root) = Fixture::recording("viewer-rec-auth");
+    fx.open("alpha").await;
+    let server = two_address_server(&fx).await;
+    let rid = "20260101T000000Z-0123abcd";
+    let reads = [
+        "/api/recordings".to_owned(),
+        format!("/api/recordings/{rid}"),
+        format!("/api/recordings/{rid}/events"),
+        format!("/api/recordings/{rid}/segments/1"),
+    ];
+    let writes = [
+        "/api/sessions/alpha/recording".to_owned(),
+        "/api/sessions/alpha/annotations".to_owned(),
+        format!("/api/recordings/{rid}/keep"),
+    ];
+    for &addr in &server.addrs {
+        let auth = bearer();
+        let own = format!("http://{addr}");
+        for path in reads.iter().chain(&writes) {
+            let method = if reads.contains(path) { "GET" } else { "POST" };
+            for (name, host, headers) in [
+                ("no token", None, vec![("Content-Type", "application/json")]),
+                (
+                    "wrong token",
+                    None,
+                    vec![
+                        ("Authorization", "Bearer 00"),
+                        ("Content-Type", "application/json"),
+                    ],
+                ),
+                (
+                    "foreign origin",
+                    None,
+                    vec![
+                        ("Authorization", auth.as_str()),
+                        ("Origin", "http://evil.example"),
+                        ("Content-Type", "application/json"),
+                    ],
+                ),
+                (
+                    "cross-site",
+                    None,
+                    vec![
+                        ("Authorization", auth.as_str()),
+                        ("Sec-Fetch-Site", "cross-site"),
+                        ("Content-Type", "application/json"),
+                    ],
+                ),
+                (
+                    "rebinding host",
+                    Some("attacker.example"),
+                    vec![
+                        ("Authorization", auth.as_str()),
+                        ("Content-Type", "application/json"),
+                    ],
+                ),
+            ] {
+                let reply = request(
+                    addr,
+                    method,
+                    path,
+                    host,
+                    &[headers.as_slice(), &[("Content-Length", "0")]].concat(),
+                )
+                .await;
+                assert_eq!(reply.status, 403, "{name}: {method} {path} on {addr}");
+                assert!(reply.body.is_empty());
+            }
+            let reply = request(
+                addr,
+                method,
+                &format!("{path}?token={TOKEN}"),
+                None,
+                &[("Content-Length", "0")],
+            )
+            .await;
+            assert_eq!(reply.status, 403, "query token: {path}");
+            // Own origin passes the checks.
+            let ok = request(
+                addr,
+                method,
+                path,
+                None,
+                &[
+                    ("Authorization", auth.as_str()),
+                    ("Origin", own.as_str()),
+                    ("Content-Length", "0"),
+                ],
+            )
+            .await;
+            assert_ne!(ok.status, 403, "{method} {path}");
+        }
+        // Read routes: GET and HEAD only. Write routes: POST only.
+        for path in &reads {
+            for method in ["POST", "PUT", "DELETE", "PATCH", "OPTIONS"] {
+                let reply = request(
+                    addr,
+                    method,
+                    path,
+                    None,
+                    &[("Authorization", auth.as_str()), ("Content-Length", "0")],
+                )
+                .await;
+                assert_eq!(reply.status, 405, "{method} {path}");
+            }
+        }
+        for path in &writes {
+            for method in ["GET", "HEAD", "PUT", "DELETE", "PATCH", "OPTIONS"] {
+                let reply = request(
+                    addr,
+                    method,
+                    path,
+                    None,
+                    &[("Authorization", auth.as_str()), ("Content-Length", "0")],
+                )
+                .await;
+                assert_eq!(reply.status, 405, "{method} {path}");
+            }
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn write_routes_bound_the_body_and_its_type() {
+    let (fx, _root) = Fixture::recording("viewer-rec-body");
+    fx.open("alpha").await;
+    let server = fx.serve_loopback(fast_limits()).await;
+    let addr = server.addr();
+    let auth = bearer();
+    let path = "/api/sessions/alpha/annotations";
+    let reply = send(
+        addr,
+        "POST",
+        path,
+        &[("Authorization", &auth), ("Content-Type", "text/plain")],
+        b"{}",
+    )
+    .await;
+    assert_eq!(reply.status, 415);
+    let reply = send(addr, "POST", path, &[("Authorization", &auth)], b"{}").await;
+    assert_eq!(reply.status, 415);
+    let big = serde_json::json!({ "text": "x".repeat(9000) }).to_string();
+    let reply = send(
+        addr,
+        "POST",
+        path,
+        &[
+            ("Authorization", &auth),
+            ("Content-Type", "application/json"),
+        ],
+        big.as_bytes(),
+    )
+    .await;
+    assert_eq!(reply.status, 413);
+    let reply = send(
+        addr,
+        "POST",
+        path,
+        &[
+            ("Authorization", &auth),
+            ("Content-Type", "application/json"),
+        ],
+        b"{not json",
+    )
+    .await;
+    assert_eq!(reply.status, 400);
+    // Not recording: the refusal is shown, nothing is written.
+    let reply = post_json(addr, path, serde_json::json!({"text":"hello"})).await;
+    assert_eq!(reply.status, 409);
+    assert!(body_json(&reply)["error"]
+        .as_str()
+        .unwrap()
+        .contains("not recording"));
+    let start = post_json(
+        addr,
+        "/api/sessions/alpha/recording",
+        serde_json::json!({"action":"start"}),
+    )
+    .await;
+    assert_eq!(start.status, 200);
+    let over = post_json(addr, path, serde_json::json!({"text": "y".repeat(4097)})).await;
+    assert_eq!(over.status, 400);
+    assert!(body_json(&over)["error"].as_str().unwrap().contains("4096"));
+    let bad = post_json(
+        addr,
+        "/api/sessions/alpha/recording",
+        serde_json::json!({"action":"pause"}),
+    )
+    .await;
+    assert_eq!(bad.status, 400);
+    let missing = post_json(
+        addr,
+        "/api/sessions/ghost/recording",
+        serde_json::json!({"action":"start"}),
+    )
+    .await;
+    assert_eq!(missing.status, 404);
+}
+
+/// The checks run before any body byte is read, and a slow body is cut
+/// off within the header read timeout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bodies_are_read_only_after_the_checks_and_within_the_timeout() {
+    let (fx, _root) = Fixture::recording("viewer-rec-slow");
+    fx.open("alpha").await;
+    let limits = Limits {
+        header_read_timeout: Duration::from_millis(500),
+        ..fast_limits()
+    };
+    let server = fx.serve_loopback(limits).await;
+    let addr = server.addr();
+    // Unauthenticated, announcing a large body that never comes: 403 at once.
+    let started = Instant::now();
+    let reply = request(
+        addr,
+        "POST",
+        "/api/sessions/alpha/annotations",
+        None,
+        &[
+            ("Content-Type", "application/json"),
+            ("Content-Length", "4000"),
+        ],
+    )
+    .await;
+    assert_eq!(reply.status, 403);
+    assert!(started.elapsed() < Duration::from_secs(2));
+    // Authenticated, the body trickles and stalls: closed within the bound.
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let head = format!(
+        "POST /api/sessions/alpha/annotations HTTP/1.1\r\nHost: {addr}\r\nAuthorization: {}\r\nContent-Type: application/json\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{{\"te",
+        bearer()
+    );
+    stream.write_all(head.as_bytes()).await.unwrap();
+    let started = Instant::now();
+    let mut raw = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut raw)).await;
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "{:?}",
+        started.elapsed()
+    );
+    let text = String::from_utf8_lossy(&raw);
+    assert!(
+        text.is_empty() || text.starts_with("HTTP/1.1 408"),
+        "{text}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replay_reads_serve_the_recording_with_ranges_and_reject_bad_ids() {
+    let (fx, _root) = Fixture::recording("viewer-rec-read");
+    let server = fx.serve_loopback(fast_limits()).await;
+    let addr = server.addr();
+    let rid = viewer_recording(&fx, addr).await;
+
+    let list = api(addr, "/api/recordings").await;
+    assert_eq!(list.status, 200);
+    let listed = body_json(&list);
+    assert_eq!(listed["recordings"][0]["id"], rid.as_str());
+    assert_eq!(listed["recordings"][0]["active"], false);
+
+    let detail = body_json(&api(addr, &format!("/api/recordings/{rid}")).await);
+    assert_eq!(detail["manifest"]["codec"], "av1");
+    assert_eq!(detail["manifest"]["trigger"], "viewer");
+    let segments = detail["manifest"]["segments"].as_array().unwrap().len();
+    assert_eq!(segments, 1);
+
+    let events = body_json(&api(addr, &format!("/api/recordings/{rid}/events")).await);
+    let events = events.as_array().unwrap();
+    assert_eq!(events[0]["kind"], "recording_started");
+    assert_eq!(events[0]["source"], "viewer");
+    let note = events.iter().find(|e| e["kind"] == "annotation").unwrap();
+    assert_eq!(note["source"], "viewer");
+    let stop = events.last().unwrap();
+    assert_eq!(
+        (stop["kind"].as_str(), stop["source"].as_str()),
+        (Some("recording_stopped"), Some("viewer"))
+    );
+
+    let seg = format!("/api/recordings/{rid}/segments/1");
+    let full = api(addr, &seg).await;
+    assert_eq!(full.status, 200);
+    assert_eq!(full.header("content-type"), Some("video/webm"));
+    assert_eq!(full.header("accept-ranges"), Some("bytes"));
+    let len = full.body.len();
+    assert!(len > 20);
+    let auth = bearer();
+    let part = request(
+        addr,
+        "GET",
+        &seg,
+        None,
+        &[("Authorization", &auth), ("Range", "bytes=4-9")],
+    )
+    .await;
+    assert_eq!(part.status, 206);
+    assert_eq!(part.body, full.body[4..=9]);
+    assert_eq!(
+        part.header("content-range"),
+        Some(format!("bytes 4-9/{len}").as_str())
+    );
+    let past = request(
+        addr,
+        "GET",
+        &seg,
+        None,
+        &[
+            ("Authorization", &auth),
+            ("Range", &format!("bytes={len}-")),
+        ],
+    )
+    .await;
+    assert_eq!(past.status, 416);
+    let head = request(addr, "HEAD", &seg, None, &[("Authorization", &auth)]).await;
+    assert_eq!(head.status, 200);
+    assert!(head.body.is_empty());
+    assert_eq!(
+        head.header("content-length"),
+        Some(len.to_string().as_str())
+    );
+
+    for bad in [
+        "/api/recordings/..".to_owned(),
+        "/api/recordings/%2e%2e".to_owned(),
+        format!("/api/recordings/{rid}%2f..%2fx"),
+        format!("/api/recordings/{rid}0"),
+        "/api/recordings/20260101T000000Z-ffffffff".to_owned(),
+        format!("/api/recordings/{rid}/segments/0"),
+        format!("/api/recordings/{rid}/segments/2"),
+        format!("/api/recordings/{rid}/segments/1000000"),
+        format!("/api/recordings/{rid}/segments/+1"),
+        format!("/api/recordings/{rid}/segments/..%2f..%2fmanifest.json"),
+        format!("/api/recordings/{rid}/manifest.json"),
+    ] {
+        let reply = api(addr, &bad).await;
+        assert_eq!(reply.status, 404, "{bad}");
+    }
+}
+
+/// Viewer actions do not count as activity; keep and unkeep work from the
+/// page and the list shows kept, active and over-budget states.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn viewer_actions_keep_and_list_without_touching_activity() {
+    let (fx, _root) = Fixture::recording("viewer-rec-keep");
+    let server = fx.serve_loopback(fast_limits()).await;
+    let addr = server.addr();
+    let rid = viewer_recording(&fx, addr).await;
+    let before = fx.registry.list()[0].last_activity.clone();
+    let active = post_json(
+        addr,
+        "/api/sessions/alpha/recording",
+        serde_json::json!({"action":"start"}),
+    )
+    .await;
+    let active_id = body_json(&active)["id"].as_str().unwrap().to_owned();
+    let again = post_json(
+        addr,
+        "/api/sessions/alpha/recording",
+        serde_json::json!({"action":"start"}),
+    )
+    .await;
+    assert_eq!(body_json(&again)["changed"], false);
+    let kept = post_json(
+        addr,
+        &format!("/api/recordings/{rid}/keep"),
+        serde_json::json!({"keep":true}),
+    )
+    .await;
+    assert_eq!(kept.status, 200);
+    assert_eq!(body_json(&kept)["changed"], true);
+    let listed = body_json(&api(addr, "/api/recordings").await);
+    let rows = listed["recordings"].as_array().unwrap();
+    let find = |id: &str| rows.iter().find(|r| r["id"] == id).unwrap().clone();
+    assert_eq!(find(&rid)["kept"], true);
+    assert_eq!(find(&active_id)["active"], true);
+    assert_eq!(listed["kept_over_budget"], false);
+    assert!(listed["kept_bytes"].as_u64().unwrap() > 0);
+    let sessions = body_json(&api(addr, "/api/sessions").await);
+    assert_eq!(sessions["sessions"][0]["recording"], active_id.as_str());
+    let unknown = post_json(
+        addr,
+        "/api/recordings/20260101T000000Z-ffffffff/keep",
+        serde_json::json!({"keep":true}),
+    )
+    .await;
+    assert_eq!(unknown.status, 404);
+    let unkept = post_json(
+        addr,
+        &format!("/api/recordings/{rid}/keep"),
+        serde_json::json!({"keep":false}),
+    )
+    .await;
+    assert_eq!(body_json(&unkept)["changed"], true);
+    assert_eq!(fx.registry.list()[0].last_activity, before);
 }

@@ -40,7 +40,8 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use rdpilot::ConnectionConfig;
 use rdpilot_ipc::{SessionId, SessionLifecycle, SessionStatus};
 
-use crate::events::SessionEvents;
+use crate::events::{CloseReason, EventSource, RecordingTrigger, SessionEvents};
+use crate::recording::{RecordingService, Target};
 use crate::seams::{
     BoxFuture, BundleSource, DaemonError, ManagedSession, NoBundleSource, ReconciliationSink,
     SessionConnector, SessionEntry, ViewFrameSource,
@@ -163,6 +164,7 @@ pub struct Registry {
     sink: Arc<dyn ReconciliationSink>,
     bundles: Arc<dyn BundleSource>,
     next_generation: AtomicU64,
+    recordings: Arc<RecordingService>,
 }
 
 /// Private ownership handle retained until the `Connected` IPC response is
@@ -177,14 +179,61 @@ impl Registry {
     /// Construct an empty registry over the given (injectable — production
     /// wiring in Plan 12-06, fakes in tests) connector and reconciliation
     /// sink.
+    /// Recording is not available in a registry built this way.
     #[must_use]
     pub fn new(connector: Arc<dyn SessionConnector>, sink: Arc<dyn ReconciliationSink>) -> Self {
+        Self::with_recordings(connector, sink, RecordingService::disabled())
+    }
+
+    /// A registry whose sessions can be recorded through `recordings`.
+    #[must_use]
+    pub(crate) fn with_recordings(
+        connector: Arc<dyn SessionConnector>,
+        sink: Arc<dyn ReconciliationSink>,
+        recordings: Arc<RecordingService>,
+    ) -> Self {
         Registry {
             sessions: Mutex::new(HashMap::new()),
             connector,
             sink,
             bundles: Arc::new(NoBundleSource),
             next_generation: AtomicU64::new(1),
+            recordings,
+        }
+    }
+
+    /// The recording service.
+    pub(crate) fn recordings(&self) -> &Arc<RecordingService> {
+        &self.recordings
+    }
+
+    /// What a recording of live session `id` needs, under the brief outer
+    /// lock only (no per-session lock, no activity change).
+    ///
+    /// # Errors
+    ///
+    /// [`DaemonError::SessionNotFound`] or [`DaemonError::StillConnecting`].
+    pub(crate) fn recording_target(&self, id: &SessionId) -> Result<Target, DaemonError> {
+        #[allow(clippy::expect_used)] // A poisoned registry mutex is unrecoverable.
+        let guard = self.sessions.lock().expect("registry mutex poisoned");
+        match guard.get(id) {
+            Some(SessionEntry::Live {
+                events,
+                frame,
+                name,
+                host,
+                ..
+            }) => Ok(Target {
+                events: Arc::clone(events),
+                frame: frame.clone(),
+                session: id.as_str().to_owned(),
+                name: name.clone(),
+                host: host.clone(),
+            }),
+            Some(SessionEntry::Connecting { .. }) => {
+                Err(DaemonError::StillConnecting(id.as_str().to_owned()))
+            }
+            _ => Err(DaemonError::SessionNotFound(id.as_str().to_owned())),
         }
     }
 
@@ -260,17 +309,20 @@ impl Registry {
         host: String,
         cfg: ConnectionConfig,
     ) -> Result<SessionId, DaemonError> {
-        Ok(self.open_tracked(name, host, cfg).await?.id)
+        Ok(self.open_tracked(name, host, cfg, None).await?.0.id)
     }
 
     /// Like [`Registry::open`], but returns an internal exact-generation
-    /// ownership handle for the IPC response path.
+    /// ownership handle for the IPC response path. With `record`, a
+    /// recording starts right after the session is inserted; its outcome
+    /// (the id, or why it could not start) never fails the connect.
     pub(crate) async fn open_tracked(
         &self,
         name: Option<String>,
         host: String,
         cfg: ConnectionConfig,
-    ) -> Result<ConnectLease, DaemonError> {
+        record: Option<RecordingTrigger>,
+    ) -> Result<(ConnectLease, Option<Result<String, String>>), DaemonError> {
         let id = match &name {
             Some(n) => {
                 let id = SessionId::from_str(n).map_err(DaemonError::Connect)?;
@@ -285,7 +337,7 @@ impl Registry {
             Ok(session) => {
                 let frame = session.frame_source();
                 let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
-                let events = Arc::new(SessionEvents::new(&id, generation, frame.clone(), None));
+                let events = Arc::new(SessionEvents::new(&id, generation, frame.clone()));
                 let ended_watch = frame
                     .clone()
                     .map(|frame| crate::events::watch_session_end(frame, Arc::clone(&events)));
@@ -318,7 +370,18 @@ impl Registry {
                     );
                 } // guard dropped here — never held across the .await below
                 self.sink.record_open(&id, &host, &now_wall);
-                Ok(ConnectLease { id, generation })
+                let recording = match record {
+                    Some(trigger) => Some(match self.recording_target(&id) {
+                        Ok(target) => self
+                            .recordings
+                            .start(target, trigger, EventSource::Cli)
+                            .await
+                            .map(|started| started.id),
+                        Err(e) => Err(e.to_string()),
+                    }),
+                    None => None,
+                };
+                Ok((ConnectLease { id, generation }, recording))
             }
             Err(e) => {
                 #[allow(clippy::expect_used)] // A poisoned registry mutex is unrecoverable.
@@ -341,6 +404,20 @@ impl Registry {
     /// `Connecting` placeholder is put back so its upgrade/rollback re-lock
     /// still finds its slot), or the underlying close/join error.
     pub async fn close(&self, id: &SessionId) -> Result<(), DaemonError> {
+        self.close_with(id, CloseReason::Disconnect).await
+    }
+
+    /// Like [`Registry::close`], for the idle reaper: a recording of the
+    /// session ends with the reason `idle_reap`.
+    ///
+    /// # Errors
+    ///
+    /// As for [`Registry::close`].
+    pub async fn close_idle(&self, id: &SessionId) -> Result<(), DaemonError> {
+        self.close_with(id, CloseReason::IdleReap).await
+    }
+
+    async fn close_with(&self, id: &SessionId, reason: CloseReason) -> Result<(), DaemonError> {
         let entry = {
             #[allow(clippy::expect_used)] // A poisoned registry mutex is unrecoverable.
             let mut guard = self.sessions.lock().expect("registry mutex poisoned");
@@ -351,11 +428,13 @@ impl Registry {
             Some(SessionEntry::Live {
                 session,
                 ended_watch,
+                events,
                 ..
             }) => {
                 // Our own close is not a server-side end: stop the watcher
                 // before the session loop is told to stop.
                 drop(ended_watch);
+                self.recordings.session_closed(&events, reason);
                 // Take the SIZED `Box` out of the `Option` (never the
                 // unsized `dyn ManagedSession` itself, which does not
                 // compile out of an `Arc` -- research Pitfall 2) and close
@@ -419,12 +498,15 @@ impl Registry {
         let Some(SessionEntry::Live {
             session,
             ended_watch,
+            events,
             ..
         }) = entry
         else {
             return Ok(false);
         };
         drop(ended_watch);
+        self.recordings
+            .session_closed(&events, CloseReason::ConnectAborted);
         if let Some(session) = session.lock().await.take() {
             session.close().await?;
         }
@@ -560,8 +642,17 @@ impl Registry {
         let guard = self.sessions.lock().expect("registry mutex poisoned");
         guard
             .iter()
-            .map(|(id, entry)| entry.to_status(id))
+            .map(|(id, entry)| self.status_of(id, entry))
             .collect()
+    }
+
+    /// The list entry of `entry`, with its active recording.
+    fn status_of(&self, id: &SessionId, entry: &SessionEntry) -> SessionStatus {
+        let mut status = entry.to_status(id);
+        if let SessionEntry::Live { events, .. } = entry {
+            status.recording = self.recordings.recording_of(&events.header().log_id);
+        }
+        status
     }
 
     /// Insert an `Orphaned` entry directly (no I/O here — used by the
@@ -642,6 +733,23 @@ pub(crate) enum EventsLookup {
     Closed,
 }
 
+/// Why a viewer recording action was refused.
+#[derive(Debug)]
+pub(crate) enum Refusal {
+    /// The session is not in the registry (or still connecting).
+    NoSession(String),
+    /// The request is not possible now (not recording, bad text, busy).
+    Rejected(String),
+    /// Recording could not start (storage, configuration).
+    Unavailable(String),
+}
+
+impl From<DaemonError> for Refusal {
+    fn from(e: DaemonError) -> Self {
+        Refusal::NoSession(e.to_string())
+    }
+}
+
 /// One session as the live viewer sees it: the credential-free list entry
 /// plus its frame source's ended state.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -680,6 +788,44 @@ impl ViewerRegistry {
         self.inner.frame_source(id)
     }
 
+    /// Start recording live session `id` from the viewer. Returns the
+    /// recording id and whether it changed anything.
+    pub(crate) async fn record_start(&self, id: &SessionId) -> Result<(String, bool), Refusal> {
+        let target = self.inner.recording_target(id).map_err(Refusal::from)?;
+        self.inner
+            .recordings
+            .start(target, RecordingTrigger::Viewer, EventSource::Viewer)
+            .await
+            .map(|s| (s.id, s.changed))
+            .map_err(Refusal::Unavailable)
+    }
+
+    /// Stop recording live session `id` from the viewer; `None` when it was
+    /// not recording.
+    pub(crate) fn record_stop(&self, id: &SessionId) -> Result<Option<String>, Refusal> {
+        let target = self.inner.recording_target(id).map_err(Refusal::from)?;
+        Ok(self.inner.recordings.stop(
+            &target.events,
+            EventSource::Viewer,
+            crate::events::StopReason::Requested,
+        ))
+    }
+
+    /// Annotate the active recording of live session `id` from the viewer.
+    pub(crate) fn annotate(&self, id: &SessionId, text: &str) -> Result<String, Refusal> {
+        let target = self.inner.recording_target(id).map_err(Refusal::from)?;
+        self.inner
+            .recordings
+            .annotate(&target.events, EventSource::Viewer, text)
+            .map_err(Refusal::Rejected)
+    }
+
+    /// The recording service (listing, keep and file reads, which the
+    /// viewer runs on blocking threads).
+    pub(crate) fn recordings(&self) -> Arc<RecordingService> {
+        Arc::clone(&self.inner.recordings)
+    }
+
     /// The event log for `id`, read under the registry lock only briefly.
     pub(crate) fn events(&self, id: &SessionId) -> EventsLookup {
         #[allow(clippy::expect_used)] // A poisoned registry mutex is unrecoverable.
@@ -706,7 +852,7 @@ impl Registry {
                     _ => (false, false),
                 };
                 ViewerSession {
-                    status: entry.to_status(id),
+                    status: self.status_of(id, entry),
                     ended,
                     frames,
                 }

@@ -78,6 +78,7 @@ fn request(name: &str) -> Request {
         cua_version: "latest-dev".to_owned(),
         cua_auto_download: true,
         connect_ack: true,
+        record: None,
     }
 }
 

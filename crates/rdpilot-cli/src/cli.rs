@@ -61,9 +61,57 @@ pub enum Command {
     #[command(subcommand)]
     Config(ConfigCmd),
 
-    /// Start the read-only live viewer for the running daemon and print its
-    /// URLs. Runs until Ctrl-C; never starts a daemon.
+    /// Start the live viewer for the running daemon and print its URLs.
+    /// Runs until Ctrl-C; never starts a daemon.
     View(ViewArgs),
+
+    /// Start or stop recording a connected session (`rdpilot record start|stop`).
+    #[command(subcommand)]
+    Record(RecordCmd),
+
+    /// Add a note to a session's active recording.
+    Annotate(AnnotateArgs),
+
+    /// List recordings and mark them keep (`rdpilot recording list|keep|unkeep`).
+    #[command(subcommand)]
+    Recording(RecordingCmd),
+}
+
+/// `record start|stop --session NAME`.
+#[derive(Debug, Subcommand)]
+pub enum RecordCmd {
+    /// Start a new recording of a connected session from now on.
+    Start(SessionArg),
+    /// Stop the session's recording; the session continues.
+    Stop(SessionArg),
+}
+
+/// `annotate --session NAME TEXT`.
+#[derive(Debug, Args)]
+pub struct AnnotateArgs {
+    /// The recording session.
+    #[arg(long)]
+    pub session: String,
+    /// The note (at most 4 KiB).
+    pub text: String,
+}
+
+/// `recording list|keep ID|unkeep ID`.
+#[derive(Debug, Subcommand)]
+pub enum RecordingCmd {
+    /// List recordings with their size and keep mark, and the totals.
+    List,
+    /// Mark a recording keep: it is never deleted automatically.
+    Keep(RecordingIdArg),
+    /// Clear a recording's keep mark: it is subject to the next pruning.
+    Unkeep(RecordingIdArg),
+}
+
+/// A recording id (as shown by `rdpilot recording list`).
+#[derive(Debug, Args)]
+pub struct RecordingIdArg {
+    /// The recording id.
+    pub id: String,
 }
 
 /// `view [--bind loopback|loopback+tailnet] [--tailnet-address <ipv4>]`.
@@ -126,6 +174,26 @@ pub struct ConnectArgs {
     /// Caller-supplied session name; omit for an auto-generated id (D-29).
     #[arg(long)]
     pub name: Option<String>,
+
+    /// Record this session, whatever `[recording]` in config.toml says.
+    #[arg(long, conflicts_with = "no_record")]
+    pub record: bool,
+
+    /// Do not record this session, whatever `[recording]` in config.toml says.
+    #[arg(long = "no-record")]
+    pub no_record: bool,
+}
+
+impl ConnectArgs {
+    /// `Some(true)` for `--record`, `Some(false)` for `--no-record`.
+    #[must_use]
+    pub fn record_flag(&self) -> Option<bool> {
+        match (self.record, self.no_record) {
+            (true, _) => Some(true),
+            (_, true) => Some(false),
+            _ => None,
+        }
+    }
 }
 
 /// The `config` subcommand family.
@@ -378,6 +446,41 @@ mod tests {
         assert!(parse(&["session", "connect", "rdp://u@h"]).is_ok());
         assert!(parse(&["config", "resolve", "web1", "-o", "CuaEnabled=no"]).is_ok());
         assert!(parse(&["connect"]).is_err(), "the target is required");
+    }
+
+    #[test]
+    fn record_flags_conflict_and_recording_verbs_parse() {
+        let flag = |args: &[&str]| {
+            let Command::Connect(c) = parse(args).expect("parses").command else {
+                panic!("expected connect");
+            };
+            c.record_flag()
+        };
+        assert_eq!(flag(&["connect", "web1"]), None);
+        assert_eq!(flag(&["connect", "web1", "--record"]), Some(true));
+        assert_eq!(flag(&["connect", "web1", "--no-record"]), Some(false));
+        assert!(parse(&["connect", "web1", "--record", "--no-record"]).is_err());
+        assert!(parse(&["record", "start", "--session", "a"]).is_ok());
+        assert!(parse(&["record", "stop", "--session", "a"]).is_ok());
+        assert!(
+            parse(&["record", "start"]).is_err(),
+            "--session is required"
+        );
+        let Command::Annotate(a) = parse(&["annotate", "--session", "a", "look here"])
+            .expect("parses")
+            .command
+        else {
+            panic!("expected annotate");
+        };
+        assert_eq!((a.session.as_str(), a.text.as_str()), ("a", "look here"));
+        assert!(
+            parse(&["annotate", "--session", "a"]).is_err(),
+            "text is required"
+        );
+        assert!(parse(&["recording", "list"]).is_ok());
+        assert!(parse(&["recording", "keep", "20260101T000000Z-0123abcd"]).is_ok());
+        assert!(parse(&["recording", "unkeep", "20260101T000000Z-0123abcd"]).is_ok());
+        assert!(parse(&["recording", "keep"]).is_err());
     }
 
     #[test]

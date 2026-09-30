@@ -6,3 +6,11 @@ resolver = "2"
 version = "0.2.0"
 edition = "2021"
 license = "LGPL-3.0-or-later"
+
+# Build the recording encoder optimized and without debug assertions in dev
+# and test builds. (Its generic code still compiles at the caller's level,
+# so a full-HD encode test stays slower than in a release build.)
+[profile.dev.package.rav1e]
+opt-level = 3
+debug-assertions = false
+overflow-checks = false

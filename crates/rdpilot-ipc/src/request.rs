@@ -21,6 +21,11 @@ pub enum Request {
         cua_auto_download: bool,
         #[serde(default)]
         connect_ack: bool,
+        /// Record this session from connect, and why; `None` means off.
+        /// The CLI resolves it from `--record`/`--no-record`, the per-host
+        /// list and the global switch.
+        #[serde(default)]
+        record: Option<WireRecordTrigger>,
     },
     ConnectAck {
         session: SessionId,
@@ -68,6 +73,37 @@ pub enum Request {
         #[serde(default)]
         tailnet_address: Option<String>,
     },
+    /// Start recording a connected session from now on.
+    RecordStart {
+        session: SessionId,
+    },
+    /// Stop the session's active recording; the session continues.
+    RecordStop {
+        session: SessionId,
+    },
+    /// Add a note to the session's active recording (at most 4 KiB).
+    Annotate {
+        session: SessionId,
+        text: String,
+    },
+    /// The recordings on disk with their totals.
+    RecordingList {},
+    /// Mark a recording keep (never pruned) or clear the mark.
+    RecordingKeep {
+        id: String,
+        keep: bool,
+    },
+}
+
+/// Why a session records from connect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WireRecordTrigger {
+    /// `[recording] enabled`.
+    GlobalConfig,
+    /// A `[[recording.hosts]]` entry for the target.
+    HostConfig,
+    /// `rdpilot connect --record`.
+    ConnectFlag,
 }
 /// Which addresses the live viewer binds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -83,7 +119,11 @@ pub trait SessionScoped {
 impl SessionScoped for Request {
     fn session(&self) -> Option<&SessionId> {
         match self {
-            Self::Connect { .. } | Self::List {} | Self::ViewerStart { .. } => None,
+            Self::Connect { .. }
+            | Self::List {}
+            | Self::ViewerStart { .. }
+            | Self::RecordingList {}
+            | Self::RecordingKeep { .. } => None,
             Self::ConnectAck { session }
             | Self::Disconnect { session }
             | Self::Ping { session }
@@ -93,7 +133,10 @@ impl SessionScoped for Request {
             | Self::DesktopSize { session }
             | Self::Put { session, .. }
             | Self::Get { session, .. }
-            | Self::CuaAttach { session } => Some(session),
+            | Self::CuaAttach { session }
+            | Self::RecordStart { session }
+            | Self::RecordStop { session }
+            | Self::Annotate { session, .. } => Some(session),
         }
     }
 }
@@ -113,6 +156,9 @@ mod tests {
             "Put",
             "Get",
             "CuaAttach",
+            "RecordStart",
+            "RecordStop",
+            "Annotate",
         ] {
             assert!(serde_json::from_value::<Request>(serde_json::json!({"op":op})).is_err());
         }
@@ -164,5 +210,66 @@ mod tests {
                 tailnet_address: Some(_)
             }
         ));
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn connect_record_defaults_to_off_and_round_trips() {
+        let json = serde_json::json!({
+            "op": "Connect", "name": null, "host": "h", "port": null,
+            "username": "u", "password": "p", "domain": null,
+            "accept_invalid_certs": false, "cua_enabled": false,
+            "cua_version": "latest-dev", "cua_auto_download": true,
+        });
+        let req: Request = serde_json::from_value(json.clone()).unwrap();
+        assert!(matches!(req, Request::Connect { record: None, .. }));
+        let mut with = json;
+        with["record"] = serde_json::json!("HostConfig");
+        let req: Request = serde_json::from_value(with).unwrap();
+        assert!(matches!(
+            req,
+            Request::Connect {
+                record: Some(WireRecordTrigger::HostConfig),
+                ..
+            }
+        ));
+        assert_eq!(serde_json::to_value(&req).unwrap()["record"], "HostConfig");
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn recording_requests_round_trip_and_scope() {
+        let session: SessionId = "web".parse().unwrap();
+        for req in [
+            Request::RecordStart {
+                session: session.clone(),
+            },
+            Request::RecordStop {
+                session: session.clone(),
+            },
+            Request::Annotate {
+                session: session.clone(),
+                text: "note".into(),
+            },
+        ] {
+            let back: Request =
+                serde_json::from_value(serde_json::to_value(&req).unwrap()).unwrap();
+            assert_eq!(back.session().map(SessionId::as_str), Some("web"));
+        }
+        for req in [
+            Request::RecordingList {},
+            Request::RecordingKeep {
+                id: "20260101T000000Z-0123abcd".into(),
+                keep: true,
+            },
+        ] {
+            let json = serde_json::to_value(&req).unwrap();
+            let back: Request = serde_json::from_value(json).unwrap();
+            assert!(back.session().is_none());
+        }
+        assert!(serde_json::from_value::<Request>(
+            serde_json::json!({"op":"Annotate","session":"web"})
+        )
+        .is_err());
     }
 }

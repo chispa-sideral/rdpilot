@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="referrer" content="no-referrer">
-<title>rdpilot live viewer (read-only)</title>
+<title>rdpilot live viewer</title>
 <style nonce="__NONCE__">
 body { font-family: system-ui, sans-serif; margin: 1rem; background: #f4f4f4; color: #111; }
 h1 { font-size: 1.2rem; margin: 0 0 .5rem 0; }
@@ -25,16 +25,38 @@ canvas { max-width: 100%; height: auto; border: 1px solid #ddd; display: block; 
 .strip .marker { color: #555; font-style: italic; }
 .strip .outcome-error, .strip .outcome-no_reply { color: #a00; }
 .strip .outcome-running { color: #06c; }
+.strip li.seekable, .logs li { cursor: pointer; }
+.rec { font-size: .8rem; margin: .25rem 0; }
+.rec .on { color: #a00; font-weight: bold; }
+.rec input[type=text] { width: 16rem; }
+.rec .msg { color: #555; margin-left: .5rem; }
+.rec .msg.refused { color: #a00; }
+.logs { list-style: none; margin: .25rem 0 0 0; padding: 0; max-height: 12rem; overflow-y: auto; font-size: .8rem; border-top: 1px solid #ddd; font-family: ui-monospace, monospace; }
+.logs li { padding: .1rem 0; border-bottom: 1px solid #eee; white-space: nowrap; }
+.logs li.current { background: #ffe9a8; }
+video { max-width: 100%; height: auto; border: 1px solid #ddd; display: block; background: #000; }
+.controls { font-size: .8rem; margin: .25rem 0; display: flex; gap: .5rem; align-items: center; flex-wrap: wrap; }
+.controls input[type=range] { width: 20rem; }
+#recordings-view { margin-bottom: 1rem; }
+.warn { color: #a00; font-weight: bold; }
 </style>
 </head>
 <body>
-<h1>rdpilot live viewer <span class="note">(read-only)</span></h1>
-<p class="note">This page only shows sessions. It sends no input and cannot connect, disconnect or control a session. Keep the URL private: anyone with it and network access can view the screens. The URL contains the access token, so a reload keeps working.</p>
+<h1>rdpilot live viewer</h1>
+<p class="note">This page shows sessions and their recordings. It sends no input to sessions and cannot connect or disconnect them; it can start and stop recording, annotate and keep recordings. Keep the URL private: anyone with it and network access can view the screens and use these recording controls. The URL contains the access token, so a reload keeps working.</p>
 <p id="error"></p>
 <table>
-<thead><tr><th>session</th><th>name</th><th>host</th><th>status</th><th>connected since</th><th>last activity</th><th></th></tr></thead>
+<thead><tr><th>session</th><th>name</th><th>host</th><th>status</th><th>connected since</th><th>last activity</th><th>recording</th><th></th></tr></thead>
 <tbody id="sessions"></tbody>
 </table>
+<p><button type="button" id="recordings-button">Recordings</button></p>
+<div id="recordings-view" class="hidden">
+<table>
+<thead><tr><th>recording</th><th>session</th><th>host</th><th>start (UTC)</th><th>duration</th><th>size</th><th>active</th><th>kept</th><th></th><th></th></tr></thead>
+<tbody id="recordings"></tbody>
+</table>
+<p class="note" id="recordings-totals"></p>
+</div>
 <div class="panels" id="panels"></div>
 <script nonce="__NONCE__">
 (function () {
@@ -43,7 +65,7 @@ canvas { max-width: 100%; height: auto; border: 1px solid #ddd; display: block; 
   var params = new URLSearchParams(window.location.search);
   var token = params.get("token");
   // Read-only status for tests and the proof harness. It never holds the token.
-  var status = { sessions: {}, list: [], listUpdatedAt: 0, stripRows: stripRows };
+  var status = { sessions: {}, list: [], listUpdatedAt: 0, stripRows: stripRows, recordings: null, replay: null };
   window.rdpilotViewer = status;
   var panels = {};
   var errorEl = document.getElementById("error");
@@ -62,7 +84,7 @@ canvas { max-width: 100%; height: auto; border: 1px solid #ddd; display: block; 
   // The activity strip as rows, newest first. A pure function of the log
   // header and its events (live or recorded): one row per call, "running"
   // until its finish is in the events, plus marker rows.
-  function stripRows(header, events) {
+  function stripRows(header, events, replay) {
     var finished = {};
     events.forEach(function (e) { if (e.kind === "call_finished") { finished[e.call] = e; } });
     var rows = [];
@@ -88,24 +110,31 @@ canvas { max-width: 100%; height: auto; border: 1px solid #ddd; display: block; 
       }
       rows.push(row);
     });
-    if (events.length && events[0].seq > 1) {
+    // A recording holds every event it recorded: no dropped-events marker.
+    if (!replay && events.length && events[0].seq > 1) {
       rows.push({ seq: 0, time: "", source: "", kind: "marker", name: "Older events dropped" });
     }
     return rows.reverse();
   }
 
-  function drawStrip(p) {
-    var rows = stripRows(p.header, p.events);
-    while (p.strip.firstChild) { p.strip.removeChild(p.strip.firstChild); }
+  function drawStrip(p) { fillStrip(p.strip, stripRows(p.header, p.events), null); }
+
+  // Render strip rows; `onPick(seq)` makes rows selectable (replay).
+  function fillStrip(ul, rows, onPick) {
+    while (ul.firstChild) { ul.removeChild(ul.firstChild); }
     rows.forEach(function (row) {
       var li = document.createElement("li");
+      if (onPick && row.seq) {
+        li.className = "seekable";
+        li.addEventListener("click", function () { onPick(row.seq); });
+      }
       li.dataset.kind = row.kind;
       li.dataset.seq = row.seq;
       if (row.kind === "call") {
         li.dataset.call = row.call;
         li.dataset.outcome = row.outcome;
       } else {
-        li.className = "marker";
+        li.className = (li.className ? li.className + " " : "") + "marker";
       }
       [row.time, row.name, row.source, row.outcome, row.duration].forEach(function (value, i) {
         if (value == null || value === "") { return; }
@@ -113,7 +142,7 @@ canvas { max-width: 100%; height: auto; border: 1px solid #ddd; display: block; 
         if (i === 3) { span.className = "outcome-" + value; }
         li.appendChild(text(span, value));
       });
-      p.strip.appendChild(li);
+      ul.appendChild(li);
     });
   }
 
@@ -125,6 +154,7 @@ canvas { max-width: 100%; height: auto; border: 1px solid #ddd; display: block; 
       cell(row, s.id); cell(row, s.name); cell(row, s.host);
       cell(row, s.ended ? "Disconnected" : s.status);
       cell(row, s.connected_since); cell(row, s.last_activity);
+      cell(row, s.recording ? "recording (" + s.recording + ")" : "-");
       var td = document.createElement("td");
       if (s.frames) {
         var button = document.createElement("button");
@@ -153,6 +183,10 @@ canvas { max-width: 100%; height: auto; border: 1px solid #ddd; display: block; 
         status.list = data.sessions;
         status.listUpdatedAt = Date.now();
         renderList(data.sessions);
+        data.sessions.forEach(function (sess) {
+          var p = panels[sess.id];
+          if (p) { showRecording(p, sess.recording || null); }
+        });
       })
       .catch(function (e) { text(errorEl, e.message + " (is rdpilot view still running?)"); })
       .then(function () { window.setTimeout(pollList, 1000); });
@@ -180,13 +214,15 @@ canvas { max-width: 100%; height: auto; border: 1px solid #ddd; display: block; 
     stage.appendChild(banner);
     panel.appendChild(title);
     panel.appendChild(meta);
+    var rec = recordingControls(id);
+    panel.appendChild(rec.el);
     panel.appendChild(stage);
     var strip = document.createElement("ul");
     strip.className = "strip";
     panel.appendChild(strip);
     document.getElementById("panels").appendChild(panel);
     var p = {
-      id: id, el: panel, canvas: canvas, meta: meta, banner: banner, strip: strip, seq: 0, open: true,
+      id: id, el: panel, canvas: canvas, meta: meta, banner: banner, strip: strip, seq: 0, open: true, rec: rec,
       // Aborts this panel's in-flight requests when it closes.
       ctrl: new AbortController(),
       header: null, latest: 0, events: [], eventsDone: false
@@ -194,10 +230,80 @@ canvas { max-width: 100%; height: auto; border: 1px solid #ddd; display: block; 
     panels[id] = p;
     status.sessions[id] = {
       seq: 0, receivedAt: 0, width: 0, height: 0, state: "waiting",
-      logId: null, latest: 0, events: []
+      logId: null, latest: 0, events: [], recording: null
     };
     text(meta, "waiting for the first frame");
+    var listed = status.list.filter(function (x) { return x.id === id; })[0];
+    showRecording(p, listed && listed.recording ? listed.recording : null);
     pollFrame(p);
+  }
+
+  function postJson(url, body) {
+    return fetch(url, {
+      method: "POST", cache: "no-store",
+      headers: { "Authorization": "Bearer " + token, "Content-Type": "application/json" },
+      body: JSON.stringify(body)
+    }).then(function (r) {
+      return r.text().then(function (t) {
+        var data = {};
+        try { data = t ? JSON.parse(t) : {}; } catch (e) { data = {}; }
+        return { ok: r.ok, status: r.status, data: data };
+      });
+    });
+  }
+
+  // The live panel's recording indicator, Start/Stop control and
+  // annotation input. Refusals are shown in the panel.
+  function recordingControls(id) {
+    var el = document.createElement("div");
+    el.className = "rec";
+    var indicator = document.createElement("span");
+    var toggle = document.createElement("button");
+    toggle.type = "button";
+    toggle.className = "record-toggle";
+    var input = document.createElement("input");
+    input.type = "text";
+    input.maxLength = 4096;
+    input.placeholder = "annotation";
+    input.className = "annotation-input";
+    var add = document.createElement("button");
+    add.type = "button";
+    add.className = "annotation-add";
+    text(add, "Add");
+    var msg = document.createElement("span");
+    msg.className = "msg";
+    [indicator, document.createTextNode(" "), toggle, document.createTextNode(" "), input, add, msg]
+      .forEach(function (n) { el.appendChild(n); });
+    var base = "/api/sessions/" + encodeURIComponent(id);
+    function say(message, refused) {
+      text(msg, message);
+      msg.className = refused ? "msg refused" : "msg";
+    }
+    toggle.addEventListener("click", function () {
+      var p = panels[id];
+      var action = p && p.recording ? "stop" : "start";
+      postJson(base + "/recording", { action: action }).then(function (res) {
+        if (!res.ok) { say(res.data.error || ("HTTP " + res.status), true); return; }
+        say(res.data.message, false);
+        if (panels[id]) { showRecording(panels[id], action === "start" ? res.data.id : null); }
+      }).catch(function (e) { say(e.message, true); });
+    });
+    add.addEventListener("click", function () {
+      postJson(base + "/annotations", { text: input.value }).then(function (res) {
+        if (!res.ok) { say(res.data.error || ("HTTP " + res.status), true); return; }
+        input.value = "";
+        say(res.data.message, false);
+      }).catch(function (e) { say(e.message, true); });
+    });
+    return { el: el, indicator: indicator, toggle: toggle, input: input, add: add, msg: msg };
+  }
+
+  function showRecording(p, recordingId) {
+    p.recording = recordingId;
+    if (status.sessions[p.id]) { status.sessions[p.id].recording = recordingId; }
+    text(p.rec.indicator, recordingId ? "Recording (" + recordingId + ")" : "Not recording");
+    p.rec.indicator.className = recordingId ? "on" : "";
+    text(p.rec.toggle, recordingId ? "Stop recording" : "Start recording");
   }
 
   function closePanel(id) {
@@ -305,6 +411,387 @@ canvas { max-width: 100%; height: auto; border: 1px solid #ddd; display: block; 
       pollEvents(p).then(next, next);
     }
     next();
+  }
+
+  // --- Recordings list ------------------------------------------------------
+
+  var recordingsOpen = false;
+
+  function size(bytes) {
+    var units = ["B", "KiB", "MiB", "GiB"];
+    var v = bytes, u = 0;
+    while (v >= 1024 && u < units.length - 1) { v /= 1024; u += 1; }
+    return u === 0 ? bytes + " B" : v.toFixed(1) + " " + units[u];
+  }
+
+  function duration(ms) {
+    var s = Math.floor(ms / 1000);
+    var h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60);
+    s = s % 60;
+    return (h ? h + "h" : "") + (h || m ? pad(m, h ? 2 : 1) + "m" : "") + pad(s, h || m ? 2 : 1) + "s";
+  }
+
+  function setKeep(rid, keep) {
+    return postJson("/api/recordings/" + rid + "/keep", { keep: keep }).then(function (res) {
+      if (!res.ok) { text(errorEl, res.data.error || ("keep: HTTP " + res.status)); }
+      return loadRecordings().then(function () {
+        if (status.replay && status.replay.id === rid) { status.replay.kept = keep; drawReplayKeep(); }
+      });
+    });
+  }
+
+  function renderRecordings(data) {
+    var body = document.getElementById("recordings");
+    while (body.firstChild) { body.removeChild(body.firstChild); }
+    data.recordings.slice().reverse().forEach(function (r) {
+      var row = document.createElement("tr");
+      row.dataset.recording = r.id;
+      cell(row, r.id); cell(row, r.session_name || r.session); cell(row, r.host);
+      cell(row, r.started_at); cell(row, duration(r.duration_ms)); cell(row, size(r.bytes));
+      cell(row, r.active ? "yes" : "no"); cell(row, r.kept ? "kept" : "");
+      var keepTd = document.createElement("td");
+      var keep = document.createElement("button");
+      keep.type = "button";
+      keep.className = "keep-toggle";
+      text(keep, r.kept ? "Unkeep" : "Keep");
+      keep.addEventListener("click", function () { setKeep(r.id, !r.kept); });
+      keepTd.appendChild(keep);
+      row.appendChild(keepTd);
+      var openTd = document.createElement("td");
+      var open = document.createElement("button");
+      open.type = "button";
+      open.className = "open-recording";
+      text(open, "Open");
+      open.addEventListener("click", function () { openReplay(r.id); });
+      openTd.appendChild(open);
+      row.appendChild(openTd);
+      body.appendChild(row);
+    });
+    var totals = document.getElementById("recordings-totals");
+    while (totals.firstChild) { totals.removeChild(totals.firstChild); }
+    totals.appendChild(document.createTextNode(
+      "kept: " + size(data.kept_bytes) + "; unkept: " + size(data.unkept_bytes) + " of " + size(data.budget_bytes) + " budget"));
+    if (data.kept_over_budget) {
+      var w = document.createElement("span");
+      w.className = "warn";
+      text(w, " Kept recordings use more than the budget; nothing is deleted automatically.");
+      totals.appendChild(w);
+    }
+  }
+
+  function loadRecordings() {
+    return fetch("/api/recordings", { headers: authHeaders(), cache: "no-store" })
+      .then(function (r) {
+        if (!r.ok) { throw new Error("recordings: HTTP " + r.status); }
+        return r.json();
+      })
+      .then(function (data) { status.recordings = data; renderRecordings(data); })
+      .catch(function (e) { text(errorEl, e.message); });
+  }
+
+  function pollRecordings() {
+    if (!recordingsOpen) { return; }
+    loadRecordings().then(function () { window.setTimeout(pollRecordings, 5000); });
+  }
+
+  document.getElementById("recordings-button").addEventListener("click", function () {
+    recordingsOpen = !recordingsOpen;
+    document.getElementById("recordings-view").className = recordingsOpen ? "" : "hidden";
+    if (recordingsOpen) { pollRecordings(); }
+  });
+
+  // --- Replay ----------------------------------------------------------------
+  //
+  // One <video> plays the recording's segments from Blob URLs (fetched with
+  // the token header). The position is the segment start plus the video's
+  // current time; between segments (no display change) a clock moves on and
+  // the previous segment's last frame stays on screen.
+
+  var STRIP_KINDS = { call_started: 1, call_finished: 1, cua_attached: 1, cua_detached: 1, session_ended: 1 };
+  var replay = null;
+
+  function segmentNumber(file) { return Number(String(file).split(".")[0]); }
+
+  function utcAt(ms) {
+    if (!replay) { return ""; }
+    var start = Date.parse(replay.manifest.started_at);
+    return isNaN(start) ? "" : new Date(start + ms).toISOString();
+  }
+
+  function logText(e) {
+    var parts = [e.at, e.source, e.kind];
+    ["name", "outcome", "duration_ms", "reason", "trigger", "text", "segment", "width", "height", "count", "attachment"]
+      .forEach(function (k) { if (e[k] != null) { parts.push(k + "=" + e[k]); } });
+    return parts.join("  ");
+  }
+
+  function closeReplay() {
+    if (!replay) { return; }
+    replay.closed = true;
+    window.clearInterval(replay.timer);
+    Object.keys(replay.blobs).forEach(function (k) { URL.revokeObjectURL(replay.blobs[k]); });
+    if (replay.el.parentNode) { replay.el.parentNode.removeChild(replay.el); }
+    replay = null;
+    status.replay = null;
+  }
+
+  function openReplay(rid) {
+    closeReplay();
+    var base = "/api/recordings/" + rid;
+    Promise.all([
+      fetch(base, { headers: authHeaders(), cache: "no-store" }).then(function (r) {
+        if (!r.ok) { throw new Error("recording: HTTP " + r.status); }
+        return r.json();
+      }),
+      fetch(base + "/events", { headers: authHeaders(), cache: "no-store" }).then(function (r) {
+        if (!r.ok) { throw new Error("events: HTTP " + r.status); }
+        return r.json();
+      })
+    ]).then(function (res) { buildReplay(rid, res[0], res[1]); })
+      .catch(function (e) { text(errorEl, e.message); });
+  }
+
+  function buildReplay(rid, detail, events) {
+    var m = detail.manifest;
+    var segments = (m.segments || []).map(function (s) {
+      return { n: segmentNumber(s.file), start: s.start_offset_ms, end: s.end_offset_ms };
+    });
+    var lastEvent = events.length ? events[events.length - 1].offset_ms : 0;
+    var lastSegment = segments.length ? segments[segments.length - 1].end : 0;
+    var total = Math.max(m.duration_ms || 0, lastEvent, lastSegment, 1);
+    var panel = document.createElement("div");
+    panel.className = "panel replay";
+    panel.dataset.recording = rid;
+    var title = document.createElement("h2");
+    text(title, "Recording " + rid + " (" + (m.session.name || m.session.id) + ", " + m.host + ")");
+    var meta = document.createElement("div");
+    meta.className = "meta";
+    var controls = document.createElement("div");
+    controls.className = "controls";
+    var play = document.createElement("button");
+    play.type = "button";
+    play.className = "play";
+    text(play, "Play");
+    var timeline = document.createElement("input");
+    timeline.type = "range";
+    timeline.className = "timeline";
+    timeline.min = "0"; timeline.max = String(total); timeline.step = "1"; timeline.value = "0";
+    var speed = document.createElement("select");
+    speed.className = "speed";
+    ["0.5", "1", "2", "4"].forEach(function (v) {
+      var o = document.createElement("option");
+      o.value = v; text(o, v + "x"); if (v === "1") { o.selected = true; }
+      speed.appendChild(o);
+    });
+    var clock = document.createElement("span");
+    clock.className = "utc";
+    var keep = document.createElement("button");
+    keep.type = "button";
+    keep.className = "replay-keep";
+    var close = document.createElement("button");
+    close.type = "button";
+    text(close, "Close");
+    [play, timeline, speed, clock, keep, close].forEach(function (n) { controls.appendChild(n); });
+    var stage = document.createElement("div");
+    stage.className = "stage";
+    var video = document.createElement("video");
+    video.muted = true;
+    video.preload = "auto";
+    video.playsInline = true;
+    stage.appendChild(video);
+    var strip = document.createElement("ul");
+    strip.className = "strip";
+    var logs = document.createElement("ul");
+    logs.className = "logs";
+    [title, meta, controls, stage, strip, logs].forEach(function (n) { panel.appendChild(n); });
+    var container = document.getElementById("panels");
+    container.insertBefore(panel, container.firstChild);
+
+    replay = {
+      id: rid, manifest: m, events: events, segments: segments, total: total, el: panel,
+      video: video, strip: strip, logs: logs, clock: clock, play: play, timeline: timeline, keepButton: keep,
+      position: 0, playing: false, speed: 1, segment: null, blobs: {}, loading: {}, lastTick: Date.now(),
+      highlighted: 0, closed: false, switching: false
+    };
+    status.replay = {
+      id: rid, position_ms: 0, segment: null, highlighted_seq: 0, playing: false,
+      kept: detail.kept, active: detail.active, total_ms: total, loaded: false, video_loaded: false
+    };
+    text(meta, (detail.active ? "still recording; " : "") + segments.length + " segment(s), " + duration(total) + ", " + events.length + " events");
+    drawReplayKeep();
+
+    events.forEach(function (e) {
+      var li = document.createElement("li");
+      li.dataset.seq = e.seq;
+      li.dataset.offset = e.offset_ms;
+      text(li, logText(e));
+      li.addEventListener("click", function () { seek(e.offset_ms); });
+      logs.appendChild(li);
+    });
+
+    play.addEventListener("click", function () {
+      replay.playing = !replay.playing;
+      if (replay.playing && replay.position >= replay.total) { replay.position = 0; }
+      replay.lastTick = Date.now();
+      text(play, replay.playing ? "Pause" : "Play");
+      sync(true);
+    });
+    timeline.addEventListener("input", function () { seek(Number(timeline.value)); });
+    speed.addEventListener("change", function () {
+      replay.speed = Number(speed.value);
+      video.playbackRate = replay.speed;
+    });
+    keep.addEventListener("click", function () { setKeep(rid, !status.replay.kept); });
+    close.addEventListener("click", closeReplay);
+    video.addEventListener("ended", function () { if (replay) { replay.lastTick = Date.now(); } });
+
+    replay.timer = window.setInterval(tick, 50);
+    seek(0);
+    status.replay.loaded = true;
+  }
+
+  function drawReplayKeep() {
+    if (!replay) { return; }
+    text(replay.keepButton, status.replay.kept ? "Unkeep" : "Keep");
+  }
+
+  function segmentAt(pos) {
+    var found = null;
+    replay.segments.forEach(function (s) { if (pos >= s.start && pos < s.end) { found = s; } });
+    return found;
+  }
+
+  function lastSegmentBefore(pos) {
+    var found = null;
+    replay.segments.forEach(function (s) { if (s.end <= pos) { found = s; } });
+    return found;
+  }
+
+  function blobFor(s) {
+    if (replay.blobs[s.n]) { return Promise.resolve(replay.blobs[s.n]); }
+    if (!replay.loading[s.n]) {
+      var r = replay;
+      r.loading[s.n] = fetch("/api/recordings/" + r.id + "/segments/" + s.n, { headers: authHeaders(), cache: "no-store" })
+        .then(function (res) {
+          if (!res.ok) { throw new Error("segment: HTTP " + res.status); }
+          return res.blob();
+        })
+        .then(function (blob) { var url = URL.createObjectURL(blob); r.blobs[s.n] = url; return url; });
+    }
+    return replay.loading[s.n];
+  }
+
+  // Show segment `s` at `seconds` into it. Only the latest call applies: a
+  // segment download that finishes after a later seek is ignored.
+  function show(s, seconds, playIt) {
+    var r = replay;
+    var ticket = r.showTicket = (r.showTicket || 0) + 1;
+    return blobFor(s).then(function (url) {
+      if (r !== replay || r.closed || ticket !== r.showTicket) { return; }
+      var v = r.video;
+      var apply = function () {
+        if (r !== replay || ticket !== r.showTicket) { return; }
+        var max = isFinite(v.duration) ? Math.max(0, v.duration - 0.001) : seconds;
+        v.currentTime = Math.min(seconds, max);
+        v.playbackRate = r.speed;
+        if (playIt) { v.play().catch(function () {}); } else { v.pause(); }
+        r.switching = false;
+        // draw() does not run while paused: publish the applied segment here.
+        status.replay.segment = r.segment;
+        status.replay.video_loaded = true;
+      };
+      if (r.segment !== s.n) {
+        r.segment = s.n;
+        r.switching = true;
+        v.src = url;
+        v.addEventListener("loadedmetadata", apply, { once: true });
+        v.load();
+      } else if (v.readyState < 1) {
+        // The same segment is still loading: apply once its metadata is in.
+        v.addEventListener("loadedmetadata", apply, { once: true });
+      } else {
+        apply();
+      }
+    });
+  }
+
+  function seek(pos) {
+    if (!replay) { return; }
+    replay.position = Math.max(0, Math.min(pos, replay.total));
+    replay.lastTick = Date.now();
+    sync(true);
+  }
+
+  // Bring the video, strip, logs and clock to the current position.
+  function sync(force) {
+    var r = replay;
+    var pos = r.position;
+    var s = segmentAt(pos);
+    if (r.switching && !force) {
+      draw();
+      return;
+    }
+    if (s) {
+      var want = (pos - s.start) / 1000;
+      var drift = r.segment === s.n ? Math.abs(r.video.currentTime - want) : Infinity;
+      var stateOff = r.video.paused === r.playing && !r.video.ended;
+      if (force || r.segment !== s.n || drift > 0.3 || stateOff) {
+        show(s, want, r.playing);
+      }
+    } else {
+      var before = lastSegmentBefore(pos);
+      if (before && (force || r.segment !== before.n || !r.video.paused)) {
+        show(before, (before.end - before.start) / 1000, false);
+      }
+    }
+    draw();
+  }
+
+  function draw() {
+    var r = replay;
+    var pos = r.position;
+    r.timeline.value = String(Math.round(pos));
+    text(r.clock, utcAt(pos));
+    var upTo = r.events.filter(function (e) { return e.offset_ms <= pos; });
+    var stripEvents = upTo.filter(function (e) { return STRIP_KINDS[e.kind]; });
+    fillStrip(r.strip, stripRows(null, stripEvents, true), function (seq) {
+      var e = r.events.filter(function (x) { return x.seq === seq; })[0];
+      if (e) { seek(e.offset_ms); }
+    });
+    var current = upTo.length ? upTo[upTo.length - 1].seq : 0;
+    if (current !== r.highlighted) {
+      Array.prototype.forEach.call(r.logs.children, function (li) {
+        li.className = Number(li.dataset.seq) === current ? "current" : "";
+        if (Number(li.dataset.seq) === current) { li.scrollIntoView({ block: "nearest" }); }
+      });
+      r.highlighted = current;
+    }
+    var st = status.replay;
+    st.position_ms = pos;
+    st.segment = r.segment;
+    st.highlighted_seq = current;
+    st.playing = r.playing;
+    st.strip_rows = stripEvents.length;
+  }
+
+  function tick() {
+    var r = replay;
+    if (!r || r.closed) { return; }
+    var now = Date.now();
+    var dt = (now - r.lastTick) * r.speed;
+    r.lastTick = now;
+    if (!r.playing) { return; }
+    var s = segmentAt(r.position);
+    if (s && r.segment === s.n && !r.video.paused && !r.video.ended) {
+      r.position = Math.min(s.start + r.video.currentTime * 1000, r.total);
+    } else {
+      r.position = Math.min(r.position + dt, r.total);
+    }
+    if (r.position >= r.total) {
+      r.playing = false;
+      text(r.play, "Play");
+    }
+    sync(false);
   }
 
   if (!token) {

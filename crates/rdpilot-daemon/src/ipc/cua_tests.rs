@@ -548,3 +548,56 @@ async fn native_verbs_record_name_outcome_and_duration_only() {
         })
         .await;
 }
+
+/// With a recording on, Cua messages still cross unchanged (each `exchange`
+/// compares the echo), and the recording holds the calls without any
+/// argument, result or error text.
+#[tokio::test]
+async fn cua_forwarding_is_unchanged_while_recording() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let root = crate::recording::store::tests::temp_root("cua-rec");
+            let service = crate::recording::RecordingService::fixed(
+                crate::recording::StorageSettings {
+                    root: root.clone(),
+                    max_fps: 4.0,
+                    budget_bytes: 1 << 30,
+                },
+                Arc::new(crate::recording::encoder::tests::FakeFactory::default()),
+                60_000,
+            );
+            let registry = Arc::new(Registry::with_recordings(
+                Arc::new(Connector),
+                Arc::new(NoopReconciliationSink),
+                service,
+            ));
+            let id = open(&registry, "rec").await;
+            let started = native(&registry, Request::RecordStart { session: id.clone() }).await;
+            assert!(matches!(started, WireResponse::RecordingChanged { changed: true, .. }));
+            let mut client = server(registry.clone(), 4096);
+            attach(&mut client, id.clone()).await;
+            let _ = read_frame::<_, CuaStreamFrame>(&mut client).await.unwrap();
+            exchange(&mut client, json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"type_text","arguments":{"text":MARKER,MARKER:1}}})).await;
+            exchange(&mut client, json!({"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":MARKER}]}})).await;
+            exchange(&mut client, json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"click"}})).await;
+            exchange(&mut client, json!({"jsonrpc":"2.0","id":2,"error":{"code":-1,"message":MARKER}})).await;
+            write_frame(&mut client, &CuaStreamFrame::Closed { reason: "done".into() })
+                .await
+                .unwrap();
+            let _ = read_frame::<_, CuaStreamFrame>(&mut client).await;
+            let log = registry.events(&id).unwrap();
+            wait_for_kind(&log, |k| matches!(k, EventKind::CuaDetached { .. })).await;
+            native(&registry, Request::RecordStop { session: id.clone() }).await;
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let dir = std::fs::read_dir(&root).unwrap().next().unwrap().unwrap().path();
+            let lines = crate::recording::store::read_events(&dir);
+            let kinds: Vec<&str> = lines.iter().filter_map(|e| e["kind"].as_str()).collect();
+            assert!(kinds.contains(&"cua_attached") && kinds.contains(&"cua_detached"));
+            assert_eq!(kinds.iter().filter(|k| **k == "call_finished").count(), 2);
+            let raw = std::fs::read_to_string(dir.join("events.jsonl")).unwrap();
+            assert!(!raw.contains(MARKER));
+            assert!(!raw.contains("arguments"));
+            let _ = std::fs::remove_dir_all(root);
+        })
+        .await;
+}

@@ -23,6 +23,9 @@
 //!   CLI/MCP client can share them without depending on this crate.
 //! - `events` — the per-session event log (tool and verb names, outcomes
 //!   and timings; never arguments or results) shown by the live viewer.
+//! - `recording` — opt-in session recording: owner-only recording
+//!   directories with a manifest, the persisted event log and AV1/WebM
+//!   video segments, retention and the keep mark.
 //! - [`dispatch`] — `rdpilot-ipc::Request` -> registry ops -> `WireResponse`
 //!   (Plan 12-04).
 //! - [`reconcile`] — disk-persisted crash-restart reconciliation state
@@ -63,6 +66,9 @@ mod events;
 mod ipc;
 mod lifecycle;
 mod reconcile;
+mod recording;
+#[cfg(test)]
+mod recording_tests;
 mod registry;
 mod seams;
 mod server;
@@ -70,6 +76,8 @@ mod synthetic_frames;
 mod viewer;
 #[cfg(test)]
 mod viewer_tests;
+#[cfg(windows)]
+mod win_acl;
 
 pub use reconcile::{scan_orphans, seed_into, JsonReconciliationSink, ReconciliationRecord};
 pub use registry::Registry;
@@ -105,3 +113,27 @@ pub use ipc::{accept_and_authorize, bind, socket_path};
 // `#![cfg(unix)]`).
 #[cfg(unix)]
 pub use rdpilot_ipc::connect_or_spawn;
+
+/// Create an owner-only recording directory, as the recorder does (test
+/// support for the `windows-dacl` job).
+///
+/// # Errors
+///
+/// The underlying I/O error.
+#[cfg(windows)]
+#[doc(hidden)]
+pub fn create_private_recording_dir(path: &std::path::Path) -> std::io::Result<()> {
+    recording::store::create_private_dir(path)
+}
+
+/// Create an owner-only recording file, as the recorder does (test support
+/// for the `windows-dacl` job).
+///
+/// # Errors
+///
+/// The underlying I/O error.
+#[cfg(windows)]
+#[doc(hidden)]
+pub fn create_private_recording_file(path: &std::path::Path) -> std::io::Result<()> {
+    recording::store::open_private_file(path, true, false).map(drop)
+}

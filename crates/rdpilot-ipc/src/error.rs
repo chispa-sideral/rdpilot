@@ -65,6 +65,10 @@ pub enum WireErrorCode {
     /// SESSION-04). Produced by the registry's atomic-insert collision path
     /// (Plan 12-03). Wire string: `duplicate-session`.
     DuplicateSession,
+    /// A recording request that cannot be done: the session is not
+    /// recording, the annotation is empty or over 4 KiB, the recording is
+    /// busy, or the recording id is unknown. Wire string: `recording`.
+    Recording,
     /// A `Connect` with Cua enabled failed before the RDP logon because the
     /// rdpilot-bridge or the Cua driver could not be obtained or verified
     /// (daemon-only concept). The message names the component, version,
@@ -86,6 +90,7 @@ mod tests {
             (WireErrorCode::ChecksumMismatch, "\"checksum-mismatch\""),
             (WireErrorCode::Internal, "\"internal\""),
             (WireErrorCode::DuplicateSession, "\"duplicate-session\""),
+            (WireErrorCode::Recording, "\"recording\""),
             (WireErrorCode::BundleUnavailable, "\"bundle-unavailable\""),
         ];
         for (code, expected) in cases {
@@ -105,6 +110,7 @@ mod tests {
             "\"checksum-mismatch\"",
             "\"internal\"",
             "\"duplicate-session\"",
+            "\"recording\"",
             "\"bundle-unavailable\"",
         ] {
             let code: WireErrorCode = serde_json::from_str(json)?;
