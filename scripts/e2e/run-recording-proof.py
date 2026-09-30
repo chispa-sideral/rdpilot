@@ -28,10 +28,12 @@ input and the Keep toggle.
 
 Live setup (before the first logon of the three users): the taskbar clock
 must be hidden for them, or its minute tick is a display change in the
-still interval. For example, as an administrator on the guest, load
+still interval, and the text caret must not blink, or Notepad's caret is
+one. For example, as an administrator on the guest, load
 C:\Users\Default\NTUSER.DAT and set
 Software\Microsoft\Windows\CurrentVersion\Policies\Explorer HideClock=1
-(REG_DWORD) in it, so every new profile starts without the clock.
+(REG_DWORD) and "Control Panel\Desktop" CursorBlinkRate=-1 (REG_SZ) in it,
+so every new profile starts without the clock and with a steady caret.
 
 Credentials come only from the environment and reach rdpilot only through
 subprocess environment. Recordings are written to the temp directory and
@@ -56,7 +58,10 @@ HERE = Path(__file__).resolve().parent
 LIVE_TARGETS = ("a", "b", "c")
 FAKE_TARGETS = ("a", "b", "c")
 # The live proof waits this long with a still display on a.
-IDLE_S = 135
+IDLE_S = 160
+# The still interval starts this long after the page annotation: the Cua
+# agent cursor overlay fades out about 20 s after the last Cua action.
+SETTLE_MS = 35000
 # A replayed frame must show the typed marker within this time after the
 # typing call finished.
 LEGIBLE_WITHIN_MS = 2000
@@ -514,10 +519,18 @@ class Proof(viewer_proof.Proof):
         await self.endpoints["a"].tool("launch_app", {"path": r"C:\Windows\System32\notepad.exe"})
         window = await self.find_window("a", "Notepad")
         await asyncio.sleep(2)
+        # Background typing reaches Notepad's text area only when it has the
+        # focus: a native click in it gives the focus.
+        editor = await self.notepad_editor("a", window)
+        frame = editor["frame"]
+        await self.cli("input", "click", "--session", "a",
+                       "--x", str(frame["x"] + frame["w"] // 2), "--y", str(frame["y"] + frame["h"] // 2))
+        await asyncio.sleep(1)
+        editor = await self.notepad_editor("a", window)
         before = self.output / "a-native-before-typing.png"
         await self.cli("screenshot", "--session", "a", "--output", str(before))
         marker = self.typed_marker
-        await self.endpoints["a"].tool("type_text", {**window, "text": marker})
+        await self.endpoints["a"].tool("type_text", {**window, "element_token": editor["element_token"], "text": marker})
         typed_at = time.time()
         await asyncio.sleep(1.5)
         native = self.output / "a-native-after-typing.png"
@@ -557,7 +570,17 @@ class Proof(viewer_proof.Proof):
         a = self.events("a")
         self.live_event_checks(a, self.events("b"), failure)
         self.idle_check(a, idle_from, idle_to)
-        self.live_marker = {"typed_at": typed_at, "native": native, "before": before}
+        self.live_marker = {"typed_at": typed_at, "native": native, "before": before, "editor": frame}
+
+    async def notepad_editor(self, target, window):
+        """Notepad's text area from the accessibility tree: element token and screen frame."""
+        e2e = self.e2e
+        state = e2e.structured(await self.endpoints[target].tool(
+            "get_window_state", {**window, "include_screenshot": False, "include_accessibility_tree": True}))
+        editors = [obj for obj in e2e.objects(state)
+                   if "element_token" in obj and obj.get("role") == "Edit" and obj.get("label") == "Text Editor"]
+        require(editors and "frame" in editors[0], f"{target}: Notepad text area not in the accessibility tree")
+        return editors[0]
 
     async def find_window(self, target, title_part):
         e2e, endpoint = self.e2e, self.endpoints[target]
@@ -584,11 +607,11 @@ class Proof(viewer_proof.Proof):
                    b_start=self.excerpt([b[0]]), b_stop=self.excerpt([b[-1]]))
 
     def idle_check(self, events, idle_from, idle_to):
-        """No video frame in the still interval: from 10 s after the page
+        """No video frame in the still interval: from SETTLE_MS after the page
         annotation (the desktop settles) to the end of the idle wait, at
         least 2 minutes."""
         note = next(e for e in events if e["kind"] == "annotation" and e["source"] == "viewer")
-        start = note["offset_ms"] + 10000
+        start = note["offset_ms"] + SETTLE_MS
         end = note["offset_ms"] + round((idle_to - idle_from) * 1000) - 3000
         require(end - start >= 120000, f"a: still interval only {end - start} ms")
         frames = [o for o in self.packet_offsets("a") if start <= o <= end]
@@ -606,10 +629,14 @@ class Proof(viewer_proof.Proof):
         typing = next(e for e in events if e["kind"] == "call_finished" and e.get("name") == "type_text")
         before = np.asarray(Image.open(self.live_marker["before"]).convert("RGB")).astype(int)
         after = np.asarray(Image.open(self.live_marker["native"]).convert("RGB")).astype(int)
-        diff = np.abs(after - before).max(axis=2) > 48
+        # Only the first text line of the editor: the title, the status bar
+        # and the Cua cursor overlay also change when the marker is typed.
+        editor = self.live_marker["editor"]
+        left, top = editor["x"], editor["y"]
+        diff = np.abs(after - before)[top:top + 48, left:left + editor["w"]].max(axis=2) > 48
         ys, xs = np.nonzero(diff)
         require(len(xs) > 50, "no typed marker found in the native screenshots")
-        box = [max(0, xs.min() - 4), max(0, ys.min() - 4), xs.max() + 5, ys.max() + 5]
+        box = [max(0, left + xs.min() - 4), max(0, top + ys.min() - 4), left + xs.max() + 5, top + ys.max() + 5]
         crop_native = after[box[1]:box[3], box[0]:box[2]]
         Image.fromarray(crop_native.astype("uint8")).save(self.output / "marker-crop-native.png")
 
