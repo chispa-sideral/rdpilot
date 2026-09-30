@@ -309,9 +309,9 @@ impl Session {
             _ => Err(Error::dvc("unexpected ping response")),
         }
     }
-    /// Launch the served bridge (`install`, which verifies and installs the
-    /// bundle, then starts the installed copy) through the Run dialog. One
-    /// launch per generation.
+    /// Launch a local copy of the served bridge (`install`, which verifies
+    /// and installs the bundle, then starts the installed copy) through the
+    /// Run dialog; see [`bridge_launch_command`]. One launch per generation.
     pub async fn deploy_and_launch(&self) -> Result<Duration> {
         if self.bridge.ready() {
             return self.ping().await;
@@ -478,12 +478,25 @@ impl Drop for StagedFile {
     }
 }
 
-/// What the Run dialog receives: start the bridge served on the RDPILOT
-/// drive with `install`.
+/// The directory the daemon serves the bundle in, as the guest sees it.
+const SERVED_BUNDLE_DIR: &str = r"\\tsclient\RDPILOT\bundle";
+
+/// What the Run dialog receives. Windows asks for confirmation before it
+/// starts an executable from the redirected drive, so `cmd` first copies the
+/// served bridge into `%LOCALAPPDATA%\rdpilot\launch-<generation>.exe`,
+/// starts that local copy with `install` (which verifies the served bundle and
+/// its own image against the manifest, installs, starts the installed copy
+/// and exits), then deletes the copy. The name is unique per generation, so
+/// concurrent connects of the same user do not share a launcher; a retried
+/// launch for the same generation fails at `copy` while the first launcher
+/// still runs. `&&` chains stop at the first failure, so nothing runs from an
+/// unexpected directory. Only `%LOCALAPPDATA%` can contain spaces; it is
+/// quoted, and every other token is a fixed name or a number.
 fn bridge_launch_command(generation: u64) -> String {
+    let launcher = format!("launch-{generation}.exe");
     format!(
-        r#""\\tsclient\RDPILOT\bundle\{}" install --generation {generation}"#,
-        rdpilot_bridge_protocol::BRIDGE_EXE_NAME
+        r#"cmd /d /c cd /d "%LOCALAPPDATA%" && (md rdpilot 2>nul & cd rdpilot) && copy /y {SERVED_BUNDLE_DIR}\{exe} {launcher} && (.\{launcher} install --generation {generation} & del {launcher})"#,
+        exe = rdpilot_bridge_protocol::BRIDGE_EXE_NAME,
     )
 }
 
@@ -507,14 +520,50 @@ mod tests {
         )
     }
     #[test]
-    fn launch_command_starts_the_served_bridge_without_powershell() {
+    fn launch_command_copies_the_served_bridge_and_starts_the_local_copy() {
         assert_eq!(
             bridge_launch_command(42),
-            r#""\\tsclient\RDPILOT\bundle\rdpilot-bridge.exe" install --generation 42"#
+            r#"cmd /d /c cd /d "%LOCALAPPDATA%" && (md rdpilot 2>nul & cd rdpilot) && copy /y \\tsclient\RDPILOT\bundle\rdpilot-bridge.exe launch-42.exe && (.\launch-42.exe install --generation 42 & del launch-42.exe)"#
         );
-        assert!(!bridge_launch_command(1)
-            .to_lowercase()
-            .contains("powershell"));
+    }
+
+    #[test]
+    fn launch_command_never_starts_an_executable_from_the_redirected_drive() {
+        let command = bridge_launch_command(7);
+        assert!(!command.to_lowercase().contains("powershell"));
+        // The only reference to the drive is the copy source.
+        assert_eq!(command.matches(r"\\tsclient").count(), 1);
+        assert!(command.contains(r"copy /y \\tsclient\RDPILOT\bundle\rdpilot-bridge.exe "));
+        // The started image is the local copy in %LOCALAPPDATA%\rdpilot.
+        assert!(command.contains(r"&& (.\launch-7.exe install --generation 7 "));
+        assert!(command.contains(r#"cd /d "%LOCALAPPDATA%" && (md rdpilot 2>nul & cd rdpilot) &&"#));
+    }
+
+    #[test]
+    fn launch_command_is_unique_per_generation_and_uses_its_full_value() {
+        let generation = u64::MAX;
+        let command = bridge_launch_command(generation);
+        let launcher = format!("launch-{generation}.exe");
+        // copy target, start, delete.
+        assert_eq!(command.matches(&launcher).count(), 3);
+        assert!(command.ends_with(&format!(
+            "install --generation {generation} & del {launcher})"
+        )));
+        assert_ne!(bridge_launch_command(1), bridge_launch_command(2));
+        assert!(!bridge_launch_command(1).contains("launch-2.exe"));
+    }
+
+    #[test]
+    fn launch_command_quoting_is_balanced_and_only_around_localappdata() {
+        let command = bridge_launch_command(123_456_789);
+        // `cmd /c` keeps the line as typed: it does not start with a quote,
+        // so cmd strips no quote characters.
+        assert!(command.starts_with("cmd /d /c cd "));
+        assert_eq!(command.matches('"').count(), 2);
+        assert!(command.contains(r#""%LOCALAPPDATA%""#));
+        assert_eq!(command.matches('(').count(), command.matches(')').count());
+        // Nothing the Run dialog or cmd would treat as another line or pipe.
+        assert!(!command.contains('\n') && !command.contains('|') && !command.contains('^'));
     }
     #[tokio::test]
     async fn native_recovery_stays_available_with_dead_cua_bridge() {

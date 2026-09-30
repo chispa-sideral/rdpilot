@@ -126,6 +126,19 @@ fn extract(archive: &Path, stage: &Path, files: &BTreeMap<String, String>) -> io
     Ok(())
 }
 
+/// Check that `image` (the running launcher, a local copy of the served
+/// bridge) is the bridge that the manifest in `source` names.
+pub fn verify_image(source: &Path, image: &Path) -> io::Result<()> {
+    let manifest = read_manifest(&source.join(MANIFEST_NAME))?;
+    check_hash(image, &manifest.bridge_sha256).map_err(|e| {
+        error(format!(
+            "{} is not the rdpilot-bridge of bundle {}: {e}",
+            image.display(),
+            manifest.bundle_id
+        ))
+    })
+}
+
 /// Install the bundle in `source` under `base` and return the installed
 /// directory. `tag` makes the staging directory name unique per caller.
 pub fn install(source: &Path, base: &Path, tag: &str) -> io::Result<PathBuf> {
@@ -325,6 +338,19 @@ mod tests {
         let again = install(b.source.path(), base.path(), "8").unwrap();
         assert_eq!(again, dir);
         assert_eq!(listing(base.path()), vec![b.manifest.bundle_id.clone()]);
+    }
+
+    #[test]
+    fn the_launcher_must_be_the_bridge_the_manifest_names() {
+        let b = standard();
+        let local = tempfile::tempdir().unwrap();
+        let launcher = local.path().join("launch-7.exe");
+        fs::copy(b.source.path().join(BRIDGE_EXE_NAME), &launcher).unwrap();
+        verify_image(b.source.path(), &launcher).unwrap();
+        fs::write(&launcher, b"MZ other").unwrap();
+        let error = verify_image(b.source.path(), &launcher).unwrap_err();
+        assert!(error.to_string().contains(&b.manifest.bundle_id), "{error}");
+        assert!(verify_image(b.source.path(), &local.path().join("missing.exe")).is_err());
     }
 
     #[test]

@@ -1,6 +1,9 @@
-//! `rdpilot-bridge install --generation N [--source DIR]`: verify and
-//! install the served bundle under `%LOCALAPPDATA%\rdpilot`, then start the
-//! installed copy with `run` and exit.
+//! `rdpilot-bridge install --generation N [--source DIR]`: check that this
+//! image is the bridge the served manifest names, verify and install the
+//! served bundle under `%LOCALAPPDATA%\rdpilot`, then start the installed
+//! copy with `run` and exit. The daemon starts it from a local copy
+//! (`%LOCALAPPDATA%\rdpilot\launch-<generation>.exe`), never from the
+//! redirected drive.
 //!
 //! `rdpilot-bridge run --generation N`: carry the Cua MCP stream for one RDP
 //! session generation (started by `install`).
@@ -38,6 +41,9 @@ fn install(mut args: std::vec::IntoIter<String>) -> std::io::Result<()> {
     if args.next().is_some() {
         return Err(std::io::Error::other(USAGE));
     }
+    // The daemon starts a local copy of the served bridge; it must be the
+    // bridge the served manifest names before it installs anything.
+    install::verify_image(&source, &std::env::current_exe()?)?;
     let dir = install::install(&source, &install::default_base()?, &generation.to_string())?;
     let mut run = std::process::Command::new(dir.join(rdpilot_bridge_protocol::BRIDGE_EXE_NAME));
     run.arg("run")

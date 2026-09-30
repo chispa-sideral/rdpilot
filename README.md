@@ -191,9 +191,13 @@ downloaded from upstream under its own licence; rdpilot does not redistribute
 it. Development bridges and the released bridge are not Authenticode-signed.
 
 **Guest footprint.** The daemon serves the bridge, the archive and a manifest on
-the RDP drive `\\tsclient\RDPILOT\bundle` and types
-`"\\tsclient\RDPILOT\bundle\rdpilot-bridge.exe" install --generation N` into the
-Run dialog. The bridge verifies every file, extracts the archive, installs into
+the RDP drive `\\tsclient\RDPILOT\bundle`. Windows asks for confirmation before
+it starts a program from that drive, so the daemon types a `cmd /d /c` line
+into the Run dialog that copies the served bridge to
+`%LOCALAPPDATA%\rdpilot\launch-<generation>.exe`, starts that copy with
+`install --generation <generation>`, and deletes the copy when it exits. The
+bridge checks its own image and every served file against the manifest,
+extracts the archive, installs into
 `%LOCALAPPDATA%\rdpilot\<bundle id>`, starts `cua-driver.exe mcp --direct`
 there with telemetry disabled, and contains it in a kill-on-close job. It writes
 nothing else: no registry, service, scheduled task, PATH or firewall change
