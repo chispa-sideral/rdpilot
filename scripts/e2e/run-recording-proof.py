@@ -38,7 +38,9 @@ so every new profile starts without the clock and with a steady caret.
 Credentials come only from the environment and reach rdpilot only through
 subprocess environment. Recordings are written to the temp directory and
 deleted at the end; the evidence directory (new, owner-only) holds listings,
-event-log excerpts, figures, crops and browser captures. The viewer token is
+event-log excerpts, figures (among them a's video bytes against the PNG
+bytes of its decoded frames and, on Linux, the recorder threads' CPU time),
+crops and browser captures. The viewer token is
 replaced by <token>, and a final scan fails the run if the token, a
 credential or the argument marker appears in any evidence file. This
 harness provisions nothing: lease the Windows machine with the
@@ -149,6 +151,7 @@ class Proof(viewer_proof.Proof):
         (config / "config.toml").write_text("" if self.fake else '[[recording.hosts]]\nhost = "a"\nenabled = true\n')
         self.ids = {}
         self.page_errors = []
+        self.recorder_threads = {}
 
     # --- rdpilot helpers ------------------------------------------------------
 
@@ -297,6 +300,31 @@ class Proof(viewer_proof.Proof):
                             "colour": [stream.get("color_range"), stream.get("color_space")],
                             "start_offset_ms": seg["start_offset_ms"], "end_offset_ms": seg["end_offset_ms"]})
         return results
+
+    def png_equivalent(self, target):
+        """Total video bytes against the PNG bytes of the same frames: every
+        segment decoded to one PNG per frame (passthrough timing, so the
+        count equals the encoded frames)."""
+        manifest = self.manifest(target)
+        frames = png_bytes = 0
+        out = self.temp / f"png-{target}"
+        for seg in manifest["segments"]:
+            shutil.rmtree(out, ignore_errors=True)
+            out.mkdir(mode=0o700)
+            path = self.rec_dir(target) / "segments" / seg["file"]
+            subprocess.run(["ffmpeg", "-v", "error", "-i", str(path), "-fps_mode", "passthrough",
+                            "-c:v", "png", str(out / "%06d.png")], capture_output=True, text=True,
+                           timeout=600, check=True)
+            pngs = list(out.glob("*.png"))
+            require(len(pngs) == seg["frames"], f"{seg['file']}: {len(pngs)} PNG frames, manifest {seg['frames']}")
+            frames += len(pngs)
+            png_bytes += sum(p.stat().st_size for p in pngs)
+        shutil.rmtree(out, ignore_errors=True)
+        video_bytes = sum(s["bytes"] for s in manifest["segments"])
+        require(frames and video_bytes < png_bytes, f"{target}: video {video_bytes} B not below PNG {png_bytes} B")
+        return {"frames": frames, "video_bytes": video_bytes, "png_bytes": png_bytes,
+                "ratio": round(png_bytes / video_bytes, 1), "size": [manifest["segments"][0]["width"],
+                                                                     manifest["segments"][0]["height"]]}
 
     def packet_offsets(self, target):
         """Recording-timeline offsets (ms) of every video frame on disk."""
@@ -541,6 +569,9 @@ class Proof(viewer_proof.Proof):
                                "end_reason": self.manifest(target).get("end_reason"),
                                "trigger": self.manifest(target).get("trigger")}
             self.write(f"events-{target}.json", json.dumps(self.excerpt(events), indent=2))
+        png = self.png_equivalent("a")
+        self.summary["a_video_vs_png"] = png
+        self.check("a_video_smaller_than_png", **png)
         if self.fake:
             a = self.events("a")
             sources = {(e["kind"], e.get("text")): e["source"] for e in a if e["kind"] == "annotation"}
@@ -739,6 +770,23 @@ class Proof(viewer_proof.Proof):
         self.check("replay_marker_legible_within_2s", typing_call_finished_ms=typing["offset_ms"], crop_box=[int(v) for v in box],
                    browsers=results)
 
+    async def sample_recorder_threads(self):
+        """CPU time of the daemon's recorder threads (the recorder and the
+        encoder pool it starts, which inherit its name), sampled every 0.5 s:
+        a thread that exits loses at most its last interval."""
+        tick = os.sysconf("SC_CLK_TCK")
+        while self.daemon and self.daemon.returncode is None:
+            for task in Path(f"/proc/{self.daemon.pid}/task").glob("*"):
+                try:
+                    stat = (task / "stat").read_text()
+                except OSError:
+                    continue
+                name = stat[stat.index("(") + 1:stat.rindex(")")]
+                if name.startswith("rdpilot-recorde"):
+                    fields = stat[stat.rindex(")") + 2:].split()
+                    self.recorder_threads[task.name] = (int(fields[11]) + int(fields[12])) / tick
+            await asyncio.sleep(0.5)
+
     def cpu_seconds(self):
         if not self.daemon:
             return None
@@ -761,6 +809,7 @@ class Proof(viewer_proof.Proof):
                                                                stdout=daemon_log, stderr=daemon_log)
             await asyncio.sleep(0.3)
             cpu0, t0 = self.cpu_seconds(), time.monotonic()
+            sampler = asyncio.create_task(self.sample_recorder_threads())
             if self.fake:
                 await self.connect_with("a", "--record")
                 await self.connect_with("b", "--no-record")
@@ -780,8 +829,11 @@ class Proof(viewer_proof.Proof):
                     await self.live_flow(browser)
                 await browser.close()
                 cpu = self.cpu_seconds()
+                sampler.cancel()
                 self.summary["daemon_cpu"] = {"seconds": round(cpu - cpu0, 2) if cpu is not None else None,
-                                              "wall_seconds": round(time.monotonic() - t0, 1)}
+                                              "wall_seconds": round(time.monotonic() - t0, 1),
+                                              "recorder_threads_seconds": round(sum(self.recorder_threads.values()), 2),
+                                              "recorder_threads_seen": len(self.recorder_threads)}
                 if self.fake:
                     await self.replay_flow(playwright)
                 else:
