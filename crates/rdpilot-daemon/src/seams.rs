@@ -512,6 +512,40 @@ pub enum DaemonError {
     /// password field).
     #[error("config resolution failed: {0}")]
     Config(String),
+    /// A Cua-enabled connect could not obtain its bundle (fails closed
+    /// before the RDP logon). The message names the component, version,
+    /// architecture, cause and fixes.
+    #[error("{0}")]
+    Bundle(String),
+}
+
+/// Supplies the verified bundle directory a Cua-enabled connect serves.
+/// Called before the RDP logon; an error fails the connect closed.
+pub(crate) trait BundleSource: Send + Sync {
+    fn prepare(
+        &self,
+        request: crate::bundle::BundleRequest,
+    ) -> BoxFuture<'_, Result<crate::bundle::PreparedBundle, crate::bundle::BundleError>>;
+}
+
+/// A source that is never ready. Registries built without a source use it,
+/// so a Cua-enabled connect fails closed instead of reaching the network.
+pub(crate) struct NoBundleSource;
+
+impl BundleSource for NoBundleSource {
+    fn prepare(
+        &self,
+        request: crate::bundle::BundleRequest,
+    ) -> BoxFuture<'_, Result<crate::bundle::PreparedBundle, crate::bundle::BundleError>> {
+        Box::pin(async move {
+            Err(crate::bundle::BundleError {
+                component: crate::bundle::Component::CuaDriver,
+                version: request.cua_version,
+                arch: request.arch,
+                cause: crate::bundle::Cause::Io("no bundle source configured".to_owned()),
+            })
+        })
+    }
 }
 
 /// Owned attachment boundary used by the IPC upgrade and its portable tests.

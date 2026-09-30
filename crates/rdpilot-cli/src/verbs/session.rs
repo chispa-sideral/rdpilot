@@ -86,15 +86,14 @@ pub async fn connect(args: ConnectArgs, json: bool) -> Result<(), CliError> {
 
 /// Human-readable result for a successful connect.
 ///
-/// A session can be usable for basic RDP operations without the optional
-/// bridge executable, but native Cua desktop tools will not
-/// work. Make that degraded mode unmissable instead of presenting it as a
-/// routine connection status.
+/// A Cua-enabled connect either has a live bridge or fails, so a session
+/// without a bridge is one connected with `CuaEnabled no`. Say so plainly:
+/// Cua tools and file transfer are unavailable in it.
 fn connect_status_message(session: &str, bridge_live: bool) -> String {
     if bridge_live {
         format!("connected {session}; bridge live")
     } else {
-        format!("connected {session}; bridge not configured; session management available")
+        format!("connected {session}; native only (CuaEnabled no): no Cua tools or put/get")
     }
 }
 
@@ -202,10 +201,10 @@ mod tests {
     use super::connect_status_message;
 
     #[test]
-    fn bridgeless_status_reports_session_management_only() {
+    fn bridgeless_status_reports_native_only() {
         assert_eq!(
             connect_status_message("desktop", false),
-            "connected desktop; bridge not configured; session management available"
+            "connected desktop; native only (CuaEnabled no): no Cua tools or put/get"
         );
     }
 

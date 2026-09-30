@@ -28,10 +28,11 @@ use rdpilot_ipc::{
     WireMouseAction, WireResponse, IPC_COMPATIBILITY_VERSION,
 };
 
+use crate::bundle::{Arch, BundleRequest};
 use crate::diagnostics::{Diagnostics, Stage};
 use crate::events::CliCall;
 use crate::registry::{ConnectLease, Registry};
-use crate::seams::DaemonError;
+use crate::seams::{BundleSource, DaemonError};
 
 /// Response plus a private cleanup handle retained only by the IPC server
 /// until the response has crossed the local transport.
@@ -72,14 +73,15 @@ pub(crate) struct ConnectFields {
     pub(crate) connect_ack: bool,
 }
 
-/// Open a session. `resolve_bundle` is the daemon-local bridge bundle
-/// lookup, injected so tests need no process-global configuration; it is
-/// never called when `cua_enabled` is false.
+/// Open a session. With `cua_enabled`, `bundles` must supply a verified
+/// bundle before the RDP connection starts; otherwise the connect fails
+/// closed and no RDP session is opened. With `cua_enabled` off, `bundles`
+/// is never asked.
 pub(crate) async fn dispatch_connect(
     registry: &Registry,
     fields: ConnectFields,
     diagnostics: Option<&Diagnostics>,
-    resolve_bundle: impl FnOnce() -> Result<Option<PathBuf>, DaemonError>,
+    bundles: &dyn BundleSource,
 ) -> DispatchOutcome {
     let ConnectFields {
         name,
@@ -90,8 +92,8 @@ pub(crate) async fn dispatch_connect(
         domain,
         accept_invalid_certs,
         cua_enabled,
-        cua_version: _,
-        cua_auto_download: _,
+        cua_version,
+        cua_auto_download,
         connect_ack,
     } = fields;
     let mut cfg = ConnectionConfig::new(host.clone(), username, password)
@@ -118,19 +120,30 @@ pub(crate) async fn dispatch_connect(
         }
     };
     cfg = cfg.share_root(share_root);
-    // The bundle is daemon-local: callers cannot supply arbitrary executable
-    // paths. With `cua_enabled` off the bundle is never resolved, so no
-    // bridge is deployed and the session stays native-only.
+    // The bundle is daemon-local: callers select a Cua version but cannot
+    // supply executable paths. It is prepared before the RDP logon, so a
+    // missing or unverifiable component fails the connect closed. With
+    // `cua_enabled` off no bundle is prepared and the session stays
+    // native-only.
+    let mut warnings = Vec::new();
     let bridge_configured = if cua_enabled {
-        match resolve_bundle() {
-            Ok(Some(bundle_path)) => {
-                cfg = cfg.bundle_path(bundle_path);
+        let request = BundleRequest {
+            cua_version,
+            auto_download: cua_auto_download,
+            arch: Arch::X86_64,
+        };
+        match bundles.prepare(request).await {
+            Ok(bundle) => {
+                cfg = cfg.bundle_path(bundle.dir).bundle_id(bundle.bundle_id);
+                for warning in &bundle.warnings {
+                    eprintln!("rdpilot-daemon: warning: {warning}");
+                }
+                warnings = bundle.warnings;
                 true
             }
-            Ok(None) => false,
             Err(e) => {
                 return DispatchOutcome {
-                    response: WireResponse::Error(e.into()),
+                    response: WireResponse::Error(DaemonError::Bundle(e.to_string()).into()),
                     connect_lease: None,
                 }
             }
@@ -189,7 +202,7 @@ pub(crate) async fn dispatch_connect(
             session,
             connect_ack_required: connect_ack,
             bridge_live: bridge_configured,
-            warnings: Vec::new(),
+            warnings,
         },
         connect_lease: Some(lease),
     }
@@ -239,7 +252,7 @@ pub(crate) async fn dispatch_for_ipc(
                     connect_ack,
                 },
                 diagnostics,
-                resolve_bundle_path,
+                registry.bundle_source(),
             )
             .await;
         }
@@ -364,20 +377,8 @@ fn resolve_share_root() -> Result<PathBuf, DaemonError> {
     Ok(rdpilot_config::share_root_or_default(&resolved))
 }
 
-/// Resolve the daemon-local bridge executable path (Plan 15-06 live-fix),
-/// via the identical file -> env layering as [`resolve_share_root`]. `Ok(None)`
-/// means no bridge path is configured -- a legitimate session-management-only
-/// mode, not an error.
-fn resolve_bundle_path() -> Result<Option<PathBuf>, DaemonError> {
-    let resolved = resolve_identity_config()?;
-    Ok(resolved.bundle_path.map(PathBuf::from))
-}
-
-/// Shared file -> env layered [`rdpilot_config::ResolvedConfig`] resolution
-/// (neither `share_root` nor `bundle_path` is a wire field). Factored out so [`resolve_share_root`] and
-/// [`resolve_bundle_path`] share one resolution call rather than two
-/// independent (and potentially divergent) reads of the same underlying
-/// config layers.
+/// File -> env layered [`rdpilot_config::ResolvedConfig`] resolution
+/// (`share_root` is not a wire field).
 fn resolve_identity_config() -> Result<rdpilot_config::ResolvedConfig, DaemonError> {
     rdpilot_config::resolve().map_err(|e| DaemonError::Config(e.to_string()))
 }
@@ -662,37 +663,72 @@ mod tests {
         }
     }
 
-    /// Run `dispatch_connect` with a resolver that reports a bundle and counts calls.
-    async fn connect_with_bundle(
+    /// A bundle source that counts calls and answers with `result`.
+    struct StubBundles {
+        calls: Arc<AtomicUsize>,
+        result: Result<crate::bundle::PreparedBundle, crate::bundle::BundleError>,
+    }
+
+    impl BundleSource for StubBundles {
+        fn prepare(
+            &self,
+            _request: BundleRequest,
+        ) -> BoxFuture<'_, Result<crate::bundle::PreparedBundle, crate::bundle::BundleError>>
+        {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let result = self.result.clone();
+            Box::pin(async move { result })
+        }
+    }
+
+    fn prepared() -> crate::bundle::PreparedBundle {
+        crate::bundle::PreparedBundle {
+            dir: PathBuf::from("/bundle"),
+            bundle_id: "bundle-under-test".to_owned(),
+            warnings: vec!["using cached Cua".to_owned()],
+        }
+    }
+
+    struct ConnectRun {
+        response: WireResponse,
+        source_calls: usize,
+        connects: usize,
+        deploys: usize,
+        bundles: Vec<Option<PathBuf>>,
+    }
+
+    /// Run `dispatch_connect` against a counting connector and bundle source.
+    async fn run_connect(
         cua_enabled: bool,
-    ) -> (WireResponse, usize, usize, Vec<Option<PathBuf>>) {
+        result: Result<crate::bundle::PreparedBundle, crate::bundle::BundleError>,
+    ) -> ConnectRun {
         let connector = FakeConnector::default();
         let (deploys, bundles) = (connector.deploys.clone(), connector.bundles.clone());
         let registry = Registry::new(Arc::new(connector), Arc::new(NoopReconciliationSink));
-        let resolver_calls = Arc::new(AtomicUsize::new(0));
-        let calls = resolver_calls.clone();
-        let outcome = dispatch_connect(&registry, connect_fields(cua_enabled), None, move || {
-            calls.fetch_add(1, Ordering::SeqCst);
-            Ok(Some(PathBuf::from("/bundle")))
-        })
-        .await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let source = StubBundles {
+            calls: calls.clone(),
+            result,
+        };
+        let outcome = dispatch_connect(&registry, connect_fields(cua_enabled), None, &source).await;
         let recorded = bundles.lock().map(|b| b.clone()).unwrap_or_default();
-        (
-            outcome.response,
-            resolver_calls.load(Ordering::SeqCst),
-            deploys.load(Ordering::SeqCst),
-            recorded,
-        )
+        ConnectRun {
+            response: outcome.response,
+            source_calls: calls.load(Ordering::SeqCst),
+            connects: recorded.len(),
+            deploys: deploys.load(Ordering::SeqCst),
+            bundles: recorded,
+        }
     }
 
     #[tokio::test]
-    async fn cua_disabled_never_resolves_a_bundle_or_deploys_a_bridge() {
-        let (response, resolver_calls, deploys, bundles) = connect_with_bundle(false).await;
-        assert_eq!(resolver_calls, 0, "the bundle resolver must not run");
-        assert_eq!(deploys, 0, "no bridge may be deployed");
-        assert_eq!(bundles, vec![None], "cfg.bundle_path must stay unset");
+    async fn cua_disabled_never_prepares_a_bundle_or_deploys_a_bridge() {
+        let run = run_connect(false, Ok(prepared())).await;
+        assert_eq!(run.source_calls, 0, "the bundle source must not run");
+        assert_eq!(run.deploys, 0, "no bridge may be deployed");
+        assert_eq!(run.bundles, vec![None], "cfg.bundle_path must stay unset");
         assert!(matches!(
-            response,
+            run.response,
             WireResponse::Connected {
                 bridge_live: false,
                 ..
@@ -701,31 +737,55 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cua_enabled_deploys_the_bridge_when_a_bundle_resolves() {
-        let (response, resolver_calls, deploys, bundles) = connect_with_bundle(true).await;
-        assert_eq!(resolver_calls, 1);
-        assert_eq!(deploys, 1);
-        assert_eq!(bundles, vec![Some(PathBuf::from("/bundle"))]);
-        assert!(matches!(
-            response,
+    async fn cua_enabled_deploys_the_prepared_bundle_and_returns_its_warnings() {
+        let run = run_connect(true, Ok(prepared())).await;
+        assert_eq!(run.source_calls, 1);
+        assert_eq!(run.deploys, 1);
+        assert_eq!(run.bundles, vec![Some(PathBuf::from("/bundle"))]);
+        match run.response {
             WireResponse::Connected {
                 bridge_live: true,
+                warnings,
                 ..
-            }
-        ));
+            } => assert_eq!(warnings, vec!["using cached Cua".to_owned()]),
+            other => panic!("expected Connected, got {other:?}"),
+        }
     }
 
     #[tokio::test]
-    async fn cua_enabled_without_a_bundle_stays_native_only() {
-        let registry = test_registry();
-        let outcome = dispatch_connect(&registry, connect_fields(true), None, || Ok(None)).await;
-        assert!(matches!(
-            outcome.response,
-            WireResponse::Connected {
-                bridge_live: false,
-                ..
+    async fn cua_enabled_without_a_bundle_fails_closed_before_any_rdp_session() {
+        let error = crate::bundle::BundleError {
+            component: crate::bundle::Component::CuaDriver,
+            version: "latest-dev".to_owned(),
+            arch: Arch::X86_64,
+            cause: crate::bundle::Cause::Offline("connection refused".to_owned()),
+        };
+        let run = run_connect(true, Err(error)).await;
+        assert_eq!(run.source_calls, 1);
+        assert_eq!(run.connects, 0, "the RDP connector must never be called");
+        assert_eq!(run.deploys, 0);
+        match run.response {
+            WireResponse::Error(WireError { message, .. }) => {
+                assert!(
+                    message.contains("Cua driver latest-dev (x86_64)"),
+                    "{message}"
+                );
+                assert!(message.contains("CuaEnabled=no"), "{message}");
             }
-        ));
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_registry_without_a_bundle_source_fails_cua_connects_closed() {
+        let registry = test_registry();
+        let mut request = connect_request(Some("web"), "10.0.0.5");
+        if let Request::Connect { cua_enabled, .. } = &mut request {
+            *cua_enabled = true;
+        }
+        let response = dispatch(&registry, request).await;
+        assert!(matches!(response, WireResponse::Error(_)), "{response:?}");
+        assert_eq!(registry.len(), 0);
     }
 
     fn connect_request(name: Option<&str>, host: &str) -> Request {
@@ -737,7 +797,7 @@ mod tests {
             password: "pw".to_owned(),
             domain: None,
             accept_invalid_certs: false,
-            cua_enabled: true,
+            cua_enabled: false,
             cua_version: "latest-dev".to_owned(),
             cua_auto_download: true,
             connect_ack: false,

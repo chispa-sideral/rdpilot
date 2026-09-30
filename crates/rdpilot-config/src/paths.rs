@@ -48,9 +48,43 @@ pub fn hosts_file_path() -> Option<PathBuf> {
     config_dir().map(|d| d.join("hosts"))
 }
 
+/// The daemon's download cache: `$XDG_CACHE_HOME/rdpilot` (else
+/// `~/.cache/rdpilot`) on Linux, `%LOCALAPPDATA%\rdpilot\cache` on Windows,
+/// `~/Library/Caches/rdpilot` on macOS. `None` only when no home directory
+/// resolves.
+#[must_use]
+pub fn cache_dir() -> Option<PathBuf> {
+    BaseDirs::new().map(|b| cache_dir_in(b.cache_dir()))
+}
+
+/// [`cache_dir`] below an OS cache root.
+fn cache_dir_in(os_cache_root: &std::path::Path) -> PathBuf {
+    let dir = os_cache_root.join("rdpilot");
+    if cfg!(windows) {
+        // %LOCALAPPDATA% is not cache-only; keep the cache in its own folder.
+        dir.join("cache")
+    } else {
+        dir
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cache_dir_follows_the_platform_convention() {
+        let root = std::path::Path::new("root");
+        let expected = if cfg!(windows) {
+            root.join("rdpilot").join("cache")
+        } else {
+            root.join("rdpilot")
+        };
+        assert_eq!(cache_dir_in(root), expected);
+        if let (Some(cache), Some(base)) = (cache_dir(), BaseDirs::new()) {
+            assert!(cache.starts_with(base.cache_dir()));
+        }
+    }
 
     #[test]
     fn config_file_path_matches_platform_convention() {
