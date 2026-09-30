@@ -17,7 +17,7 @@ th, td { border: 1px solid #ccc; padding: .25rem .5rem; font-size: .85rem; text-
 .stage { position: relative; }
 canvas { max-width: 100%; height: auto; border: 1px solid #ddd; display: block; }
 .banner { position: absolute; left: 0; right: 0; top: 0; padding: .5rem; background: rgba(160, 0, 0, .85); color: #fff; font-weight: bold; }
-.hidden { display: none; }
+.hidden { display: none !important; }
 #error { color: #a00; }
 .strip { list-style: none; margin: .25rem 0 0 0; padding: 0; max-height: 12rem; overflow-y: auto; font-size: .8rem; border-top: 1px solid #ddd; }
 .strip li { padding: .1rem 0; border-bottom: 1px solid #eee; white-space: nowrap; }
@@ -39,14 +39,20 @@ video { max-width: 100%; height: auto; border: 1px solid #ddd; display: block; b
 .controls input[type=range] { width: 20rem; }
 #recordings-view { margin-bottom: 1rem; }
 .warn { color: #a00; font-weight: bold; }
+.control { font-size: .8rem; margin: .25rem 0; display: flex; gap: .5rem; align-items: center; flex-wrap: wrap; }
+.control .notice { color: #a00; font-weight: bold; }
+.control .dropped { color: #555; }
+.panel.holding { outline: 4px solid #d97700; outline-offset: 2px; }
+.panel.holding canvas { cursor: crosshair; }
+canvas:focus { outline: none; }
 </style>
 </head>
 <body>
 <h1>rdpilot live viewer</h1>
-<p class="note">This page shows sessions and their recordings. It sends no input to sessions and cannot connect or disconnect them; it can start and stop recording, annotate and keep recordings. Keep the URL private: anyone with it and network access can view the screens and use these recording controls. The URL contains the access token, so a reload keeps working.</p>
+<p class="note" id="note">This page shows sessions and their recordings. With Takeover, this tab controls a session's keyboard and mouse until it releases control, the agent or another viewer takes over, or the lease ends; it cannot connect or disconnect sessions. It can also start and stop recording, annotate and keep recordings. Keep the URL private: anyone with it and network access can view the screens and take control of every session of this daemon. The URL contains the access token, so a reload keeps working.</p>
 <p id="error"></p>
 <table>
-<thead><tr><th>session</th><th>name</th><th>host</th><th>status</th><th>connected since</th><th>last activity</th><th>recording</th><th></th></tr></thead>
+<thead><tr><th>session</th><th>name</th><th>host</th><th>status</th><th>connected since</th><th>last activity</th><th>recording</th><th>control</th><th></th></tr></thead>
 <tbody id="sessions"></tbody>
 </table>
 <p><button type="button" id="recordings-button">Recordings</button></p>
@@ -65,7 +71,11 @@ video { max-width: 100%; height: auto; border: 1px solid #ddd; display: block; b
   var params = new URLSearchParams(window.location.search);
   var token = params.get("token");
   // Read-only status for tests and the proof harness. It never holds the token.
-  var status = { sessions: {}, list: [], listUpdatedAt: 0, stripRows: stripRows, recordings: null, replay: null };
+  var status = {
+    sessions: {}, list: [], listUpdatedAt: 0, stripRows: stripRows, recordings: null, replay: null,
+    control: false, writes: true, idleTimeoutSecs: 300,
+    scancode: scancode, scalePoint: scalePoint, lossText: lossText, controllerText: controllerText
+  };
   window.rdpilotViewer = status;
   var panels = {};
   var errorEl = document.getElementById("error");
@@ -105,6 +115,14 @@ video { max-width: 100%; height: auto; border: 1px solid #ddd; display: block; b
         row.name = "Cua detached (" + e.reason + ")";
       } else if (e.kind === "session_ended") {
         row.name = "Session ended by the server";
+      } else if (e.kind === "control_taken") {
+        row.name = "Control taken by " + who(e.by);
+      } else if (e.kind === "control_taken_over") {
+        row.name = "Control taken over from " + who(e.from) + " by " + who(e.by);
+      } else if (e.kind === "control_released") {
+        row.name = "Control released by " + who(e.from) + "; the agent controls";
+      } else if (e.kind === "control_ended") {
+        row.name = "Control of " + who(e.from) + " ended (" + String(e.reason).replace(/_/g, " ") + "); the agent controls";
       } else {
         row.name = "Other event";
       }
@@ -115,6 +133,73 @@ video { max-width: 100%; height: auto; border: 1px solid #ddd; display: block; b
       rows.push({ seq: 0, time: "", source: "", kind: "marker", name: "Older events dropped" });
     }
     return rows.reverse();
+  }
+
+  // --- Control: pure helpers (exercised by the proof harness) --------------
+
+  function who(c) {
+    if (!c || c.kind === "agent") { return "the agent"; }
+    return "human viewer " + c.address;
+  }
+
+  // KeyboardEvent.code -> [Set-1 scancode, extended]. Physical key
+  // positions only; unlisted keys are not sent.
+  var SCANCODES = (function () {
+    var t = {
+      Escape: [0x01], Minus: [0x0C], Equal: [0x0D], Backspace: [0x0E], Tab: [0x0F],
+      BracketLeft: [0x1A], BracketRight: [0x1B], Enter: [0x1C], ControlLeft: [0x1D],
+      Semicolon: [0x27], Quote: [0x28], Backquote: [0x29], ShiftLeft: [0x2A], Backslash: [0x2B],
+      Comma: [0x33], Period: [0x34], Slash: [0x35], ShiftRight: [0x36], AltLeft: [0x38],
+      Space: [0x39], CapsLock: [0x3A], F11: [0x57], F12: [0x58], IntlBackslash: [0x56],
+      NumpadEnter: [0x1C, true], ControlRight: [0x1D, true], AltRight: [0x38, true],
+      Home: [0x47, true], ArrowUp: [0x48, true], PageUp: [0x49, true], ArrowLeft: [0x4B, true],
+      ArrowRight: [0x4D, true], End: [0x4F, true], ArrowDown: [0x50, true], PageDown: [0x51, true],
+      Insert: [0x52, true], Delete: [0x53, true]
+    };
+    "QWERTYUIOP".split("").forEach(function (c, i) { t["Key" + c] = [0x10 + i]; });
+    "ASDFGHJKL".split("").forEach(function (c, i) { t["Key" + c] = [0x1E + i]; });
+    "ZXCVBNM".split("").forEach(function (c, i) { t["Key" + c] = [0x2C + i]; });
+    "1234567890".split("").forEach(function (c, i) { t["Digit" + c] = [0x02 + i]; });
+    for (var f = 1; f <= 10; f++) { t["F" + f] = [0x3A + f]; }
+    return t;
+  })();
+
+  function scancode(code) {
+    var s = SCANCODES[code];
+    return s ? { code: s[0], extended: !!s[1] } : null;
+  }
+
+  // A point in the canvas's CSS box -> framebuffer pixels of the frame shown.
+  function scalePoint(cssX, cssY, cssWidth, cssHeight, width, height) {
+    if (!cssWidth || !cssHeight || !width || !height) { return null; }
+    var x = Math.floor(cssX * width / cssWidth);
+    var y = Math.floor(cssY * height / cssHeight);
+    return { x: Math.max(0, Math.min(width - 1, x)), y: Math.max(0, Math.min(height - 1, y)) };
+  }
+
+  function lossText(lost, idleSecs) {
+    if (!lost) { return "Control lost"; }
+    if (lost.by) { return "Taken over by " + who(lost.by); }
+    switch (lost.reason) {
+      case "idle_timeout":
+        var minutes = Math.round(idleSecs / 60);
+        return idleSecs >= 60
+          ? "Ended after " + minutes + " minute" + (minutes === 1 ? "" : "s") + " without input"
+          : "Ended after " + idleSecs + " seconds without input";
+      case "heartbeat_lost": return "Ended: no heartbeat";
+      case "viewer_stopped": return "Ended: the viewer stopped";
+      case "session_ended": return "Session ended";
+      case "daemon_stopped": return "Ended: the daemon stopped";
+      case "released": return "Released";
+      default: return "Control lost";
+    }
+  }
+
+  function controllerText(c, mine) {
+    if (mine) { return "You control this session"; }
+    if (!c || c.kind === "agent") { return "Controlled by the agent"; }
+    var since = c.since ? localTime(c.since).slice(0, 8) : "";
+    return "Controlled by human viewer " + c.address + (since ? " since " + since : "");
   }
 
   function drawStrip(p) { fillStrip(p.strip, stripRows(p.header, p.events), null); }
@@ -155,6 +240,7 @@ video { max-width: 100%; height: auto; border: 1px solid #ddd; display: block; b
       cell(row, s.ended ? "Disconnected" : s.status);
       cell(row, s.connected_since); cell(row, s.last_activity);
       cell(row, s.recording ? "recording (" + s.recording + ")" : "-");
+      cell(row, s.controller ? controllerText(s.controller, !!(panels[s.id] && panels[s.id].lease)) : "-");
       var td = document.createElement("td");
       if (s.frames) {
         var button = document.createElement("button");
@@ -182,10 +268,17 @@ video { max-width: 100%; height: auto; border: 1px solid #ddd; display: block; b
         text(errorEl, "");
         status.list = data.sessions;
         status.listUpdatedAt = Date.now();
+        status.control = !!data.control;
+        status.writes = data.writes !== false;
+        status.idleTimeoutSecs = data.idle_timeout_secs || 300;
         renderList(data.sessions);
         data.sessions.forEach(function (sess) {
           var p = panels[sess.id];
-          if (p) { showRecording(p, sess.recording || null); }
+          if (p) {
+            showRecording(p, sess.recording || null);
+            showControl(p, sess);
+            p.rec.el.className = status.writes ? "rec" : "rec hidden";
+          }
         });
       })
       .catch(function (e) { text(errorEl, e.message + " (is rdpilot view still running?)"); })
@@ -215,6 +308,9 @@ video { max-width: 100%; height: auto; border: 1px solid #ddd; display: block; b
     panel.appendChild(title);
     panel.appendChild(meta);
     var rec = recordingControls(id);
+    rec.el.className = status.writes ? "rec" : "rec hidden";
+    var control = controlBar(id);
+    panel.appendChild(control.el);
     panel.appendChild(rec.el);
     panel.appendChild(stage);
     var strip = document.createElement("ul");
@@ -223,6 +319,7 @@ video { max-width: 100%; height: auto; border: 1px solid #ddd; display: block; b
     document.getElementById("panels").appendChild(panel);
     var p = {
       id: id, el: panel, canvas: canvas, meta: meta, banner: banner, strip: strip, seq: 0, open: true, rec: rec,
+      control: control, lease: null, generation: 0, queue: [], sending: false, heartbeat: null, flushTimer: null,
       // Aborts this panel's in-flight requests when it closes.
       ctrl: new AbortController(),
       header: null, latest: 0, events: [], eventsDone: false
@@ -230,11 +327,14 @@ video { max-width: 100%; height: auto; border: 1px solid #ddd; display: block; b
     panels[id] = p;
     status.sessions[id] = {
       seq: 0, receivedAt: 0, width: 0, height: 0, state: "waiting",
-      logId: null, latest: 0, events: [], recording: null
+      logId: null, latest: 0, events: [], recording: null,
+      control: { held: false, controller: "", notice: "", dropped: 0, applied: 0 }
     };
     text(meta, "waiting for the first frame");
     var listed = status.list.filter(function (x) { return x.id === id; })[0];
     showRecording(p, listed && listed.recording ? listed.recording : null);
+    if (listed) { showControl(p, listed); }
+    captureInput(p);
     pollFrame(p);
   }
 
@@ -298,6 +398,214 @@ video { max-width: 100%; height: auto; border: 1px solid #ddd; display: block; b
     return { el: el, indicator: indicator, toggle: toggle, input: input, add: add, msg: msg };
   }
 
+  // --- Control: Takeover / Release, heartbeat and input capture ------------
+
+  function controlBar(id) {
+    var el = document.createElement("div");
+    el.className = "control";
+    var button = document.createElement("button");
+    button.type = "button";
+    button.className = "takeover";
+    text(button, "Takeover");
+    var line = document.createElement("span");
+    line.className = "controller";
+    var notice = document.createElement("span");
+    notice.className = "notice";
+    var dropped = document.createElement("span");
+    dropped.className = "dropped";
+    [button, line, notice, dropped].forEach(function (n) { el.appendChild(n); });
+    button.addEventListener("click", function () {
+      var p = panels[id];
+      if (!p) { return; }
+      if (p.lease) { release(p); } else { take(p); }
+    });
+    return { el: el, button: button, line: line, notice: notice, dropped: dropped };
+  }
+
+  function controlUrl(p, what) { return "/api/sessions/" + encodeURIComponent(p.id) + "/" + what; }
+
+  function showControl(p, sess) {
+    var usable = status.control && sess.input;
+    p.control.el.className = usable ? "control" : "control hidden";
+    var line = controllerText(sess.controller, !!p.lease);
+    text(p.control.line, line);
+    status.sessions[p.id].control.controller = line;
+  }
+
+  function setHeld(p, grant) {
+    p.lease = grant ? grant.lease : null;
+    p.generation = grant ? grant.generation : 0;
+    p.el.className = grant ? "panel holding" : "panel";
+    text(p.control.button, grant ? "Release" : "Takeover");
+    var st = status.sessions[p.id];
+    if (st) { st.control.held = !!grant; }
+    if (grant) {
+      var line = controllerText(null, true);
+      text(p.control.line, line);
+      if (st) { st.control.controller = line; }
+      p.canvas.tabIndex = 0;
+      p.canvas.focus();
+      if (!p.heartbeat) { p.heartbeat = window.setInterval(function () { beat(p); }, 1000); }
+    } else {
+      p.queue = [];
+      if (p.heartbeat) { window.clearInterval(p.heartbeat); p.heartbeat = null; }
+    }
+  }
+
+  function notice(p, message) {
+    text(p.control.notice, message);
+    var st = status.sessions[p.id];
+    if (st) { st.control.notice = message; }
+  }
+
+  function lost(p, info) {
+    if (!p.lease) { return; }
+    setHeld(p, null);
+    notice(p, lossText(info, status.idleTimeoutSecs));
+    text(p.control.line, "");
+  }
+
+  function take(p) {
+    notice(p, "Taking control...");
+    postJson(controlUrl(p, "control"), { action: "take" }).then(function (res) {
+      if (res.ok) { notice(p, ""); setHeld(p, res.data); return; }
+      notice(p, res.data.error || (res.data.lost ? lossText(res.data.lost, status.idleTimeoutSecs) : "Takeover refused (HTTP " + res.status + ")"));
+    }).catch(function (e) { notice(p, e.message); });
+  }
+
+  function release(p) {
+    var lease = p.lease;
+    setHeld(p, null);
+    notice(p, "");
+    return postJson(controlUrl(p, "control"), { action: "release", lease: lease }).catch(function () {});
+  }
+
+  function answer(p, res) {
+    if (res.status === 409) { lost(p, res.data.lost); return false; }
+    if (res.status === 404) { lost(p, { reason: "session_ended" }); return false; }
+    return res.ok;
+  }
+
+  // A lease-bound control action. A reply for a lease this tab no longer
+  // holds is ignored, so a late 409 cannot drop a newer lease.
+  function command(p, action) {
+    var lease = p.lease;
+    return postJson(controlUrl(p, "control"), { action: action, lease: lease })
+      .then(function (res) { if (p.lease === lease) { answer(p, res); } })
+      .catch(function () {});
+  }
+
+  function beat(p) {
+    if (p.lease) { command(p, "heartbeat"); }
+  }
+
+  function enqueue(p, event) {
+    if (!p.lease) { return; }
+    var last = p.queue[p.queue.length - 1];
+    if (event.type === "move" && last && last.type === "move") { p.queue[p.queue.length - 1] = event; } else { p.queue.push(event); }
+    if (!p.flushTimer) { p.flushTimer = window.setTimeout(function () { p.flushTimer = null; flush(p); }, 30); }
+  }
+
+  // One input request in flight per panel, at most 64 events each.
+  function flush(p) {
+    if (p.sending || !p.lease || !p.queue.length) { return; }
+    var events = p.queue.splice(0, 64);
+    var lease = p.lease;
+    p.sending = true;
+    // Key and button events are never dropped: an unsent batch goes back to
+    // the front of the queue and is retried.
+    function retry(delay) {
+      if (p.lease !== lease) { return; }
+      p.queue = events.concat(p.queue);
+      window.setTimeout(function () { flush(p); }, delay);
+    }
+    postJson(controlUrl(p, "input"), {
+      lease: lease, generation: p.generation,
+      width: p.canvas.width, height: p.canvas.height, events: events
+    }).then(function (res) {
+      p.sending = false;
+      if (p.lease !== lease) { return; }
+      if (res.status === 429 || res.status === 503) { retry(200); return; }
+      if (res.data && res.data.dropped) {
+        var d = res.data.dropped, n = (d.stale || 0) + (d.geometry || 0) + (d.generation || 0);
+        var st = status.sessions[p.id];
+        if (st) { st.control.dropped += n; st.control.applied += res.data.applied || 0; }
+        if (n) { text(p.control.dropped, n + " input event(s) not applied (the screen changed)"); }
+      }
+      if (answer(p, res)) { flush(p); }
+    }).catch(function () { p.sending = false; retry(500); });
+  }
+
+  function captureInput(p) {
+    var c = p.canvas;
+    function point(e) {
+      var r = c.getBoundingClientRect();
+      return scalePoint(e.clientX - r.left, e.clientY - r.top, r.width, r.height, c.width, c.height);
+    }
+    function move(e) {
+      var at = point(e);
+      if (at) { enqueue(p, { type: "move", x: at.x, y: at.y }); }
+    }
+    var BUTTONS = ["left", "middle", "right", "x1", "x2"];
+    c.addEventListener("pointermove", function (e) { if (p.lease) { move(e); } });
+    c.addEventListener("pointerdown", function (e) {
+      if (!p.lease || !BUTTONS[e.button]) { return; }
+      e.preventDefault();
+      c.focus();
+      move(e);
+      enqueue(p, { type: "button", button: BUTTONS[e.button], down: true });
+    });
+    c.addEventListener("pointerup", function (e) {
+      if (!p.lease || !BUTTONS[e.button]) { return; }
+      e.preventDefault();
+      move(e);
+      enqueue(p, { type: "button", button: BUTTONS[e.button], down: false });
+    });
+    c.addEventListener("contextmenu", function (e) { if (p.lease) { e.preventDefault(); } });
+    c.addEventListener("wheel", function (e) {
+      if (!p.lease) { return; }
+      e.preventDefault();
+      move(e);
+      if (e.deltaY) { enqueue(p, { type: "wheel", vertical: true, units: e.deltaY > 0 ? -120 : 120 }); }
+      if (e.deltaX) { enqueue(p, { type: "wheel", vertical: false, units: e.deltaX > 0 ? 120 : -120 }); }
+    }, { passive: false });
+    function key(down) {
+      return function (e) {
+        if (!p.lease) { return; }
+        var s = scancode(e.code);
+        if (!s) { return; }
+        e.preventDefault();
+        enqueue(p, { type: "key", code: s.code, extended: s.extended, down: down });
+      };
+    }
+    c.addEventListener("keydown", key(true));
+    c.addEventListener("keyup", key(false));
+  }
+
+  // Losing focus or visibility releases every held key and button (the
+  // lease stays); leaving the page releases the lease.
+  function blurAll() {
+    Object.keys(panels).forEach(function (id) {
+      var p = panels[id];
+      if (!p.lease) { return; }
+      p.queue = [];
+      command(p, "blur");
+    });
+  }
+  window.addEventListener("blur", blurAll);
+  document.addEventListener("visibilitychange", function () { if (document.hidden) { blurAll(); } });
+  window.addEventListener("pagehide", function () {
+    Object.keys(panels).forEach(function (id) {
+      var p = panels[id];
+      if (!p.lease) { return; }
+      fetch(controlUrl(p, "control"), {
+        method: "POST", keepalive: true, cache: "no-store",
+        headers: { "Authorization": "Bearer " + token, "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "release", lease: p.lease })
+      }).catch(function () {});
+    });
+  });
+
   function showRecording(p, recordingId) {
     p.recording = recordingId;
     if (status.sessions[p.id]) { status.sessions[p.id].recording = recordingId; }
@@ -309,6 +617,7 @@ video { max-width: 100%; height: auto; border: 1px solid #ddd; display: block; b
   function closePanel(id) {
     var p = panels[id];
     if (!p) { return; }
+    if (p.lease) { release(p); }
     p.open = false;
     p.ctrl.abort();
     delete panels[id];
@@ -507,7 +816,10 @@ video { max-width: 100%; height: auto; border: 1px solid #ddd; display: block; b
   // current time; between segments (no display change) a clock moves on and
   // the previous segment's last frame stays on screen.
 
-  var STRIP_KINDS = { call_started: 1, call_finished: 1, cua_attached: 1, cua_detached: 1, session_ended: 1 };
+  var STRIP_KINDS = {
+    call_started: 1, call_finished: 1, cua_attached: 1, cua_detached: 1, session_ended: 1,
+    control_taken: 1, control_taken_over: 1, control_released: 1, control_ended: 1
+  };
   var replay = null;
 
   function segmentNumber(file) { return Number(String(file).split(".")[0]); }
@@ -522,6 +834,7 @@ video { max-width: 100%; height: auto; border: 1px solid #ddd; display: block; b
     var parts = [e.at, e.source, e.kind];
     ["name", "outcome", "duration_ms", "reason", "trigger", "text", "segment", "width", "height", "count", "attachment"]
       .forEach(function (k) { if (e[k] != null) { parts.push(k + "=" + e[k]); } });
+    ["from", "by"].forEach(function (k) { if (e[k]) { parts.push(k + "=" + who(e[k])); } });
     return parts.join("  ");
   }
 
