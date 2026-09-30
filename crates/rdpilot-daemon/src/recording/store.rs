@@ -34,7 +34,6 @@ pub(crate) const MAX_AGE_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 const ID_LEN: usize = 25;
 
 /// Highest segment number.
-#[allow(dead_code)] // The viewer's segment route reads it.
 pub(crate) const MAX_SEGMENT: u32 = 999_999;
 
 pub(crate) const MANIFEST: &str = "manifest.json";
@@ -180,7 +179,6 @@ impl Store {
     }
 
     /// The path of closed segment `n` of recording `id`, when it exists.
-    #[allow(dead_code)] // The viewer's segment route reads it.
     pub(crate) fn segment_path(&self, id: &str, n: u32) -> Option<PathBuf> {
         if !(1..=MAX_SEGMENT).contains(&n) {
             return None;

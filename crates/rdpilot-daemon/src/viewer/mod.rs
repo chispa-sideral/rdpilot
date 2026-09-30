@@ -1,16 +1,19 @@
-//! Read-only live viewer: a small HTTP/1.1 server that shows
-//! the daemon's own session framebuffers in a browser.
+//! Live viewer: a small HTTP/1.1 server that shows the daemon's own session
+//! framebuffers in a browser, controls and annotates their recordings, and
+//! replays recordings. It sends no input to sessions.
 //!
 //! - Off by default. It starts only on an explicit `ViewerStart` IPC request
 //!   (`rdpilot view`) and lives only while that IPC connection stays open.
 //!   One viewer at a time.
 //! - Binds explicit addresses only: `127.0.0.1`, plus this host's Tailscale
 //!   address when the bind set allows it and one is found ([`bind`]).
-//! - Every request passes the Host, Origin/`Sec-Fetch-Site`, token and
-//!   method checks in [`auth`] before routing.
-//! - The viewer receives only [`ViewerRegistry`] (session list and passive
-//!   frame lookup). It has no path to input, Cua, transfer, connect,
-//!   disconnect or activity tracking, and it never takes a per-session lock.
+//! - Every request passes the Host, Origin/`Sec-Fetch-Site` and token
+//!   checks in [`auth`] before routing; the route table allows each route
+//!   its methods only.
+//! - The viewer receives only [`ViewerRegistry`] (session list, passive
+//!   frame lookup, recording actions and recording reads). It has no path
+//!   to input, Cua, transfer, connect, disconnect or activity tracking, and
+//!   it never takes a per-session lock.
 //! - All tasks run on the multi-thread runtime (`tokio::spawn`), and frame
 //!   capture and PNG encoding run in `spawn_blocking`: nothing runs on the
 //!   IPC `LocalSet` thread or on an RDP session thread.
@@ -20,6 +23,7 @@ mod auth;
 mod bind;
 mod frames;
 mod http;
+mod replay;
 
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicBool, Ordering};

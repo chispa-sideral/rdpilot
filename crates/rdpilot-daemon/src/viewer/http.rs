@@ -1,15 +1,22 @@
 //! HTTP/1.1 serving for the live viewer: accept loops, per-connection
-//! bounds, and the closed, read-only route table.
+//! bounds, and the closed route table.
 //!
-//! Routes (GET only, after [`AuthPolicy::check`]):
-//! - `/` — the viewer page (token in `?token=`);
-//! - `/api/sessions` — the session list;
-//! - `/api/sessions/{id}/frame?after=SEQ` — long-poll for a newer frame;
-//! - `/api/sessions/{id}/events?after=SEQ` — the session's retained events
-//!   with `seq > SEQ`, answered immediately (never held open).
+//! Routes (after [`AuthPolicy::check`]):
+//! - GET `/` — the viewer page (token in `?token=`);
+//! - GET `/api/sessions` — the session list;
+//! - GET `/api/sessions/{id}/frame?after=SEQ` — long-poll for a newer frame;
+//! - GET `/api/sessions/{id}/events?after=SEQ` — the session's retained
+//!   events with `seq > SEQ`, answered immediately (never held open);
+//! - POST `/api/sessions/{id}/recording` — start or stop recording;
+//! - POST `/api/sessions/{id}/annotations` — annotate the recording;
+//! - GET/HEAD `/api/recordings`, `/api/recordings/{rid}`,
+//!   `/api/recordings/{rid}/events`, `/api/recordings/{rid}/segments/{n}` —
+//!   replay reads;
+//! - POST `/api/recordings/{rid}/keep` — mark or unmark keep.
 //!
-//! Everything else is 404. No route accepts a body or reaches input, Cua,
-//! transfer, connect or disconnect.
+//! A known route with another method is 405; an unknown path is 404 for
+//! GET and HEAD and 405 otherwise. No route reaches input, Cua, transfer,
+//! connect or disconnect. The POST routes are in [`super::replay`].
 //!
 //! Bounds: at most [`Limits::max_connections`] accepted connections across
 //! all listeners (excess connections are closed at accept); request headers
@@ -31,7 +38,7 @@ use http_body_util::Full;
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
-use hyper::{header, Request, Response, StatusCode};
+use hyper::{header, Method, Request, Response, StatusCode};
 use hyper_util::rt::{TokioIo, TokioTimer};
 use rdpilot_ipc::SessionId;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -42,13 +49,14 @@ use tokio::time::Sleep;
 
 use super::auth::{query_param, AuthPolicy};
 use super::frames::{FrameCache, FrameReply, FRAME_INTERVAL};
+use super::replay;
 use super::GateGuard;
 use crate::registry::{EventsLookup, ViewerRegistry};
 
 /// The page. `__NONCE__` is replaced per response.
 const PAGE: &str = include_str!("page.html");
 
-type Body = Full<Bytes>;
+pub(crate) type Body = Full<Bytes>;
 
 /// Per-connection and per-request bounds.
 #[derive(Debug, Clone, Copy)]
@@ -166,54 +174,165 @@ async fn serve_connection(stream: TcpStream, state: Arc<ServerState>) {
         .await;
 }
 
+/// A parsed route.
+enum Route {
+    Document,
+    Sessions,
+    Frame(SessionId),
+    Events(SessionId),
+    Record(SessionId),
+    Annotate(SessionId),
+    Recordings,
+    Recording(String),
+    RecordingEvents(String),
+    Segment(String, u32),
+    Keep(String),
+    /// A known path whose id does not parse.
+    BadId,
+}
+
+impl Route {
+    /// The methods this route takes.
+    fn allows(&self, method: &Method) -> bool {
+        match self {
+            // Unknown or malformed ids are 404 whatever the method.
+            Route::BadId => true,
+            Route::Document | Route::Sessions | Route::Frame(_) | Route::Events(_) => {
+                method == Method::GET
+            }
+            Route::Record(_) | Route::Annotate(_) | Route::Keep(_) => method == Method::POST,
+            Route::Recordings
+            | Route::Recording(_)
+            | Route::RecordingEvents(_)
+            | Route::Segment(..) => method == Method::GET || method == Method::HEAD,
+        }
+    }
+}
+
+fn session_id(raw: &str) -> Option<SessionId> {
+    percent_decode(raw)
+        .filter(|id| !id.contains('/'))
+        .and_then(|id| id.parse::<SessionId>().ok())
+}
+
+fn recording_id(raw: &str) -> Option<String> {
+    crate::recording::store::valid_id(raw).then(|| raw.to_owned())
+}
+
+fn parse_route(path: &str) -> Option<Route> {
+    if path == "/" {
+        return Some(Route::Document);
+    }
+    if path == "/api/sessions" {
+        return Some(Route::Sessions);
+    }
+    if path == "/api/recordings" {
+        return Some(Route::Recordings);
+    }
+    if let Some(rest) = path.strip_prefix("/api/sessions/") {
+        let (raw, tail) = rest.rsplit_once('/')?;
+        let make: fn(SessionId) -> Route = match tail {
+            "frame" => Route::Frame,
+            "events" => Route::Events,
+            "recording" => Route::Record,
+            "annotations" => Route::Annotate,
+            _ => return None,
+        };
+        return Some(session_id(raw).map_or(Route::BadId, make));
+    }
+    if let Some(rest) = path.strip_prefix("/api/recordings/") {
+        let mut parts = rest.split('/');
+        let raw = parts.next()?;
+        let route = match (parts.next(), parts.next(), parts.next()) {
+            (None, _, _) => recording_id(raw).map(Route::Recording),
+            (Some("events"), None, _) => recording_id(raw).map(Route::RecordingEvents),
+            (Some("keep"), None, _) => recording_id(raw).map(Route::Keep),
+            (Some("segments"), Some(n), None) => {
+                let number = n
+                    .parse::<u32>()
+                    .ok()
+                    .filter(|n| (1..=crate::recording::store::MAX_SEGMENT).contains(n))
+                    .filter(|_| n.bytes().all(|b| b.is_ascii_digit()));
+                match (recording_id(raw), number) {
+                    (Some(id), Some(number)) => Some(Route::Segment(id, number)),
+                    _ => None,
+                }
+            }
+            _ => return None,
+        };
+        return Some(route.unwrap_or(Route::BadId));
+    }
+    None
+}
+
 /// Route one request. Every response carries the security headers.
 pub(crate) async fn handle(req: Request<Incoming>, state: &ServerState) -> Response<Body> {
-    let (parts, _body) = req.into_parts();
+    let (parts, body) = req.into_parts();
     if let Err(status) = state.auth.check(&parts) {
         return empty(status);
     }
-    let path = parts.uri.path();
-    if path == "/" {
-        return document();
-    }
-    if path == "/api/sessions" {
-        return sessions(state);
-    }
-    if let Some(id) = path
-        .strip_prefix("/api/sessions/")
-        .and_then(|rest| rest.strip_suffix("/frame"))
-    {
-        let Some(id) = percent_decode(id)
-            .filter(|id| !id.contains('/'))
-            .and_then(|id| id.parse::<SessionId>().ok())
-        else {
-            return empty(StatusCode::NOT_FOUND);
+    let method = parts.method.clone();
+    let Some(route) = parse_route(parts.uri.path()) else {
+        return if method == Method::GET || method == Method::HEAD {
+            empty(StatusCode::NOT_FOUND)
+        } else {
+            empty(StatusCode::METHOD_NOT_ALLOWED)
         };
-        let after = query_param(parts.uri.query(), "after")
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(0);
-        return frame(state, &id, after).await;
+    };
+    if !route.allows(&method) {
+        return empty(StatusCode::METHOD_NOT_ALLOWED);
     }
-    if let Some(id) = path
-        .strip_prefix("/api/sessions/")
-        .and_then(|rest| rest.strip_suffix("/events"))
-    {
-        let Some(id) = percent_decode(id)
-            .filter(|id| !id.contains('/'))
-            .and_then(|id| id.parse::<SessionId>().ok())
-        else {
-            return empty(StatusCode::NOT_FOUND);
-        };
-        let after = match query_param(parts.uri.query(), "after") {
-            None => 0,
-            Some(value) => match value.parse::<u64>() {
-                Ok(after) => after,
-                Err(_) => return empty(StatusCode::BAD_REQUEST),
-            },
-        };
-        return events(state, &id, after);
+    let registry = &state.registry;
+    match route {
+        Route::Document => document(),
+        Route::Sessions => sessions(state),
+        Route::BadId => empty(StatusCode::NOT_FOUND),
+        Route::Frame(id) => {
+            let after = query_param(parts.uri.query(), "after")
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(0);
+            frame(state, &id, after).await
+        }
+        Route::Events(id) => {
+            let after = match query_param(parts.uri.query(), "after") {
+                None => 0,
+                Some(value) => match value.parse::<u64>() {
+                    Ok(after) => after,
+                    Err(_) => return empty(StatusCode::BAD_REQUEST),
+                },
+            };
+            events(state, &id, after)
+        }
+        Route::Record(id) => {
+            match replay::read_json(&parts, body, state.limits.header_read_timeout).await {
+                Ok(json) => replay::post_recording(registry, &id, &json).await,
+                Err(reply) => reply,
+            }
+        }
+        Route::Annotate(id) => {
+            match replay::read_json(&parts, body, state.limits.header_read_timeout).await {
+                Ok(json) => replay::post_annotation(registry, &id, &json),
+                Err(reply) => reply,
+            }
+        }
+        Route::Keep(rid) => {
+            match replay::read_json(&parts, body, state.limits.header_read_timeout).await {
+                Ok(json) => replay::post_keep(registry, rid, &json).await,
+                Err(reply) => reply,
+            }
+        }
+        Route::Recordings => replay::list(registry).await,
+        Route::Recording(rid) => replay::detail(registry, rid).await,
+        Route::RecordingEvents(rid) => replay::events(registry, rid).await,
+        Route::Segment(rid, n) => {
+            let range = parts
+                .headers
+                .get(header::RANGE)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned);
+            replay::segment(registry, rid, n, range).await
+        }
     }
-    empty(StatusCode::NOT_FOUND)
 }
 
 /// The retained events after `after`: 200 with the page, 204 while the
@@ -260,7 +379,11 @@ fn with_security_headers(mut response: Response<Body>) -> Response<Body> {
     response
 }
 
-fn response(status: StatusCode, content_type: &'static str, body: Bytes) -> Response<Body> {
+pub(crate) fn response(
+    status: StatusCode,
+    content_type: &'static str,
+    body: Bytes,
+) -> Response<Body> {
     let mut response = Response::new(Full::new(body));
     *response.status_mut() = status;
     response.headers_mut().insert(
@@ -270,7 +393,7 @@ fn response(status: StatusCode, content_type: &'static str, body: Bytes) -> Resp
     with_security_headers(response)
 }
 
-fn empty(status: StatusCode) -> Response<Body> {
+pub(crate) fn empty(status: StatusCode) -> Response<Body> {
     let mut response = Response::new(Full::new(Bytes::new()));
     *response.status_mut() = status;
     with_security_headers(response)
@@ -289,7 +412,8 @@ fn document() -> Response<Body> {
     );
     let csp = format!(
         "default-src 'none'; script-src 'nonce-{nonce}'; style-src 'nonce-{nonce}'; \
-         img-src blob:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; \
+         img-src blob:; media-src blob:; connect-src 'self'; frame-ancestors 'none'; \
+         base-uri 'none'; \
          form-action 'none'"
     );
     if let Ok(value) = header::HeaderValue::from_str(&csp) {

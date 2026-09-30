@@ -1,7 +1,7 @@
 //! Request checks for the live viewer, in this order: Host (DNS-rebinding
-//! guard) -> Origin and `Sec-Fetch-Site` (cross-origin guard) -> token ->
-//! method. Every failure is a bare 403 (405 for a method other than GET
-//! after the other checks pass). Nothing here logs.
+//! guard) -> Origin and `Sec-Fetch-Site` (cross-origin guard) -> token.
+//! Every failure is a bare 403. The route table then answers 405 for a
+//! method a route does not take. Nothing here logs.
 
 use std::net::SocketAddr;
 
@@ -116,11 +116,6 @@ impl AuthPolicy {
         };
         if !presented.is_some_and(|t| self.token.matches(t)) {
             return Err(StatusCode::FORBIDDEN);
-        }
-
-        // 4. Method: read-only.
-        if parts.method != Method::GET {
-            return Err(StatusCode::METHOD_NOT_ALLOWED);
         }
         Ok(())
     }

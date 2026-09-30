@@ -733,6 +733,23 @@ pub(crate) enum EventsLookup {
     Closed,
 }
 
+/// Why a viewer recording action was refused.
+#[derive(Debug)]
+pub(crate) enum Refusal {
+    /// The session is not in the registry (or still connecting).
+    NoSession(String),
+    /// The request is not possible now (not recording, bad text, busy).
+    Rejected(String),
+    /// Recording could not start (storage, configuration).
+    Unavailable(String),
+}
+
+impl From<DaemonError> for Refusal {
+    fn from(e: DaemonError) -> Self {
+        Refusal::NoSession(e.to_string())
+    }
+}
+
 /// One session as the live viewer sees it: the credential-free list entry
 /// plus its frame source's ended state.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -769,6 +786,44 @@ impl ViewerRegistry {
     /// The frame source for `id`, read under the registry lock only briefly.
     pub(crate) fn frame_source(&self, id: &SessionId) -> FrameLookup {
         self.inner.frame_source(id)
+    }
+
+    /// Start recording live session `id` from the viewer. Returns the
+    /// recording id and whether it changed anything.
+    pub(crate) async fn record_start(&self, id: &SessionId) -> Result<(String, bool), Refusal> {
+        let target = self.inner.recording_target(id).map_err(Refusal::from)?;
+        self.inner
+            .recordings
+            .start(target, RecordingTrigger::Viewer, EventSource::Viewer)
+            .await
+            .map(|s| (s.id, s.changed))
+            .map_err(Refusal::Unavailable)
+    }
+
+    /// Stop recording live session `id` from the viewer; `None` when it was
+    /// not recording.
+    pub(crate) fn record_stop(&self, id: &SessionId) -> Result<Option<String>, Refusal> {
+        let target = self.inner.recording_target(id).map_err(Refusal::from)?;
+        Ok(self.inner.recordings.stop(
+            &target.events,
+            EventSource::Viewer,
+            crate::events::StopReason::Requested,
+        ))
+    }
+
+    /// Annotate the active recording of live session `id` from the viewer.
+    pub(crate) fn annotate(&self, id: &SessionId, text: &str) -> Result<String, Refusal> {
+        let target = self.inner.recording_target(id).map_err(Refusal::from)?;
+        self.inner
+            .recordings
+            .annotate(&target.events, EventSource::Viewer, text)
+            .map_err(Refusal::Rejected)
+    }
+
+    /// The recording service (listing, keep and file reads, which the
+    /// viewer runs on blocking threads).
+    pub(crate) fn recordings(&self) -> Arc<RecordingService> {
+        Arc::clone(&self.inner.recordings)
     }
 
     /// The event log for `id`, read under the registry lock only briefly.

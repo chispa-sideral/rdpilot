@@ -539,6 +539,11 @@ impl RecordingService {
             })
     }
 
+    /// The recordings root, for the viewer's read routes.
+    pub(crate) fn root(&self) -> Option<PathBuf> {
+        self.settings().ok().map(|s| s.root)
+    }
+
     /// Daemon shutdown: stop every recording (`daemon_stopped`) and wait up
     /// to 10 s for the recorders to finish their last segments.
     pub(crate) async fn shutdown(&self) {
