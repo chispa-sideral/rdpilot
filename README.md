@@ -463,7 +463,7 @@ Cua integration harness; upstream tool schema behavior is Cua's responsibility.
 
 Run `python3 scripts/e2e/run-viewer-proof.py --help` for the live viewer proof.
 Its `--fake` mode runs offline against the fake connector; its live mode needs a
-small CrabBox Azure Windows lease with two Windows users and release builds.
+Windows host with two independent Windows users and release builds.
 `python3 scripts/e2e/run-recording-proof.py --help` describes the session
 recording proof: `--fake` runs offline (it needs `ffmpeg`, `ffprobe` and
 Playwright Chromium and Firefox); live mode needs three Windows users.

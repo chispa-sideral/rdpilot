@@ -8,8 +8,8 @@ calls through rdpilot-mcp and a native verb, then a panel closed and reopened:
   uv run --with playwright python3 scripts/e2e/run-viewer-proof.py --fake \
     --bin-dir target/debug --output /private/viewer-fake-proof
 
-Live mode (a small CrabBox Azure Windows lease with two independent Windows
-users; release builds, as users install them):
+Live mode (a Windows host with two independent Windows users; release builds,
+as users install them):
   cargo build --release --workspace
   export RDPILOT_VIEW_A_HOST=... RDPILOT_VIEW_A_USERNAME=... RDPILOT_VIEW_A_PASSWORD=...
   export RDPILOT_VIEW_B_HOST=... RDPILOT_VIEW_B_USERNAME=... RDPILOT_VIEW_B_PASSWORD=...
@@ -26,10 +26,10 @@ subprocess environment, never arguments or evidence. The viewer token is
 replaced by <token> in every evidence file, and a final scan fails the run if
 the token or a credential value appears in any evidence file. The output
 directory is new and owner-only; it holds guest screen content. This harness
-provisions nothing: lease the Windows machine with the crabbox-azure-windows
-skill first. Tailnet evidence is the host's own tailnet URL plus the rejection
-checks on loopback and tailnet; the cross-machine check is the human opening
-the printed tailnet URL from another tailnet device.
+provisions nothing: prepare the Windows host first. Tailnet evidence is the
+host's own tailnet URL plus the rejection checks on loopback and tailnet; the
+cross-machine check is the human opening the printed tailnet URL from another
+tailnet device.
 
 The 2 s check times the first viewer frame that SHOWS the change: the harness
 keeps the canvas pixels of a region before the change and waits for a frame
