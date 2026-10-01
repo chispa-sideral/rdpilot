@@ -30,3 +30,6 @@ __pycache__/
 # project-local override copy by convention for local dev/testing.
 config.toml
 .rdpilot.toml
+
+# Local-only agent skill; it is not part of the repository.
+/.agents/skills/rdpilot-live-proof/
