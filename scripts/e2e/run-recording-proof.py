@@ -7,8 +7,8 @@ fake Cua; needs ffmpeg, ffprobe and Playwright Chromium and Firefox):
   uv run --with playwright python3 scripts/e2e/run-recording-proof.py --fake \
     --bin-dir target/debug --output /private/recording-fake-proof
 
-Live mode (a small CrabBox Azure Windows lease with three independent
-Windows users; release builds, as users install them):
+Live mode (a Windows host with three independent Windows users; release
+builds, as users install them):
   cargo build --release --workspace
   export RDPILOT_REC_{A,B,C}_HOST=... RDPILOT_REC_{A,B,C}_USERNAME=... RDPILOT_REC_{A,B,C}_PASSWORD=...
   # optional: RDPILOT_REC_{A,B,C}_PORT, RDPILOT_REC_{A,B,C}_DOMAIN
@@ -43,8 +43,7 @@ bytes of its decoded frames and, on Linux, the recorder threads' CPU time),
 crops and browser captures. The viewer token is
 replaced by <token>, and a final scan fails the run if the token, a
 credential or the argument marker appears in any evidence file. This
-harness provisions nothing: lease the Windows machine with the
-crabbox-azure-windows skill first.
+harness provisions nothing: prepare the Windows host first.
 """
 import argparse
 import asyncio
