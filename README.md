@@ -356,7 +356,9 @@ A human take from the agent waits up to 10 seconds for an agent operation
 that is already running and never interrupts it. This includes a long native
 operation such as a file `put` or `get`: when the operation does not end in
 time, the take is refused with "an agent operation is still running ...; try
-again", and the agent keeps control.
+again", and the agent keeps control. The daemon tracks at most 64 acting Cua
+calls without an answer per MCP attachment: when more are pending, the oldest
+of them no longer holds up a take.
 
 When a tab loses the lease, it shows why within about a second ("Taken over
 by the agent", "Taken over by human viewer ADDRESS", "Ended after N minutes
