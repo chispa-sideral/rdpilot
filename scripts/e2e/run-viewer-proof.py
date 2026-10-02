@@ -74,6 +74,8 @@ LIVE_FAILING_TOOL = "rdpilot_proof_missing_tool"
 CHANGE_BUDGET_MS = 2000
 # The viewer caps each session at 4 frames per second.
 MAX_FPS = 4
+# Longest wait for the viewer ports to close after `rdpilot view` exits.
+PORT_CLOSE_BOUND_S = 3
 # A canvas pixel counts as changed when a colour channel moves by more than this.
 PIXEL_DELTA = 48
 # The typed marker changes about 1400 text-box pixels at 1920x1080; a blinking
@@ -412,15 +414,20 @@ class Proof:
         self.viewer.send_signal(signal.SIGINT)
         code = await asyncio.wait_for(self.viewer.wait(), 10)
         require(code == 0, f"rdpilot view exit code {code}")
+        # The daemon closes the listeners shortly after `rdpilot view` exits.
         for url in self.urls:
             host, port = self.addr(url).rsplit(":", 1)
-            try:
-                reader, writer = await asyncio.wait_for(asyncio.open_connection(host, int(port)), 2)
-                writer.close()
-                raise ProofError(f"viewer port still open on {host}")
-            except (OSError, asyncio.TimeoutError):
-                pass
-        self.check("viewer_stopped_on_ctrl_c_and_ports_closed")
+            deadline = time.monotonic() + PORT_CLOSE_BOUND_S
+            while True:
+                try:
+                    reader, writer = await asyncio.wait_for(asyncio.open_connection(host, int(port)), 2)
+                    writer.close()
+                except (OSError, asyncio.TimeoutError):
+                    break
+                if time.monotonic() >= deadline:
+                    raise ProofError(f"viewer port still open on {host} {PORT_CLOSE_BOUND_S} s after exit")
+                await asyncio.sleep(0.1)
+        self.check("viewer_stopped_on_ctrl_c_and_ports_closed", bound_s=PORT_CLOSE_BOUND_S)
 
     # --- browser --------------------------------------------------------------
 
