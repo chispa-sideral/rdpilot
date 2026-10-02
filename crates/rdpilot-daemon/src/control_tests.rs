@@ -510,6 +510,80 @@ async fn fencing_drops_old_geometry_and_old_generations_and_coalesces_moves() {
     assert_eq!(f.sink.take(), vec![key(0x1E, true)]);
 }
 
+fn left(down: bool) -> HumanEvent {
+    HumanEvent::Button {
+        button: PointerButton::Left,
+        down,
+    }
+}
+
+/// Geometry fencing never leaves a button down: the release of a held
+/// button passes after a resize, and a fenced pointer event releases every
+/// held button.
+#[tokio::test]
+async fn geometry_fencing_never_leaves_a_button_down() {
+    let f = fixture();
+    let grant = take(&f, 3).await;
+    let press = vec![HumanEvent::Move { x: 5, y: 5 }, left(true)];
+    let report = f
+        .control
+        .input(&grant.lease, 7, (800, 600), press.clone())
+        .await
+        .unwrap();
+    assert_eq!(report.applied, 2);
+    f.sink.take();
+
+    // 1. Resize, then the page's button-up aimed at the old size: applied.
+    *f.frames.0.lock().unwrap() = Some((1024, 768));
+    let report = f
+        .control
+        .input(&grant.lease, 7, (800, 600), vec![left(false)])
+        .await
+        .unwrap();
+    assert_eq!(report.applied, 1);
+    assert_eq!(report.dropped.geometry, 0);
+    assert_eq!(f.sink.take(), vec![left(false)]);
+    // A button-up for a button not held is fenced as before.
+    let report = f
+        .control
+        .input(&grant.lease, 7, (800, 600), vec![left(false)])
+        .await
+        .unwrap();
+    assert_eq!(report.dropped.geometry, 1);
+    assert!(f.sink.take().is_empty());
+
+    // 2. Press at the new size, resize again, then a move aimed at the
+    // old size: dropped, and the held button is released.
+    let report = f
+        .control
+        .input(&grant.lease, 7, (1024, 768), press)
+        .await
+        .unwrap();
+    assert_eq!(report.applied, 2);
+    f.sink.take();
+    *f.frames.0.lock().unwrap() = Some((800, 600));
+    let report = f
+        .control
+        .input(
+            &grant.lease,
+            7,
+            (1024, 768),
+            vec![HumanEvent::Move { x: 6, y: 6 }, left(false)],
+        )
+        .await
+        .unwrap();
+    assert_eq!(report.applied, 0);
+    assert_eq!(
+        report.dropped.geometry, 2,
+        "the move and the late button-up"
+    );
+    assert_eq!(f.sink.take(), vec![left(false)], "released once");
+    // Nothing is left to release.
+    let transition = f.control.release(&grant.lease).unwrap();
+    assert_eq!(transition.releases(), 0);
+    f.control.discharge(transition).await;
+}
+
 #[tokio::test]
 async fn at_most_one_controller_and_no_lease_id_in_events_or_status() {
     let f = fixture();

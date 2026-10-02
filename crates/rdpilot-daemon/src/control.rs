@@ -94,7 +94,8 @@ pub enum HumanEvent {
 }
 
 impl HumanEvent {
-    /// Pointer events are fenced by frame geometry; key events are not.
+    /// Pointer events are fenced by frame geometry (except the release of
+    /// a held button); key events are not.
     fn is_pointer(&self) -> bool {
         !matches!(self, HumanEvent::Key { .. })
     }
@@ -849,8 +850,10 @@ impl SessionControl {
 
     /// Apply the holder's input. Each event is checked against the current
     /// lease, and pointer events against the current frame geometry, right
-    /// before it is sent; events of an older generation are dropped. Runs
-    /// of pointer moves are coalesced to the last one.
+    /// before it is sent; events of an older generation are dropped. The
+    /// release of a held button is never fenced by geometry, and a fenced
+    /// pointer event releases every held button. Runs of pointer moves are
+    /// coalesced to the last one.
     ///
     /// # Errors
     ///
@@ -883,7 +886,7 @@ impl SessionControl {
         for event in events {
             remaining -= 1;
             let current = self.frame.as_ref().and_then(|frame| frame.geometry());
-            {
+            let fenced = {
                 let mut state = self.state();
                 let holder = match state.held(lease) {
                     Ok(holder) => holder,
@@ -893,15 +896,35 @@ impl SessionControl {
                         return Ok(report);
                     }
                 };
-                if event.is_pointer() && !geometry_matches(&event, geometry, current) {
-                    report.dropped.geometry += 1;
-                    continue;
+                let off_frame = event.is_pointer()
+                    && !geometry_matches(&event, geometry, current)
+                    && !releases_held_button(&holder.held, &event);
+                if off_frame {
+                    // The pointer no longer aims at this frame: no button
+                    // stays down behind a dropped release.
+                    let buttons: Vec<Held> = holder
+                        .held
+                        .iter()
+                        .copied()
+                        .filter(|held| matches!(held, Held::Button(_)))
+                        .collect();
+                    for button in &buttons {
+                        holder.held.remove(button);
+                    }
+                    Some(buttons)
+                } else {
+                    track(&mut holder.held, &event);
+                    let now = Instant::now();
+                    holder.last_input = now;
+                    holder.last_heartbeat = now;
+                    state.touch_human();
+                    None
                 }
-                track(&mut holder.held, &event);
-                let now = Instant::now();
-                holder.last_input = now;
-                holder.last_heartbeat = now;
-                state.touch_human();
+            };
+            if let Some(buttons) = fenced {
+                report.dropped.geometry += 1;
+                self.send_releases(buttons).await;
+                continue;
             }
             match tokio::time::timeout(INPUT_SEND_TIMEOUT, input.send(vec![event])).await {
                 Ok(Ok(())) => report.applied += 1,
@@ -1001,6 +1024,11 @@ async fn until_signalled<T>(notify: &Notify, mut ready: impl FnMut() -> Option<T
         }
         signalled.await;
     }
+}
+
+/// Whether `event` releases a button the holder holds.
+fn releases_held_button(held: &BTreeSet<Held>, event: &HumanEvent) -> bool {
+    matches!(*event, HumanEvent::Button { button, down: false } if held.contains(&Held::Button(button)))
 }
 
 fn track(held: &mut BTreeSet<Held>, event: &HumanEvent) {

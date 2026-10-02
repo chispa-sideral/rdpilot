@@ -380,7 +380,10 @@ input wait until those releases are sent. Losing focus or visibility releases
 them too (the lease stays). Input events name the lease, the session
 incarnation and the frame size they were aimed at; the daemon drops (and
 counts) events of an old lease, pointer events aimed at an old frame size, and
-events for an older session with the same name.
+events for an older session with the same name. The release of a held mouse
+button is never dropped for its frame size, and a pointer event dropped for
+an old frame size releases every held mouse button, so no button stays down
+after a resize.
 
 Agent takeover. The agent takes control back immediately, through its own
 surface:
