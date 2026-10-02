@@ -79,6 +79,18 @@ canvas:focus { outline: none; }
   window.rdpilotViewer = status;
   var panels = {};
   var errorEl = document.getElementById("error");
+  var READ_ONLY_NOTE = "This page shows sessions and their recordings. It is read-only: it cannot take control, " +
+    "start or stop recording, annotate or keep recordings, and it cannot connect or disconnect sessions. Keep the " +
+    "URL private: anyone with it and network access can view the screens of every session of this daemon. The URL " +
+    "contains the access token, so a reload keeps working.";
+
+  // Read-only mode: the note says so, and no Keep or Unkeep button shows.
+  function applyWrites() {
+    if (!status.writes) { text(document.getElementById("note"), READ_ONLY_NOTE); }
+    Array.prototype.forEach.call(document.querySelectorAll(".keep-toggle, .replay-keep"), function (b) {
+      b.classList.toggle("hidden", !status.writes);
+    });
+  }
 
   function authHeaders() { return { "Authorization": "Bearer " + token }; }
   function text(el, value) { el.textContent = value == null ? "" : String(value); return el; }
@@ -271,6 +283,7 @@ canvas:focus { outline: none; }
         status.control = !!data.control;
         status.writes = data.writes !== false;
         status.idleTimeoutSecs = data.idle_timeout_secs || 300;
+        applyWrites();
         renderList(data.sessions);
         data.sessions.forEach(function (sess) {
           var p = panels[sess.id];
@@ -764,6 +777,7 @@ canvas:focus { outline: none; }
       keep.className = "keep-toggle";
       text(keep, r.kept ? "Unkeep" : "Keep");
       keep.addEventListener("click", function () { setKeep(r.id, !r.kept); });
+      keep.classList.toggle("hidden", !status.writes);
       keepTd.appendChild(keep);
       row.appendChild(keepTd);
       var openTd = document.createElement("td");
@@ -966,6 +980,7 @@ canvas:focus { outline: none; }
   function drawReplayKeep() {
     if (!replay) { return; }
     text(replay.keepButton, status.replay.kept ? "Unkeep" : "Keep");
+    replay.keepButton.classList.toggle("hidden", !status.writes);
   }
 
   function segmentAt(pos) {

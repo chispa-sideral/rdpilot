@@ -30,8 +30,9 @@ down: the fake sink's held count drops to 0, live text arrives lowercase);
 `rdpilot takeover` run exactly as printed in the native error; a tab closed
 while holding the lease (control returns to the agent within the heartbeat
 bound); `rdpilot list` and the session's event log with every change, its
-source and reason; and `rdpilot view --read-only` with no Takeover control
-and every write route answering 404 on every bound address.
+source and reason; and `rdpilot view --read-only` with no Takeover control,
+a read-only note, no Keep button in the recording list or the replay of a
+short recording, and every write route answering 404 on every bound address.
 
 Credentials come only from the environment and reach rdpilot only through
 subprocess environment. The viewer token is replaced by <token> in evidence,
@@ -94,6 +95,7 @@ class Proof(viewer_proof.Proof):
         self.targets = (SESSION,)
         self.summary["mode"] = "fake" if fake else "live"
         self.input_log = self.temp / "input.jsonl"
+        self.env["RDPILOT_RECORDING__DIR"] = str(self.temp / "recordings")
         if fake:
             self.env["RDPILOT_DAEMON_TEST_INPUT_LOG"] = str(self.input_log)
         else:
@@ -516,7 +518,24 @@ class Proof(viewer_proof.Proof):
         self.check("status_log_and_strip_show_every_change", events=summary, list_controller="agent")
         await tab2.context.close()
 
+    async def finished_recording(self):
+        """Record a short while, so the read-only page has a recording with Keep controls to hide."""
+        for action in ("start", "stop"):
+            status, body = self.api(f"/api/sessions/{SESSION}/recording", "POST", json.dumps({"action": action}))
+            require(status < 300, f"recording {action}: HTTP {status} {self.clean(body.decode(errors='replace'))}")
+            if action == "start":
+                await asyncio.sleep(2)
+        deadline = time.monotonic() + 30
+        while True:
+            listing = await self.cli("recording", "list")
+            ours = [r for r in listing["recordings"] if r["session"] == SESSION]
+            if ours and not any(r["active"] for r in ours):
+                return
+            require(time.monotonic() < deadline, f"recording not finished: {ours}")
+            await asyncio.sleep(0.5)
+
     async def read_only_flow(self, browser):
+        await self.finished_recording()
         await self.stop_viewer()
         await self.start_view("--read-only")
         page = await self.open_tab(browser, "read-only tab")
@@ -524,6 +543,19 @@ class Proof(viewer_proof.Proof):
         recording_visible = await page.is_visible(f"{PANEL} .record-toggle")
         require(not takeover_visible and not recording_visible,
                 f"read-only page offers write controls: takeover {takeover_visible}, recording {recording_visible}")
+        note = await page.text_content("#note")
+        require("read-only" in note and "Takeover" not in note and "take control of" not in note,
+                f"read-only page note: {note}")
+        await page.click("#recordings-button")
+        await page.wait_for_selector("#recordings tr .open-recording", timeout=15000)
+        keep_visible = await page.locator("#recordings .keep-toggle").evaluate_all(
+            "els => els.filter(e => e.offsetParent !== null).length")
+        require(keep_visible == 0, f"read-only recording list shows {keep_visible} Keep button(s)")
+        await page.click("#recordings tr .open-recording")
+        await page.wait_for_function("() => window.rdpilotViewer.replay && window.rdpilotViewer.replay.loaded",
+                                     timeout=15000)
+        replay_keep_visible = await page.is_visible(".replay-keep")
+        require(not replay_keep_visible, "read-only replay shows a Keep button")
         await self.screenshot(page, "05-read-only-viewer.png")
         statuses = {}
         for url in self.urls:
@@ -535,7 +567,8 @@ class Proof(viewer_proof.Proof):
                 statuses[f"{addr.rsplit(':', 1)[0]} {path.rsplit('/', 1)[1]}"] = status
         require(all(s == 404 for s in statuses.values()), f"read-only write routes: {statuses}")
         require((await self.controller()).get("kind") == "agent", "read-only viewer changed control")
-        self.check("read_only_viewer_has_no_takeover_and_no_write_route", statuses=statuses)
+        self.check("read_only_viewer_has_no_takeover_and_no_write_route", statuses=statuses,
+                   note="read-only", keep_buttons_visible=0, replay_keep_visible=False)
         await page.context.close()
 
     async def execute(self):
