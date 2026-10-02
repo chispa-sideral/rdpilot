@@ -8,6 +8,12 @@
 //!   did not release. [`SessionControl::discharge`] sends those releases
 //!   (awaited, through the session's own input channel) before the next
 //!   controller's first action.
+//! - Every lease end and change follows one order: the transition is
+//!   registered as pending in the same critical section that changes the
+//!   lease, and agent admission ([`SessionControl::admit_agent`],
+//!   [`SessionControl::wait_released`] before a Cua call is forwarded) and
+//!   a human take wait until no transition is pending. So no controller
+//!   acts while a key or button of the previous holder is still down.
 //! - A human take from the agent marks the lease held at once, so new agent
 //!   actions are refused, and then waits (bounded by [`TAKE_WAIT`]) for the
 //!   agent operations already in flight: a native operation holding the
@@ -26,6 +32,7 @@
 use std::collections::{BTreeSet, VecDeque};
 use std::future::Future;
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -322,12 +329,35 @@ impl State {
     }
 }
 
+/// Transitions whose releases are not sent yet.
+#[derive(Debug, Default)]
+struct Pending {
+    count: AtomicUsize,
+    /// Signalled whenever `count` drops.
+    done: Notify,
+}
+
+/// Counts one transition as pending until it is dropped (after
+/// [`SessionControl::discharge`], or when a caller is cancelled).
+#[derive(Debug)]
+struct PendingGuard(Arc<Pending>);
+
+impl Drop for PendingGuard {
+    fn drop(&mut self) {
+        self.0.count.fetch_sub(1, Ordering::AcqRel);
+        self.0.done.notify_waiters();
+    }
+}
+
 /// The release obligation (and the recorded change) of one control change.
 /// Pass it to [`SessionControl::discharge`] before the next controller acts.
+/// Until it is discharged (or dropped), agent admission and human takes of
+/// the session wait.
 #[must_use = "a transition's releases must be discharged"]
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct Transition {
     release: Vec<Held>,
+    _pending: PendingGuard,
 }
 
 impl Transition {
@@ -347,6 +377,8 @@ pub struct SessionControl {
     state: Mutex<State>,
     /// Signalled whenever the in-flight Cua count drops.
     settled: Notify,
+    /// Transitions not yet discharged.
+    pending: Arc<Pending>,
     /// Serializes human input and releases.
     input_lock: tokio::sync::Mutex<()>,
 }
@@ -367,6 +399,7 @@ impl SessionControl {
             input,
             state: Mutex::new(State::default()),
             settled: Notify::new(),
+            pending: Arc::new(Pending::default()),
             input_lock: tokio::sync::Mutex::new(()),
         }
     }
@@ -375,6 +408,18 @@ impl SessionControl {
         match self.state.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    /// A pending transition that releases `held`. Call it in the same
+    /// critical section of the state mutex that changes the lease, so an
+    /// admission check under that mutex sees the lease change and the
+    /// pending release together.
+    fn transition(&self, held: impl IntoIterator<Item = Held>) -> Transition {
+        self.pending.count.fetch_add(1, Ordering::AcqRel);
+        Transition {
+            release: held.into_iter().collect(),
+            _pending: PendingGuard(Arc::clone(&self.pending)),
         }
     }
 
@@ -436,11 +481,47 @@ impl SessionControl {
     /// # Errors
     ///
     /// [`DaemonError::HumanControl`] naming the holder and the CLI command.
+    #[cfg(test)]
     pub(crate) fn check_agent(&self) -> Result<(), DaemonError> {
         match &self.state().lease {
             None => Ok(()),
             Some(lease) => Err(self.human_control_error(lease)),
         }
+    }
+
+    /// Admit one native agent action: refused while a human holds or is
+    /// taking the lease; otherwise it waits until the releases of every
+    /// earlier lease end or change are sent.
+    ///
+    /// # Errors
+    ///
+    /// [`DaemonError::HumanControl`] naming the holder and the CLI command.
+    pub(crate) async fn admit_agent(&self) -> Result<(), DaemonError> {
+        self.until_released(|| {
+            let state = self.state();
+            match &state.lease {
+                Some(lease) => Some(Err(self.human_control_error(lease))),
+                None => self.released().then_some(Ok(())),
+            }
+        })
+        .await
+    }
+
+    /// Wait until the releases of every earlier lease end or change are
+    /// sent (before an admitted Cua call is forwarded).
+    pub(crate) async fn wait_released(&self) {
+        self.until_released(|| self.released().then_some(())).await;
+    }
+
+    /// Whether no transition is pending.
+    fn released(&self) -> bool {
+        self.pending.count.load(Ordering::Acquire) == 0
+    }
+
+    /// Poll `ready` now and after every discharged transition until it
+    /// answers.
+    async fn until_released<T>(&self, ready: impl FnMut() -> Option<T>) -> T {
+        until_signalled(&self.pending.done, ready).await
     }
 
     fn human_control_error(&self, lease: &Lease) -> DaemonError {
@@ -527,9 +608,7 @@ impl SessionControl {
                 by: ControllerRef::Agent,
             },
         );
-        Some(Transition {
-            release: lease.held.into_iter().collect(),
-        })
+        Some(self.transition(lease.held))
     }
 
     /// End a human lease for `reason` (daemon source). `None` when none.
@@ -547,13 +626,12 @@ impl SessionControl {
                 },
             );
         }
-        Some(Transition {
-            release: lease.held.into_iter().collect(),
-        })
+        Some(self.transition(lease.held))
     }
 
     /// Send the releases of `transition`, awaited, through the session's
-    /// input channel. Serialized with human input.
+    /// input channel. Serialized with human input. Its pending count ends
+    /// when they are sent.
     pub(crate) async fn discharge(&self, transition: Transition) {
         let _guard = self.input_lock.lock().await;
         self.send_releases(transition.release).await;
@@ -620,9 +698,7 @@ impl SessionControl {
                         EventSource::Viewer,
                         EventKind::ControlTakenOver { from, by },
                     );
-                    Some(Transition {
-                        release: old.held.into_iter().collect(),
-                    })
+                    Some(self.transition(old.held))
                 }
                 pending => {
                     if let Some(pending) = pending {
@@ -635,6 +711,7 @@ impl SessionControl {
         };
         if let Some(transition) = moved {
             self.discharge(transition).await;
+            self.wait_released().await;
             return Ok(self.grant(&lease));
         }
 
@@ -647,6 +724,7 @@ impl SessionControl {
         let settled = tokio::time::timeout(bound, async {
             agent_idle.await;
             self.wait_settled().await;
+            self.wait_released().await;
         })
         .await;
         pending.armed = false;
@@ -692,15 +770,7 @@ impl SessionControl {
 
     /// Wait until no acting Cua call is in flight.
     async fn wait_settled(&self) {
-        loop {
-            let notified = self.settled.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            if self.state().inflight == 0 {
-                return;
-            }
-            notified.await;
-        }
+        until_signalled(&self.settled, || (self.state().inflight == 0).then_some(())).await;
     }
 
     /// Whether `lease` is the granted lease, without changing anything.
@@ -734,8 +804,8 @@ impl SessionControl {
         let mut state = self.state();
         let lease = state.held(lease)?;
         lease.last_heartbeat = Instant::now();
-        let release = std::mem::take(&mut lease.held).into_iter().collect();
-        Ok(Transition { release })
+        let held = std::mem::take(&mut lease.held);
+        Ok(self.transition(held))
     }
 
     /// The holder releases control to the agent.
@@ -757,9 +827,7 @@ impl SessionControl {
                 from: lease.controller(),
             },
         );
-        Ok(Transition {
-            release: lease.held.into_iter().collect(),
-        })
+        Ok(self.transition(lease.held))
     }
 
     /// End a granted lease whose heartbeat or input stopped. A take that
@@ -919,6 +987,19 @@ fn geometry_matches(event: &HumanEvent, aimed: (u32, u32), current: Option<(u32,
     match *event {
         HumanEvent::Move { x, y } => u32::from(x) < aimed.0 && u32::from(y) < aimed.1,
         _ => true,
+    }
+}
+
+/// Poll `ready` now and after every signal of `notify` until it answers.
+async fn until_signalled<T>(notify: &Notify, mut ready: impl FnMut() -> Option<T>) -> T {
+    loop {
+        let signalled = notify.notified();
+        tokio::pin!(signalled);
+        signalled.as_mut().enable();
+        if let Some(answer) = ready() {
+            return answer;
+        }
+        signalled.await;
     }
 }
 

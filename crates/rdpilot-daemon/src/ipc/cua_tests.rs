@@ -16,10 +16,12 @@ use tokio::sync::{mpsc, watch};
 struct FakeSession {
     busy: Arc<AtomicBool>,
     dead: watch::Sender<bool>,
+    gated: Option<Arc<GatedSink>>,
 }
 struct FakeAttachment {
     busy: Arc<AtomicBool>,
     dead: watch::Receiver<bool>,
+    gated: Option<Arc<GatedSink>>,
     tx: mpsc::Sender<Value>,
     rx: mpsc::Receiver<Value>,
 }
@@ -39,6 +41,9 @@ impl ManagedCua for FakeAttachment {
             }
             if message.get("stall").is_some() {
                 std::future::pending::<()>().await;
+            }
+            if let Some(gated) = &self.gated {
+                gated.log.lock().unwrap().push(Seen::Cua);
             }
             self.tx
                 .send(message)
@@ -80,6 +85,7 @@ impl ManagedSession for FakeSession {
             Ok(Box::new(FakeAttachment {
                 busy: self.busy.clone(),
                 dead: self.dead.subscribe(),
+                gated: self.gated.clone(),
                 tx,
                 rx,
             }) as Box<dyn ManagedCua>)
@@ -133,20 +139,72 @@ impl ManagedSession for FakeSession {
     fn deploy_and_launch(&self) -> BoxFuture<'_, Result<Duration, DaemonError>> {
         Box::pin(async { Ok(Duration::ZERO) })
     }
+    fn human_input(&self) -> Option<Arc<dyn crate::seams::HumanInput>> {
+        self.gated
+            .clone()
+            .map(|gated| gated as Arc<dyn crate::seams::HumanInput>)
+    }
 }
+
+/// What a gated session saw, in order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Seen {
+    Human(crate::control::HumanEvent),
+    Cua,
+}
+
+/// Human input that waits at a gate; it and the Cua attachment record into
+/// one sequence.
+struct GatedSink {
+    log: std::sync::Mutex<Vec<Seen>>,
+    gate: tokio::sync::Semaphore,
+}
+
+impl crate::seams::HumanInput for GatedSink {
+    fn send(
+        &self,
+        events: Vec<crate::control::HumanEvent>,
+    ) -> crate::seams::SendFuture<'_, Result<(), DaemonError>> {
+        Box::pin(async move {
+            drop(self.gate.acquire().await.unwrap());
+            self.log
+                .lock()
+                .unwrap()
+                .extend(events.into_iter().map(Seen::Human));
+            Ok(())
+        })
+    }
+}
+
+/// A fresh fake session; with `gated`, its human input and Cua calls
+/// record into that sink.
+fn fake_session(gated: Option<Arc<GatedSink>>) -> Box<dyn ManagedSession> {
+    let (dead, _) = watch::channel(false);
+    Box::new(FakeSession {
+        busy: Arc::new(AtomicBool::new(false)),
+        dead,
+        gated,
+    })
+}
+
+struct GatedConnector(Arc<GatedSink>);
+impl SessionConnector for GatedConnector {
+    fn connect(
+        &self,
+        _: rdpilot::ConnectionConfig,
+    ) -> BoxFuture<'static, Result<Box<dyn ManagedSession>, DaemonError>> {
+        let gated = Arc::clone(&self.0);
+        Box::pin(async move { Ok(fake_session(Some(gated))) })
+    }
+}
+
 struct Connector;
 impl SessionConnector for Connector {
     fn connect(
         &self,
         _: rdpilot::ConnectionConfig,
     ) -> BoxFuture<'static, Result<Box<dyn ManagedSession>, DaemonError>> {
-        Box::pin(async {
-            let (dead, _) = watch::channel(false);
-            Ok(Box::new(FakeSession {
-                busy: Arc::new(AtomicBool::new(false)),
-                dead,
-            }) as Box<dyn ManagedSession>)
-        })
+        Box::pin(async { Ok(fake_session(None)) })
     }
 }
 fn server(registry: Arc<Registry>, capacity: usize) -> tokio::io::DuplexStream {
@@ -676,6 +734,80 @@ async fn the_stream_gates_acting_calls_under_a_human_lease() {
             assert_eq!(refused, crate::events::CallOutcome::Error);
             assert!(events.iter().any(|e| e.source == crate::events::EventSource::Cua
                 && matches!(e.kind, crate::events::EventKind::ControlTakenOver { .. })));
+        })
+        .await;
+}
+
+/// Through the real stream: a Release while the holder's key press still
+/// waits for the input channel, then an acting Cua call. The call reaches
+/// Cua only after the press and its release.
+#[tokio::test]
+async fn an_acting_cua_call_after_a_release_waits_for_the_releases() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let gated = Arc::new(GatedSink {
+                log: std::sync::Mutex::new(Vec::new()),
+                gate: tokio::sync::Semaphore::new(0),
+            });
+            let registry = Arc::new(Registry::new(
+                Arc::new(GatedConnector(Arc::clone(&gated))),
+                Arc::new(NoopReconciliationSink),
+            ));
+            let id = open(&registry, "notepad").await;
+            let viewer = crate::registry::ViewerControl::new(Arc::clone(&registry));
+            let (grant, _) = viewer
+                .take(&id, "100.64.0.5".parse().unwrap())
+                .await
+                .unwrap();
+            let mut client = server(registry.clone(), 4096);
+            attach(&mut client, id.clone()).await;
+            let _ = read_frame::<_, CuaStreamFrame>(&mut client).await.unwrap();
+            let shift = |down| crate::control::HumanEvent::Key {
+                code: 0x2A,
+                extended: false,
+                down,
+            };
+            let human = {
+                let viewer = viewer.clone();
+                let id = id.clone();
+                let lease = grant.lease.clone();
+                tokio::task::spawn_local(async move {
+                    viewer
+                        .input(&id, &lease, grant.generation, (1, 1), vec![shift(true)])
+                        .await
+                })
+            };
+            tokio::task::yield_now().await;
+            let release = {
+                let viewer = viewer.clone();
+                let id = id.clone();
+                let lease = grant.lease.clone();
+                tokio::task::spawn_local(async move { viewer.release(&id, &lease).await })
+            };
+            tokio::task::yield_now().await;
+            write_frame(
+                &mut client,
+                &CuaStreamFrame::Message {
+                    message: json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"type_text","arguments":{"text":"a"}}}),
+                },
+            )
+            .await
+            .unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            gated.gate.add_permits(1);
+            let CuaStreamFrame::Message { message: echoed } =
+                read_frame::<_, CuaStreamFrame>(&mut client).await.unwrap()
+            else {
+                panic!("expected a message");
+            };
+            assert_eq!(echoed["id"], 1, "forwarded, not refused");
+            assert!(echoed.get("method").is_some(), "the echo from Cua");
+            human.await.unwrap().unwrap();
+            release.await.unwrap().unwrap();
+            assert_eq!(
+                *gated.log.lock().unwrap(),
+                vec![Seen::Human(shift(true)), Seen::Human(shift(false)), Seen::Cua]
+            );
         })
         .await;
 }

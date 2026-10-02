@@ -579,7 +579,8 @@ impl Registry {
 
     /// Like [`Registry::call`], for agent input (native Mouse and Key): after
     /// the per-session lock is taken, the call is refused while a human
-    /// viewer holds (or is taking) the control lease. Checking under the
+    /// viewer holds (or is taking) the control lease, and waits for the
+    /// releases of an ended lease to be sent. Checking under the
     /// per-session lock is what orders it with a human take, which marks
     /// the lease first and then waits for this lock.
     ///
@@ -607,7 +608,7 @@ impl Registry {
             }
         };
         let guard = entry.lock().await;
-        control.check_agent()?;
+        control.admit_agent().await?;
         match guard.as_deref() {
             Some(session) => op(session).await,
             None => Err(DaemonError::SessionNotFound(id.as_str().to_owned())),

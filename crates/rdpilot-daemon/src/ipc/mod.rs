@@ -317,6 +317,8 @@ async fn forward_cua<S: AsyncRead + AsyncWrite + Unpin>(
                             }
                             match inbound {
                                 Inbound::Forward(message) => {
+                                    // Also the releases of any other lease end.
+                                    gate.control().wait_released().await;
                                     tracker.observe_request(&message);
                                     if !matches!(tokio::time::timeout(STREAM_WRITE_TIMEOUT, attachment.send(message)).await, Ok(Ok(()))) {
                                         break 'stream "Cua input unavailable";

@@ -538,10 +538,18 @@ wait and retry, or take over with: rdpilot takeover --session notepad"
     );
 }
 
-/// A registry session whose human input goes to a shared [`Sink`].
-struct InputSession(Arc<Sink>);
+/// Human input that also hears when the agent's native action reaches an
+/// [`InputSession`].
+trait AgentLog: HumanInput {
+    fn agent_acted(&self) {}
+}
 
-impl crate::seams::ManagedSession for InputSession {
+impl AgentLog for Sink {}
+
+/// A registry session whose human input goes to a shared sink.
+struct InputSession<S>(Arc<S>);
+
+impl<S: AgentLog> crate::seams::ManagedSession for InputSession<S> {
     fn close(self: Box<Self>) -> crate::seams::BoxFuture<'static, Result<(), DaemonError>> {
         Box::pin(async { Ok(()) })
     }
@@ -555,13 +563,19 @@ impl crate::seams::ManagedSession for InputSession {
         &self,
         _: rdpilot::MouseAction,
     ) -> crate::seams::BoxFuture<'_, Result<(), DaemonError>> {
-        Box::pin(async { Ok(()) })
+        Box::pin(async {
+            self.0.agent_acted();
+            Ok(())
+        })
     }
     fn send_key(
         &self,
         _: rdpilot::KeyAction,
     ) -> crate::seams::BoxFuture<'_, Result<(), DaemonError>> {
-        Box::pin(async { Ok(()) })
+        Box::pin(async {
+            self.0.agent_acted();
+            Ok(())
+        })
     }
     fn upload_file(
         &self,
@@ -591,9 +605,9 @@ impl crate::seams::ManagedSession for InputSession {
     }
 }
 
-struct InputConnector(Arc<Sink>);
+struct InputConnector<S>(Arc<S>);
 
-impl crate::seams::SessionConnector for InputConnector {
+impl<S: AgentLog> crate::seams::SessionConnector for InputConnector<S> {
     fn connect(
         &self,
         _: rdpilot::ConnectionConfig,
@@ -650,5 +664,265 @@ async fn closing_a_session_ends_its_lease_with_releases() {
     assert_eq!(
         control.heartbeat(&grant.lease),
         Err(NotHeld::Lost(Loss::reason(EndReason::SessionEnded)))
+    );
+}
+
+/// One entry of the exact sequence a gated session sees.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Rec {
+    /// A human event (or a release) reached the session's input channel.
+    Human(HumanEvent),
+    /// The agent's native action reached the session.
+    Agent,
+}
+
+/// A human input sink that holds every send until the gate opens, and
+/// records human events and agent actions in one sequence.
+struct GatedSink {
+    log: Mutex<Vec<Rec>>,
+    gate: tokio::sync::Semaphore,
+}
+
+impl GatedSink {
+    fn new() -> Self {
+        GatedSink {
+            log: Mutex::new(Vec::new()),
+            gate: tokio::sync::Semaphore::new(0),
+        }
+    }
+
+    fn open(&self) {
+        self.gate.add_permits(1);
+    }
+
+    fn log(&self) -> Vec<Rec> {
+        self.log.lock().unwrap().clone()
+    }
+}
+
+impl HumanInput for GatedSink {
+    fn send(&self, events: Vec<HumanEvent>) -> SendFuture<'_, Result<(), DaemonError>> {
+        Box::pin(async move {
+            drop(self.gate.acquire().await.unwrap());
+            self.log
+                .lock()
+                .unwrap()
+                .extend(events.into_iter().map(Rec::Human));
+            Ok(())
+        })
+    }
+}
+
+impl AgentLog for GatedSink {
+    fn agent_acted(&self) {
+        self.log.lock().unwrap().push(Rec::Agent);
+    }
+}
+
+/// A registry with one session whose human input goes to a new
+/// [`GatedSink`], and a viewer over it.
+struct Gated {
+    sink: Arc<GatedSink>,
+    registry: Arc<crate::registry::Registry>,
+    viewer: crate::registry::ViewerControl,
+    id: rdpilot_ipc::SessionId,
+}
+
+async fn gated() -> Gated {
+    let sink = Arc::new(GatedSink::new());
+    let registry = Arc::new(crate::registry::Registry::new(
+        Arc::new(InputConnector(Arc::clone(&sink))),
+        Arc::new(crate::seams::NoopReconciliationSink),
+    ));
+    let id = registry
+        .open(
+            Some("web".into()),
+            "h".into(),
+            rdpilot::ConnectionConfig::new("h", "u", "p"),
+        )
+        .await
+        .unwrap();
+    let viewer = crate::registry::ViewerControl::new(Arc::clone(&registry));
+    Gated {
+        sink,
+        registry,
+        viewer,
+        id,
+    }
+}
+
+/// The lease end or change under test.
+#[derive(Debug, Clone, Copy)]
+enum EndPath {
+    Release,
+    HeartbeatLost,
+    IdleTimeout,
+    ViewerStopped,
+    DaemonStopped,
+    CliTakeover,
+}
+
+/// Run `path` while the holder's key press is still waiting for the
+/// session's input channel, then a native agent key action. The gate
+/// opens last. The agent's action must reach the session only after the
+/// press and its release.
+async fn native_action_after(path: EndPath) -> Vec<Rec> {
+    let Gated {
+        sink,
+        registry,
+        viewer,
+        id,
+    } = gated().await;
+    let (grant, _) = viewer.take(&id, tab(1)).await.unwrap();
+    let control = registry.control(&id).unwrap();
+
+    // 1. The holder presses Shift; the send waits at the gate.
+    let human = control.input(
+        &grant.lease,
+        grant.generation,
+        (1, 1),
+        vec![key(SHIFT, true)],
+    );
+    // 2. The lease ends or changes.
+    let end = async {
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        match path {
+            EndPath::Release => viewer.release(&id, &grant.lease).await.unwrap(),
+            EndPath::HeartbeatLost => {
+                let later = Instant::now() + HEARTBEAT_TIMEOUT + Duration::from_secs(1);
+                let transition = control.expire(later, DEFAULT_IDLE_TIMEOUT).unwrap();
+                control.discharge(transition).await;
+            }
+            EndPath::IdleTimeout => viewer.sweep(Duration::ZERO).await,
+            EndPath::ViewerStopped => viewer.end_all().await,
+            EndPath::DaemonStopped => registry.end_all_leases(EndReason::DaemonStopped).await,
+            EndPath::CliTakeover => {
+                let (_, changed) = registry.takeover(&id, EventSource::Cli).await.unwrap();
+                assert!(changed);
+            }
+        }
+    };
+    // 3. Another agent client acts (native Key).
+    let agent = async {
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        registry
+            .call_acting(&id, |s| s.send_key(rdpilot::KeyAction::Type("a".into())))
+            .await
+    };
+    // 4. The input channel takes events again.
+    let open = async {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        sink.open();
+    };
+    let (human, (), agent, ()) = tokio::join!(human, end, agent, open);
+    assert_eq!(human.unwrap().applied, 1, "{path:?}");
+    agent.unwrap();
+    assert!(control.check_agent().is_ok(), "{path:?}");
+    sink.log()
+}
+
+/// The sequence every lease end and change must produce: the press, its
+/// release, and only then the agent's action.
+fn released_then_agent() -> Vec<Rec> {
+    vec![
+        Rec::Human(key(SHIFT, true)),
+        Rec::Human(key(SHIFT, false)),
+        Rec::Agent,
+    ]
+}
+
+#[tokio::test(start_paused = true)]
+async fn release_sends_releases_before_the_next_agent_action() {
+    assert_eq!(
+        native_action_after(EndPath::Release).await,
+        released_then_agent()
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn heartbeat_loss_sends_releases_before_the_next_agent_action() {
+    assert_eq!(
+        native_action_after(EndPath::HeartbeatLost).await,
+        released_then_agent()
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn idle_timeout_sends_releases_before_the_next_agent_action() {
+    assert_eq!(
+        native_action_after(EndPath::IdleTimeout).await,
+        released_then_agent()
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn viewer_stop_sends_releases_before_the_next_agent_action() {
+    assert_eq!(
+        native_action_after(EndPath::ViewerStopped).await,
+        released_then_agent()
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn daemon_exit_sends_releases_before_the_next_agent_action() {
+    assert_eq!(
+        native_action_after(EndPath::DaemonStopped).await,
+        released_then_agent()
+    );
+}
+
+/// `rdpilot takeover` from one client, then a native action from another.
+#[tokio::test(start_paused = true)]
+async fn cli_takeover_sends_releases_before_another_agent_action() {
+    assert_eq!(
+        native_action_after(EndPath::CliTakeover).await,
+        released_then_agent()
+    );
+}
+
+/// A take by another tab sends the first tab's releases before the new
+/// holder's first event, even while the first tab's input is in flight.
+#[tokio::test(start_paused = true)]
+async fn another_tab_acts_only_after_the_first_tabs_releases() {
+    let Gated {
+        sink, viewer, id, ..
+    } = gated().await;
+    let (first, _) = viewer.take(&id, tab(1)).await.unwrap();
+    let first_input = viewer.input(
+        &id,
+        &first.lease,
+        first.generation,
+        (1, 1),
+        vec![key(SHIFT, true)],
+    );
+    let second = async {
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        let (second, _) = viewer.take(&id, tab(2)).await.unwrap();
+        viewer
+            .input(
+                &id,
+                &second.lease,
+                second.generation,
+                (1, 1),
+                vec![key(0x1E, true), key(0x1E, false)],
+            )
+            .await
+            .unwrap()
+    };
+    let open = async {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        sink.open();
+    };
+    let (first_input, second, ()) = tokio::join!(first_input, second, open);
+    assert_eq!(first_input.unwrap().applied, 1);
+    assert_eq!(second.applied, 2);
+    assert_eq!(
+        sink.log(),
+        vec![
+            Rec::Human(key(SHIFT, true)),
+            Rec::Human(key(SHIFT, false)),
+            Rec::Human(key(0x1E, true)),
+            Rec::Human(key(0x1E, false)),
+        ]
     );
 }

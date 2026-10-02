@@ -375,11 +375,12 @@ lease count as session activity.
 
 On every change of controller and every end, the daemon sends a release for
 each key and button that the human holder pressed and did not release, before
-the next controller acts. Losing focus or visibility releases them too (the
-lease stays). Input events name the lease, the session incarnation and the
-frame size they were aimed at; the daemon drops (and counts) events of an old
-lease, pointer events aimed at an old frame size, and events for an older
-session with the same name.
+the next controller acts: agent input (native and Cua) and a new holder's
+input wait until those releases are sent. Losing focus or visibility releases
+them too (the lease stays). Input events name the lease, the session
+incarnation and the frame size they were aimed at; the daemon drops (and
+counts) events of an old lease, pointer events aimed at an old frame size, and
+events for an older session with the same name.
 
 Agent takeover. The agent takes control back immediately, through its own
 surface:
