@@ -51,7 +51,8 @@
 # --read-only.
 # read_only = false
 # Seconds without human input after which a viewer's control lease ends and
-# control returns to the agent. Env: RDPILOT_VIEWER__IDLE_TIMEOUT.
+# control returns to the agent. At least 1; 0 is rejected (the timeout cannot
+# be turned off). Env: RDPILOT_VIEWER__IDLE_TIMEOUT.
 # idle_timeout = 300
 
 # Session recording. Off unless switched on here, per host below, per

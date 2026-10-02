@@ -369,8 +369,9 @@ the tab closes or stops sending its heartbeat (5 seconds), after the idle
 timeout without input (default 300 seconds), when the viewer stops, when the
 session ends, and when the daemon exits. Every end except a takeover by
 another tab returns control to the agent. Set the idle timeout with
-`[viewer] idle_timeout` (seconds) or `RDPILOT_VIEWER__IDLE_TIMEOUT`. A
-session under a human lease is not idle-reaped; human input and the end of a
+`[viewer] idle_timeout` (seconds) or `RDPILOT_VIEWER__IDLE_TIMEOUT`. The
+value must be at least 1: `0` is rejected (the idle timeout cannot be turned
+off). A session under a human lease is not idle-reaped; human input and the end of a
 lease count as session activity.
 
 On every change of controller and every end, the daemon sends a release for
