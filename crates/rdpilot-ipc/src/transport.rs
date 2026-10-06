@@ -49,6 +49,8 @@ use std::time::Duration;
 #[cfg(unix)]
 use directories::BaseDirs;
 #[cfg(unix)]
+use std::os::unix::process::CommandExt;
+#[cfg(unix)]
 use tokio::net::UnixStream;
 
 /// A transport-layer error: I/O failure, frame encode failure, or frame
@@ -249,8 +251,8 @@ pub async fn connect_existing(socket_path: &Path) -> io::Result<UnixStream> {
 /// `daemon_exe` if it is not already listening (CLI-01/DAEMON-03).
 ///
 /// Always tries a plain connect FIRST. Only on failure does it spawn
-/// `daemon_exe` (detached -- never waited on; the daemon backgrounds
-/// itself) and retry the connect over [`BACKOFF_MS`]'s bounded sequence,
+/// `daemon_exe` in its own process group and retry the connect over
+/// [`BACKOFF_MS`]'s bounded sequence,
 /// returning the first successful stream.
 ///
 /// Two clients racing to auto-start the daemon simultaneously both reach
@@ -270,11 +272,11 @@ pub async fn connect_or_spawn(socket_path: &Path, daemon_exe: &Path) -> io::Resu
         return Ok(stream);
     }
 
-    // No listener yet (or a stale socket file) -- spawn the daemon
-    // detached. Never `.wait()` on the child: the daemon is meant to keep
-    // running as a long-lived background process independent of this
-    // client's own lifetime.
-    std::process::Command::new(daemon_exe).spawn()?;
+    // No listener yet (or a stale socket file). Give the daemon its own
+    // process group so caller-group teardown cannot end live sessions.
+    std::process::Command::new(daemon_exe)
+        .process_group(0)
+        .spawn()?;
 
     for backoff in BACKOFF_MS {
         tokio::time::sleep(Duration::from_millis(*backoff)).await;
