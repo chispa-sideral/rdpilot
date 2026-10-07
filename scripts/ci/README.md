@@ -63,3 +63,49 @@ tags is not supported by this workflow.
 
 Publisher tests use synthetic assets and stateful GitHub command failures;
 they never create a production release.
+
+The required `desktop` job uses a Windows Server 2025 hosted runner for real
+loopback RDP with NLA/CredSSP, temporary standard users and product-default
+graphics. It builds the candidate client, daemon, MCP and bridge, delivers the
+bridge through normal RDPDR, and verifies the running guest bridge/Cua against
+the installed bundle manifest and source hash. Cua 0.34.0, Playwright 1.63.0 and
+Pillow 12.3.0 are pinned. The existing full two-user Cua, two-user browser viewer
+and single-user takeover proofs run serially. Fault isolation, recovery, file
+transfer, browser latency/authentication, takeover/read-only behavior and actual
+Ctrl-C shutdown assertions remain required.
+
+On a fresh Windows host, from an administrator MSVC shell:
+
+```powershell
+cargo build --release --locked -p rdpilot-cli -p rdpilot-daemon -p rdpilot-mcp -p rdpilot-bridge --target x86_64-pc-windows-msvc
+python -m pip install playwright==1.63.0 Pillow==12.3.0
+python -m playwright install chromium
+$proofOutput = Join-Path $env:TEMP ('desktop-proof-' + [guid]::NewGuid())
+python scripts/ci/hosted_desktop.py --initialize --output $proofOutput
+./scripts/ci/run-hosted-desktop.ps1 -BinDir target/x86_64-pc-windows-msvc/release -Output $proofOutput -ExpectedCommit (git rev-parse HEAD)
+```
+
+The gate refuses an existing rdpilot daemon, pipe or native cache. It provisions
+only disposable local users; it must not be used while another rdpilot session
+uses that host. Password files, child temporary files and raw diagnostics live
+under an owner-only Windows ACL. Only `artifacts/` may be uploaded: fixed-schema
+check summaries, validated provenance, cleanup readbacks and successfully
+scanned screenshots. Build/setup/proof/scan/cleanup failures remain red with
+static failure stages. Raw exceptions and transcripts are never uploaded.
+Cleanup revalidates held process identities and user SIDs, logs off only owned
+sessions, removes unloaded nonspecial owned profiles and guest files, removes
+owned accounts/cache/private files and restores registry/service/firewall state.
+Each cleanup action is bounded and attempted independently.
+
+The Python harnesses remain usable against supplied remote Windows credentials;
+they provision nothing. Their existing documented environment variables and
+credential-file interfaces are unchanged. To require source delivery, add
+`--bundle <bridge-directory> --source-bridge-sha256 <sha256> --cua-version 0.34.0`.
+For loopback viewer/takeover use `--bind loopback --allow-no-tailnet`.
+
+Coverage exclusions are explicit: tailnet/cross-machine access, UAC/secure
+desktop, live recording's Linux metrics/third user and the optional guest Job
+executable. Windows containment tests remain separate required checks. Pillow
+records image differences without introducing a pixel threshold. Missing
+required checks, unknown exclusions, fake execution, skipped faults or absent
+provenance cannot pass the live gate. Release invokes the same required CI.

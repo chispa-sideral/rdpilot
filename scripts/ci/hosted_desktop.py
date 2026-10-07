@@ -1,0 +1,330 @@
+"""Owned local Windows RDP setup, serial existing proofs and bounded cleanup.
+
+No provider provisioning; requires an administrator and an unused rdpilot host.
+Raw output and credentials stay inside the pre-created owner-only ACL boundary.
+"""
+import argparse
+import base64
+import hashlib
+import importlib.util
+import json
+import os
+from pathlib import Path
+import secrets
+import shutil
+import subprocess
+import sys
+import time
+
+HERE = Path(__file__).resolve().parent
+spec = importlib.util.spec_from_file_location('live_proof', HERE/'run-live-proof.py')
+live = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(live)
+
+
+def powershell(script, values=None, timeout=30):
+    env = dict(os.environ)
+    env['RDPILOT_HOST_CONTROL'] = json.dumps(values or {})
+    source = "$ErrorActionPreference='Stop';$v=$env:RDPILOT_HOST_CONTROL|ConvertFrom-Json;"+script
+    result = subprocess.run(['powershell.exe','-NoProfile','-NonInteractive','-EncodedCommand',
+        base64.b64encode(source.encode('utf-16le')).decode()], env=env, capture_output=True, timeout=timeout)
+    if result.returncode:
+        raise RuntimeError('Private host action failed')
+    data = result.stdout.decode('utf-8-sig', errors='replace').strip()
+    return json.loads(data) if data else None
+
+
+# WTS enumeration avoids localized quser parsing; every logoff is SID-bound.
+WTS = r'''
+Add-Type @'
+using System; using System.Runtime.InteropServices;
+public class OwnedSessions {
+ [StructLayout(LayoutKind.Sequential)] public struct Info { public int Id; public IntPtr Name; public int State; }
+ [DllImport("wtsapi32.dll")] public static extern bool WTSEnumerateSessions(IntPtr h,int r,int v,out IntPtr p,out int n);
+ [DllImport("wtsapi32.dll",CharSet=CharSet.Unicode)] public static extern bool WTSQuerySessionInformation(IntPtr h,int id,int cls,out IntPtr p,out int n);
+ [DllImport("wtsapi32.dll")] public static extern void WTSFreeMemory(IntPtr p);
+ [DllImport("wtsapi32.dll")] public static extern bool WTSLogoffSession(IntPtr h,int id,bool wait);
+ public static string Query(int id,int cls){IntPtr p;int n;if(!WTSQuerySessionInformation(IntPtr.Zero,id,cls,out p,out n))throw new Exception("Session query failed");try{return Marshal.PtrToStringUni(p);}finally{WTSFreeMemory(p);}}
+}
+'@
+$ptr=[IntPtr]::Zero;$count=0
+if(![OwnedSessions]::WTSEnumerateSessions([IntPtr]::Zero,0,1,[ref]$ptr,[ref]$count)){throw 'Session enumeration failed'}
+$matched=@()
+try {
+ $size=[Runtime.InteropServices.Marshal]::SizeOf([type][OwnedSessions+Info])
+ for($i=0;$i -lt $count;$i++) {
+  $s=[Runtime.InteropServices.Marshal]::PtrToStructure([IntPtr]::Add($ptr,$i*$size),[type][OwnedSessions+Info])
+  $user=[OwnedSessions]::Query($s.Id,5);$domain=[OwnedSessions]::Query($s.Id,7)
+  if(!$user){continue}
+  $sid=([Security.Principal.NTAccount]::new($domain,$user)).Translate([Security.Principal.SecurityIdentifier]).Value
+  if($sid -eq $v.sid){$matched+=$s.Id}
+ }
+} finally {[OwnedSessions]::WTSFreeMemory($ptr)}
+'''
+
+PREFLIGHT = r'''
+$cache=Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'rdpilot\cache'
+if(Test-Path $cache){throw 'Existing cache is unowned'}
+if(@(Get-ChildItem '\\.\pipe\'|Where-Object Name -eq 'rdpilot-daemon').Count){throw 'Existing daemon pipe is unowned'}
+if(@(Get-CimInstance Win32_Process|Where-Object Name -in @('rdpilot-daemon.exe','rdpilot-mcp.exe','rdpilot.exe')).Count){throw 'Existing product process is unowned'}
+$ts='HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server';$tcp=Join-Path $ts 'WinStations\RDP-Tcp'
+$regs=@()
+foreach($entry in @(@($ts,'fDenyTSConnections'),@($tcp,'UserAuthentication'))) {
+ $p=(Get-ItemProperty $entry[0]).PSObject.Properties[$entry[1]]
+ $regs+=@{path=$entry[0];name=$entry[1];present=($null -ne $p);value=if($p){$p.Value}else{$null}}
+}
+$svc=Get-CimInstance Win32_Service -Filter "Name='TermService'"
+@{cache=$cache;registry=$regs;service=@{state=$svc.State;start_mode=$svc.StartMode};
+ os=(Get-CimInstance Win32_OperatingSystem).Caption;image_os=$env:ImageOS;image_version=$env:ImageVersion;computer=$env:COMPUTERNAME}|ConvertTo-Json -Depth 8 -Compress
+'''
+SETUP = r'''
+Set-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' fDenyTSConnections 0
+Set-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' UserAuthentication 1
+if((Get-CimInstance Win32_Service -Filter "Name='TermService'").StartMode -eq 'Disabled'){Set-Service TermService -StartupType Manual}
+Start-Service TermService
+New-NetFirewallRule -Name $v.rule -DisplayName 'rdpilot local desktop proof' -Direction Inbound -Action Allow -Protocol TCP -LocalPort 3389 -RemoteAddress '127.0.0.1'|Out-Null
+'''
+CREATE_USER = r'''
+if(Get-LocalUser $v.name -ErrorAction SilentlyContinue){throw 'Unowned account exists'}
+$u=New-LocalUser -Name $v.name -Description $v.marker -Password (ConvertTo-SecureString $v.password -AsPlainText -Force) -PasswordNeverExpires
+$record=@{name=$u.Name;sid=$u.SID.Value}
+$record|ConvertTo-Json -Compress|Set-Content -Encoding UTF8 $v.journal
+$record|ConvertTo-Json -Compress
+'''
+GROUPS = r'''
+$u=Get-LocalUser $v.name
+if($u.SID.Value -ne $v.sid){throw 'Account identity changed'}
+Add-LocalGroupMember -SID 'S-1-5-32-555' -Member $u
+Add-LocalGroupMember -SID 'S-1-5-32-545' -Member $u
+'''
+PROFILE = r'''
+$profile=Get-CimInstance Win32_UserProfile -Filter "SID='$($v.sid)'"
+if($profile){
+ if($profile.Special -or $profile.Loaded){throw 'Profile is special or loaded'}
+ $path=$profile.LocalPath
+ if((Split-Path $path -Parent) -ne (Join-Path $env:SystemDrive 'Users') -or (Split-Path $path -Leaf) -ne $v.name){throw 'Unowned profile path'}
+ $profile|Remove-CimInstance
+ if(Test-Path $path){throw 'Profile/guest files remain'}
+}
+if(Get-CimInstance Win32_UserProfile -Filter "SID='$($v.sid)'"){throw 'Profile row remains'}
+if(Test-Path (Join-Path (Join-Path $env:SystemDrive 'Users') $v.name)){throw 'Owned guest directory remains'}
+'''
+REMOVE_USER = r'''
+$u=Get-LocalUser $v.name -ErrorAction SilentlyContinue
+if($u){if($u.SID.Value -ne $v.sid){throw 'Account identity changed'};Remove-LocalUser -SID $u.SID}
+if(Get-LocalUser $v.name -ErrorAction SilentlyContinue){throw 'Account remains'}
+'''
+STOP_PROCESS = r'''
+$p=Get-Process -Id $v.pid -ErrorAction SilentlyContinue
+if($p){
+ $handle=$p.Handle
+ if($p.StartTime.ToUniversalTime().ToFileTimeUtc().ToString() -ne $v.created -or $p.Path -ine $v.image){throw 'Process identity changed'}
+ $p.Kill();if(!$p.WaitForExit(10000)){throw 'Owned process remains'}
+}
+'''
+
+
+def cleanup_actions(actions):
+    """Every independently bounded action is attempted even after failure."""
+    results = {}
+    for name, action in actions:
+        try:
+            action()
+            results[name] = True
+        except BaseException:
+            results[name] = False
+    return results
+
+
+def cleanup_suite(users, journal, cache):
+    actions=[]
+    def stop_processes():
+        records=json.loads(journal.read_text()) if journal.exists() else []
+        values = powershell(r'''$ok=$true
+foreach($record in $v.records){try{
+ $p=Get-Process -Id $record.pid -ErrorAction SilentlyContinue
+ if($p){$handle=$p.Handle
+  if($p.StartTime.ToUniversalTime().ToFileTimeUtc().ToString() -ne $record.created -or $p.Path -ine $record.image){throw 'Process identity changed'}
+  $p.Kill();if(!$p.WaitForExit(1000)){throw 'Owned process remains'}
+ }
+}catch{$ok=$false}}
+$ok|ConvertTo-Json
+''', {'records':records},30)
+        if values is not True:raise RuntimeError('Owned process cleanup failed')
+    actions.append(('owned_processes_removed',stop_processes))
+    for i,user in enumerate(users):
+        def reconcile(user=user):
+            if 'sid' in user:return
+            observed=powershell(r'''
+$u=Get-LocalUser $v.name -ErrorAction SilentlyContinue
+if(!$u){@{absent=$true}|ConvertTo-Json -Compress}else{
+ if($u.Description -ne $v.marker){throw 'Creation ownership marker mismatch'}
+ @{name=$u.Name;sid=$u.SID.Value}|ConvertTo-Json -Compress
+}
+''',user,10)
+            if observed.get('absent'):user['sid']='S-1-0-0'
+            else:user.update(observed)
+        actions.append(('user_'+str(i)+'_creation_reconciled',reconcile))
+        def logoff(user=user):
+            powershell(WTS+r'''
+foreach($id in $matched){if(![OwnedSessions]::WTSLogoffSession([IntPtr]::Zero,$id,$false)){throw 'Owned logoff failed'}}
+''',user,15)
+            deadline=time.monotonic()+20
+            while time.monotonic()<deadline:
+                loaded=powershell("$p=Get-CimInstance Win32_UserProfile -Filter \"SID='$($v.sid)'\";[bool]($p -and $p.Loaded)|ConvertTo-Json",user,5)
+                if not loaded:
+                    powershell(WTS+"if($matched.Count){throw 'Owned session remains'}",user,5)
+                    return
+                time.sleep(0.5)
+            raise RuntimeError('Profile stayed loaded')
+        actions += [('user_'+str(i)+'_sessions',logoff),('user_'+str(i)+'_profile_guest_removed',lambda user=user:powershell(PROFILE,user,20)),('user_'+str(i)+'_account',lambda user=user:powershell(PROFILE+REMOVE_USER,user,20))]
+    def clear_cache():
+        powershell("if(Test-Path $v.path){Remove-Item $v.path -Recurse -Force};if(Test-Path $v.path){throw 'Cache remains'}",{'path':cache},20)
+    actions.append(('native_cache_removed',clear_cache))
+    return cleanup_actions(actions)
+
+
+def measure_process_refusal():
+    child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(120)'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+    record=live.process_identity(child.pid)
+    try:
+        for field,value in (('created',str(int(record['created'])+1)),('image','unowned.exe')):
+            refused=False
+            try:powershell(STOP_PROCESS,{**record,field:value},10)
+            except RuntimeError:refused=True
+            if not refused or child.poll() is not None:raise RuntimeError('Owned process refusal was not proven')
+    finally:
+        powershell(STOP_PROCESS,record,15)
+        child.wait(timeout=5)
+
+
+def initialize(output):
+    output=Path(output)
+    output.mkdir(parents=True,exist_ok=False)
+    artifacts=output/'artifacts';artifacts.mkdir()
+    (artifacts/'gate.json').write_text(json.dumps({'status':'failed','failure_stage':'build_or_dependencies'}))
+
+
+def run(args):
+    output=Path(args.output).resolve();artifacts=output/'artifacts';private=output/'private'
+    if not artifacts.is_dir() or private.exists():
+        raise RuntimeError('Initialize new gate output first')
+    private.mkdir()
+    powershell("& icacls $v.path /inheritance:r /grant:r \"$($env:USERDOMAIN)\\$($env:USERNAME):(OI)(CI)F\"|Out-Null;if($LASTEXITCODE){throw 'Private ACL failed'}",{'path':str(private)})
+    os.environ['TEMP']=os.environ['TMP']=str(private)
+    snapshot=None;results={};suites=[];users=[];journal=private/'processes.json';rule='RdpilotDesktop-'+secrets.token_hex(8)
+    stage='preflight';passed=False;setup_attempted=False
+    try:
+        snapshot=powershell(PREFLIGHT)
+        measure_process_refusal()
+        commit=subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()
+        tree=subprocess.check_output(['git','rev-parse','HEAD^{tree}'],text=True).strip()
+        if commit!=args.expected_commit or not all(len(x)==40 and all(c in '0123456789abcdef' for c in x) for x in (commit,tree)):
+            raise RuntimeError('Source identity mismatch')
+        bin_dir=Path(args.bin_dir).resolve()
+        hashes={name:hashlib.sha256((bin_dir/(name+'.exe')).read_bytes()).hexdigest() for name in ('rdpilot','rdpilot-daemon','rdpilot-mcp','rdpilot-bridge')}
+        environment={k:snapshot[k] for k in ('os','image_os','image_version')}
+        # Values below are from local OS/image metadata, never guest/tool text.
+        environment.update(source_commit=commit,source_tree=tree,binary_sha256=hashes,
+            auth='NLA/CredSSP; explicit self-signed TLS acceptance',graphics='product default',account_role='standard',
+            target='loopback',cua_version='0.34.0',process_identity_refusals_verified=True)
+        (artifacts/'environment.json').write_text(json.dumps(environment,indent=2))
+        bundle=private/'bundle';bundle.mkdir();shutil.copyfile(bin_dir/'rdpilot-bridge.exe',bundle/'rdpilot-bridge.exe')
+        stage='setup';setup_attempted=True;powershell(SETUP,{'rule':rule})
+        deadline=time.monotonic()+45*60
+        for proof in live.CHECKS:
+            stage=proof;users=[];journal=private/(proof+'-processes.json');credentials={}
+            for label in (('a',) if proof=='takeover' else ('a','b')):
+                name='rdp'+secrets.token_hex(7)
+                password='Rdp1!'+secrets.token_urlsafe(24)+'aA1!'
+                print('::add-mask::'+password,flush=True)
+                user={'name':name,'marker':'rdpilot-owned-'+secrets.token_hex(16)}
+                users.append(user)
+                created=powershell(CREATE_USER,{**user,'password':password,'journal':str(private/('created-'+name+'.json'))})
+                user.update(created)
+                # Journal SID before groups/credentials or any other fallible action.
+                (private/'users.json').write_text(json.dumps(users))
+                powershell(GROUPS,user)
+                credentials[label]={'host':'127.0.0.1','port':3389,'username':name,'domain':snapshot['computer'],'password':password}
+                (private/(label+'.json')).write_text(json.dumps(credentials[label]))
+            child_env=dict(os.environ)
+            for label,cred in credentials.items():
+                prefix='RDPILOT_TAKE_' if proof=='takeover' else 'RDPILOT_VIEW_'+label.upper()+'_'
+                child_env.update({prefix+k.upper():str(v) for k,v in cred.items()})
+            command=[sys.executable,str(HERE/'run-live-proof.py'),proof,'--bin-dir',str(bin_dir),'--bundle',str(bundle),
+                '--output',str(private/(proof+'-raw')),'--artifacts',str(artifacts),'--source-bridge-sha256',hashes['rdpilot-bridge'],
+                '--journal',str(journal),'--credentials-a',str(private/'a.json'),'--credentials-b',str(private/'b.json')]
+            remaining=min(900,int(deadline-time.monotonic()))
+            if remaining<=0:raise TimeoutError('Work budget expired')
+            with (private/(proof+'-console.log')).open('wb') as raw:
+                child=subprocess.Popen(command,env=child_env,stdout=raw,stderr=raw)
+                # Held wrapper PID is recorded too; timeout cannot orphan its children.
+                record=live.process_identity(child.pid)
+                try:code=child.wait(timeout=remaining+30)
+                except subprocess.TimeoutExpired:
+                    powershell(STOP_PROCESS,record,15);code=1
+            selected=json.loads((artifacts/(proof+'.json')).read_text()) if (artifacts/(proof+'.json')).exists() else {'status':'failed'}
+            suites.append(proof)
+            try:checks=cleanup_suite(users,journal,snapshot['cache'])
+            except BaseException:checks={'suite_cleanup':False}
+            results[proof]=checks;users=[]
+            if code or selected['status']!='passed' or not all(checks.values()):
+                raise RuntimeError('Required proof or cleanup failed')
+        passed=True;stage='none'
+    except BaseException:
+        passed=False
+    finally:
+        if snapshot is not None:
+            if users:
+                try:results['unfinished_suite']=cleanup_suite(users,journal,snapshot['cache'])
+                except BaseException:results['unfinished_suite']={'suite_cleanup':False}
+            actions=[]
+            if setup_attempted:
+                for i,reg in enumerate(snapshot['registry']):
+                    actions.append(('registry_'+str(i),lambda reg=reg:powershell(r'''
+if($v.present){Set-ItemProperty $v.path -Name $v.name -Value $v.value}else{Remove-ItemProperty $v.path -Name $v.name -ErrorAction SilentlyContinue}
+$p=(Get-ItemProperty $v.path).PSObject.Properties[$v.name]
+if(($null -ne $p) -ne $v.present -or ($v.present -and $p.Value -ne $v.value)){throw 'Registry restoration failed'}
+''',reg,10)))
+                actions.append(('firewall',lambda:powershell("Get-NetFirewallRule -Name $v.rule -ErrorAction SilentlyContinue|Remove-NetFirewallRule;if(Get-NetFirewallRule -Name $v.rule -ErrorAction SilentlyContinue){throw 'Firewall rule remains'}",{'rule':rule},15)))
+                actions.append(('service',lambda:powershell(r'''
+if($v.state -eq 'Stopped'){Stop-Service TermService -Force}
+$mode=switch($v.start_mode){'Auto'{'Automatic'} 'Disabled'{'Disabled'} default{'Manual'}}
+Set-Service TermService -StartupType $mode
+$s=Get-CimInstance Win32_Service -Filter "Name='TermService'"
+if($s.State -ne $v.state -or $s.StartMode -ne $v.start_mode){throw 'Service restoration failed'}
+''',snapshot['service'],20)))
+            results['host']=cleanup_actions(actions)
+        try:
+            shutil.rmtree(private)
+            removed=not private.exists()
+        except OSError:removed=False
+        results['private_removed']=removed
+        clean=removed and all(all(c.values()) for c in results.values() if isinstance(c,dict))
+        passed=passed and clean and suites==list(live.CHECKS)
+        if not passed:
+            for screenshot in artifacts.glob('*.png'):
+                screenshot.unlink()
+        (artifacts/'cleanup.json').write_text(json.dumps(results,indent=2))
+        (artifacts/'gate.json').write_text(json.dumps({'status':'passed' if passed else 'failed','failure_stage':'none' if passed else (stage if stage!='none' else 'cleanup'),'completed_suites':suites},indent=2))
+    print('Hosted desktop gate '+('passed' if passed else 'failed')+'; stage: '+stage,flush=True)
+    return 0 if passed else 1
+
+
+def main():
+    parser=argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--output',required=True)
+    parser.add_argument('--initialize',action='store_true')
+    parser.add_argument('--bin-dir')
+    parser.add_argument('--expected-commit')
+    args=parser.parse_args()
+    if args.initialize:
+        initialize(args.output);return 0
+    try:return run(args)
+    except BaseException:
+        print('Hosted desktop gate failed before setup; safe build-stage artifact retained.')
+        return 1
+
+
+if __name__=='__main__':
+    raise SystemExit(main())

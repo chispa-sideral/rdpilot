@@ -17,6 +17,7 @@ The output is owner-only and contains guest desktop content. This harness
 provisions nothing. Two local TCP relays forward existing RDP access and allow
 an exact-target connection loss; all guest control uses RDP/native Cua MCP.
 """
+import proof_support
 import argparse
 import asyncio
 import base64
@@ -236,7 +237,7 @@ class Run:
         self.relays, self.endpoints, self.metadata = {}, {}, {}
         self.checks = []
         self.daemon = None
-        self.summary = {"status": "running", "checks": self.checks, "unverified": ["UAC/secure-desktop behavior is unsupported; no elevation guarantee"]}
+        self.summary = {"mode": "live", "status": "running", "checks": self.checks, "unverified": ["UAC/secure-desktop behavior is unsupported; no elevation guarantee"]}
 
     def clean(self, text):
         for cred in self.credentials.values():
@@ -252,7 +253,9 @@ class Run:
         lines = []
         for target, entry in entries.items():
             lines += [f"Host {target}", f"  HostName {quote(entry['host'])}", f"  User {quote(entry['username'])}",
-                      f"  PasswordCommand {quote('printenv E2E_PASSWORD_' + target.upper())}"]
+                      f"  PasswordCommand {quote(proof_support.password_command(target))}"]
+            if getattr(self.args, "cua_version", None):
+                lines.append(f"  CuaVersion {quote(self.args.cua_version)}")
             if entry.get("port"):
                 lines.append(f"  Port {entry['port']}")
             if entry.get("domain"):
@@ -304,6 +307,9 @@ class Run:
         endpoint = Mcp(self, target)
         self.endpoints[target] = endpoint
         await endpoint.start()
+        from types import SimpleNamespace
+        await proof_support.installed_identity(self, target, endpoint, SimpleNamespace(
+            psquote=psquote, powershell=powershell, require=require))
         return endpoint
 
     def filename(self, target, suffix):
@@ -561,6 +567,7 @@ $text=& $exe 'runtime::windows_tests::job_closes_root_and_descendant_created_aft
                 await self.attach(target)
                 await self.fixture(target)
                 await self.transfer(target)
+                await self.native_recovery(target, "before_faults")
             await self.isolation()
             await self.job_test()
             if not self.args.skip_faults:
@@ -593,12 +600,17 @@ $text=& $exe 'runtime::windows_tests::job_closes_root_and_descendant_created_aft
                 await relay.close()
             daemon_log.close()
             self.save()
+            needles = [str(c["password"]).encode() for c in self.credentials.values() if c.get("password")]
+            require(not any(needle in path.read_bytes() for path in self.output.rglob("*") if path.is_file() for needle in needles), "Credential in evidence")
+            self.check("evidence_contains_no_credentials")
             shutil.rmtree(self.temp)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--bin-dir", required=True)
+    parser.add_argument("--source-bridge-sha256", help="require running guest/manifest identity to match source")
+    parser.add_argument("--cua-version", help="pin the upstream Cua bundle version")
     parser.add_argument("--bundle", help="daemon bundle_path directory (default: download into a fresh cache)")
     parser.add_argument("--credentials-a", required=True)
     parser.add_argument("--credentials-b", required=True)
