@@ -612,7 +612,7 @@ mod tests {
 
                     tokio::time::timeout(
                         std::time::Duration::from_secs(5),
-                        input_tx.send(RdpInputEvent::FastPath(vec![competitor.clone()])),
+                        input_tx.send(RdpInputEvent::FastPath(vec![competitor])),
                     )
                     .await
                     .map_err(|_| "competitor enqueue deadline".to_owned())?
@@ -644,11 +644,11 @@ mod tests {
                                             "Type resumed after competitor action".to_owned()
                                         );
                                     }
-                                    all_type.push(event.clone());
+                                    all_type.push(*event);
                                 }
                                 _ => {
                                     saw_competitor = true;
-                                    competitor_events.push(event.clone());
+                                    competitor_events.push(*event);
                                 }
                             }
                         }

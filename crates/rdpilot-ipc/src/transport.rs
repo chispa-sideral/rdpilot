@@ -365,7 +365,6 @@ mod output_limit_tests {
 #[allow(clippy::expect_used, clippy::unwrap_used)] // Test-only fail-fast assertions -- mirrors this crate's other test modules' established convention.
 mod tests {
     use serde::Deserialize;
-    use tokio::io::AsyncWriteExt as _;
 
     use super::*;
 
