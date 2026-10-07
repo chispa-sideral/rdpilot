@@ -22,16 +22,35 @@ live = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(live)
 
 
+ERROR_CODES={'host_action','member_exists','parameter_binding','group_not_found','user_not_found','access_denied','native_error','timeout','invalid_host_json'}
+
+class HostActionError(RuntimeError):
+    def __init__(self,code):
+        self.code=code if code in ERROR_CODES else 'host_action'
+        super().__init__('Private host action failed')
+
+
 def powershell(script, values=None, timeout=30):
     env = dict(os.environ)
     env['RDPILOT_HOST_CONTROL'] = json.dumps(values or {})
-    source = "$ErrorActionPreference='Stop';$v=$env:RDPILOT_HOST_CONTROL|ConvertFrom-Json;"+script
-    result = subprocess.run(['powershell.exe','-NoProfile','-NonInteractive','-EncodedCommand',
+    source = "$ErrorActionPreference='Stop';$v=$env:RDPILOT_HOST_CONTROL|ConvertFrom-Json;try{"+script+r'''
+}catch{
+ $code=switch -Wildcard ($_.FullyQualifiedErrorId){
+  'MemberExists*'{'member_exists'} '*ParameterBinding*'{'parameter_binding'}
+  'GroupNotFound*'{'group_not_found'} 'UserNotFound*'{'user_not_found'}
+  '*AccessDenied*'{'access_denied'} '*Win32*'{'native_error'} default{'host_action'}
+ }
+ [Console]::Error.Write($code);exit 1
+}
+'''
+    try:result = subprocess.run(['powershell.exe','-NoProfile','-NonInteractive','-EncodedCommand',
         base64.b64encode(source.encode('utf-16le')).decode()], env=env, capture_output=True, timeout=timeout)
+    except subprocess.TimeoutExpired:raise HostActionError('timeout')
     if result.returncode:
-        raise RuntimeError('Private host action failed')
+        raise HostActionError(result.stderr.decode('ascii',errors='replace').strip())
     data = result.stdout.decode('utf-8-sig', errors='replace').strip()
-    return json.loads(data) if data else None
+    try:return json.loads(data) if data else None
+    except ValueError:raise HostActionError('invalid_host_json')
 
 
 # WTS enumeration avoids localized quser parsing; every logoff is SID-bound.
@@ -91,14 +110,29 @@ $record=@{name=$u.Name;sid=$u.SID.Value}
 $record|ConvertTo-Json -Compress|Set-Content -Encoding UTF8 $v.journal
 $record|ConvertTo-Json -Compress
 '''
-GROUPS = r'''
+ENSURE_GROUP = r'''
 $u=Get-LocalUser $v.name
 if($u.SID.Value -ne $v.sid){throw 'Account identity changed'}
-Add-LocalGroupMember -SID 'S-1-5-32-555' -Member $u
-Add-LocalGroupMember -SID 'S-1-5-32-545' -Member $u
+$members=@(Get-LocalGroupMember -SID $v.group_sid)
+$initially=@($members|Where-Object {$_.SID.Value -eq $v.sid}).Count -gt 0
+if(!$initially){Add-LocalGroupMember -SID $v.group_sid -Member $u}
+$now=@(Get-LocalGroupMember -SID $v.group_sid|Where-Object {$_.SID.Value -eq $v.sid}).Count -gt 0
+if(!$now){throw 'Required group membership absent'}
+@{initially_member=$initially;membership_verified=$now}|ConvertTo-Json -Compress
 '''
+ROLE = r'''
+$u=Get-LocalUser $v.name
+if($u.SID.Value -ne $v.sid -or !$u.Enabled){throw 'Account role identity mismatch'}
+$rdp=@(Get-LocalGroupMember -SID 'S-1-5-32-555'|Where-Object {$_.SID.Value -eq $v.sid}).Count -gt 0
+$users=@(Get-LocalGroupMember -SID 'S-1-5-32-545'|Where-Object {$_.SID.Value -eq $v.sid}).Count -gt 0
+$admin=@(Get-LocalGroupMember -SID 'S-1-5-32-544'|Where-Object {$_.SID.Value -eq $v.sid}).Count -gt 0
+if(!$rdp -or !$users -or $admin){throw 'Standard user membership mismatch'}
+@{rdp_member=$rdp;users_member=$users;administrator_member=$admin}|ConvertTo-Json -Compress
+'''
+
 PROFILE = r'''
 $profile=Get-CimInstance Win32_UserProfile -Filter "SID='$($v.sid)'"
+$present=$null -ne $profile
 if($profile){
  if($profile.Special -or $profile.Loaded){throw 'Profile is special or loaded'}
  $path=$profile.LocalPath
@@ -108,8 +142,11 @@ if($profile){
 }
 if(Get-CimInstance Win32_UserProfile -Filter "SID='$($v.sid)'"){throw 'Profile row remains'}
 if(Test-Path (Join-Path (Join-Path $env:SystemDrive 'Users') $v.name)){throw 'Owned guest directory remains'}
+@{profile_was_present=$present;profile_guest_removed=$true}|ConvertTo-Json -Compress
 '''
 REMOVE_USER = r'''
+if(Get-CimInstance Win32_UserProfile -Filter "SID='$($v.sid)'"){throw 'Profile row remains before account removal'}
+if(Test-Path (Join-Path (Join-Path $env:SystemDrive 'Users') $v.name)){throw 'Guest profile directory remains before account removal'}
 $u=Get-LocalUser $v.name -ErrorAction SilentlyContinue
 if($u){if($u.SID.Value -ne $v.sid){throw 'Account identity changed'};Remove-LocalUser -SID $u.SID}
 if(Get-LocalUser $v.name -ErrorAction SilentlyContinue){throw 'Account remains'}
@@ -136,9 +173,11 @@ def cleanup_actions(actions):
     return results
 
 
-def cleanup_suite(users, journal, cache):
+def cleanup_suite(users, journal, cache, require_profiles=False):
     actions=[]
+    profile_presence={}
     def stop_processes():
+        if require_profiles and not journal.exists():raise RuntimeError('Required process journal absent')
         records=json.loads(journal.read_text()) if journal.exists() else []
         values = powershell(r'''$ok=$true
 foreach($record in $v.records){try{
@@ -177,11 +216,19 @@ foreach($id in $matched){if(![OwnedSessions]::WTSLogoffSession([IntPtr]::Zero,$i
                     return
                 time.sleep(0.5)
             raise RuntimeError('Profile stayed loaded')
-        actions += [('user_'+str(i)+'_sessions',logoff),('user_'+str(i)+'_profile_guest_removed',lambda user=user:powershell(PROFILE,user,20)),('user_'+str(i)+'_account',lambda user=user:powershell(PROFILE+REMOVE_USER,user,20))]
+        def remove_profile(user=user,index=i):
+            observed=powershell(PROFILE,user,20)
+            present=isinstance(observed,dict) and observed.get('profile_was_present') is True
+            profile_presence['user_'+str(index)+'_profile_was_present']=present
+            if require_profiles and not present:raise RuntimeError('Required live profile was not observed')
+        actions += [('user_'+str(i)+'_sessions',logoff),('user_'+str(i)+'_profile_guest_removed',remove_profile),('user_'+str(i)+'_account',lambda user=user:powershell(REMOVE_USER,user,20))]
     def clear_cache():
         powershell("if(Test-Path $v.path){Remove-Item $v.path -Recurse -Force};if(Test-Path $v.path){throw 'Cache remains'}",{'path':cache},20)
     actions.append(('native_cache_removed',clear_cache))
-    return cleanup_actions(actions)
+    results=cleanup_actions(actions)
+    # Presence is required only after a completed live proof, not failed setup.
+    if require_profiles:results.update(profile_presence)
+    return results
 
 
 def measure_process_refusal():
@@ -213,7 +260,7 @@ def run(args):
     powershell("& icacls $v.path /inheritance:r /grant:r \"$($env:USERDOMAIN)\\$($env:USERNAME):(OI)(CI)F\"|Out-Null;if($LASTEXITCODE){throw 'Private ACL failed'}",{'path':str(private)})
     os.environ['TEMP']=os.environ['TMP']=str(private)
     snapshot=None;results={};suites=[];users=[];journal=private/'processes.json';rule='RdpilotDesktop-'+secrets.token_hex(8)
-    stage='preflight';passed=False;setup_attempted=False
+    stage='preflight';failure_code='none';passed=False;setup_attempted=False;roles=[];memberships=[]
     try:
         snapshot=powershell(PREFLIGHT)
         measure_process_refusal()
@@ -233,24 +280,36 @@ def run(args):
         stage='setup';setup_attempted=True;powershell(SETUP,{'rule':rule})
         deadline=time.monotonic()+45*60
         for proof in live.CHECKS:
-            stage=proof;users=[];journal=private/(proof+'-processes.json');credentials={}
+            stage=proof+'_create_user';users=[];journal=private/(proof+'-processes.json');credentials={}
             for label in (('a',) if proof=='takeover' else ('a','b')):
                 name='rdp'+secrets.token_hex(7)
                 password='Rdp1!'+secrets.token_urlsafe(24)+'aA1!'
                 print('::add-mask::'+password,flush=True)
+                stage=proof+'_create_user'
                 user={'name':name,'marker':'rdpilot-owned-'+secrets.token_hex(16)}
                 users.append(user)
                 created=powershell(CREATE_USER,{**user,'password':password,'journal':str(private/('created-'+name+'.json'))})
                 user.update(created)
                 # Journal SID before groups/credentials or any other fallible action.
                 (private/'users.json').write_text(json.dumps(users))
-                powershell(GROUPS,user)
+                for group,sid in (('remote','S-1-5-32-555'),('users','S-1-5-32-545')):
+                    stage=proof+'_group_'+group
+                    member=powershell(ENSURE_GROUP,{**user,'group_sid':sid})
+                    if (not isinstance(member,dict) or type(member.get('initially_member')) is not bool or member.get('membership_verified') is not True):
+                        raise RuntimeError('Group evidence unavailable')
+                    memberships.append({'proof':proof,'group':group,**member})
+                stage=proof+'_account_role'
+                role=powershell(ROLE,user)
+                if role!={'rdp_member':True,'users_member':True,'administrator_member':False}:raise RuntimeError('Role evidence unavailable')
+                roles.append({'proof':proof,**role})
+                stage=proof+'_credentials'
                 credentials[label]={'host':'127.0.0.1','port':3389,'username':name,'domain':snapshot['computer'],'password':password}
                 (private/(label+'.json')).write_text(json.dumps(credentials[label]))
             child_env=dict(os.environ)
             for label,cred in credentials.items():
                 prefix='RDPILOT_TAKE_' if proof=='takeover' else 'RDPILOT_VIEW_'+label.upper()+'_'
                 child_env.update({prefix+k.upper():str(v) for k,v in cred.items()})
+            stage=proof+'_harness'
             command=[sys.executable,str(HERE/'run-live-proof.py'),proof,'--bin-dir',str(bin_dir),'--bundle',str(bundle),
                 '--output',str(private/(proof+'-raw')),'--artifacts',str(artifacts),'--source-bridge-sha256',hashes['rdpilot-bridge'],
                 '--journal',str(journal),'--credentials-a',str(private/'a.json'),'--credentials-b',str(private/'b.json')]
@@ -265,14 +324,16 @@ def run(args):
                     powershell(STOP_PROCESS,record,15);code=1
             selected=json.loads((artifacts/(proof+'.json')).read_text()) if (artifacts/(proof+'.json')).exists() else {'status':'failed'}
             suites.append(proof)
-            try:checks=cleanup_suite(users,journal,snapshot['cache'])
+            stage=proof+'_cleanup'
+            try:checks=cleanup_suite(users,journal,snapshot['cache'],require_profiles=(code==0 and selected['status']=='passed'))
             except BaseException:checks={'suite_cleanup':False}
             results[proof]=checks;users=[]
             if code or selected['status']!='passed' or not all(checks.values()):
                 raise RuntimeError('Required proof or cleanup failed')
         passed=True;stage='none'
-    except BaseException:
+    except BaseException as error:
         passed=False
+        failure_code=error.code if isinstance(error,HostActionError) else 'required_gate'
     finally:
         if snapshot is not None:
             if users:
@@ -305,8 +366,9 @@ if($s.State -ne $v.state -or $s.StartMode -ne $v.start_mode){throw 'Service rest
         if not passed:
             for screenshot in artifacts.glob('*.png'):
                 screenshot.unlink()
+        (artifacts/'account-roles.json').write_text(json.dumps({'roles':roles,'memberships':memberships},indent=2))
         (artifacts/'cleanup.json').write_text(json.dumps(results,indent=2))
-        (artifacts/'gate.json').write_text(json.dumps({'status':'passed' if passed else 'failed','failure_stage':'none' if passed else (stage if stage!='none' else 'cleanup'),'completed_suites':suites},indent=2))
+        (artifacts/'gate.json').write_text(json.dumps({'status':'passed' if passed else 'failed','failure_stage':'none' if passed else (stage if stage!='none' else 'cleanup'),'completed_suites':suites,'failure_code':failure_code if not passed else 'none'},indent=2))
     print('Hosted desktop gate '+('passed' if passed else 'failed')+'; stage: '+stage,flush=True)
     return 0 if passed else 1
 

@@ -122,6 +122,29 @@ class OwnershipTests(unittest.TestCase):
             self.assertIn('StartTime.ToUniversalTime().ToFileTimeUtc()',host.STOP_PROCESS)
             self.assertIn('$p.Path -ine $v.image',host.STOP_PROCESS)
 
+    def test_host_action_diagnostics_are_closed_categories(self):
+        for raw in ('member_exists','parameter_binding','user_not_found','untrusted-password-lease-token'):
+            child=subprocess.CompletedProcess([],1,b'',raw.encode())
+            with patch.object(host.subprocess,'run',return_value=child):
+                with self.assertRaises(host.HostActionError) as caught:host.powershell('trusted-script')
+            self.assertIn(caught.exception.code,host.ERROR_CODES)
+            self.assertNotIn('untrusted',str(caught.exception))
+        with patch.object(host.subprocess,'run',side_effect=subprocess.TimeoutExpired('secret-command',1)):
+            with self.assertRaises(host.HostActionError) as caught:host.powershell('trusted-script')
+        self.assertEqual(caught.exception.code,'timeout')
+
+    def test_profile_presence_after_live_run_is_required(self):
+        with tempfile.TemporaryDirectory() as directory:
+            journal=Path(directory)/'pids.json';journal.write_text('[]')
+            def control(script,values=None,timeout=30):
+                if script.startswith('$ok='):return True
+                if script==host.PROFILE:return {'profile_was_present':False,'profile_guest_removed':True}
+                return False
+            with patch.object(host,'powershell',side_effect=control):
+                results=host.cleanup_suite([{'name':'owned','sid':'S-1-5-21-42'}],journal,'cache',require_profiles=True)
+            self.assertFalse(results['user_0_profile_was_present'])
+            self.assertFalse(results['user_0_profile_guest_removed'])
+
     def test_static_build_failure_artifact_is_initialized_before_dependencies(self):
         with tempfile.TemporaryDirectory() as directory:
             output=Path(directory)/'output';host.initialize(output)
