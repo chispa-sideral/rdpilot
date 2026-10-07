@@ -250,6 +250,25 @@ pub enum EventKind {
     Annotation {
         text: String,
     },
+    /// A human viewer took control from the agent.
+    ControlTaken {
+        by: crate::control::ControllerRef,
+    },
+    /// Control moved from one controller to another (agent takeover, or
+    /// another viewer tab).
+    ControlTakenOver {
+        from: crate::control::ControllerRef,
+        by: crate::control::ControllerRef,
+    },
+    /// The human holder released control; the agent controls.
+    ControlReleased {
+        from: crate::control::ControllerRef,
+    },
+    /// A human lease ended without a takeover; the agent controls.
+    ControlEnded {
+        from: crate::control::ControllerRef,
+        reason: crate::control::EndReason,
+    },
     /// A kind this reader does not know (read side only).
     #[serde(other)]
     Unknown,
@@ -561,6 +580,7 @@ impl Drop for WatchTask {
 pub(crate) fn watch_session_end(
     frame: Arc<dyn ViewFrameSource>,
     events: Arc<SessionEvents>,
+    control: Arc<crate::control::SessionControl>,
 ) -> WatchTask {
     let task = tokio::spawn(async move {
         let mut after = 0;
@@ -568,6 +588,7 @@ pub(crate) fn watch_session_end(
             let status = frame.changed(after).await;
             if status.ended {
                 events.record(EventSource::Cli, EventKind::SessionEnded);
+                crate::registry::end_lease(&control, crate::control::EndReason::SessionEnded).await;
                 return;
             }
             if status.seq <= after {
@@ -1426,7 +1447,14 @@ mod tests {
             1,
             Some(Arc::clone(&frames) as Arc<dyn ViewFrameSource>),
         ));
-        let _watch = watch_session_end(frames.clone(), Arc::clone(&log));
+        let control = Arc::new(crate::control::SessionControl::new(
+            "alpha",
+            1,
+            Arc::clone(&log),
+            None,
+            None,
+        ));
+        let _watch = watch_session_end(frames.clone(), Arc::clone(&log), control);
         frames.0.send_modify(|s| s.seq = 1);
         frames.0.send_modify(|s| s.seq = 2);
         tokio::time::sleep(Duration::from_millis(30)).await;
@@ -1446,7 +1474,14 @@ mod tests {
         let (tx, _) = watch::channel(rdpilot::FrameStatus::default());
         let frames = Arc::new(EndingFrames(tx));
         let log = Arc::new(log());
-        let watch = watch_session_end(frames.clone(), Arc::clone(&log));
+        let control = Arc::new(crate::control::SessionControl::new(
+            "alpha",
+            1,
+            Arc::clone(&log),
+            None,
+            None,
+        ));
+        let watch = watch_session_end(frames.clone(), Arc::clone(&log), control);
         tokio::task::yield_now().await;
         drop(watch);
         tokio::time::sleep(Duration::from_millis(30)).await;
@@ -1456,5 +1491,77 @@ mod tests {
         // The task released its references.
         assert_eq!(Arc::strong_count(&log), 1);
         assert_eq!(Arc::strong_count(&frames), 1);
+    }
+
+    /// Pins the control kinds of schema 1 (additive): controller
+    /// descriptors and reasons only.
+    #[test]
+    fn control_kinds_golden_json() {
+        use crate::control::{ControllerRef, EndReason};
+        let human = || ControllerRef::Human {
+            address: "100.64.0.9".into(),
+        };
+        let event = |seq, source, kind| SessionEvent {
+            seq,
+            at: "2024-01-01T00:00:01.250Z".into(),
+            offset_ms: 1250,
+            frame_seq: 3,
+            source,
+            kind,
+        };
+        let events = vec![
+            event(
+                1,
+                EventSource::Viewer,
+                EventKind::ControlTaken { by: human() },
+            ),
+            event(
+                2,
+                EventSource::Cua,
+                EventKind::ControlTakenOver {
+                    from: human(),
+                    by: ControllerRef::Agent,
+                },
+            ),
+            event(
+                3,
+                EventSource::Viewer,
+                EventKind::ControlReleased { from: human() },
+            ),
+            event(
+                4,
+                EventSource::Daemon,
+                EventKind::ControlEnded {
+                    from: human(),
+                    reason: EndReason::IdleTimeout,
+                },
+            ),
+        ];
+        let json = serde_json::to_value(&events).unwrap();
+        let common = r#""at":"2024-01-01T00:00:01.250Z","offset_ms":1250,"frame_seq":3"#;
+        let h = r#"{"kind":"human","address":"100.64.0.9"}"#;
+        let expected: serde_json::Value = serde_json::from_str(&format!(
+            r#"[
+              {{"seq":1,{common},"source":"viewer","kind":"control_taken","by":{h}}},
+              {{"seq":2,{common},"source":"cua","kind":"control_taken_over","from":{h},"by":{{"kind":"agent"}}}},
+              {{"seq":3,{common},"source":"viewer","kind":"control_released","from":{h}}},
+              {{"seq":4,{common},"source":"daemon","kind":"control_ended","from":{h},"reason":"idle_timeout"}}
+            ]"#
+        ))
+        .unwrap();
+        assert_eq!(json, expected);
+        let back: Vec<SessionEvent> = serde_json::from_value(json).unwrap();
+        assert_eq!(back, events);
+        for reason in [
+            EndReason::HeartbeatLost,
+            EndReason::ViewerStopped,
+            EndReason::SessionEnded,
+            EndReason::DaemonStopped,
+        ] {
+            let text = serde_json::to_string(&reason).unwrap();
+            assert!(text
+                .chars()
+                .all(|c| c == '"' || c == '_' || c.is_ascii_lowercase()));
+        }
     }
 }

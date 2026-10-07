@@ -4,7 +4,7 @@
 //! instead, which is the only consumer that legitimately depends on both
 //! `rdpilot` and `rdpilot-ipc`.").
 
-use rdpilot_ipc::{WireError, WireErrorCode};
+use rdpilot_ipc::{WireController, WireControllerKind, WireError, WireErrorCode};
 
 use crate::seams::DaemonError;
 
@@ -62,6 +62,7 @@ impl From<DaemonError> for WireError {
             DaemonError::Config(_) => WireErrorCode::Internal,
             DaemonError::Recording(_) => WireErrorCode::Recording,
             DaemonError::Bundle(_) => WireErrorCode::BundleUnavailable,
+            DaemonError::HumanControl { .. } => WireErrorCode::HumanControl,
             // No trailing wildcard: `DaemonError` is defined in THIS
             // crate, so — unlike `wire_code_for_sdk_error`'s match on the
             // externally-`#[non_exhaustive]` `rdpilot::Error` above — the
@@ -72,7 +73,19 @@ impl From<DaemonError> for WireError {
             // error (T-12-05's forcing-function guarantee, fully realized
             // for this same-crate type).
         };
-        WireError { code, message }
+        let controller = match err {
+            DaemonError::HumanControl { address, since, .. } => Some(WireController {
+                kind: WireControllerKind::Human,
+                address: Some(address),
+                since: Some(since),
+            }),
+            _ => None,
+        };
+        WireError {
+            code,
+            message,
+            controller,
+        }
     }
 }
 

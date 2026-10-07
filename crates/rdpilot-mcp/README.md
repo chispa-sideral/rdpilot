@@ -6,8 +6,16 @@ NAME` (with `CuaEnabled yes`, the default); the daemon downloads and deploys the
 Cua bundle during that connect, so no `bundle_path` is needed.
 
 The endpoint forwards initialization, tool schemas, requests, responses,
-notifications and image content unchanged. It has no desktop tool adapters,
-coordinate conversion or additional MCP management tools. Use separate MCP
+notifications and image content unchanged, with one exception that the
+daemon applies (see Takeover in the main README): it adds an optional boolean
+`takeover` argument to every acting tool in `tools/list` results and removes
+it from every call before Cua sees it. While a human viewer holds the
+session's control lease, the daemon answers an acting call with an `isError`
+result that names the holder and the `takeover` argument, and does not
+forward it; a call with `"takeover": true` ends the lease first and is then
+forwarded. Read-only tools are never refused. This binary stays an opaque
+forwarder. It has no desktop tool adapters, coordinate conversion or
+additional MCP management tools. Use separate MCP
 processes for separate RDP targets. Cua's session labels are guest data and
 never select another RDP target.
 

@@ -60,6 +60,9 @@ async fn dispatch(command: Command, json: bool) -> Result<(), CliError> {
         Command::Disconnect(args) | Command::Session(SessionCmd::Disconnect(args)) => {
             verbs::session::disconnect(args, json).await
         }
+        Command::Takeover(args) | Command::Session(SessionCmd::Takeover(args)) => {
+            verbs::session::takeover(args, json).await
+        }
 
         Command::Screenshot(args) | Command::Perceive(PerceiveCmd::Screenshot(args)) => {
             verbs::perceive::screenshot(args, json).await

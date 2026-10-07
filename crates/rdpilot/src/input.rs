@@ -495,6 +495,87 @@ pub enum KeyAction {
     Combo(Vec<Key>),
 }
 
+/// A pointer button a viewer can press, including the browser X buttons.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PointerButton {
+    /// The left (primary) button.
+    Left,
+    /// The middle (wheel) button.
+    Middle,
+    /// The right (secondary) button.
+    Right,
+    /// The first extra button (typically Back).
+    X1,
+    /// The second extra button (typically Forward).
+    X2,
+}
+
+/// One raw input event for a daemon-side human input path: a physical key
+/// position (Set-1 scancode) or a pointer event in framebuffer pixels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RawInput {
+    /// Move the pointer to `(x, y)`.
+    PointerMove { x: u16, y: u16 },
+    /// Press or release a pointer button at the current position.
+    Button { button: PointerButton, down: bool },
+    /// Rotate the wheel by `units` (120 per notch) at the current position.
+    Wheel { vertical: bool, units: i16 },
+    /// Press or release the key with Set-1 scancode `code`.
+    Key {
+        code: u8,
+        extended: bool,
+        down: bool,
+    },
+}
+
+/// Translate raw events into `ironrdp_input` operations, in order.
+pub(crate) fn raw_operations(events: &[RawInput]) -> Vec<Operation> {
+    let mut ops = Vec::with_capacity(events.len());
+    for event in events {
+        match *event {
+            RawInput::PointerMove { x, y } => {
+                ops.push(Operation::MouseMove(MousePosition { x, y }))
+            }
+            RawInput::Button { button, down } => {
+                let button = match button {
+                    PointerButton::Left => MouseButton::Left,
+                    PointerButton::Middle => MouseButton::Middle,
+                    PointerButton::Right => MouseButton::Right,
+                    PointerButton::X1 => MouseButton::X1,
+                    PointerButton::X2 => MouseButton::X2,
+                };
+                ops.push(if down {
+                    Operation::MouseButtonPressed(button)
+                } else {
+                    Operation::MouseButtonReleased(button)
+                });
+            }
+            RawInput::Wheel { vertical, units } => {
+                // Split like `Scroll` so no operation exceeds the wire cap.
+                for op in wheel_rotation_operations(units) {
+                    if let Operation::WheelRotations(mut w) = op {
+                        w.is_vertical = vertical;
+                        ops.push(Operation::WheelRotations(w));
+                    }
+                }
+            }
+            RawInput::Key {
+                code,
+                extended,
+                down,
+            } => {
+                let scancode = Scancode::from_u8(extended, code);
+                ops.push(if down {
+                    Operation::KeyPressed(scancode)
+                } else {
+                    Operation::KeyReleased(scancode)
+                });
+            }
+        }
+    }
+    ops
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -848,5 +929,55 @@ mod tests {
 
         let mod_free = key_operations(&KeyAction::Combo(vec![Key::A]));
         assert_eq!(mod_free.len(), 2);
+    }
+
+    #[test]
+    fn raw_input_maps_to_operations_in_order() {
+        let ops = raw_operations(&[
+            RawInput::PointerMove { x: 3, y: 4 },
+            RawInput::Button {
+                button: PointerButton::X2,
+                down: true,
+            },
+            RawInput::Button {
+                button: PointerButton::X2,
+                down: false,
+            },
+            RawInput::Wheel {
+                vertical: false,
+                units: -360,
+            },
+            RawInput::Key {
+                code: 0x2A,
+                extended: false,
+                down: true,
+            },
+            RawInput::Key {
+                code: 0x48,
+                extended: true,
+                down: false,
+            },
+        ]);
+        assert_eq!(
+            format!("{ops:?}"),
+            format!(
+                "{:?}",
+                vec![
+                    Operation::MouseMove(MousePosition { x: 3, y: 4 }),
+                    Operation::MouseButtonPressed(MouseButton::X2),
+                    Operation::MouseButtonReleased(MouseButton::X2),
+                    Operation::WheelRotations(WheelRotations {
+                        is_vertical: false,
+                        rotation_units: -240,
+                    }),
+                    Operation::WheelRotations(WheelRotations {
+                        is_vertical: false,
+                        rotation_units: -120,
+                    }),
+                    Operation::KeyPressed(Scancode::from_u8(false, 0x2A)),
+                    Operation::KeyReleased(Scancode::from_u8(true, 0x48)),
+                ]
+            )
+        );
     }
 }

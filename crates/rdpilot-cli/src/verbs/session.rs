@@ -4,7 +4,10 @@
 //! the auto-started daemon, and render the SPECIFIC response variant it
 //! expects (table by default, `--json` opt-in).
 
-use rdpilot_ipc::{Request, SessionLifecycle, WireRecordTrigger, WireRecordingState, WireResponse};
+use rdpilot_ipc::{
+    Request, SessionLifecycle, WireController, WireControllerKind, WireRecordTrigger,
+    WireRecordingState, WireResponse,
+};
 
 use rdpilot_config::hosts::expand_password_command;
 
@@ -136,7 +139,7 @@ pub async fn list(json: bool) -> Result<(), CliError> {
             if json {
                 print_json(&sessions)
             } else {
-                const HEADERS: [&str; 7] = [
+                const HEADERS: [&str; 8] = [
                     "id",
                     "name",
                     "host",
@@ -144,6 +147,7 @@ pub async fn list(json: bool) -> Result<(), CliError> {
                     "connected-since",
                     "last-activity",
                     "recording",
+                    "control",
                 ];
                 let rows: Vec<Vec<String>> = sessions
                     .iter()
@@ -156,6 +160,9 @@ pub async fn list(json: bool) -> Result<(), CliError> {
                             s.connected_since.clone().unwrap_or_default(),
                             s.last_activity.clone().unwrap_or_default(),
                             s.recording.clone().unwrap_or_else(|| "-".to_owned()),
+                            s.controller
+                                .as_ref()
+                                .map_or_else(|| "-".to_owned(), controller_str),
                         ]
                     })
                     .collect();
@@ -167,6 +174,73 @@ pub async fn list(json: bool) -> Result<(), CliError> {
         other => Err(CliError::Internal(format!(
             "unexpected response to List: {other:?}"
         ))),
+    }
+}
+
+/// `agent`, or `human <address> since <HH:MM:SS> UTC`.
+fn controller_str(controller: &WireController) -> String {
+    match controller.kind {
+        WireControllerKind::Agent => "agent".to_owned(),
+        WireControllerKind::Human => format!("human {}", holder_since(controller)),
+    }
+}
+
+/// `<address> since <HH:MM:SS> UTC` of a human controller.
+fn holder_since(controller: &WireController) -> String {
+    format!(
+        "{} since {}",
+        controller.address.as_deref().unwrap_or("?"),
+        controller
+            .since
+            .as_deref()
+            .map_or_else(|| "?".to_owned(), clock_time)
+    )
+}
+
+/// `HH:MM:SS UTC` of an ISO-8601 UTC time.
+fn clock_time(iso: &str) -> String {
+    iso.get(11..19)
+        .map_or_else(|| iso.to_owned(), |hms| format!("{hms} UTC"))
+}
+
+/// `takeover --session <id>`: end any human viewer's control lease and
+/// return control to the agent.
+///
+/// # Errors
+///
+/// The daemon's error (`SessionNotFound` for an unknown session), or a
+/// transport/auto-start failure.
+pub async fn takeover(args: SessionArg, json: bool) -> Result<(), CliError> {
+    let name = args.session;
+    let session = name.parse().map_err(CliError::Internal)?;
+    match round_trip(Request::Takeover { session }).await? {
+        WireResponse::TakenOver { previous, changed } => {
+            if json {
+                print_json(&serde_json::json!({ "changed": changed, "previous": previous }))
+            } else {
+                if changed {
+                    println!(
+                        "control of {name} returned to the agent (was {})",
+                        human_str(&previous)
+                    );
+                } else {
+                    println!("the agent already controls {name}; nothing changed");
+                }
+                Ok(())
+            }
+        }
+        WireResponse::Error(err) => Err(CliError::from(err)),
+        other => Err(CliError::Internal(format!(
+            "unexpected response to Takeover: {other:?}"
+        ))),
+    }
+}
+
+/// `human viewer <address> since <HH:MM:SS> UTC`, or `the agent`.
+fn human_str(controller: &WireController) -> String {
+    match controller.kind {
+        WireControllerKind::Agent => "the agent".to_owned(),
+        WireControllerKind::Human => format!("human viewer {}", holder_since(controller)),
     }
 }
 

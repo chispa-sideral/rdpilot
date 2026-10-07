@@ -35,7 +35,7 @@ impl std::str::FromStr for ViewerBind {
 }
 
 /// The resolved `[viewer]` settings.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct ViewerConfig {
     /// Bind set. Default: loopback plus tailnet.
     #[serde(default)]
@@ -43,6 +43,28 @@ pub struct ViewerConfig {
     /// Explicit Tailscale IPv4 address (skips automatic detection).
     #[serde(default)]
     pub tailnet_address: Option<Ipv4Addr>,
+    /// Serve without the Takeover control and every write route.
+    #[serde(default)]
+    pub read_only: bool,
+    /// Seconds without human input after which a viewer's control lease
+    /// ends and control returns to the agent. Default 300; 0 is rejected.
+    #[serde(default = "default_idle_timeout")]
+    pub idle_timeout: u64,
+}
+
+impl Default for ViewerConfig {
+    fn default() -> Self {
+        ViewerConfig {
+            bind: ViewerBind::default(),
+            tailnet_address: None,
+            read_only: false,
+            idle_timeout: default_idle_timeout(),
+        }
+    }
+}
+
+fn default_idle_timeout() -> u64 {
+    300
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -52,10 +74,17 @@ struct ViewerLayer {
 }
 
 pub(crate) fn deserialize_viewer(built: Config) -> Result<ViewerConfig, ConfigError> {
-    built
+    let viewer = built
         .try_deserialize::<ViewerLayer>()
         .map(|layer| layer.viewer)
-        .map_err(|e| ConfigError::file(e.to_string()))
+        .map_err(|e| ConfigError::file(e.to_string()))?;
+    if viewer.idle_timeout == 0 {
+        return Err(ConfigError::file(
+            "invalid viewer idle_timeout 0 (expected at least 1 second; the idle timeout cannot be \
+turned off)",
+        ));
+    }
+    Ok(viewer)
 }
 
 /// Resolve `[viewer]` from the platform config file and `RDPILOT_VIEWER__*`
@@ -98,6 +127,32 @@ mod tests {
         assert_eq!(cfg, ViewerConfig::default());
         assert_eq!(cfg.bind, ViewerBind::LoopbackAndTailnet);
         assert_eq!(cfg.tailnet_address, None);
+        assert!(!cfg.read_only);
+        assert_eq!(cfg.idle_timeout, 300);
+        Ok(())
+    }
+
+    #[test]
+    fn read_only_and_idle_timeout_resolve_from_file_then_env(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let file = File::from_str(
+            "[viewer]\nread_only = true\nidle_timeout = 60",
+            FileFormat::Toml,
+        );
+        let from_file = deserialize_viewer(Config::builder().add_source(file.clone()).build()?)?;
+        assert!(from_file.read_only);
+        assert_eq!(from_file.idle_timeout, 60);
+        let with_env = deserialize_viewer(
+            Config::builder()
+                .add_source(file)
+                .add_source(env(&[
+                    ("RDPILOT_VIEWER__READ_ONLY", "false"),
+                    ("RDPILOT_VIEWER__IDLE_TIMEOUT", "120"),
+                ]))
+                .build()?,
+        )?;
+        assert!(!with_env.read_only);
+        assert_eq!(with_env.idle_timeout, 120);
         Ok(())
     }
 
@@ -128,6 +183,20 @@ mod tests {
             with_env.tailnet_address,
             Some(Ipv4Addr::new(100, 100, 1, 2))
         );
+        Ok(())
+    }
+
+    #[test]
+    fn zero_idle_timeout_is_an_error() -> Result<(), Box<dyn std::error::Error>> {
+        let file = File::from_str("[viewer]\nidle_timeout = 0", FileFormat::Toml);
+        let Err(err) = deserialize_viewer(Config::builder().add_source(file).build()?) else {
+            panic!("idle_timeout = 0 is accepted");
+        };
+        assert!(err.to_string().contains("idle_timeout 0"), "{err}");
+        let env_zero = Config::builder()
+            .add_source(env(&[("RDPILOT_VIEWER__IDLE_TIMEOUT", "0")]))
+            .build()?;
+        assert!(deserialize_viewer(env_zero).is_err());
         Ok(())
     }
 

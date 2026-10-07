@@ -79,6 +79,7 @@ fn code_for(err: &CliError) -> u8 {
             WireErrorCode::ChecksumMismatch => 6,
             WireErrorCode::DuplicateSession => 7,
             WireErrorCode::BundleUnavailable => 9,
+            WireErrorCode::HumanControl => 10,
             // `Internal`, the client-only `DaemonUnreachable` wire variant
             // (never actually produced by the daemon — see
             // `CliError::DaemonUnreachable` for the real client-side path),
@@ -132,10 +133,7 @@ mod tests {
     use super::*;
 
     fn wire(code: WireErrorCode) -> CliError {
-        CliError::Wire(WireError {
-            code,
-            message: "x".to_owned(),
-        })
+        CliError::Wire(WireError::new(code, "x"))
     }
 
     #[test]
@@ -146,6 +144,11 @@ mod tests {
         assert_eq!(code_for(&wire(WireErrorCode::ChecksumMismatch)), 6);
         assert_eq!(code_for(&wire(WireErrorCode::DuplicateSession)), 7);
         assert_eq!(code_for(&wire(WireErrorCode::BundleUnavailable)), 9);
+        assert_eq!(code_for(&wire(WireErrorCode::HumanControl)), 10);
+        assert_eq!(
+            code_str_for(&wire(WireErrorCode::HumanControl)),
+            "human-control"
+        );
         assert_eq!(code_for(&wire(WireErrorCode::Internal)), 1);
         assert_eq!(code_for(&wire(WireErrorCode::Recording)), 1);
         assert_eq!(code_str_for(&wire(WireErrorCode::Recording)), "recording");
@@ -162,6 +165,7 @@ mod tests {
             WireErrorCode::ChecksumMismatch,
             WireErrorCode::DuplicateSession,
             WireErrorCode::BundleUnavailable,
+            WireErrorCode::HumanControl,
         ]
         .map(|code| code_for(&wire(code)));
         let unique: std::collections::HashSet<u8> = codes.iter().copied().collect();

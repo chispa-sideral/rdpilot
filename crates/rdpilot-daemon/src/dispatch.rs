@@ -332,14 +332,20 @@ pub(crate) async fn dispatch_for_ipc(
         }
         Request::Mouse { session, action } => {
             let action = sdk_mouse_action(action);
-            match registry.call(&session, move |s| s.send_mouse(action)).await {
+            match registry
+                .call_acting(&session, move |s| s.send_mouse(action))
+                .await
+            {
                 Ok(()) => WireResponse::Ack,
                 Err(e) => WireResponse::Error(e.into()),
             }
         }
         Request::Key { session, action } => {
             let action = sdk_key_action(action);
-            match registry.call(&session, move |s| s.send_key(action)).await {
+            match registry
+                .call_acting(&session, move |s| s.send_key(action))
+                .await
+            {
                 Ok(()) => WireResponse::Ack,
                 Err(e) => WireResponse::Error(e.into()),
             }
@@ -371,6 +377,12 @@ pub(crate) async fn dispatch_for_ipc(
         }
         Request::RecordingList {} => recording_list(registry).await,
         Request::RecordingKeep { id, keep } => recording_keep(registry, id, keep).await,
+        Request::Takeover { session } => {
+            match registry.takeover(&session, EventSource::Cli).await {
+                Ok((previous, changed)) => WireResponse::TakenOver { previous, changed },
+                Err(e) => WireResponse::Error(e.into()),
+            }
+        }
     };
     if let Some(call) = cli_call {
         call.finish(!matches!(response, WireResponse::Error(_)));
@@ -906,7 +918,7 @@ mod tests {
         assert_eq!(run.connects, 0, "the RDP connector must never be called");
         assert_eq!(run.deploys, 0);
         match run.response {
-            WireResponse::Error(WireError { code, message }) => {
+            WireResponse::Error(WireError { code, message, .. }) => {
                 assert_eq!(code, WireErrorCode::BundleUnavailable);
                 assert!(
                     message.contains("Cua driver latest-dev (x86_64)"),
@@ -1087,6 +1099,117 @@ mod tests {
             matches!(response, WireResponse::Ack),
             "expected Ack, got {response:?}"
         );
+    }
+
+    /// Take the human lease of `session` for a tab at 100.101.102.103.
+    async fn human_take(registry: &Registry, session: &SessionId) {
+        registry
+            .control(session)
+            .expect("live session")
+            .take("100.101.102.103".parse().unwrap(), async {})
+            .await
+            .expect("take");
+    }
+
+    #[tokio::test]
+    async fn native_input_during_a_human_lease_fails_with_the_takeover_command() {
+        let registry = test_registry();
+        let session = connected_session(&registry).await;
+        human_take(&registry, &session).await;
+        let mut command = String::new();
+        for request in [
+            Request::Key {
+                session: session.clone(),
+                action: WireKeyAction::Type("hi".into()),
+            },
+            Request::Mouse {
+                session: session.clone(),
+                action: WireMouseAction::Move { x: 1, y: 2 },
+            },
+        ] {
+            match dispatch(&registry, request).await {
+                WireResponse::Error(WireError {
+                    code: WireErrorCode::HumanControl,
+                    message,
+                    controller: Some(controller),
+                }) => {
+                    assert_eq!(controller.kind, rdpilot_ipc::WireControllerKind::Human);
+                    assert_eq!(controller.address.as_deref(), Some("100.101.102.103"));
+                    assert!(controller.since.is_some());
+                    assert!(message.starts_with(
+                        "session \"web\" is controlled by human viewer 100.101.102.103 since "
+                    ));
+                    command = message
+                        .rsplit_once("take over with: ")
+                        .expect("names the command")
+                        .1
+                        .to_owned();
+                }
+                other => panic!("expected HumanControl, got {other:?}"),
+            }
+        }
+        assert_eq!(command, "rdpilot takeover --session web");
+        // Native reads keep working during the lease.
+        for request in [
+            Request::Screenshot {
+                session: session.clone(),
+            },
+            Request::DesktopSize {
+                session: session.clone(),
+            },
+            Request::List {},
+        ] {
+            assert!(!matches!(
+                dispatch(&registry, request).await,
+                WireResponse::Error(_)
+            ));
+        }
+        let statuses = registry.list();
+        assert_eq!(
+            statuses[0].controller.as_ref().map(|c| c.kind),
+            Some(rdpilot_ipc::WireControllerKind::Human)
+        );
+        // Running the printed command returns control; the same call works.
+        match dispatch(
+            &registry,
+            Request::Takeover {
+                session: session.clone(),
+            },
+        )
+        .await
+        {
+            WireResponse::TakenOver { previous, changed } => {
+                assert!(changed);
+                assert_eq!(previous.address.as_deref(), Some("100.101.102.103"));
+            }
+            other => panic!("expected TakenOver, got {other:?}"),
+        }
+        let action = WireKeyAction::Type("hi".into());
+        assert!(matches!(
+            dispatch(&registry, Request::Key { session, action }).await,
+            WireResponse::Ack
+        ));
+    }
+
+    #[tokio::test]
+    async fn takeover_is_a_no_op_under_agent_control_and_fails_for_an_unknown_session() {
+        let registry = test_registry();
+        let session = connected_session(&registry).await;
+        assert!(matches!(
+            dispatch(&registry, Request::Takeover { session }).await,
+            WireResponse::TakenOver {
+                changed: false,
+                previous
+            } if previous.kind == rdpilot_ipc::WireControllerKind::Agent
+        ));
+        let ghost = "ghost".parse().unwrap();
+        assert!(matches!(
+            dispatch(&registry, Request::Takeover { session: ghost }).await,
+            WireResponse::Error(WireError {
+                code: WireErrorCode::SessionNotFound,
+                ..
+            })
+        ));
     }
 
     #[tokio::test]

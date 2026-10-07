@@ -72,6 +72,18 @@ pub enum Request {
         /// Explicit Tailscale IPv4 address; `None` detects it.
         #[serde(default)]
         tailnet_address: Option<String>,
+        /// Serve without the Takeover control and every write route.
+        #[serde(default)]
+        read_only: bool,
+        /// Seconds without human input after which a human control lease
+        /// ends; `None` uses the daemon default (300).
+        #[serde(default)]
+        idle_timeout_secs: Option<u64>,
+    },
+    /// End any human viewer's control lease on the session (with its
+    /// held-key release) and return control to the agent.
+    Takeover {
+        session: SessionId,
     },
     /// Start recording a connected session from now on.
     RecordStart {
@@ -136,7 +148,8 @@ impl SessionScoped for Request {
             | Self::CuaAttach { session }
             | Self::RecordStart { session }
             | Self::RecordStop { session }
-            | Self::Annotate { session, .. } => Some(session),
+            | Self::Annotate { session, .. }
+            | Self::Takeover { session } => Some(session),
         }
     }
 }
@@ -159,6 +172,7 @@ mod tests {
             "RecordStart",
             "RecordStop",
             "Annotate",
+            "Takeover",
         ] {
             assert!(serde_json::from_value::<Request>(serde_json::json!({"op":op})).is_err());
         }
@@ -198,16 +212,32 @@ mod tests {
         let req = Request::ViewerStart {
             bind: WireViewerBind::LoopbackAndTailnet,
             tailnet_address: Some("100.64.0.1".into()),
+            read_only: true,
+            idle_timeout_secs: Some(60),
         };
         let json = serde_json::to_value(&req).unwrap();
         assert_eq!(json["op"], "ViewerStart");
+        let old: Request = serde_json::from_value(serde_json::json!({
+            "op": "ViewerStart", "bind": "Loopback",
+        }))
+        .unwrap();
+        assert!(matches!(
+            old,
+            Request::ViewerStart {
+                read_only: false,
+                idle_timeout_secs: None,
+                ..
+            }
+        ));
         let back: Request = serde_json::from_value(json).unwrap();
         assert!(back.session().is_none());
         assert!(matches!(
             back,
             Request::ViewerStart {
                 bind: WireViewerBind::LoopbackAndTailnet,
-                tailnet_address: Some(_)
+                tailnet_address: Some(_),
+                read_only: true,
+                idle_timeout_secs: Some(60),
             }
         ));
     }

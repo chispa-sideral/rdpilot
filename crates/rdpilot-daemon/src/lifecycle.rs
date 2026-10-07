@@ -412,6 +412,52 @@ mod tests {
         );
     }
 
+    /// A session under a human lease is never idle-reaped; after the lease
+    /// ends it is not reaped at once either (the end counts as activity).
+    #[tokio::test]
+    async fn a_human_lease_blocks_idle_reaping_and_its_end_counts_as_activity() {
+        let registry = fake_registry();
+        let id = registry
+            .open(Some("web".to_owned()), "10.0.0.5".to_owned(), test_cfg())
+            .await
+            .expect("open should succeed");
+        let control = registry.control(&id).expect("live");
+        control
+            .take("127.0.0.1".parse().unwrap(), async {})
+            .await
+            .expect("take");
+        let cfg = LifecycleConfig {
+            idle_timeout: Duration::from_millis(40),
+            empty_grace: Duration::from_millis(60),
+            reap_interval: Duration::from_millis(10),
+        };
+        let shutdown = ShutdownSignal::new();
+        let registry_for_driver = Arc::clone(&registry);
+        let shutdown_for_driver = shutdown.clone();
+        let driver = async move {
+            tokio::time::sleep(Duration::from_millis(120)).await;
+            assert_eq!(registry_for_driver.len(), 1, "a human lease blocks reaping");
+            assert!(registry_for_driver.live_idle_durations().is_empty());
+            // A long human lease ends: not reaped right away.
+            let transition = control
+                .end_human(crate::control::EndReason::ViewerStopped)
+                .expect("lease");
+            control.discharge(transition).await;
+            let idle = registry_for_driver.live_idle_durations();
+            assert!(idle[0].1 < Duration::from_millis(40), "{idle:?}");
+            tokio::time::sleep(Duration::from_millis(15)).await;
+            assert_eq!(registry_for_driver.len(), 1);
+            // Under agent control, reaping works as before.
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            assert_eq!(registry_for_driver.len(), 0);
+            shutdown_for_driver.fire();
+        };
+        tokio::join!(
+            idle_reaper(Arc::clone(&registry), cfg, shutdown.clone()),
+            driver
+        );
+    }
+
     #[tokio::test]
     async fn idle_reaper_leaves_a_freshly_active_session_alone() {
         let registry = fake_registry();

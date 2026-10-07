@@ -82,6 +82,10 @@ impl Env {
             .env("RDPILOT_DAEMON_SINK_PATH", &self.sink)
             .env("RDPILOT_DAEMON_TEST_CONNECTOR", "1")
             .env("RDPILOT_DAEMON_TEST_FRAMES", "1")
+            .env(
+                "RDPILOT_DAEMON_TEST_INPUT_LOG",
+                self.root.join("input.jsonl"),
+            )
             .env("RDPILOT_DAEMON_IDLE_TIMEOUT_MS", self.idle_ms.to_string())
             .env("RDPILOT_DAEMON_EMPTY_GRACE_MS", self.grace_ms.to_string())
             .env("RDPILOT_DAEMON_REAP_INTERVAL_MS", "50")
@@ -499,4 +503,88 @@ fn an_open_viewer_changes_neither_idle_reaping_nor_self_shutdown() {
     let (frames, final_status) = poller.join().unwrap();
     assert!(frames >= 2, "the watcher saw {frames} frames");
     assert_eq!(final_status, 410, "the watched session reported closed");
+}
+
+fn http_post(addr: SocketAddr, path: &str, token: &str, body: &str) -> u16 {
+    let mut stream = TcpStream::connect(addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(25)))
+        .unwrap();
+    write!(
+        stream,
+        "POST {path} HTTP/1.1\r\nHost: {addr}\r\nOrigin: http://{addr}\r\n\
+Authorization: Bearer {token}\r\nContent-Type: application/json\r\n\
+Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+    .unwrap();
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).unwrap();
+    let head = String::from_utf8_lossy(&raw);
+    head.split(' ').nth(1).unwrap().parse().unwrap()
+}
+
+/// `--read-only` serves no write route; the default viewer offers control.
+#[test]
+fn read_only_viewer_has_no_write_route() {
+    let mut env = Env::new("readonly", 60_000, 1_000);
+    env.connect("alpha");
+    for (read_only, args) in [
+        (true, vec!["--bind", "loopback", "--read-only"]),
+        (false, vec!["--bind", "loopback"]),
+    ] {
+        let mut viewer = Viewer::start(&env, &args);
+        let (addr, token) = (viewer.addr(), viewer.token());
+        let reply = http_get(addr, "/api/sessions", Some(&token));
+        let json: serde_json::Value = serde_json::from_slice(&reply.body).unwrap();
+        assert_eq!(json["control"], !read_only);
+        assert_eq!(json["idle_timeout_secs"], 300);
+        let take = http_post(
+            addr,
+            "/api/sessions/alpha/control",
+            &token,
+            r#"{"action":"take"}"#,
+        );
+        let record = http_post(
+            addr,
+            "/api/sessions/alpha/recording",
+            &token,
+            r#"{"action":"stop"}"#,
+        );
+        if read_only {
+            assert_eq!((take, record), (404, 404));
+        } else {
+            assert_eq!(take, 200);
+            assert_eq!(record, 200);
+            let list = env.list();
+            assert_eq!(list[0]["controller"]["kind"], "human");
+            assert_eq!(list[0]["controller"]["address"], "127.0.0.1");
+            // Native input names the takeover command; running it works.
+            let key = env.run(&["input", "key", "--session", "alpha", "--combo", "enter"]);
+            assert_eq!(key.status.code(), Some(10), "{}", key.stderr);
+            assert!(
+                key.stderr
+                    .contains("or take over with: rdpilot takeover --session alpha"),
+                "{}",
+                key.stderr
+            );
+            let takeover = env.run(&["takeover", "--session", "alpha"]);
+            assert!(takeover.status.success(), "{}", takeover.stderr);
+            assert!(takeover.stdout.starts_with(
+                "control of alpha returned to the agent (was human viewer 127.0.0.1 since "
+            ));
+            let key = env.run(&["input", "key", "--session", "alpha", "--combo", "enter"]);
+            assert!(key.status.success(), "{}", key.stderr);
+        }
+        sigint(&viewer.child);
+        assert!(viewer.wait_exit(Duration::from_secs(5)).success());
+        wait_for("viewer port to close", Duration::from_secs(3), || {
+            TcpStream::connect(addr).is_err()
+        });
+    }
+    let run = env.run(&["disconnect", "--session", "alpha"]);
+    assert!(run.status.success());
+    wait_for("daemon self-shutdown", Duration::from_secs(5), || {
+        socket_gone(&env.socket())
+    });
 }
