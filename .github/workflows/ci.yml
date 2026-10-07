@@ -3,6 +3,7 @@ name: CI
 on:
   push:
   pull_request:
+  workflow_call:
 
 permissions:
   contents: read
@@ -11,33 +12,126 @@ jobs:
   linux:
     name: Linux checks
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo check --workspace --all-targets
-      - run: cargo test --workspace
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Formatting
+        run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo check --workspace --all-targets --locked
+      - run: cargo test --workspace --locked
+      - name: CI and publisher failure-injection tests
+        run: python3 -m unittest discover -s scripts/ci -p 'test_*.py'
 
   windows:
     name: Windows config and CLI unit tests
     runs-on: windows-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo test -p rdpilot-config
-      - run: cargo test -p rdpilot-cli --bins
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - run: cargo test -p rdpilot-config --locked
+      - run: cargo test -p rdpilot-cli --bins --locked
 
   windows-dacl:
     name: Windows DACL
     runs-on: windows-latest
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - name: Enable MSVC developer environment
         uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
         with:
           arch: x64
+      - name: Windows Clippy
+        run: cargo clippy -p rdpilot-daemon -p rdpilot-ipc -p rdpilot-bridge --all-targets --locked -- -D warnings
+      - name: Python for publisher tests
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - name: CI and publisher failure-injection tests
+        run: python -m unittest discover -s scripts/ci -p 'test_*.py'
       - shell: pwsh
         run: ./scripts/ci/run-windows-dacl.ps1
 
       - name: Windows bridge and containment tests
-        run: cargo test -p rdpilot-bridge --lib --tests
+        run: cargo test -p rdpilot-bridge --lib --tests --locked
+
+  offline:
+    name: Offline viewer, recording and takeover proofs
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - name: Browser and media dependencies
+        run: |
+          python -m pip install playwright==1.63.0
+          python -m playwright install --with-deps chromium firefox
+          sudo apt-get update
+          sudo apt-get install --yes ffmpeg
+      - name: Build proof binaries
+        id: build
+        run: cargo build --locked -p rdpilot-cli -p rdpilot-daemon -p rdpilot-mcp
+      - name: Offline viewer proof
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: python scripts/ci/run-offline-proof.py viewer --bin-dir target/debug --output "$RUNNER_TEMP/offline-viewer"
+      - name: Offline recording proof
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: python scripts/ci/run-offline-proof.py recording --bin-dir target/debug --output "$RUNNER_TEMP/offline-recording"
+      - name: Offline takeover proof
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: python scripts/ci/run-offline-proof.py takeover --bin-dir target/debug --output "$RUNNER_TEMP/offline-takeover"
+      - name: Sanitized offline proof summaries
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: offline-proof-summaries
+          path: |
+            ${{ runner.temp }}/offline-viewer/artifact-summary.json
+            ${{ runner.temp }}/offline-recording/artifact-summary.json
+            ${{ runner.temp }}/offline-takeover/artifact-summary.json
+          retention-days: 7
+          if-no-files-found: warn
+
+  success:
+    name: Required checks success
+    if: ${{ always() }}
+    needs: [linux, windows, windows-dacl, offline]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Require every predecessor
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: python3 scripts/ci/check-ci-results.py linux windows windows-dacl offline
