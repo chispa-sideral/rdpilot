@@ -129,9 +129,7 @@ pub(crate) async fn run(
                         // Pre-built by Session::send_mouse/send_key; this loop
                         // only forwards, it never constructs input events or
                         // sleeps between them (Pitfall 3).
-                        active_stage
-                            .process_fastpath_input(&mut image, &events)
-                            .map_err(|e| Error::Session(format!("input injection failed: {e}")))?
+                        process_fastpath_input(&mut active_stage, &mut image, &events)?
                     }
                     Some(RdpInputEvent::Request(envelope)) => {
                         // Proactive send: DvcProcessor::start()/process() are
@@ -230,6 +228,26 @@ pub(crate) async fn run(
     }
 
     Ok(())
+}
+
+/// Encode one queued input action as one or more legal fast-path input PDUs.
+///
+/// This is called synchronously by `run` before it writes the action's outputs
+/// and returns to `select!`, so splitting the wire representation cannot let a
+/// later queued action interleave with this action's translated event stream.
+fn process_fastpath_input(
+    active_stage: &mut ActiveStage,
+    image: &mut DecodedImage,
+    events: &[ironrdp::pdu::input::fast_path::FastPathInputEvent],
+) -> Result<Vec<ActiveStageOutput>> {
+    let mut outputs = Vec::new();
+    for batch in events.chunks(255) {
+        let mut batch_outputs = active_stage
+            .process_fastpath_input(image, batch)
+            .map_err(|e| Error::Session(format!("input injection failed: {e}")))?;
+        outputs.append(&mut batch_outputs);
+    }
+    Ok(outputs)
 }
 
 /// Build the outbound DVC frame bytes for a single typed bridge request
@@ -350,6 +368,116 @@ async fn reactivate(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ironrdp::connector::connection_activation::ConnectionActivationSequence;
+    use ironrdp::connector::{Config, ConnectionResult, Credentials, DesktopSize};
+    use ironrdp::core::decode;
+    use ironrdp::graphics::image_processing::PixelFormat;
+    use ironrdp::pdu::gcc::KeyboardType;
+    use ironrdp::pdu::input::fast_path::FastPathInput;
+    use ironrdp::pdu::input::fast_path::{FastPathInputEvent, KeyboardFlags};
+    use ironrdp::pdu::rdp::capability_sets::MajorPlatformType;
+    use ironrdp::pdu::rdp::client_info::{PerformanceFlags, TimezoneInfo};
+    use ironrdp::session::image::DecodedImage;
+    use ironrdp_input::Database;
+
+    fn connection_result_fixture() -> ConnectionResult {
+        let config = Config {
+            credentials: Credentials::UsernamePassword {
+                username: "synthetic".into(),
+                password: "synthetic".into(),
+            },
+            domain: None,
+            enable_tls: false,
+            enable_credssp: true,
+            keyboard_type: KeyboardType::IbmEnhanced,
+            keyboard_subtype: 0,
+            keyboard_layout: 0,
+            keyboard_functional_keys_count: 12,
+            ime_file_name: String::new(),
+            dig_product_id: String::new(),
+            desktop_size: DesktopSize {
+                width: 100,
+                height: 100,
+            },
+            bitmap: None,
+            client_build: 0,
+            client_name: "rdpilot".to_owned(),
+            client_dir: "C:\\Windows\\System32\\mstscax.dll".to_owned(),
+            platform: MajorPlatformType::WINDOWS,
+            enable_server_pointer: false,
+            request_data: None,
+            autologon: false,
+            enable_audio_playback: false,
+            compression_type: None,
+            pointer_software_rendering: true,
+            multitransport_flags: None,
+            performance_flags: PerformanceFlags::default(),
+            desktop_scale_factor: 0,
+            hardware_id: None,
+            license_cache: None,
+            timezone_info: TimezoneInfo::default(),
+            alternate_shell: String::new(),
+            work_dir: String::new(),
+        };
+        ConnectionResult {
+            io_channel_id: 1003,
+            user_channel_id: 1001,
+            share_id: 1,
+            static_channels: Default::default(),
+            desktop_size: config.desktop_size,
+            enable_server_pointer: false,
+            pointer_software_rendering: false,
+            connection_activation: ConnectionActivationSequence::new(config, 1003, 1001),
+            compression_type: None,
+        }
+    }
+
+    fn active_fixture() -> (ActiveStage, DecodedImage) {
+        (
+            ActiveStage::new(connection_result_fixture()),
+            DecodedImage::new(PixelFormat::RgbA32, 100, 100),
+        )
+    }
+
+    fn translated_type(
+        text: &str,
+        database: &mut Database,
+    ) -> Vec<ironrdp::pdu::input::fast_path::FastPathInputEvent> {
+        database
+            .apply(crate::input::key_operations(
+                &crate::input::KeyAction::Type(text.to_owned()),
+            ))
+            .into_iter()
+            .collect()
+    }
+
+    fn dispatch_and_decode(
+        stage: &mut ActiveStage,
+        image: &mut DecodedImage,
+        events: &[ironrdp::pdu::input::fast_path::FastPathInputEvent],
+    ) -> Vec<ironrdp::pdu::input::fast_path::FastPathInputEvent> {
+        let outputs = process_fastpath_input(stage, image, events)
+            .expect("production input dispatcher should encode this action");
+        if events.is_empty() {
+            assert!(outputs.is_empty(), "empty Type is a no-op");
+        }
+        let mut decoded = Vec::new();
+        for output in outputs {
+            if let ActiveStageOutput::ResponseFrame(bytes) = output {
+                let pdu: FastPathInput =
+                    decode(&bytes).expect("real encoded fast-path PDU decodes");
+                assert!((1..=255).contains(&pdu.input_events().len()));
+                decoded.extend_from_slice(pdu.input_events());
+            }
+        }
+        assert_eq!(decoded, events);
+        decoded
+    }
+
+    fn assert_dispatch_conserves(events: &[ironrdp::pdu::input::fast_path::FastPathInputEvent]) {
+        let (mut stage, mut image) = active_fixture();
+        dispatch_and_decode(&mut stage, &mut image, events);
+    }
 
     /// The keepalive event the loop emits is a well-formed null pointer move
     /// (sanity that the loop's keepalive source is the no-op input, no VM).
@@ -360,5 +488,186 @@ mod tests {
             ev,
             ironrdp::pdu::input::fast_path::FastPathInputEvent::MouseEvent(_)
         ));
+    }
+
+    #[test]
+    fn production_dispatcher_preserves_translated_type_events_in_legal_pdus() {
+        let mut database = Database::new();
+        for (label, text) in [
+            ("empty", "".to_owned()),
+            ("single", "x".to_owned()),
+            ("ASCII127", "x".repeat(127)),
+            ("ASCII128", "x".repeat(128)),
+            ("BMP127", "é".repeat(127)),
+            ("BMP128", "é".repeat(128)),
+            ("supplementary63", "😀".repeat(63)),
+            ("supplementary64", "😀".repeat(64)),
+            ("ASCII10000", "x".repeat(10_000)),
+            ("mixed-long", "Aé😀🙂".repeat(3_000)),
+        ] {
+            let events = translated_type(&text, &mut database);
+            assert_dispatch_conserves(&events);
+            let _ = label;
+        }
+
+        let direct = translated_type("x".repeat(128).as_str(), &mut database);
+        assert_dispatch_conserves(&direct[..255]);
+        assert_dispatch_conserves(&direct[..256]);
+    }
+
+    #[test]
+    fn stateful_combo_raw_type_mouse_and_keyboard_streams_are_conserved() {
+        let (mut stage, mut image) = active_fixture();
+        let mut database = Database::new();
+        let mut oracle = Database::new();
+
+        let mut apply_and_check = |ops: Vec<ironrdp_input::Operation>| {
+            let expected: Vec<_> = oracle.apply(ops.clone()).into_iter().collect();
+            let actual: Vec<_> = database.apply(ops).into_iter().collect();
+            assert_eq!(actual, expected, "persistent Database state agrees");
+            dispatch_and_decode(&mut stage, &mut image, &actual);
+        };
+
+        apply_and_check(crate::input::key_operations(
+            &crate::input::KeyAction::Combo(vec![crate::input::Key::Ctrl, crate::input::Key::A]),
+        ));
+        apply_and_check(crate::input::raw_operations(&[crate::RawInput::Key {
+            code: 0x1e,
+            extended: false,
+            down: true,
+        }]));
+        apply_and_check(crate::input::key_operations(
+            &crate::input::KeyAction::Type("é😀".to_owned()),
+        ));
+        for batch in
+            crate::input::mouse_operations(&crate::input::MouseAction::Move { x: 17, y: 23 })
+        {
+            apply_and_check(batch);
+        }
+        apply_and_check(crate::input::key_operations(
+            &crate::input::KeyAction::Combo(vec![crate::input::Key::B]),
+        ));
+        apply_and_check(crate::input::raw_operations(&[crate::RawInput::Key {
+            code: 0x1e,
+            extended: false,
+            down: false,
+        }]));
+    }
+
+    #[tokio::test]
+    async fn run_keeps_a_queued_action_after_the_complete_type_stream() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let text = "x".repeat(10_000);
+                let type_events = translated_type(&text, &mut Database::new());
+                let competitor = FastPathInputEvent::KeyboardEvent(KeyboardFlags::empty(), 0x1e);
+                let (input_tx, input_rx) = mpsc::channel(2);
+                input_tx
+                    .send(RdpInputEvent::FastPath(type_events.clone()))
+                    .await
+                    .expect("Type action enqueued");
+
+                // A small duplex buffer makes the pump wait for the peer while writing
+                // the many Type frames. Enqueue the competitor after observing frame 1.
+                let (client, server) = tokio::io::duplex(1024);
+                let framed = ironrdp_tokio::TokioFramed::new(
+                    Box::new(client) as crate::connect::UpgradedStream
+                );
+                let mut peer = ironrdp_tokio::TokioFramed::new(server);
+                let bridge = std::sync::Arc::new(crate::bridge::BridgeShared::new());
+                let shutdown = bridge.clone();
+                let pump = tokio::task::spawn_local(run(
+                    framed,
+                    connection_result_fixture(),
+                    input_rx,
+                    SharedFrame::new(),
+                    bridge,
+                ));
+
+                let observed = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+                    let mut all_type = Vec::new();
+                    let (_, first_frame) =
+                        tokio::time::timeout(std::time::Duration::from_secs(5), peer.read_pdu())
+                            .await
+                            .map_err(|_| "first Type frame deadline".to_owned())?
+                            .map_err(|e| format!("first Type frame: {e}"))?;
+                    let first: FastPathInput =
+                        decode(&first_frame).map_err(|e| format!("first frame decode: {e}"))?;
+                    if !(1..=255).contains(&first.input_events().len()) {
+                        return Err(format!(
+                            "illegal first frame event count: {}",
+                            first.input_events().len()
+                        ));
+                    }
+                    all_type.extend_from_slice(first.input_events());
+
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        input_tx.send(RdpInputEvent::FastPath(vec![competitor.clone()])),
+                    )
+                    .await
+                    .map_err(|_| "competitor enqueue deadline".to_owned())?
+                    .map_err(|_| "competitor enqueue failed".to_owned())?;
+
+                    let mut saw_competitor = false;
+                    let mut competitor_events = Vec::new();
+                    while competitor_events.is_empty() {
+                        let (_, frame) = tokio::time::timeout(
+                            std::time::Duration::from_secs(5),
+                            peer.read_pdu(),
+                        )
+                        .await
+                        .map_err(|_| "frame read deadline".to_owned())?
+                        .map_err(|e| format!("run frame read: {e}"))?;
+                        let pdu: FastPathInput =
+                            decode(&frame).map_err(|e| format!("frame decode: {e}"))?;
+                        if !(1..=255).contains(&pdu.input_events().len()) {
+                            return Err(format!(
+                                "illegal frame event count: {}",
+                                pdu.input_events().len()
+                            ));
+                        }
+                        for event in pdu.input_events() {
+                            match event {
+                                FastPathInputEvent::UnicodeKeyboardEvent(..) => {
+                                    if saw_competitor {
+                                        return Err(
+                                            "Type resumed after competitor action".to_owned()
+                                        );
+                                    }
+                                    all_type.push(event.clone());
+                                }
+                                _ => {
+                                    saw_competitor = true;
+                                    competitor_events.push(event.clone());
+                                }
+                            }
+                        }
+                    }
+                    if all_type != type_events {
+                        return Err(format!(
+                            "Type event conservation failed: {} != {}",
+                            all_type.len(),
+                            type_events.len()
+                        ));
+                    }
+                    if competitor_events != vec![competitor] {
+                        return Err(format!("competitor events differ: {competitor_events:?}"));
+                    }
+                    Ok(())
+                })
+                .await
+                .map_err(|_| "queued action observation deadline".to_owned())
+                .and_then(|result| result);
+
+                shutdown.shutdown.notify_one();
+                let joined = tokio::time::timeout(std::time::Duration::from_secs(5), pump)
+                    .await
+                    .expect("pump join deadline")
+                    .expect("pump task joins");
+                assert!(joined.is_ok(), "run returned an error: {joined:?}");
+                observed.expect("queued action contiguity and event conservation");
+            })
+            .await;
     }
 }
