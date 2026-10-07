@@ -552,6 +552,15 @@ mod tests {
             extended: false,
             down: false,
         }]));
+
+        // Seed a Unicode-held state directly in the same Database used by the
+        // production raw-input path, then Type that scalar across multiple
+        // PDUs before applying its eventual release.
+        apply_and_check(vec![ironrdp_input::Operation::UnicodeKeyPressed('x')]);
+        apply_and_check(crate::input::key_operations(
+            &crate::input::KeyAction::Type("x".repeat(128)),
+        ));
+        apply_and_check(vec![ironrdp_input::Operation::UnicodeKeyReleased('x')]);
     }
 
     #[tokio::test]
