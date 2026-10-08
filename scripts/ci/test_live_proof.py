@@ -241,7 +241,9 @@ class OrchestrationModeTests(unittest.TestCase):
                 return None
             class Child:
                 pid=42
+                def kill(self):actions.append(('wrapper_kill',None))
                 def wait(self,timeout):
+                    actions.append(('wrapper_wait',timeout))
                     if failure=='timeout':raise subprocess.TimeoutExpired('private-command',timeout)
                     return 1 if failure in ('harness','observer','observer_write') else 0
             def spawn(command,**kwargs):
@@ -279,12 +281,18 @@ class OrchestrationModeTests(unittest.TestCase):
                 actions.append(('observed_state',result['state']))
                 return result
             def write(path,*argv,**kwargs):
+                if path.name.endswith('-wrapper-processes.json'):
+                    actions.append(('wrapper_journal',path.name))
+                    if failure=='wrapper_journal':raise ValueError('private-wrapper-marker')
                 if path.name=='local-acquisition.json':
                     actions.append(('acquisition_write',None))
                     if failure=='observer_write':raise PermissionError('private-lease-token')
                 return original_write(path,*argv,**kwargs)
             def identity(command,**kwargs):return ('2'*40 if command[-1]=='HEAD^{tree}' else ('3'*40 if failure=='identity' else '1'*40))+'\n'
-            with contextlib.redirect_stdout(io.StringIO()),patch.dict(os.environ),patch.object(host,'powershell',side_effect=control),patch.object(host,'measure_process_refusal'),patch.object(host.subprocess,'check_output',side_effect=identity),patch.object(host.subprocess,'Popen',side_effect=spawn),patch.object(live,'process_identity',return_value={'pid':42,'created':'1','image':'owned'}),patch.object(host.acquisition_observer,'observe_cache',side_effect=observe),patch.object(Path,'write_text',autospec=True,side_effect=write):
+            def process_identity(pid):
+                if failure=='wrapper_identity':raise ValueError('private-wrapper-marker')
+                return {'pid':42,'created':'1','image':'owned'}
+            with contextlib.redirect_stdout(io.StringIO()),patch.dict(os.environ),patch.object(host,'powershell',side_effect=control),patch.object(host,'measure_process_refusal'),patch.object(host.subprocess,'check_output',side_effect=identity),patch.object(host.subprocess,'Popen',side_effect=spawn),patch.object(live,'process_identity',side_effect=process_identity),patch.object(host.acquisition_observer,'observe_cache',side_effect=observe),patch.object(Path,'write_text',autospec=True,side_effect=write):
                 code=host.run(args)
             gate=json.loads((output/'artifacts/gate.json').read_text());cleanup=json.loads((output/'artifacts/cleanup.json').read_text())
             self.assertFalse((output/'private').exists())
@@ -301,6 +309,19 @@ class OrchestrationModeTests(unittest.TestCase):
                 self.assertEqual([cmd[2] for cmd in commands],[] if mode=='setup_diagnostic' else expected)
                 for proof in expected:
                     if mode!='setup_diagnostic':self.assertTrue(cleanup[proof]['user_0_profile_was_present'])
+
+    def test_wrapper_registration_failures_join_and_preserve_independent_cleanup(self):
+        for failure in ('wrapper_identity','wrapper_journal','timeout'):
+            code,gate,cleanup,commands,actions=self.measure('cua_diagnostic',failure=failure)
+            self.assertEqual(code,1)
+            self.assertEqual(gate['status'],'failed')
+            self.assertNotIn('private-wrapper-marker',json.dumps(gate))
+            self.assertEqual(sum(name=='wrapper_kill' for name,_ in actions),1)
+            self.assertEqual(sum(name=='wrapper_wait' for name,_ in actions),2 if failure=='timeout' else 1)
+            self.assertTrue(cleanup['host']['service'])
+            suite=cleanup['cua' if failure=='timeout' else 'unfinished_suite']
+            self.assertTrue(suite['user_0_account']);self.assertTrue(suite['user_1_account'])
+            self.assertEqual(cleanup['wrapper']['owned_stop_and_join'],failure!='timeout')
 
     def test_cua_failures_remain_red_and_continue_owned_cleanup(self):
         for failure in ('binary','identity','checks','scan_check','harness','timeout','profile','host_cleanup'):

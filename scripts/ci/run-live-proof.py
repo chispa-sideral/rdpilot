@@ -11,6 +11,7 @@ import re
 import subprocess
 import sys
 import bootstrap_desktop_observer as desktop
+import held_process
 
 E2E = Path(__file__).resolve().parents[1] / 'e2e'
 CHECKS = {
@@ -132,13 +133,11 @@ async def execute(args):
         # Journal immediately; only these exact children can be fallback-stopped.
         if os.name == 'nt':
             try:
-                records.append(process_identity(proc.pid))
-                journal.write_text(json.dumps(records))
-            except OSError:
-                await asyncio.sleep(0)
-                if proc.returncode is None:
-                    proc.kill()
-                    raise
+                await held_process.register_async(proc, process_identity, journal, records)
+            except BaseException as error:
+                if getattr(error, 'held_cleanup_failures', ()):
+                    args._secondary_failures.append(proof_support.failure_detail(RuntimeError(), 'daemon_cleanup'))
+                raise
         return proc
     harness_args = argparse.Namespace(bin_dir=args.bin_dir, bundle=args.bundle, output=args.output,
         credentials_a=args.credentials_a, credentials_b=args.credentials_b,
@@ -179,8 +178,9 @@ async def execute(args):
     run.check('private_child_temporary_boundary_verified')
     asyncio.create_subprocess_exec = tracked
     code = 0;error_detail={}
-    sentinel = await tracked(sys.executable, '-c', 'import time; time.sleep(3600)') if args.proof != 'cua' else None
+    sentinel = None
     try:
+        sentinel = await tracked(sys.executable, '-c', 'import time; time.sleep(3600)') if args.proof != 'cua' else None
         await asyncio.wait_for(run.execute(), args.timeout)
     except BaseException as error:
         code = 1
@@ -204,7 +204,7 @@ async def execute(args):
     observer = getattr(run, 'bootstrap_observer', None)
     if observer and observer.bearer:
         needles.append(observer.bearer.encode())
-    secondary=[proof_support.select_failure_detail(x) for x in getattr(run,'cleanup_failures',[])]
+    secondary=[proof_support.select_failure_detail(x) for x in args._secondary_failures + getattr(run,'cleanup_failures',[])]
     if secondary:code=1
     try:
         scanned = scan_files(Path(args.output), needles)

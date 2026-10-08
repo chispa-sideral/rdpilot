@@ -601,6 +601,28 @@ $text=& $exe 'runtime::windows_tests::job_closes_root_and_descendant_created_aft
         await self.opposite_alive()
         self.check("a.unplanned_rdp_loss_stale_endpoint_and_explicit_reconnect")
 
+    async def start_daemon(self, daemon_log):
+        self.operation = 'daemon_start'
+        self.daemon = await asyncio.create_subprocess_exec(str(self.bin / "rdpilot-daemon"), env=self.env, stdout=daemon_log, stderr=daemon_log)
+        self.operation = 'daemon_start_wait'
+        await asyncio.sleep(0.3)
+
+    async def proof_body(self):
+        for target in ("a", "b"):
+            await self.connect(target)
+            await self.attach(target)
+            await self.fixture(target)
+            await self.transfer(target)
+            await self.native_recovery(target, "before_faults")
+        await self.isolation()
+        await self.job_test()
+        if not self.args.skip_faults:
+            await self.fault("kill")
+            await self.fault("stall")
+            await self.loss()
+        else:
+            self.summary["unverified"].append("Fault injection explicitly skipped")
+
     async def execute(self):
         daemon_log = open(self.output / "daemon.log", "w")
         try:
@@ -608,24 +630,8 @@ $text=& $exe 'runtime::windows_tests::job_closes_root_and_descendant_created_aft
             for target, credentials in self.credentials.items():
                 relay = Relay(credentials)
                 self.relays[target] = (relay, await relay.start())
-            self.operation = 'daemon_start'
-            self.daemon = await asyncio.create_subprocess_exec(str(self.bin / "rdpilot-daemon"), env=self.env, stdout=daemon_log, stderr=daemon_log)
-            self.operation = 'daemon_start_wait'
-            await asyncio.sleep(0.3)
-            for target in ("a", "b"):
-                await self.connect(target)
-                await self.attach(target)
-                await self.fixture(target)
-                await self.transfer(target)
-                await self.native_recovery(target, "before_faults")
-            await self.isolation()
-            await self.job_test()
-            if not self.args.skip_faults:
-                await self.fault("kill")
-                await self.fault("stall")
-                await self.loss()
-            else:
-                self.summary["unverified"].append("Fault injection explicitly skipped")
+            await self.start_daemon(daemon_log)
+            await self.proof_body()
             self.summary["status"] = "passed"
         except BaseException as error:
             self.failure_operation = self.operation

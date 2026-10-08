@@ -15,6 +15,7 @@ import shutil
 import subprocess
 import sys
 import time
+import held_process
 import acquisition_observer
 import guest_footprint_observer as footprint
 import bootstrap_desktop_observer as desktop
@@ -226,11 +227,18 @@ def cleanup_actions(actions):
     return results
 
 
-def cleanup_suite(users, journal, cache, require_profiles=False):
+def cleanup_suite(users, journal, cache, require_profiles=False, *, required_profile_indices=None):
+    required = set(range(len(users))) if require_profiles else set()
+    if required_profile_indices is not None:
+        indices = tuple(required_profile_indices)
+        if any(type(i) is not int or i < 0 or i >= len(users) for i in indices):
+            raise ValueError('Invalid required profile index')
+        required = set(indices)
+    require_journal = require_profiles if required_profile_indices is None else bool(required)
     actions=[]
     profile_presence={}
     def stop_processes():
-        if require_profiles and not journal.exists():raise RuntimeError('Required process journal absent')
+        if require_journal and not journal.exists():raise RuntimeError('Required process journal absent')
         records=json.loads(journal.read_text()) if journal.exists() else []
         values = powershell(r'''$ok=$true
 foreach($record in $v.records){try{
@@ -276,14 +284,16 @@ foreach($id in $matched){if(![OwnedSessions]::WTSLogoffSession([IntPtr]::Zero,$i
             observed=powershell(PROFILE,user,20)
             present=isinstance(observed,dict) and observed.get('profile_was_present') is True
             profile_presence['user_'+str(index)+'_profile_was_present']=present
-            if require_profiles and not present:raise RuntimeError('Required live profile was not observed')
+            if index in required and not present:raise RuntimeError('Required live profile was not observed')
         actions += [('user_'+str(i)+'_sessions',logoff),('user_'+str(i)+'_profile_guest_removed',remove_profile),('user_'+str(i)+'_account',lambda user=user:powershell(REMOVE_USER,user,20))]
     def clear_cache():
         powershell("if(Test-Path $v.path){Remove-Item $v.path -Recurse -Force};if(Test-Path $v.path){throw 'Cache remains'}",{'path':cache},20)
     actions.append(('native_cache_removed',clear_cache))
     results=cleanup_actions(actions)
     # Presence is required only after a completed live proof, not failed setup.
-    if require_profiles:results.update(profile_presence)
+    for i in sorted(required):
+        key='user_'+str(i)+'_profile_was_present'
+        if key in profile_presence:results[key]=profile_presence[key]
     return results
 
 
@@ -333,6 +343,7 @@ def run(args):
     powershell("& icacls $v.path /inheritance:r /grant:r \"$($env:USERDOMAIN)\\$($env:USERNAME):(OI)(CI)F\"|Out-Null;if($LASTEXITCODE){throw 'Private ACL failed'}",{'path':str(private)})
     os.environ.update(private_environment(private))
     snapshot=None;results={};suites=[];attempted=[];users=[];journal=private/'processes.json';rule='RdpilotDesktop-'+secrets.token_hex(8);observation_failures=[]
+    wrapper=None;wrapper_joined=True;wrapper_stop_attempted=False
     observer_source = {}
     stage='preflight';failure_detail={};failure_code='none';passed=False;setup_attempted=False;roles=[];memberships=[];creation_observations=[]
     try:
@@ -442,11 +453,23 @@ if(Test-Path (Join-Path (Join-Path $env:SystemDrive 'Users') $v.name)){throw 'Fr
             if remaining<=0:raise TimeoutError('Work budget expired')
             with (private/(proof+'-console.log')).open('wb') as raw:
                 child=subprocess.Popen(command,env=child_env,stdout=raw,stderr=raw)
-                # Held wrapper PID is recorded too; timeout cannot orphan its children.
-                record=live.process_identity(child.pid)
-                try:code=child.wait(timeout=remaining+30)
+                wrapper=child;wrapper_joined=False;wrapper_stop_attempted=False
+                # Parent and child own distinct journals; child cannot replace ours.
+                try:
+                    held_process.register_sync(child,live.process_identity,private/(proof+'-wrapper-processes.json'),[])
+                except BaseException as error:
+                    wrapper_stop_attempted=True
+                    wrapper_joined=not getattr(error,'held_cleanup_failures',('join',))
+                    raise
+                try:
+                    code=child.wait(timeout=remaining+30)
+                    wrapper_joined=True
                 except subprocess.TimeoutExpired:
-                    powershell(STOP_PROCESS,record,15);code=1
+                    wrapper_stop_attempted=True
+                    failures=held_process.abort_sync(child,15)
+                    wrapper_joined=not failures
+                    if failures:observation_failures.append('wrapper_cleanup')
+                    code=1
             try:
                 selected=json.loads((artifacts/(proof+'.json')).read_text())
                 if not isinstance(selected,dict) or selected.get('status') not in ('passed','failed'):
@@ -503,6 +526,10 @@ if(Test-Path (Join-Path (Join-Path $env:SystemDrive 'Users') $v.name)){throw 'Fr
         failure_code=error.code if isinstance(error,HostActionError) else 'required_gate'
         failure_detail=error.detail if isinstance(error,HostActionError) else {}
     finally:
+        if wrapper is not None:
+            if not wrapper_joined and not wrapper_stop_attempted:
+                wrapper_joined=not held_process.abort_sync(wrapper,15)
+            results['wrapper']={'owned_stop_and_join':wrapper_joined}
         if snapshot is not None:
             if users:
                 try:results['unfinished_suite']=cleanup_suite(users,journal,snapshot['cache'])
