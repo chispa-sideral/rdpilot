@@ -16,6 +16,7 @@ import subprocess
 import sys
 import time
 import acquisition_observer
+import guest_footprint_observer as footprint
 import bootstrap_desktop_observer as desktop
 
 HERE = Path(__file__).resolve().parent
@@ -307,7 +308,9 @@ def private_environment(private):
 def mode_for(args):
     setup=getattr(args,'setup_diagnostic',False);cua=getattr(args,'cua_diagnostic',False)
     if setup and cua:raise ValueError('Diagnostic modes are mutually exclusive')
-    if getattr(args, 'bootstrap_desktop', False) and not cua:
+    desktop_mode=getattr(args, 'bootstrap_desktop', False);footprint_mode=getattr(args, 'bootstrap_footprint', False)
+    if desktop_mode and footprint_mode:raise ValueError('Bootstrap observers are mutually exclusive')
+    if (desktop_mode or footprint_mode) and not cua:
         raise ValueError('Bootstrap observation requires Cua diagnostic')
     return 'setup_diagnostic' if setup else 'cua_diagnostic' if cua else 'live'
 
@@ -408,6 +411,19 @@ def run(args):
             command=[sys.executable,str(HERE/'run-live-proof.py'),proof,'--bin-dir',str(bin_dir),'--bundle',str(bundle),
                 '--output',str(private/(proof+'-raw')),'--artifacts',str(artifacts),'--source-bridge-sha256',hashes['rdpilot-bridge'],
                 '--journal',str(journal),'--credentials-a',str(private/'a.json'),'--credentials-b',str(private/'b.json')]
+            fresh_footprint=False
+            if getattr(args, 'bootstrap_footprint', False):
+                try:
+                    owned=users[0]
+                    if owned.get('name')!=credentials['a']['username']:raise ValueError('Fresh target ownership unavailable')
+                    powershell(WTS+"if($matched.Count){throw 'Fresh user already has a session'}", owned, 5)
+                    fresh=powershell(r'''$u=@(Get-LocalUser -SID $v.sid)
+if($u.Count -ne 1 -or $u[0].SID.Value -cne $v.sid -or $u[0].Name -cne $v.name -or $u[0].Description -cne $v.marker){throw 'Fresh ownership unavailable'}
+if(Get-CimInstance Win32_UserProfile -Filter "SID='$($v.sid)'"){throw 'Fresh profile already exists'}
+if(Test-Path (Join-Path (Join-Path $env:SystemDrive 'Users') $v.name)){throw 'Fresh profile directory already exists'}
+@{fresh_profile_verified=$true}|ConvertTo-Json -Compress''', owned, 5)
+                    fresh_footprint=isinstance(fresh,dict) and set(fresh)=={'fresh_profile_verified'} and fresh['fresh_profile_verified'] is True
+                except Exception:observation_failures.append('guest_footprint_baseline')
             if getattr(args, 'bootstrap_desktop', False):
                 owned = users[0]
                 powershell(WTS+"if($matched.Count){throw 'Fresh user already has a session'}", owned, 5)
@@ -452,6 +468,24 @@ if(Test-Path (Join-Path (Join-Path $env:SystemDrive 'Users') $v.name)){throw 'Fr
                     observation_failures.append('acquisition_observation')
                 try:(artifacts/'local-acquisition.json').write_text(json.dumps(acquisition,indent=2)+'\n')
                 except Exception:observation_failures.append('acquisition_artifact_write')
+                if getattr(args, 'bootstrap_footprint', False):
+                    def register_footprint(record):
+                        records=json.loads(journal.read_text()) if journal.exists() else []
+                        if not isinstance(records,list):raise ValueError('Invalid owned journal')
+                        records.append(record);journal.write_text(json.dumps(records))
+                    observed=footprint.empty();joined=True
+                    try:
+                        observed,joined=footprint.observe(selected,code,observer_source,acquisition,snapshot['cache'],users[0],
+                            fresh_footprint,private,live.process_identity,register_footprint,
+                            [str(c['password']).encode() for c in credentials.values()])
+                    except BaseException:
+                        # A refused observer never interrupts the independent suite cleanup.
+                        observed=footprint.empty()
+                        observation_failures.append('guest_footprint_observation')
+                    results['guest_footprint']={'worker_joined':joined}
+                    if not joined:observation_failures.append('guest_footprint_cleanup')
+                    try:(artifacts/'guest-footprint.json').write_text(json.dumps(observed,indent=2)+'\n')
+                    except Exception:observation_failures.append('guest_footprint_artifact_write')
             stage=proof+'_cleanup'
             try:checks=cleanup_suite(users,journal,snapshot['cache'],require_profiles=(code==0 and selected['status']=='passed'))
             except BaseException:checks={'suite_cleanup':False}
@@ -516,6 +550,7 @@ def main():
     modes.add_argument('--cua-diagnostic',action='store_true',help='full Cua proof only; cannot produce a live gate pass')
     parser.add_argument('--bin-dir')
     parser.add_argument('--expected-commit')
+    parser.add_argument('--bootstrap-footprint', action='store_true', help='read-only failed first-A guest files; Cua diagnostic only')
     parser.add_argument('--bootstrap-desktop', action='store_true', help='private first-A desktop snapshots; Cua diagnostic only')
     args=parser.parse_args()
     if args.initialize:

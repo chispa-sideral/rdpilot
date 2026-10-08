@@ -206,3 +206,37 @@ The fresh-user source-only bootstrap input boundary provides raster privacy;
 byte scanning alone cannot sanitize arbitrary desktop text. This observer adds
 bounded encoding/read work and never supplies a live-proof pass. Normal CI,
 full Cua assertions and ordinary failed-image selection remain unchanged.
+
+The manual Cua diagnostic also offers `bootstrap_footprint: true` (local
+`--cua-diagnostic --bootstrap-footprint`), mutually exclusive with desktop
+snapshots. It samples once, only after a closed original first-A SDK bootstrap
+failure, before existing profile cleanup. A fresh standard account, absent
+initial profile/session and unchanged pre/post native account/profile ownership
+bind the read to that disposable user's local profile. Missing or refused
+ownership admits no content. No guest process, input or additional RDP session
+is created.
+
+`guest-footprint.json` reports independent profile, product directory, launcher
+and candidate bundle states. `source_match` establishes residual launcher bytes;
+`source_binaries_match` requires the exact trusted manifest and bridge/Cua
+hashes, but does not verify other installed assets, execution or readiness.
+Absence is inconclusive because normal bootstrap deletes launchers and failed
+staging. No state diagnoses a cause or supplies a live-proof pass.
+
+The host reader uses read-only Windows handles sharing read/write/delete, rejects
+reparse paths and hardlinks, and verifies the held local path, identity, size
+and write metadata before and after content reads. It lists at most 16 product
+root entries, counts at most four launchers and four staging directories, reads
+only the one expected bundle, two 1 MiB manifests and three 64 MiB binaries,
+and shares a 194 MiB actual-content budget. Staging contents and other manifest
+assets are not read. One held reader and parent-owned native queries have a
+30-second total bound with a forced-stop/join reserve. Output is capped while
+received at 16 KiB; private configuration is capped at 2 MiB. Windows admission
+remains to be established by an actual hosted run.
+
+Only closed source hashes, fixed states/counts and lifetime results are selected;
+paths, SIDs, account names, generations, process IDs, wrong digests, manifests
+and raw errors remain private. Unknown worker join records
+`guest_footprint_cleanup` and keeps the diagnostic red while all existing cleanup
+is attempted. Artifact-write failure is supplemental. Original Cua primary and
+secondary failures, full assertions and normal CI remain unchanged.
