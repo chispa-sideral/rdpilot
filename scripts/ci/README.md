@@ -60,6 +60,40 @@ Draft identity is checked before each replacement and publication; per-tag
 Actions concurrency serializes workflow attempts, but these reads are not an
 atomic lock against another publisher. Default-branch manual recovery for old
 tags is not supported by this workflow.
+The publisher finds a draft in the authenticated release listing, because
+the by-tag endpoint returns only published releases.
 
 Publisher tests use synthetic assets and stateful GitHub command failures;
 they never create a production release.
+
+## Live Windows desktop proofs
+
+The `desktop` job builds the client, daemon, MCP server and bridge in release
+mode and runs the live Cua, viewer and takeover harnesses against the runner's
+own RDP listener. `run-hosted-desktop.ps1 -Proof cua|viewer|takeover` creates
+disposable local standard users (Users and Remote Desktop Users, not
+administrators) with random masked passwords, enables RDP with NLA on
+`127.0.0.1:3389`, opens a loopback-only firewall rule and gives the harness a
+bundle directory that holds only the bridge built from the checked-out source.
+It stops the harness before the step timeout, logs the users off, removes their
+profiles and accounts and restores every setting it changed. The script
+changes machine settings: use it only on a disposable Windows machine.
+
+The Cua proof checks that the running guest bridge is the source build and
+records the resolved upstream Cua version and hashes. Cua resolves from the
+product's default channel, so an upstream Cua change can fail this job.
+The evidence artifact has, per proof, `environment.json` (commit, tree, image,
+authentication and graphics settings), `result.json` (stage, harness exit code,
+summary status), `cleanup.json` (one readback per restored item) and the
+harness `proof/summary.json`, screenshots and logs.
+
+To run the same harnesses against another prepared Windows host, use
+`run-cua-e2e.py` with two credential files, or `run-viewer-proof.py` and
+`run-takeover-proof.py` with `RDPILOT_VIEW_{A,B}_*` or `RDPILOT_TAKE_*`
+variables, plus `--bundle` with a directory that holds a source-built
+`rdpilot-bridge.exe` and `--allow-no-tailnet` when no tailnet is available.
+
+Not executed live: the recording proof (three concurrent users and POSIX
+client checks; offline only), tailnet and cross-machine viewing, UAC and the
+secure desktop, Windows Job containment over RDP, download of a published
+bridge release, and domain or production authentication.

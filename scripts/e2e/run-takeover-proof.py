@@ -151,7 +151,8 @@ class Proof(viewer_proof.Proof):
             args += ["--bind", self.args.bind]
         stderr = open(self.output / ("view-read-only.stderr" if extra else "view.stderr"), "w")
         self.viewer = await asyncio.create_subprocess_exec(str(self.bin / "rdpilot"), *args, env=self.env,
-                                                           stdout=asyncio.subprocess.PIPE, stderr=stderr)
+                                                           stdout=asyncio.subprocess.PIPE, stderr=stderr,
+                                                           **viewer_proof.view_process_options())
         stderr.close()
         text, deadline = "", time.monotonic() + 15
         while True:
@@ -579,9 +580,9 @@ class Proof(viewer_proof.Proof):
             if not self.fake:
                 relay = self.e2e.Relay(self.credentials[SESSION])
                 self.relays[SESSION] = (relay, await relay.start())
-            self.daemon = await asyncio.create_subprocess_exec(str(self.bin / "rdpilot-daemon"), env=self.env,
+            self.daemon = await asyncio.create_subprocess_exec(str(self.bin / viewer_proof.DAEMON), env=self.env,
                                                                stdout=daemon_log, stderr=daemon_log)
-            await asyncio.sleep(0.3)
+            await asyncio.sleep(1)
             await self.connect(SESSION)
             await self.start_view()
             async with async_playwright() as playwright:

@@ -44,9 +44,8 @@ def project(proof, summary, returncode):
         isinstance(check, dict) and check.get("check") == name and check.get("passed") is True
         for check in checks
     )]
-    scanned = CHECKS[proof][-1] in completed
     passed = (returncode == 0 and isinstance(summary, dict) and summary.get("mode") == "fake"
-              and summary.get("status") == "passed" and scanned)
+              and summary.get("status") == "passed" and len(completed) == len(CHECKS[proof]))
     stage = "none" if passed else ("harness" if returncode != 0 else "summary_or_evidence_scan")
     return {"proof": proof, "mode": "fake", "status": "passed" if passed else "failed",
             "completed_checks": completed, "failure_stage": stage}

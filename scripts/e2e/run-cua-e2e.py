@@ -9,7 +9,9 @@ Build rdpilot-cli, rdpilot-daemon, rdpilot-mcp first. Example:
 The daemon starts with an empty cache under the run's temporary directory and
 downloads the bridge and the Cua driver. --bundle DIR sets the daemon's
 bundle_path instead (for example a directory holding only a bridge built from
-this source, for a build that has no release).
+this source, for a build that has no release). With --bundle, each target
+also proves that the running guest bridge is that build and records the
+installed upstream Cua identity.
 
 Credentials JSON: host, port, username, password (optional domain). They are
 passed only through subprocess environment, never arguments or evidence.
@@ -31,6 +33,7 @@ import uuid
 
 LIMIT = 16 * 1024 * 1024
 POWERSHELL = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+DAEMON = "rdpilot-daemon.exe" if os.name == "nt" else "rdpilot-daemon"
 
 
 class ProofError(Exception):
@@ -51,6 +54,17 @@ def powershell(script):
         "-NoProfile", "-NonInteractive", "-STA", "-EncodedCommand",
         base64.b64encode(script.encode("utf-16le")).decode("ascii"),
     ]}
+
+
+def password_command(target):
+    """The hosts-file PasswordCommand that prints E2E_PASSWORD_<TARGET> from the
+    CLI child's environment; Windows has no printenv."""
+    name = "E2E_PASSWORD_" + target.upper()
+    if os.name != "nt":
+        return "printenv " + name
+    script = f"[Console]::Write([Environment]::GetEnvironmentVariable('{name}'))"
+    encoded = base64.b64encode(script.encode("utf-16le")).decode("ascii")
+    return "powershell.exe -NoProfile -NonInteractive -EncodedCommand " + encoded
 
 
 def objects(value):
@@ -252,7 +266,7 @@ class Run:
         lines = []
         for target, entry in entries.items():
             lines += [f"Host {target}", f"  HostName {quote(entry['host'])}", f"  User {quote(entry['username'])}",
-                      f"  PasswordCommand {quote('printenv E2E_PASSWORD_' + target.upper())}"]
+                      f"  PasswordCommand {quote(password_command(target))}"]
             if entry.get("port"):
                 lines.append(f"  Port {entry['port']}")
             if entry.get("domain"):
@@ -418,6 +432,45 @@ $f.Controls.AddRange(@($t,$b,$l));[Windows.Forms.Application]::Run($f)
         require(destination.read_bytes() == data, "transfer byte mismatch")
         self.check(f"{target}.bidirectional_transfer", bytes=len(data), sha256=hashlib.sha256(data).hexdigest(), upload=upload, download=download)
 
+    async def provenance(self, target):
+        """The running guest bridge and Cua driver match the installed bundle
+        manifest, and the bridge is the --bundle build when one is given."""
+        name = self.filename(target, "installed-provenance.json")
+        script = r"""
+$ErrorActionPreference='Stop'
+$walk=$PID;$bridge=$null;$cua=$null
+for($i=0;$i -lt 12;$i++) {
+ $p=Get-CimInstance Win32_Process -Filter "ProcessId=$walk"
+ if(!$p){break}
+ if($p.Name -eq 'cua-driver.exe'){$cua=$p.ExecutablePath}
+ if($p.Name -eq 'rdpilot-bridge.exe'){$bridge=$p.ExecutablePath;break}
+ $walk=[int]$p.ParentProcessId
+}
+if(!$bridge -or !$cua){throw 'Installed bridge/Cua ancestry is unavailable'}
+$root=Split-Path $bridge
+$manifest=Get-Content (Join-Path $root 'manifest.json') -Raw | ConvertFrom-Json
+@{bridge_sha256=(Get-FileHash $bridge).Hash.ToLower();cua_sha256=(Get-FileHash $cua).Hash.ToLower();
+ manifest=$manifest;installed_bundle_id=(Split-Path $root -Leaf);
+ installed_under_localappdata=$root.StartsWith((Join-Path $env:LOCALAPPDATA 'rdpilot') + '\',[StringComparison]::OrdinalIgnoreCase)} |
+ ConvertTo-Json -Depth 20 -Compress | Set-Content -Encoding UTF8 (Join-Path (Join-Path $env:TEMP 'rdpilot-transfer-root') NAME)
+""".replace("NAME", psquote(name))
+        await self.endpoints[target].tool("launch_app", powershell(script))
+        local = self.output / name
+        await self.download(target, name, local, attempts=40)
+        observed = json.loads(local.read_text(encoding="utf-8-sig"))
+        manifest = observed["manifest"]
+        require(observed["bridge_sha256"] == manifest["bridge_sha256"], "running guest bridge differs from its installed manifest")
+        if self.args.bundle:
+            source = hashlib.sha256((Path(self.args.bundle) / "rdpilot-bridge.exe").read_bytes()).hexdigest()
+            require(observed["bridge_sha256"] == source, "running guest bridge is not the --bundle build")
+        require(observed["installed_under_localappdata"] and observed["installed_bundle_id"] == manifest["bundle_id"],
+                "guest bridge did not run from its installed bundle")
+        cua = [sha for path, sha in manifest["files"].items() if path.lower().endswith("cua-driver.exe")]
+        require(len(cua) == 1 and cua[0] == observed["cua_sha256"], "running Cua driver differs from the installed manifest")
+        self.check(f"{target}.installed_source_bridge_and_cua_identity", bridge_sha256=observed["bridge_sha256"],
+                   cua_version=manifest["cua_version"], cua_sha256=observed["cua_sha256"],
+                   archive_sha256=manifest["archive_sha256"], bundle_id=manifest["bundle_id"])
+
     async def native_recovery(self, target, label):
         started = time.monotonic()
         await self.cli("ping", "--session", target, timeout=10)
@@ -554,13 +607,17 @@ $text=& $exe 'runtime::windows_tests::job_closes_root_and_descendant_created_aft
             for target, credentials in self.credentials.items():
                 relay = Relay(credentials)
                 self.relays[target] = (relay, await relay.start())
-            self.daemon = await asyncio.create_subprocess_exec(str(self.bin / "rdpilot-daemon"), env=self.env, stdout=daemon_log, stderr=daemon_log)
-            await asyncio.sleep(0.3)
+            self.daemon = await asyncio.create_subprocess_exec(str(self.bin / DAEMON), env=self.env, stdout=daemon_log, stderr=daemon_log)
+            await asyncio.sleep(1)
             for target in ("a", "b"):
                 await self.connect(target)
                 await self.attach(target)
                 await self.fixture(target)
+                await self.provenance(target)
                 await self.transfer(target)
+                await self.native_recovery(target, "before_faults")
+                if target == "a":
+                    self.check("single_session_source_bridge_native_cua_verified")
             await self.isolation()
             await self.job_test()
             if not self.args.skip_faults:
@@ -576,7 +633,10 @@ $text=& $exe 'runtime::windows_tests::job_closes_root_and_descendant_created_aft
             raise
         finally:
             for endpoint in self.endpoints.values():
-                await endpoint.stop()
+                try:
+                    await endpoint.stop()
+                except Exception:  # a broken endpoint must not skip the remaining cleanup
+                    pass
             for target in self.relays:
                 try:
                     await self.cli("disconnect", "--session", target, timeout=10, allow_failure=True)
@@ -593,7 +653,19 @@ $text=& $exe 'runtime::windows_tests::job_closes_root_and_descendant_created_aft
                 await relay.close()
             daemon_log.close()
             self.save()
-            shutil.rmtree(self.temp)
+            shutil.rmtree(self.temp, ignore_errors=True)
+            self.scan_evidence()
+
+    def scan_evidence(self):
+        """Redact text evidence, then delete any file that still holds a password."""
+        for path in self.output.rglob("*"):
+            if path.is_file() and path.suffix not in (".png", ".bin"):
+                path.write_text(self.clean(path.read_text(encoding="utf-8", errors="replace")), encoding="utf-8")
+        secrets = [str(cred["password"]).encode() for cred in self.credentials.values() if cred.get("password")]
+        leaked = [path for path in self.output.rglob("*") if path.is_file() and any(s in path.read_bytes() for s in secrets)]
+        for path in leaked:
+            path.unlink()
+        require(not leaked, "credential found in evidence; affected files removed")
 
 
 def main():

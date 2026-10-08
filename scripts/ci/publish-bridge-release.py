@@ -7,7 +7,9 @@ from pathlib import Path
 import re
 import subprocess
 import tempfile
-from urllib.parse import quote
+
+PER_PAGE = 100
+MAX_PAGES = 10
 
 
 class PublishError(Exception):
@@ -46,26 +48,43 @@ class Publisher:
                 raise PublishError("Release source does not match the checked tag revision.")
 
     def state(self):
-        endpoint = f"repos/{self.repo}/releases/tags/{quote(self.tag, safe='')}"
+        """The release with this tag, or None. Only the authenticated release
+        listing includes drafts; the by-tag endpoint returns published releases."""
+        matches = []
+        for page in range(1, MAX_PAGES + 1):
+            releases = self.releases(page)
+            for release in releases:
+                if (not isinstance(release, dict) or not isinstance(release.get("tag_name"), str)
+                        or type(release.get("draft")) is not bool or type(release.get("id")) is not int
+                        or release["id"] <= 0):
+                    raise PublishError("Release listing returned invalid draft identity.")
+                if release["tag_name"] == self.tag:
+                    matches.append(release)
+            if len(releases) < PER_PAGE:
+                break
+        else:
+            raise PublishError("Release listing exceeds the supported number of pages.")
+        if len(matches) > 1:
+            raise PublishError("More than one release has this tag; refusing mutation.")
+        return matches[0] if matches else None
+
+    def releases(self, page):
+        endpoint = f"repos/{self.repo}/releases?per_page={PER_PAGE}&page={page}"
         result = command(["gh", "api", "--include", endpoint])
         header, separator, body = result.stdout.replace("\r\n", "\n").partition("\n\n")
         match = re.match(r"HTTP/[\d.]+ (\d{3})\b", header)
         if not separator or not match:
-            raise PublishError("Release lookup did not provide a valid HTTP response.")
+            raise PublishError("Release listing did not provide a valid HTTP response.")
         status = int(match.group(1))
-        if status == 404 and result.returncode != 0:
-            return None
         if status != 200 or result.returncode != 0:
-            raise PublishError(f"Release lookup failed (HTTP {status}).")
+            raise PublishError(f"Release listing failed (HTTP {status}).")
         try:
-            state = json.loads(body)
+            releases = json.loads(body)
         except ValueError as error:
-            raise PublishError("Release lookup returned invalid JSON.") from error
-        if (not isinstance(state, dict) or state.get("tag_name") != self.tag
-                or type(state.get("draft")) is not bool or type(state.get("id")) is not int
-                or state["id"] <= 0):
-            raise PublishError("Release lookup returned invalid draft identity.")
-        return state
+            raise PublishError("Release listing returned invalid JSON.") from error
+        if not isinstance(releases, list):
+            raise PublishError("Release listing is not a list.")
+        return releases
 
     def require_draft(self):
         state = self.state()
