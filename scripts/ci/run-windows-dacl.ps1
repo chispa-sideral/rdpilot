@@ -38,7 +38,7 @@ try {
     $env:RDPILOT_SECOND_WINDOWS_PASSWORD = $password
 
     $test = Start-Process -FilePath (Get-Command cargo).Source -WorkingDirectory $repoRoot `
-        -ArgumentList @('test', '-p', 'rdpilot-daemon', '--test', 'live_daemon_windows_dacl', '--', '--ignored', '--test-threads=1') `
+        -ArgumentList @('test', '--locked', '-p', 'rdpilot-daemon', '--test', 'live_daemon_windows_dacl', '--', '--ignored', '--test-threads=1') `
         -PassThru -NoNewWindow
     if (-not $test.WaitForExit($TestTimeoutMinutes * 60 * 1000)) {
         Stop-Process -Id $test.Id -Force -ErrorAction SilentlyContinue

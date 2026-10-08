@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 
 const DIAGNOSTICS_PATH_ENV: &str = "RDPILOT_DAEMON_DIAGNOSTICS_PATH";
 const MAX_EVENTS: usize = 100;
+#[cfg(unix)]
 static TMP_SUFFIX: AtomicU64 = AtomicU64::new(0);
 
 /// Every permitted diagnostic stage. The enum is intentionally closed so a
@@ -188,7 +189,7 @@ fn save_owner_only(_path: &Path, _events: &[Event]) -> std::io::Result<()> {
     ))
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 

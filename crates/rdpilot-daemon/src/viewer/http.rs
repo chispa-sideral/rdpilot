@@ -392,13 +392,13 @@ pub(crate) async fn handle(
         Route::Record(id) => {
             match replay::read_json(&parts, body, state.limits.header_read_timeout).await {
                 Ok(json) => replay::post_recording(registry, &id, &json).await,
-                Err(reply) => reply,
+                Err(status) => empty(status),
             }
         }
         Route::Annotate(id) => {
             match replay::read_json(&parts, body, state.limits.header_read_timeout).await {
                 Ok(json) => replay::post_annotation(registry, &id, &json),
-                Err(reply) => reply,
+                Err(status) => empty(status),
             }
         }
         Route::Control(id) => {
@@ -417,7 +417,7 @@ pub(crate) async fn handle(
                     }
                     None => empty(StatusCode::NOT_FOUND),
                 },
-                Err(reply) => reply,
+                Err(status) => empty(status),
             }
         }
         Route::Input(id) => {
@@ -429,13 +429,13 @@ pub(crate) async fn handle(
                     }
                     None => empty(StatusCode::NOT_FOUND),
                 },
-                Err(reply) => reply,
+                Err(status) => empty(status),
             }
         }
         Route::Keep(rid) => {
             match replay::read_json(&parts, body, state.limits.header_read_timeout).await {
                 Ok(json) => replay::post_keep(registry, rid, &json).await,
-                Err(reply) => reply,
+                Err(status) => empty(status),
             }
         }
         Route::Recordings => replay::list(registry).await,

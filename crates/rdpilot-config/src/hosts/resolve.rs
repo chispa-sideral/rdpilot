@@ -276,7 +276,7 @@ impl Collector<'_> {
                 continue;
             };
             if word.eq_ignore_ascii_case("Host") {
-                let pats = words(rest).map_err(&at)?;
+                let pats = words(rest).map_err(at)?;
                 if pats.is_empty() {
                     return Err(at("Host needs at least one pattern".to_owned()));
                 }
@@ -298,7 +298,7 @@ impl Collector<'_> {
             };
             match kw.kind {
                 Kind::Include => {
-                    let pats = words(rest).map_err(&at)?;
+                    let pats = words(rest).map_err(at)?;
                     if pats.is_empty() {
                         return Err(at("Include needs a path".to_owned()));
                     }
@@ -309,20 +309,20 @@ impl Collector<'_> {
                     }
                 }
                 Kind::Command => {
-                    let value = keywords::validate(kw, &command_value(rest)).map_err(&at)?;
+                    let value = keywords::validate(kw, &command_value(rest)).map_err(at)?;
                     if active {
                         self.offer(kw, value, source);
                     }
                 }
                 _ => {
-                    let mut w = words(rest).map_err(&at)?;
+                    let mut w = words(rest).map_err(at)?;
                     if w.len() != 1 {
                         return Err(at(format!(
                             "{} expects exactly one value (quote values that contain spaces)",
                             kw.name
                         )));
                     }
-                    let value = keywords::validate(kw, &w.remove(0)).map_err(&at)?;
+                    let value = keywords::validate(kw, &w.remove(0)).map_err(at)?;
                     if active {
                         self.offer(kw, value, source);
                     }
@@ -433,13 +433,13 @@ pub fn resolve_host(input: &HostsInput<'_>) -> Result<ResolvedHost, HostsError> 
         let value = if kw.kind == Kind::Command {
             command_value(rest)
         } else {
-            let mut w = words(rest).map_err(&at)?;
+            let mut w = words(rest).map_err(at)?;
             if w.len() != 1 {
                 return Err(at(format!("{} expects exactly one value", kw.name)));
             }
             w.remove(0)
         };
-        let value = keywords::validate(kw, &value).map_err(&at)?;
+        let value = keywords::validate(kw, &value).map_err(at)?;
         c.offer(kw, value, Source::Option(n));
     }
 

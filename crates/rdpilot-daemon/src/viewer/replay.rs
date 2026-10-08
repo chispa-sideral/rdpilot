@@ -63,7 +63,7 @@ pub(crate) async fn read_json(
     parts: &Parts,
     body: Incoming,
     timeout: Duration,
-) -> Result<serde_json::Value, Response<Body>> {
+) -> Result<serde_json::Value, StatusCode> {
     let content_type = parts
         .headers
         .get(header::CONTENT_TYPE)
@@ -71,7 +71,7 @@ pub(crate) async fn read_json(
         .unwrap_or_default();
     let media = content_type.split(';').next().unwrap_or_default().trim();
     if !media.eq_ignore_ascii_case("application/json") {
-        return Err(empty(StatusCode::UNSUPPORTED_MEDIA_TYPE));
+        return Err(StatusCode::UNSUPPORTED_MEDIA_TYPE);
     }
     let declared = parts
         .headers
@@ -79,18 +79,18 @@ pub(crate) async fn read_json(
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<usize>().ok());
     if declared.is_some_and(|n| n > MAX_BODY) {
-        return Err(empty(StatusCode::PAYLOAD_TOO_LARGE));
+        return Err(StatusCode::PAYLOAD_TOO_LARGE);
     }
     let collected = tokio::time::timeout(timeout, Limited::new(body, MAX_BODY).collect()).await;
     let bytes = match collected {
-        Err(_) => return Err(empty(StatusCode::REQUEST_TIMEOUT)),
+        Err(_) => return Err(StatusCode::REQUEST_TIMEOUT),
         Ok(Err(e)) if e.is::<http_body_util::LengthLimitError>() => {
-            return Err(empty(StatusCode::PAYLOAD_TOO_LARGE))
+            return Err(StatusCode::PAYLOAD_TOO_LARGE)
         }
-        Ok(Err(_)) => return Err(empty(StatusCode::BAD_REQUEST)),
+        Ok(Err(_)) => return Err(StatusCode::BAD_REQUEST),
         Ok(Ok(collected)) => collected.to_bytes(),
     };
-    serde_json::from_slice(&bytes).map_err(|_| empty(StatusCode::BAD_REQUEST))
+    serde_json::from_slice(&bytes).map_err(|_| StatusCode::BAD_REQUEST)
 }
 
 /// `POST /api/sessions/{id}/recording` `{"action":"start"|"stop"}`.
