@@ -316,7 +316,7 @@ def run(args):
     private.mkdir()
     powershell("& icacls $v.path /inheritance:r /grant:r \"$($env:USERDOMAIN)\\$($env:USERNAME):(OI)(CI)F\"|Out-Null;if($LASTEXITCODE){throw 'Private ACL failed'}",{'path':str(private)})
     os.environ.update(private_environment(private))
-    snapshot=None;results={};suites=[];users=[];journal=private/'processes.json';rule='RdpilotDesktop-'+secrets.token_hex(8)
+    snapshot=None;results={};suites=[];attempted=[];users=[];journal=private/'processes.json';rule='RdpilotDesktop-'+secrets.token_hex(8)
     stage='preflight';failure_detail={};failure_code='none';passed=False;setup_attempted=False;roles=[];memberships=[];creation_observations=[]
     try:
         snapshot=powershell(PREFLIGHT)
@@ -374,18 +374,20 @@ def run(args):
                 credentials[label]={'host':'127.0.0.1','port':3389,'username':name,'domain':snapshot['computer'],'password':password}
                 (private/(label+'.json')).write_text(json.dumps(credentials[label]))
             if diagnostic:
-                suites.append('host_setup')
+                attempted.append('host_setup')
                 checks=cleanup_suite(users,journal,snapshot['cache'])
                 results['host_setup']=checks
                 creation_observations.extend({'suite':'host_setup','present':u.get('creation_present')} for u in users)
                 users=[]
                 if not all(checks.values()):raise RuntimeError('Setup cleanup failed')
+                suites.append('host_setup')
                 continue
             child_env=dict(os.environ)
             for label,cred in credentials.items():
                 prefix='RDPILOT_TAKE_' if proof=='takeover' else 'RDPILOT_VIEW_'+label.upper()+'_'
                 child_env.update({prefix+k.upper():str(v) for k,v in cred.items()})
             stage=proof+'_harness'
+            attempted.append(proof)
             command=[sys.executable,str(HERE/'run-live-proof.py'),proof,'--bin-dir',str(bin_dir),'--bundle',str(bundle),
                 '--output',str(private/(proof+'-raw')),'--artifacts',str(artifacts),'--source-bridge-sha256',hashes['rdpilot-bridge'],
                 '--journal',str(journal),'--credentials-a',str(private/'a.json'),'--credentials-b',str(private/'b.json')]
@@ -399,15 +401,17 @@ def run(args):
                 except subprocess.TimeoutExpired:
                     powershell(STOP_PROCESS,record,15);code=1
             selected=json.loads((artifacts/(proof+'.json')).read_text()) if (artifacts/(proof+'.json')).exists() else {'status':'failed'}
-            suites.append(proof)
             stage=proof+'_cleanup'
             try:checks=cleanup_suite(users,journal,snapshot['cache'],require_profiles=(code==0 and selected['status']=='passed'))
             except BaseException:checks={'suite_cleanup':False}
             results[proof]=checks
             creation_observations.extend({'suite':proof,'present':u.get('creation_present')} for u in users)
             users=[]
-            if code or selected['status']!='passed' or not all(checks.values()):
+            if code or selected['status']!='passed':
+                stage=proof+'_harness'
                 raise RuntimeError('Required proof or cleanup failed')
+            if not all(checks.values()):raise RuntimeError('Required proof or cleanup failed')
+            suites.append(proof)
         passed=True;stage='none'
     except BaseException as error:
         passed=False
@@ -448,7 +452,7 @@ if($s.State -ne $v.state -or $s.StartMode -ne $v.start_mode){throw 'Service rest
                 screenshot.unlink()
         (artifacts/'account-roles.json').write_text(json.dumps({'roles':roles,'memberships':memberships,'creation_observations':creation_observations},indent=2))
         (artifacts/'cleanup.json').write_text(json.dumps(results,indent=2))
-        (artifacts/'gate.json').write_text(json.dumps({'mode':'setup_diagnostic' if getattr(args,'setup_diagnostic',False) else 'live', 'status':('setup_passed' if getattr(args,'setup_diagnostic',False) else 'passed') if passed else 'failed','failure_stage':'none' if passed else (stage if stage!='none' else 'cleanup'),'completed_suites':suites,'failure_code':failure_code if not passed else 'none','host_failure':failure_detail if not passed else {}},indent=2))
+        (artifacts/'gate.json').write_text(json.dumps({'mode':'setup_diagnostic' if getattr(args,'setup_diagnostic',False) else 'live', 'status':('setup_passed' if getattr(args,'setup_diagnostic',False) else 'passed') if passed else 'failed','failure_stage':'none' if passed else (stage if stage!='none' else 'cleanup'),'attempted_suites':attempted,'completed_suites':suites,'failure_code':failure_code if not passed else 'none','host_failure':failure_detail if not passed else {}},indent=2))
     print('Hosted desktop gate '+('passed' if passed else 'failed')+'; stage: '+stage,flush=True)
     return 0 if passed else 1
 

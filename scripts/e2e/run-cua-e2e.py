@@ -237,6 +237,9 @@ class Run:
         self.relays, self.endpoints, self.metadata = {}, {}, {}
         self.checks = []
         self.daemon = None
+        self.operation = 'harness'
+        self.failure_operation = None
+        self.failed_cli_exit = None
         self.summary = {"mode": "live", "status": "running", "checks": self.checks, "unverified": ["UAC/secure-desktop behavior is unsupported; no elevation guarantee"]}
 
     def clean(self, text):
@@ -288,6 +291,7 @@ class Run:
             await proc.wait()
             raise
         if proc.returncode and not allow_failure:
+            self.failed_cli_exit = proc.returncode
             raise ProofError(self.clean(f"CLI {arguments[0]} failed: {out.decode(errors='replace')} {err.decode(errors='replace')}"))
         return json.loads(out) if out.strip() else {}
 
@@ -298,10 +302,14 @@ class Run:
             for target, cred in self.credentials.items()})
 
     async def connect(self, target):
+        self.operation = 'hosts_file'
         hosts = self.hosts_for_relays()
+        self.operation = 'connect_cli'
         result = await self.cli("connect", target, "-F", str(hosts), "--name", target, target=target, timeout=self.args.connect_timeout)
+        self.operation = 'bridge_ready_assertion'
         require(result.get("bridge_live"), "Connect did not report live bridge")
         self.check(f"{target}.rdp_bundle_ready")
+        self.operation = 'live_checks'
 
     async def attach(self, target):
         endpoint = Mcp(self, target)
@@ -557,10 +565,13 @@ $text=& $exe 'runtime::windows_tests::job_closes_root_and_descendant_created_aft
     async def execute(self):
         daemon_log = open(self.output / "daemon.log", "w")
         try:
+            self.operation = 'relay_start'
             for target, credentials in self.credentials.items():
                 relay = Relay(credentials)
                 self.relays[target] = (relay, await relay.start())
+            self.operation = 'daemon_start'
             self.daemon = await asyncio.create_subprocess_exec(str(self.bin / "rdpilot-daemon"), env=self.env, stdout=daemon_log, stderr=daemon_log)
+            self.operation = 'daemon_start_wait'
             await asyncio.sleep(0.3)
             for target in ("a", "b"):
                 await self.connect(target)
@@ -578,6 +589,7 @@ $text=& $exe 'runtime::windows_tests::job_closes_root_and_descendant_created_aft
                 self.summary["unverified"].append("Fault injection explicitly skipped")
             self.summary["status"] = "passed"
         except BaseException as error:
+            self.failure_operation = self.operation
             self.summary["status"] = "failed"
             self.summary["failure"] = self.clean(f"{type(error).__name__}: {error}")
             raise

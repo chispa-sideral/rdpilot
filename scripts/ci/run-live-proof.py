@@ -46,6 +46,21 @@ ALLOWED_UNVERIFIED = {
 }
 HEX = re.compile(r'[a-f0-9]{64}\Z')
 BUNDLE = re.compile(r'cua-driver-rs-v0\.34\.0-[a-f0-9]{16}\Z')
+OPERATIONS = {'harness','relay_start','daemon_start','daemon_start_wait','hosts_file','connect_cli','bridge_ready_assertion','live_checks'}
+
+
+def failure_detail(error, operation=None, cli_exit=None):
+    """Only fixed operation/type categories and numeric exit codes cross out."""
+    if isinstance(error, TimeoutError):category='timeout'
+    elif isinstance(error, FileNotFoundError):category='file_not_found'
+    elif isinstance(error, PermissionError):category='access_denied'
+    elif isinstance(error, json.JSONDecodeError):category='invalid_json'
+    elif isinstance(error, OSError):category='os_error'
+    elif type(error).__name__=='ProofError':category='proof_assertion'
+    else:category='other'
+    detail={'operation':operation if isinstance(operation,str) and operation in OPERATIONS else 'harness','exception_category':category}
+    if type(cli_exit) is int and -(2**31)<=cli_exit<2**32:detail['cli_exit_code']=cli_exit
+    return detail
 
 
 def project(proof, summary, returncode, expected_hash):
@@ -139,12 +154,13 @@ async def execute(args):
     if not Path(run.temp).resolve().is_relative_to(boundary):
         raise RuntimeError('Harness temporary files escaped private boundary')
     run.check('private_child_temporary_boundary_verified')
-    code = 0
+    code = 0;error_detail={}
     sentinel = await tracked(sys.executable, '-c', 'import time; time.sleep(3600)') if args.proof != 'cua' else None
     try:
         await asyncio.wait_for(run.execute(), args.timeout)
-    except BaseException:
+    except BaseException as error:
         code = 1
+        error_detail=failure_detail(error,getattr(run,'failure_operation',None),getattr(run,'failed_cli_exit',None))
     finally:
         asyncio.create_subprocess_exec = original
         if sentinel:
@@ -162,6 +178,7 @@ async def execute(args):
     scanned = scan_files(Path(args.output), needles)
     summary = json.loads((Path(args.output)/'summary.json').read_text())
     selected = project(args.proof, summary, code if scanned else 1, args.source_bridge_sha256)
+    if selected['status']!='passed':selected['harness_failure']=error_detail
     artifact = Path(args.artifacts)
     artifact.mkdir(parents=True, exist_ok=True)
     (artifact / (args.proof + '.json')).write_text(json.dumps(selected, indent=2)+'\n')
@@ -185,9 +202,11 @@ def main():
     args=parser.parse_args()
     try:
         return asyncio.run(execute(args))
-    except BaseException:
+    except BaseException as error:
         Path(args.artifacts).mkdir(parents=True,exist_ok=True)
-        (Path(args.artifacts)/(args.proof+'.json')).write_text(json.dumps(project(args.proof,None,1,args.source_bridge_sha256)))
+        selected=project(args.proof,None,1,args.source_bridge_sha256)
+        selected['harness_failure']=failure_detail(error)
+        (Path(args.artifacts)/(args.proof+'.json')).write_text(json.dumps(selected))
         return 1
 
 

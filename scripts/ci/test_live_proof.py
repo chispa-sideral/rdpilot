@@ -1,5 +1,7 @@
 """Failure injection against the real required live gate and projection."""
 import importlib.util
+import argparse
+import asyncio
 import json
 import os
 from pathlib import Path
@@ -70,6 +72,34 @@ class ProjectionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory);(root/'raw.txt').write_text(secret)
             self.assertFalse(live.scan_files(root,[secret.encode()]))
+
+
+class EarlyHarnessFailureTests(unittest.IsolatedAsyncioTestCase):
+    async def test_actual_cua_cli_failure_projects_operation_without_private_text(self):
+        class Child:
+            def __init__(self,code):self.returncode=code
+            async def communicate(self):return b'',b'secretcredential private-lease-token'
+            async def wait(self):return self.returncode
+            def terminate(self):self.returncode=0
+            def kill(self):self.returncode=1
+        async def spawn(*argv,**kwargs):
+            return Child(None if Path(argv[0]).name=='rdpilot-daemon' else (7 if argv[1]=='connect' else 0))
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);private=root/'private';private.mkdir()
+            for target in ('a','b'):
+                (private/(target+'.json')).write_text(json.dumps({'host':'127.0.0.1','port':3389,'username':'owned','password':'secretcredential'}))
+            args=argparse.Namespace(proof='cua',bin_dir=str(root/'bin'),bundle=str(root/'bundle'),output=str(private/'raw'),
+                artifacts=str(root/'artifacts'),source_bridge_sha256=HASH,journal=str(private/'processes.json'),
+                credentials_a=str(private/'a.json'),credentials_b=str(private/'b.json'),timeout=10)
+            with patch.object(tempfile,'tempdir',str(private)),patch.object(asyncio,'create_subprocess_exec',side_effect=spawn):
+                self.assertEqual(await live.execute(args),1)
+            selected=json.loads((root/'artifacts/cua.json').read_text())
+            self.assertEqual(selected['status'],'failed')
+            self.assertEqual(selected['harness_failure'],{'operation':'connect_cli','exception_category':'proof_assertion','cli_exit_code':7})
+            self.assertNotIn('a.rdp_bundle_ready',selected['completed_checks'])
+            self.assertNotIn('secretcredential',json.dumps(selected))
+            self.assertNotIn('private-lease-token',json.dumps(selected))
+            self.assertIn('private-lease-token',(private/'raw/summary.json').read_text())
 
 
 class OwnershipTests(unittest.TestCase):
