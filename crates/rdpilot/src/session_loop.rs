@@ -242,10 +242,11 @@ fn process_fastpath_input(
 ) -> Result<Vec<ActiveStageOutput>> {
     let mut outputs = Vec::new();
     for batch in events.chunks(255) {
-        let mut batch_outputs = active_stage
-            .process_fastpath_input(image, batch)
-            .map_err(|e| Error::Session(format!("input injection failed: {e}")))?;
-        outputs.append(&mut batch_outputs);
+        outputs.extend(
+            active_stage
+                .process_fastpath_input(image, batch)
+                .map_err(|e| Error::Session(format!("input injection failed: {e}")))?,
+        );
     }
     Ok(outputs)
 }
@@ -455,7 +456,7 @@ mod tests {
         stage: &mut ActiveStage,
         image: &mut DecodedImage,
         events: &[ironrdp::pdu::input::fast_path::FastPathInputEvent],
-    ) -> Vec<ironrdp::pdu::input::fast_path::FastPathInputEvent> {
+    ) {
         let outputs = process_fastpath_input(stage, image, events)
             .expect("production input dispatcher should encode this action");
         if events.is_empty() {
@@ -471,7 +472,6 @@ mod tests {
             }
         }
         assert_eq!(decoded, events);
-        decoded
     }
 
     fn assert_dispatch_conserves(events: &[ironrdp::pdu::input::fast_path::FastPathInputEvent]) {
@@ -493,21 +493,20 @@ mod tests {
     #[test]
     fn production_dispatcher_preserves_translated_type_events_in_legal_pdus() {
         let mut database = Database::new();
-        for (label, text) in [
-            ("empty", "".to_owned()),
-            ("single", "x".to_owned()),
-            ("ASCII127", "x".repeat(127)),
-            ("ASCII128", "x".repeat(128)),
-            ("BMP127", "é".repeat(127)),
-            ("BMP128", "é".repeat(128)),
-            ("supplementary63", "😀".repeat(63)),
-            ("supplementary64", "😀".repeat(64)),
-            ("ASCII10000", "x".repeat(10_000)),
-            ("mixed-long", "Aé😀🙂".repeat(3_000)),
+        for text in [
+            "".to_owned(),
+            "x".to_owned(),
+            "x".repeat(127),
+            "x".repeat(128),
+            "é".repeat(127),
+            "é".repeat(128),
+            "😀".repeat(63),
+            "😀".repeat(64),
+            "x".repeat(10_000),
+            "Aé😀🙂".repeat(3_000),
         ] {
             let events = translated_type(&text, &mut database);
             assert_dispatch_conserves(&events);
-            let _ = label;
         }
 
         let direct = translated_type("x".repeat(128).as_str(), &mut database);

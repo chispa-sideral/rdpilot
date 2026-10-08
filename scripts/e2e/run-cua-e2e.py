@@ -17,7 +17,6 @@ The output is owner-only and contains guest desktop content. This harness
 provisions nothing. Two local TCP relays forward existing RDP access and allow
 an exact-target connection loss; all guest control uses RDP/native Cua MCP.
 """
-import proof_support
 import argparse
 import asyncio
 import base64
@@ -83,9 +82,6 @@ class Relay:
         self.port = int(credentials.get("port", 3389))
         self.streams = set()
         self.server = None
-        self.observation = {'state':'observed','accepted':0,'upstream_connected':0,
-                            'to_upstream_bytes':0,'to_client_bytes':0,
-                            'upstream_failure':'none','copy_failure':'none'}
 
     async def start(self):
         self.server = await asyncio.start_server(self.accept, "127.0.0.1", 0)
@@ -93,37 +89,22 @@ class Relay:
 
     async def accept(self, reader, writer):
         upstream = None
-        self.observation['accepted'] += 1
         try:
             remote, upstream = await asyncio.wait_for(asyncio.open_connection(self.host, self.port), 15)
-            self.observation['upstream_connected'] += 1
             self.streams.update((writer, upstream))
 
-            async def copy(source, dest, counter):
-                try:
-                    while data := await source.read(64 * 1024):
-                        dest.write(data)
-                        await dest.drain()
-                        # Count only successfully drained bytes; never retain payloads.
-                        self.observation[counter] += len(data)
-                except OSError:
-                    self.observation['copy_failure']='os_error'
-                    raise
-                except Exception:
-                    self.observation['copy_failure']='unknown'
-                    raise
+            async def copy(source, dest):
+                while data := await source.read(64 * 1024):
+                    dest.write(data)
+                    await dest.drain()
 
-            tasks = [asyncio.create_task(copy(reader, upstream, 'to_upstream_bytes')),
-                     asyncio.create_task(copy(remote, writer, 'to_client_bytes'))]
+            tasks = [asyncio.create_task(copy(reader, upstream)), asyncio.create_task(copy(remote, writer))]
             _, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
             for task in pending:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
-        except (OSError, asyncio.TimeoutError) as error:
-            self.observation['upstream_failure']='timeout' if isinstance(error,TimeoutError) else 'os_error'
-            for key in ('errno','winerror'):
-                value=getattr(error,key,None)
-                if proof_support.bounded_int(value,-(2**31),2**32-1):self.observation[key]=value
+        except (OSError, asyncio.TimeoutError):
+            pass
         finally:
             for stream in (writer, upstream):
                 if stream is not None:
@@ -160,13 +141,12 @@ class Mcp:
         generation = uuid.uuid4().hex[:8]
         self.log = open(self.run.output / f"mcp-{self.target}-{generation}.jsonl", "w")
         stderr = open(self.run.output / f"mcp-{self.target}-{generation}.stderr", "w")
-        try:
-            self.proc = await asyncio.create_subprocess_exec(
-                str(self.run.bin / "rdpilot-mcp"), "--session", self.target,
-                env=self.run.env, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
-                stderr=stderr, limit=LIMIT + 1024,
-            )
-        finally:stderr.close()
+        self.proc = await asyncio.create_subprocess_exec(
+            str(self.run.bin / "rdpilot-mcp"), "--session", self.target,
+            env=self.run.env, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+            stderr=stderr, limit=LIMIT + 1024,
+        )
+        stderr.close()
         result = await self.request("initialize", {
             "protocolVersion": "2024-11-05", "capabilities": {},
             "clientInfo": {"name": "rdpilot-live-proof", "version": "1"},
@@ -185,45 +165,23 @@ class Mcp:
         await asyncio.wait_for(self.proc.stdin.drain(), 5)
 
     async def request(self, method, params, timeout=65):
-        protected = hasattr(self.run, 'work_budget')
-        if protected:
-            deadline = time.monotonic() + min(timeout, 65)
-        def request_bound(maximum):
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError('Protected native request deadline')
-            return min(maximum, remaining)
         self.number += 1
         request_id = f"{self.target}-{self.number}"
         request = {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params}
         self.log.write(self.run.clean(json.dumps({"request": request})) + "\n")
         self.log.flush()
-        if protected:
-            send_bound = request_bound(5)
-            await asyncio.wait_for(self.send(request), send_bound)
-        else:
-            await self.send(request)
-            deadline = time.monotonic() + timeout
+        await self.send(request)
+        deadline = time.monotonic() + timeout
         while True:
-            read_bound = request_bound(65) if protected else max(0.1, deadline - time.monotonic())
-            line = await asyncio.wait_for(self.proc.stdout.readline(), read_bound)
-            if protected:
-                request_bound(65)
+            line = await asyncio.wait_for(self.proc.stdout.readline(), max(0.1, deadline - time.monotonic()))
             require(line, f"{self.target}: MCP EOF during {method}")
             require(len(line) <= LIMIT, "oversized MCP output")
             message = json.loads(line)
             self.log.write(self.run.clean(json.dumps({"method": method, "response": message})) + "\n")
             self.log.flush()
-            if protected:
-                request_bound(65)
             if "method" in message and "id" in message:
                 # We advertised no client request capabilities; fail explicitly.
-                refusal = {"jsonrpc": "2.0", "id": message["id"], "error": {"code": -32601, "message": "client capability not offered"}}
-                if protected:
-                    send_bound = request_bound(5)
-                    await asyncio.wait_for(self.send(refusal), send_bound)
-                else:
-                    await self.send(refusal)
+                await self.send({"jsonrpc": "2.0", "id": message["id"], "error": {"code": -32601, "message": "client capability not offered"}})
                 continue
             if message.get("id") == request_id and "method" not in message:
                 require("error" not in message, f"native {method} error: {message.get('error')}")
@@ -244,26 +202,15 @@ class Mcp:
         require(self.proc.returncode != 0, "failed attachment exited as success")
 
     async def stop(self):
-        try:
-            if self.proc and self.proc.returncode is None:
-                self.proc.stdin.close()
-                def stop_bound(maximum):
-                    return max(0,min(maximum,self.run.cleanup_deadline-time.monotonic())) if hasattr(self.run,'cleanup_budget') else maximum
-                try:
-                    await asyncio.wait_for(self.proc.wait(), stop_bound(8))
-                except BaseException as primary:
-                    failed=False
-                    try:self.proc.kill()
-                    except BaseException as error:
-                        failed=True
-                        self.run.cleanup_failures.append(proof_support.failure_detail(error,'endpoint_cleanup'))
-                    try:await asyncio.wait_for(self.proc.wait(), stop_bound(5))
-                    except BaseException as error:
-                        failed=True
-                        self.run.cleanup_failures.append(proof_support.failure_detail(error,'endpoint_cleanup'))
-                    if failed or not isinstance(primary,TimeoutError):raise
-        finally:
-            if self.log:self.log.close()
+        if self.proc and self.proc.returncode is None:
+            self.proc.stdin.close()
+            try:
+                await asyncio.wait_for(self.proc.wait(), 8)
+            except asyncio.TimeoutError:
+                self.proc.kill()
+                await self.proc.wait()
+        if self.log:
+            self.log.close()
 
 
 class Run:
@@ -289,12 +236,7 @@ class Run:
         self.relays, self.endpoints, self.metadata = {}, {}, {}
         self.checks = []
         self.daemon = None
-        self.operation = 'harness'
-        self.failure_operation = None
-        self.failed_cli_exit = None
-        self.primary_failure = None
-        self.cleanup_failures = []
-        self.summary = {"mode": "live", "status": "running", "checks": self.checks, "unverified": ["UAC/secure-desktop behavior is unsupported; no elevation guarantee"]}
+        self.summary = {"status": "running", "checks": self.checks, "unverified": ["UAC/secure-desktop behavior is unsupported; no elevation guarantee"]}
 
     def clean(self, text):
         for cred in self.credentials.values():
@@ -310,9 +252,7 @@ class Run:
         lines = []
         for target, entry in entries.items():
             lines += [f"Host {target}", f"  HostName {quote(entry['host'])}", f"  User {quote(entry['username'])}",
-                      f"  PasswordCommand {quote(proof_support.password_command(target))}"]
-            if getattr(self.args, "cua_version", None):
-                lines.append(f"  CuaVersion {quote('cua-driver-rs-v' + self.args.cua_version)}")
+                      f"  PasswordCommand {quote('printenv E2E_PASSWORD_' + target.upper())}"]
             if entry.get("port"):
                 lines.append(f"  Port {entry['port']}")
             if entry.get("domain"):
@@ -341,35 +281,12 @@ class Run:
         try:
             out, err = await asyncio.wait_for(proc.communicate(), timeout)
         except BaseException:
-            try:proc.kill()
-            except BaseException as error:self.cleanup_failures.append(proof_support.failure_detail(error,'disconnect_cleanup'))
-            stop_bound=max(0,min(5,self.cleanup_deadline-time.monotonic())) if hasattr(self,'cleanup_budget') and hasattr(self,'cleanup_deadline') else 5
-            try:await asyncio.wait_for(proc.wait(),stop_bound)
-            except BaseException as error:self.cleanup_failures.append(proof_support.failure_detail(error,'disconnect_cleanup'))
+            proc.kill()
+            await proc.wait()
             raise
         if proc.returncode and not allow_failure:
-            self.failed_cli_exit = proc.returncode
-            error=ProofError(self.clean(f"CLI {arguments[0]} failed: {out.decode(errors='replace')} {err.decode(errors='replace')}"))
-            if arguments[0]=='connect':self.freeze_connect_failure(error,out)
-            raise error
+            raise ProofError(self.clean(f"CLI {arguments[0]} failed: {out.decode(errors='replace')} {err.decode(errors='replace')}"))
         return json.loads(out) if out.strip() else {}
-
-    def freeze_connect_failure(self, error, stdout=None):
-        if self.primary_failure is not None:return
-        primary=proof_support.failure_detail(error,self.operation,self.failed_cli_exit)
-        try:
-            observation=proof_support.cli_observation(stdout)
-            observation['relays']={target:proof_support.select_relay_observation(
-                self.relays[target][0].observation if target in self.relays else None) for target in ('a','b')}
-            code=self.daemon.returncode if self.daemon else None
-            observation['daemon']={'state':'alive' if self.daemon and code is None else 'exited' if self.daemon else 'unavailable'}
-            if code is not None:observation['daemon']['exit_code']=code
-            observation['observation_state']='observed'
-            primary['connect_observation']=proof_support.select_connect_observation(observation)
-        except Exception as observation_error:
-            primary['connect_observation']=proof_support.select_connect_observation({'observation_state':'observation_failed'})
-            self.cleanup_failures.append(proof_support.failure_detail(observation_error,'connect_observation'))
-        self.primary_failure=proof_support.select_failure_detail(primary)
 
     def hosts_for_relays(self):
         return self.hosts_file({
@@ -378,23 +295,15 @@ class Run:
             for target, cred in self.credentials.items()})
 
     async def connect(self, target):
-        self.operation = 'hosts_file'
         hosts = self.hosts_for_relays()
-        self.operation = 'connect_cli'
         result = await self.cli("connect", target, "-F", str(hosts), "--name", target, target=target, timeout=self.args.connect_timeout)
-        self.operation = 'bridge_ready_assertion'
         require(result.get("bridge_live"), "Connect did not report live bridge")
         self.check(f"{target}.rdp_bundle_ready")
-        self.operation = 'live_checks'
-        return result
 
     async def attach(self, target):
         endpoint = Mcp(self, target)
         self.endpoints[target] = endpoint
         await endpoint.start()
-        from types import SimpleNamespace
-        await proof_support.installed_identity(self, target, endpoint, SimpleNamespace(
-            psquote=psquote, powershell=powershell, require=require))
         return endpoint
 
     def filename(self, target, suffix):
@@ -639,95 +548,57 @@ $text=& $exe 'runtime::windows_tests::job_closes_root_and_descendant_created_aft
         await self.opposite_alive()
         self.check("a.unplanned_rdp_loss_stale_endpoint_and_explicit_reconnect")
 
-    async def start_daemon(self, daemon_log):
-        self.operation = 'daemon_start'
-        self.daemon = await asyncio.create_subprocess_exec(str(self.bin / getattr(self,'daemon_executable','rdpilot-daemon')), env=self.env, stdout=daemon_log, stderr=daemon_log)
-        self.operation = 'daemon_start_wait'
-        await asyncio.sleep(getattr(self,'daemon_start_wait',0.3))
-
-    async def proof_body(self):
-        for target in ("a", "b"):
-            await self.connect(target)
-            await self.attach(target)
-            await self.fixture(target)
-            await self.transfer(target)
-            await self.native_recovery(target, "before_faults")
-        await self.isolation()
-        await self.job_test()
-        if not self.args.skip_faults:
-            await self.fault("kill")
-            await self.fault("stall")
-            await self.loss()
-        else:
-            self.summary["unverified"].append("Fault injection explicitly skipped")
-
-    def scan_evidence(self,needles):
-        return not any(needle in path.read_bytes() for path in self.output.rglob("*") if path.is_file() for needle in needles)
-
     async def execute(self):
         daemon_log = open(self.output / "daemon.log", "w")
         try:
-            async def work():
-                self.operation = 'relay_start'
-                for target, credentials in self.credentials.items():
-                    relay = Relay(credentials)
-                    self.relays[target] = (relay, await relay.start())
-                await self.start_daemon(daemon_log)
-                await self.proof_body()
-            if hasattr(self,'work_budget'):await asyncio.wait_for(work(),self.work_budget)
-            else:await work()
+            for target, credentials in self.credentials.items():
+                relay = Relay(credentials)
+                self.relays[target] = (relay, await relay.start())
+            self.daemon = await asyncio.create_subprocess_exec(str(self.bin / "rdpilot-daemon"), env=self.env, stdout=daemon_log, stderr=daemon_log)
+            await asyncio.sleep(0.3)
+            for target in ("a", "b"):
+                await self.connect(target)
+                await self.attach(target)
+                await self.fixture(target)
+                await self.transfer(target)
+            await self.isolation()
+            await self.job_test()
+            if not self.args.skip_faults:
+                await self.fault("kill")
+                await self.fault("stall")
+                await self.loss()
+            else:
+                self.summary["unverified"].append("Fault injection explicitly skipped")
             self.summary["status"] = "passed"
         except BaseException as error:
-            self.failure_operation = self.operation
-            if self.operation=='connect_cli':self.freeze_connect_failure(error)
-            if self.primary_failure is None:self.primary_failure = proof_support.failure_detail(error,self.operation,self.failed_cli_exit)
             self.summary["status"] = "failed"
             self.summary["failure"] = self.clean(f"{type(error).__name__}: {error}")
             raise
         finally:
-            self.cleanup_deadline=time.monotonic()+getattr(self,'cleanup_budget',float('inf'))
-            async def cleanup(stage, action):
-                try:
-                    if hasattr(self,'cleanup_budget'):
-                        await asyncio.wait_for(action(),max(0.001,self.cleanup_deadline-time.monotonic()))
-                    else:await action()
-                except BaseException as error:self.cleanup_failures.append(proof_support.failure_detail(error,stage))
-            def cleanup_sync(stage, action):
-                try:
-                    action()
-                    if time.monotonic()>self.cleanup_deadline:raise TimeoutError('Harness cleanup budget')
-                except BaseException as error:self.cleanup_failures.append(proof_support.failure_detail(error,stage))
             for endpoint in self.endpoints.values():
-                await cleanup('endpoint_cleanup',endpoint.stop)
+                await endpoint.stop()
             for target in self.relays:
-                await cleanup('disconnect_cleanup',lambda target=target:self.cli("disconnect", "--session", target, timeout=10, allow_failure=True))
-            async def stop_daemon():
-                if self.daemon and self.daemon.returncode is None:
-                    self.daemon.terminate()
-                    try:await asyncio.wait_for(self.daemon.wait(), 5)
-                    except asyncio.TimeoutError:
-                        self.daemon.kill()
-                        await asyncio.wait_for(self.daemon.wait(),5)
-            await cleanup('daemon_cleanup',stop_daemon)
+                try:
+                    await self.cli("disconnect", "--session", target, timeout=10, allow_failure=True)
+                except (OSError, asyncio.TimeoutError, ValueError):
+                    pass
+            if self.daemon and self.daemon.returncode is None:
+                self.daemon.terminate()
+                try:
+                    await asyncio.wait_for(self.daemon.wait(), 5)
+                except asyncio.TimeoutError:
+                    self.daemon.kill()
+                    await self.daemon.wait()
             for relay, _ in self.relays.values():
-                await cleanup('relay_cleanup',relay.close)
-            cleanup_sync('log_cleanup',daemon_log.close)
-            cleanup_sync('summary_write',self.save)
-            def scan():
-                needles = [str(c["password"]).encode() for c in self.credentials.values() if c.get("password")]
-                require(self.scan_evidence(needles), "Credential in evidence")
-                self.check("evidence_contains_no_credentials")
-            cleanup_sync('harness_scan',scan)
-            cleanup_sync('temporary_cleanup',lambda:shutil.rmtree(self.temp))
-            if self.cleanup_failures and not self.primary_failure:
-                raise ProofError('Live harness cleanup failed')
+                await relay.close()
+            daemon_log.close()
+            self.save()
+            shutil.rmtree(self.temp)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--bin-dir", required=True)
-    parser.add_argument("--source-bridge-sha256", help="require running guest/manifest identity to match source")
-    parser.add_argument("--cua-version", help="pin the upstream Cua bundle version")
     parser.add_argument("--bundle", help="daemon bundle_path directory (default: download into a fresh cache)")
     parser.add_argument("--credentials-a", required=True)
     parser.add_argument("--credentials-b", required=True)

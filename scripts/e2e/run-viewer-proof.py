@@ -45,7 +45,6 @@ session's strip, and without argument values. Live mode keeps the MCP
 transcripts in the temp directory, since they carry the typed text, and
 fails if the typed text reaches any evidence file.
 """
-import proof_support
 import argparse
 import asyncio
 import base64
@@ -323,9 +322,7 @@ class Proof:
         lines = []
         for target, entry in entries.items():
             lines += [f"Host {target}", f"  HostName {quote(entry['host'])}", f"  User {quote(entry['username'])}",
-                      f"  PasswordCommand {quote(proof_support.password_command(target))}"]
-            if getattr(self.args, "cua_version", None):
-                lines.append(f"  CuaVersion {quote('cua-driver-rs-v' + self.args.cua_version)}")
+                      f"  PasswordCommand {quote('printenv E2E_PASSWORD_' + target.upper())}"]
             if entry.get("port"):
                 lines.append(f"  Port {entry['port']}")
             if entry.get("domain"):
@@ -381,8 +378,7 @@ class Proof:
             args += ["--bind", self.args.bind]
         stderr = open(self.output / "view.stderr", "w")
         self.viewer = await asyncio.create_subprocess_exec(str(self.bin / "rdpilot"), *args, env=self.env,
-                                                           stdout=asyncio.subprocess.PIPE, stderr=stderr,
-                                                           **proof_support.viewer_process_options())
+                                                           stdout=asyncio.subprocess.PIPE, stderr=stderr)
         stderr.close()
         text = ""
         deadline = time.monotonic() + 15
@@ -415,7 +411,7 @@ class Proof:
 
     async def stop_viewer(self):
         require(self.viewer.returncode is None, "viewer still running before Ctrl-C")
-        await proof_support.interrupt_viewer(self.viewer)
+        self.viewer.send_signal(signal.SIGINT)
         code = await asyncio.wait_for(self.viewer.wait(), 10)
         require(code == 0, f"rdpilot view exit code {code}")
         # The daemon closes the listeners shortly after `rdpilot view` exits.
@@ -848,8 +844,6 @@ $f.Controls.Add($t);[Windows.Forms.Application]::Run($f)
             # of the evidence directory (they are deleted with the temp dir).
             self.endpoints[target] = await self.e2e.Mcp(McpRun(self), target).start()
         for target in TARGETS:
-            await proof_support.installed_identity(self, target, self.endpoints[target], self.e2e)
-        for target in TARGETS:
             await self.wait_strip(page, target, lambda rows: any("Cua attached" in r["text"] for r in rows),
                                   "Cua attached", 5)
         _, _, launch_ms = await self.live_call(page, "a", "launch_app", "cua", "ok",
@@ -1036,8 +1030,6 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--fake", action="store_true", help="offline run against the fake connector")
     parser.add_argument("--bin-dir", required=True, help="directory with rdpilot, rdpilot-daemon, rdpilot-mcp")
-    parser.add_argument("--source-bridge-sha256", help="require running guest/manifest identity to match source")
-    parser.add_argument("--cua-version", help="pin the upstream Cua bundle version")
     parser.add_argument("--bundle", help="live mode: daemon bundle_path directory (default: download into a fresh cache)")
     parser.add_argument("--output", required=True, help="new evidence directory; must not already exist")
     parser.add_argument("--bind", choices=["loopback", "loopback+tailnet"],

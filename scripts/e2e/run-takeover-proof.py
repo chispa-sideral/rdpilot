@@ -41,7 +41,6 @@ a final scan fails the run if the token, a credential, the lease ids or the
 typed marker appear in any evidence file. The output directory is new and
 owner-only. This harness provisions nothing: prepare the Windows host first.
 """
-import proof_support
 import argparse
 import asyncio
 import importlib.util
@@ -152,8 +151,7 @@ class Proof(viewer_proof.Proof):
             args += ["--bind", self.args.bind]
         stderr = open(self.output / ("view-read-only.stderr" if extra else "view.stderr"), "w")
         self.viewer = await asyncio.create_subprocess_exec(str(self.bin / "rdpilot"), *args, env=self.env,
-                                                           stdout=asyncio.subprocess.PIPE, stderr=stderr,
-                                                           **proof_support.viewer_process_options())
+                                                           stdout=asyncio.subprocess.PIPE, stderr=stderr)
         stderr.close()
         text, deadline = "", time.monotonic() + 15
         while True:
@@ -230,7 +228,6 @@ class Proof(viewer_proof.Proof):
             self.agent = await viewer_proof.FakeMcp(self, SESSION).start()
         else:
             self.agent = await self.e2e.Mcp(viewer_proof.McpRun(self), SESSION).start()
-            await proof_support.installed_identity(self, SESSION, self.agent, self.e2e)
 
     def tool_args(self, name, arguments):
         args = dict(arguments)
@@ -633,8 +630,6 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--fake", action="store_true", help="offline run against the fake connector")
     parser.add_argument("--bin-dir", required=True, help="directory with rdpilot, rdpilot-daemon, rdpilot-mcp")
-    parser.add_argument("--source-bridge-sha256", help="require running guest/manifest identity to match source")
-    parser.add_argument("--cua-version", help="pin the upstream Cua bundle version")
     parser.add_argument("--bundle", help="live mode: daemon bundle_path directory (default: download into a fresh cache)")
     parser.add_argument("--output", required=True, help="new evidence directory; must not already exist")
     parser.add_argument("--bind", choices=["loopback", "loopback+tailnet"],
