@@ -22,10 +22,10 @@ live = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(live)
 
 
-ERROR_CODES={'host_action','member_exists','parameter_binding','group_not_found','user_not_found','access_denied','native_error','timeout','invalid_host_json','invalid_password','invalid_name','invalid_parameters','account_exists','internal_error','command_not_found'}
+ERROR_CODES={'host_action','member_exists','parameter_binding','group_not_found','user_not_found','access_denied','native_error','timeout','invalid_host_json','invalid_password','invalid_name','invalid_parameters','account_exists','internal_error','command_not_found','module_autoload','secure_argument','secure_crypto'}
 
 SUBACTIONS={'script','account_preflight','secure_password','new_local_user','sid_readback','sid_journal'}
-EXCEPTION_CATEGORIES={'access_denied','argument','parameter_binding','local_accounts','io','other','action_preference','invocation','security'}
+EXCEPTION_CATEGORIES={'access_denied','argument','parameter_binding','local_accounts','io','other','action_preference','invocation','security','command_not_found','crypto','runtime','invalid_operation','not_supported'}
 
 class HostActionError(RuntimeError):
     def __init__(self,code,detail=None):
@@ -57,12 +57,17 @@ def powershell(script, values=None, timeout=30):
   'GroupNotFound*'{'group_not_found'} 'UserNotFound*'{'user_not_found'}
   'InvalidPassword*'{'invalid_password'} 'InvalidName*'{'invalid_name'} 'InvalidParameters*'{'invalid_parameters'}
   'NameInUse*'{'account_exists'} 'UserExists*'{'account_exists'} 'Internal*'{'internal_error'}
+  'CouldNotAutoLoad*'{'module_autoload'}
+  'ImportSecureString_InvalidArgument_CryptographicError*'{'secure_crypto'}
+  'ImportSecureString_InvalidArgument,*'{'secure_argument'}
   '*CommandNotFound*'{'command_not_found'}
   '*AccessDenied*'{'access_denied'} '*Win32*'{'native_error'} default{'host_action'}
  }
  $category=switch -Wildcard ($exception.GetType().FullName){
   '*UnauthorizedAccess*'{'access_denied'} '*Argument*'{'argument'} '*ParameterBinding*'{'parameter_binding'}
   '*ActionPreferenceStop*'{'action_preference'} '*Invocation*'{'invocation'} '*SecurityException'{'security'}
+  '*CommandNotFoundException'{'command_not_found'} '*CryptographicException'{'crypto'}
+  '*RuntimeException'{'runtime'} '*InvalidOperationException'{'invalid_operation'} '*NotSupportedException'{'not_supported'}
   '*LocalAccounts*'{'local_accounts'} '*IOException*'{'io'} default{'other'}
  }
  if($exception.GetType().BaseType.FullName -eq 'Microsoft.PowerShell.Commands.LocalAccountsException'){$category='local_accounts'}
