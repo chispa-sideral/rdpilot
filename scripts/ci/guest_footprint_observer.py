@@ -133,8 +133,16 @@ def validate(value, source):
     return json.loads(json.dumps(value))
 
 
-def signature(info):
-    return (info.st_dev, info.st_ino, info.st_size, info.st_nlink, info.st_mtime_ns, info.st_ctime_ns)
+def signature(info, *, windows):
+    value = (info.st_dev, info.st_ino, info.st_size, info.st_nlink, info.st_mtime_ns, info.st_ctime_ns)
+    if windows:
+        # CPython 3.12 named stat keeps creation in ctime, while fstat uses
+        # ChangeTime. Birthtime supplies equivalent creation on both surfaces.
+        try:creation = info.st_birthtime_ns
+        except (AttributeError, OSError):raise ValueError() from None
+        if type(creation) is not int or creation < 0:raise ValueError()
+        value += (creation,)
+    return value
 
 
 def ancestors(path):
@@ -233,7 +241,7 @@ class Held:
     def __enter__(self):
         try:
             self.lineage = ancestors(self.path.parent)
-            self.before = signature(files.plain(self.path))
+            self.before = signature(files.plain(self.path), windows=os.name == 'nt')
             if self.before[3] != 1:raise ValueError()
             if self.before[2] > self.limit:raise files.BudgetExceeded()
             if os.name == 'nt':
@@ -244,6 +252,11 @@ class Held:
                 fd = os.open(self.path, os.O_RDONLY | getattr(os, 'O_BINARY', 0) | getattr(os, 'O_NOFOLLOW', 0))
                 try:self.file = os.fdopen(fd, 'rb', buffering=0)
                 except BaseException:os.close(fd);raise
+            self.descriptor_before = signature(os.fstat(self.file.fileno()), windows=os.name == 'nt')
+            # Shared identity/size/link/write/creation must agree before content.
+            # POSIX compares ctime too; Windows retains each distinct ctime below.
+            if self.before[:5] + self.before[6:] != self.descriptor_before[:5] + self.descriptor_before[6:]:raise ValueError()
+            if len(self.before) == 6 and self.before != self.descriptor_before:raise ValueError()
             self.check()
             return self
         except BaseException:
@@ -251,7 +264,8 @@ class Held:
 
     def check(self):
         if ancestors(self.path.parent) != self.lineage:raise ValueError()
-        if signature(files.plain(self.path)) != self.before or signature(os.fstat(self.file.fileno())) != self.before:raise ValueError()
+        if signature(files.plain(self.path), windows=os.name == 'nt') != self.before:raise ValueError()
+        if signature(os.fstat(self.file.fileno()), windows=os.name == 'nt') != self.descriptor_before:raise ValueError()
         if self.native:
             if self.native.state() != self.native_before:raise ValueError()
             # Reopen the named path under identical Windows sharing and compare its

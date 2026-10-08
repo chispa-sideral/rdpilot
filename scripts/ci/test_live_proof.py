@@ -216,7 +216,7 @@ class PinnedCuaConfigurationTests(unittest.TestCase):
 class OrchestrationModeTests(unittest.TestCase):
     def measure(self,mode,*,failure=None,cache_fixture=None):
         with tempfile.TemporaryDirectory() as directory:
-            root=Path(directory);bins=root/'bin';bins.mkdir();output=root/'out'
+            root=Path(directory).resolve(strict=True);bins=root/'bin';bins.mkdir();output=root/'out'
             for name in ('rdpilot','rdpilot-daemon','rdpilot-mcp','rdpilot-bridge'):
                 (bins/(name+'.exe')).write_bytes(name.encode())
             if failure=='binary':(bins/'rdpilot-mcp.exe').unlink()

@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -61,9 +62,25 @@ def native_profile(path=None):
         'sid': OWNED['sid'], 'path': expected, 'special': False, 'loaded': True}}
 
 
+@contextlib.contextmanager
+def owned_alias():
+    """An alias entirely inside an owned tree; POSIX is a spelling surrogate."""
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory).resolve(strict=True)
+        target = root/'target';target.mkdir();alias = root/'alias'
+        if os.name == 'nt':
+            result = subprocess.run(['cmd.exe', '/d', '/c', 'mklink', '/J', str(alias), str(target)], capture_output=True)
+            if result.returncode != 0:raise AssertionError('Owned junction fixture setup failed')
+        else:alias.symlink_to(target, target_is_directory=True)
+        try:yield alias, target
+        finally:
+            if os.name == 'nt':os.rmdir(alias)
+            else:alias.unlink()
+
+
 class Fixture:
     def __init__(self, directory):
-        self.path = Path(directory);self.profile = self.path/'owned-profile';self.profile.mkdir()
+        self.path = Path(directory).resolve(strict=True);self.profile = self.path/'owned-profile';self.profile.mkdir()
         self.cache = self.path/'cache';self.cache.mkdir()
         self.source, self.acquisition, self.expected = identity()
         self.manifest = {key: self.expected[key] for key in ('bundle_id', 'cua_version', 'bridge_sha256', 'archive_sha256')}
@@ -142,6 +159,88 @@ class SelectionTests(unittest.TestCase):
 
 class ActualFileTests(unittest.TestCase):
     def setUp(self):self.temp = tempfile.TemporaryDirectory();self.addCleanup(self.temp.cleanup);self.fixture = Fixture(self.temp.name)
+
+    def windows_signatures(self, changes, after_initial=None):
+        # Explicit synthetic Windows 3.12 stat records at the metadata seam.
+        # Held still opens and reads an actual owned file using this host's rules.
+        original = observer.signature;calls = 0
+        fields = ('st_dev', 'st_ino', 'st_size', 'st_nlink', 'st_mtime_ns', 'st_ctime_ns')
+        def selected(info, **kwargs):
+            nonlocal calls
+            surface = 'named' if calls % 2 == 0 else 'descriptor';calls += 1
+            record = {key: getattr(info, key) for key in fields}
+            record.update(st_ctime_ns=100 if surface == 'named' else 200, st_birthtime_ns=100)
+            record.update(changes.get(surface, {}))
+            if record.get('st_birthtime_ns') == 'missing':del record['st_birthtime_ns']
+            value = original(SimpleNamespace(**record), windows=True)
+            if calls == 2 and after_initial:changes.update(after_initial)
+            return value
+        return patch.object(observer, 'signature', side_effect=selected)
+
+    def test_synthetic_windows_distinct_initial_ctimes_read_actual_file(self):
+        path = self.fixture.launcher()
+        with self.windows_signatures({}), observer.Held(path, 1024) as held:
+            self.assertEqual(held.before[5:], (100, 100))
+            self.assertEqual(held.descriptor_before[5:], (200, 100))
+            self.assertIsInstance(held.file, io.FileIO)
+            self.assertEqual(observer.Budget(len(BRIDGE)).read(held, 1024), BRIDGE)
+            self.assertEqual(os.lseek(held.file.fileno(), 0, os.SEEK_CUR), len(BRIDGE))
+
+    def test_synthetic_windows_initial_creation_and_shared_mismatches_refuse(self):
+        path = self.fixture.launcher();info = path.stat()
+        variants = [('st_birthtime_ns', value) for value in ('missing', None, True, -1, 1.5, 101)]
+        variants += [(key, getattr(info, key) + 1) for key in ('st_dev', 'st_ino', 'st_size', 'st_nlink', 'st_mtime_ns')]
+        for surface in ('named', 'descriptor'):
+            for field, value in variants:
+                with self.subTest(surface=surface, field=field, value=value), self.windows_signatures({surface: {field: value}}):
+                    with self.assertRaises(ValueError), observer.Held(path, 1024):
+                        self.fail('Initial mismatch admitted content')
+        class RefusedCreation:
+            def __getattr__(self, name):
+                if name == 'st_birthtime_ns':raise OSError()
+                return getattr(info, name)
+        with self.assertRaises(ValueError):observer.signature(RefusedCreation(), windows=True)
+
+    def test_synthetic_windows_original_timestamp_baselines_refuse_before_read(self):
+        path = self.fixture.launcher()
+        for surface in ('named', 'descriptor'):
+            for field in ('st_ctime_ns', 'st_birthtime_ns'):
+                with self.subTest(surface=surface, field=field), self.windows_signatures({}, {surface: {field: 999}}):
+                    with self.assertRaises(ValueError), observer.Held(path, 1024):
+                        self.fail('Changed original baseline admitted content')
+
+    def test_synthetic_windows_each_timestamp_race_refuses_after_actual_read(self):
+        path = self.fixture.launcher()
+        for surface in ('named', 'descriptor'):
+            for field in ('st_ctime_ns', 'st_birthtime_ns'):
+                changes = {}
+                with self.subTest(surface=surface, field=field), self.windows_signatures(changes):
+                    with self.assertRaises(ValueError):
+                        with observer.Held(path, 1024) as held:
+                            self.assertEqual(observer.Budget(len(BRIDGE)).read(held, 1024), BRIDGE)
+                            self.assertEqual(os.lseek(held.file.fileno(), 0, os.SEEK_CUR), len(BRIDGE))
+                            changes[surface] = {field: 999}
+
+    def test_posix_initial_ctime_equality_still_refuses(self):
+        # Explicit POSIX stat signatures are a logic control even on Windows.
+        path = self.fixture.launcher();original = observer.signature;calls = 0
+        def selected(info, **kwargs):
+            nonlocal calls
+            value = original(info, windows=False);calls += 1
+            return value[:-1] + (100 if calls % 2 else 200,)
+        with patch.object(observer, 'signature', side_effect=selected):
+            with self.assertRaises(ValueError), observer.Held(path, 1024):
+                self.fail('Different POSIX initial ctime admitted')
+
+    def test_owned_alias_fixture_reaches_positive_residual_reads(self):
+        with owned_alias() as (alias, target):
+            fixture = Fixture(alias)
+            self.assertEqual(fixture.path, target)
+            fixture.launcher();fixture.bundle()
+            result = fixture.sample()
+            self.assertEqual(result['outcome'], 'observed')
+            self.assertEqual(result['launcher'], 'source_match')
+            self.assertEqual(result['candidate_bundle'], 'source_binaries_match')
 
     def test_absence_directory_launcher_and_source_binaries_independent(self):
         f = self.fixture
@@ -448,6 +547,15 @@ class ParentTests(unittest.TestCase):
 
 
 class HostSeamTests(unittest.TestCase):
+    def test_owned_alias_fixture_reaches_selected_write_and_all_cleanup(self):
+        with owned_alias() as (alias, target):
+            # Interpose only the fixture's TemporaryDirectory spelling. Cleanup
+            # remains owned by the outer real TemporaryDirectory context.
+            with patch.object(existing.tempfile, 'TemporaryDirectory', return_value=contextlib.nullcontext(str(alias))):
+                self.measure()
+            self.assertTrue(target.is_dir())
+            self.assertFalse((target/'out'/'private').exists())
+
     def measure(self, refusal=None):
         host = existing.host;fixture = existing.OrchestrationModeTests()
         events = [];selected = failure();original_namespace = argparse.Namespace
