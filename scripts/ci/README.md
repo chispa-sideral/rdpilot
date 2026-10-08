@@ -109,3 +109,12 @@ executable. Windows containment tests remain separate required checks. Pillow
 records image differences without introducing a pixel threshold. Missing
 required checks, unknown exclusions, fake execution, skipped faults or absent
 provenance cannot pass the live gate. Release invokes the same required CI.
+
+`Desktop host setup diagnostic` is a separate manual workflow for setup failures.
+It creates disposable users, verifies their actual group roles and removes them,
+restoring the host with the same owned cleanup. It builds no product binaries and
+runs no RDP, Cua or browser proofs. Its `setup_diagnostic` / `setup_passed` output
+cannot satisfy the required live CI or release gate. The same diagnostic can run
+locally by adding `--setup-diagnostic` to `hosted_desktop.py` after initializing a
+fresh output directory. Failures expose only fixed subaction/category labels and
+numeric native/HRESULT codes; credentials and raw host stderr stay private.

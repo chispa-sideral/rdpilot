@@ -1,0 +1,35 @@
+name: Desktop host setup diagnostic
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  setup:
+    name: Host setup and cleanup only (no RDP proof)
+    runs-on: windows-2025
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Initialize safe setup evidence
+        shell: pwsh
+        run: python scripts/ci/hosted_desktop.py --initialize --output "$env:RUNNER_TEMP/setup-diagnostic"
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - name: Measure owned host setup and cleanup
+        shell: pwsh
+        run: python scripts/ci/hosted_desktop.py --setup-diagnostic --output "$env:RUNNER_TEMP/setup-diagnostic" --expected-commit "${{ github.sha }}"
+      - name: Safe setup diagnosis
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: desktop-setup-diagnostic
+          path: ${{ runner.temp }}/setup-diagnostic/artifacts/
+          retention-days: 7
+          if-no-files-found: error

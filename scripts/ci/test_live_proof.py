@@ -155,6 +155,20 @@ class OwnershipTests(unittest.TestCase):
             self.assertTrue(Path(child.stdout.strip()).resolve().is_relative_to(private.resolve()))
         for checks in live.CHECKS.values():self.assertIn('private_child_temporary_boundary_verified',checks)
 
+    def test_setup_diagnostic_is_separate_from_required_live_gate(self):
+        workflow=(HERE.parents[1]/'.github/workflows/desktop-setup-diagnostic.yml').read_text()
+        self.assertIn('workflow_dispatch:',workflow)
+        self.assertNotIn('  push:',workflow)
+        self.assertIn('--setup-diagnostic',workflow)
+        self.assertNotIn('cargo build',workflow)
+        ci=(HERE.parents[1]/'.github/workflows/ci.yml').read_text()
+        self.assertNotIn('--setup-diagnostic',ci)
+        self.assertIn("'setup_passed'",Path(host.__file__).read_text())
+        unsafe={'subaction':{'token':'secret'},'exception_category':'secret','hresult':'secret','native_error':True}
+        error=host.HostActionError('unknown-secret-code',unsafe)
+        self.assertEqual(error.code,'host_action')
+        self.assertNotIn('secret',json.dumps(error.detail))
+
     def test_static_build_failure_artifact_is_initialized_before_dependencies(self):
         with tempfile.TemporaryDirectory() as directory:
             output=Path(directory)/'output';host.initialize(output)

@@ -24,30 +24,48 @@ spec.loader.exec_module(live)
 
 ERROR_CODES={'host_action','member_exists','parameter_binding','group_not_found','user_not_found','access_denied','native_error','timeout','invalid_host_json'}
 
+SUBACTIONS={'script','account_preflight','new_local_user','sid_readback','sid_journal'}
+EXCEPTION_CATEGORIES={'access_denied','argument','parameter_binding','local_accounts','io','other'}
+
 class HostActionError(RuntimeError):
-    def __init__(self,code):
+    def __init__(self,code,detail=None):
         self.code=code if code in ERROR_CODES else 'host_action'
+        raw=detail if isinstance(detail,dict) else {}
+        self.detail={'subaction':raw.get('subaction') if isinstance(raw.get('subaction'),str) and raw.get('subaction') in SUBACTIONS else 'script',
+            'exception_category':raw.get('exception_category') if isinstance(raw.get('exception_category'),str) and raw.get('exception_category') in EXCEPTION_CATEGORIES else 'other'}
+        for key in ('hresult','native_error'):
+            value=raw.get(key)
+            if type(value) is int and -(2**31)<=value<2**32:self.detail[key]=value
         super().__init__('Private host action failed')
 
 
 def powershell(script, values=None, timeout=30):
     env = dict(os.environ)
     env['RDPILOT_HOST_CONTROL'] = json.dumps(values or {})
-    source = "$ErrorActionPreference='Stop';$v=$env:RDPILOT_HOST_CONTROL|ConvertFrom-Json;try{"+script+r'''
+    source = "$ErrorActionPreference='Stop';$v=$env:RDPILOT_HOST_CONTROL|ConvertFrom-Json;$subaction='script';try{"+script+r'''
 }catch{
  $code=switch -Wildcard ($_.FullyQualifiedErrorId){
   'MemberExists*'{'member_exists'} '*ParameterBinding*'{'parameter_binding'}
   'GroupNotFound*'{'group_not_found'} 'UserNotFound*'{'user_not_found'}
   '*AccessDenied*'{'access_denied'} '*Win32*'{'native_error'} default{'host_action'}
  }
- [Console]::Error.Write($code);exit 1
+ $category=switch -Wildcard ($_.Exception.GetType().FullName){
+  '*UnauthorizedAccess*'{'access_denied'} '*Argument*'{'argument'} '*ParameterBinding*'{'parameter_binding'}
+  '*LocalAccounts*'{'local_accounts'} '*IOException*'{'io'} default{'other'}
+ }
+ $detail=@{code=$code;subaction=$subaction;exception_category=$category;hresult=$_.Exception.HResult}
+ if($null -ne $_.Exception.NativeErrorCode){$detail.native_error=$_.Exception.NativeErrorCode}
+ [Console]::Error.Write(($detail|ConvertTo-Json -Compress));exit 1
 }
 '''
     try:result = subprocess.run(['powershell.exe','-NoProfile','-NonInteractive','-EncodedCommand',
         base64.b64encode(source.encode('utf-16le')).decode()], env=env, capture_output=True, timeout=timeout)
     except subprocess.TimeoutExpired:raise HostActionError('timeout')
     if result.returncode:
-        raise HostActionError(result.stderr.decode('ascii',errors='replace').strip())
+        data=result.stderr.decode('ascii',errors='replace').strip()
+        try:detail=json.loads(data)
+        except ValueError:detail={}
+        raise HostActionError(detail.get('code',data) if isinstance(detail,dict) else 'host_action',detail)
     data = result.stdout.decode('utf-8-sig', errors='replace').strip()
     try:return json.loads(data) if data else None
     except ValueError:raise HostActionError('invalid_host_json')
@@ -104,9 +122,13 @@ Start-Service TermService
 New-NetFirewallRule -Name $v.rule -DisplayName 'rdpilot local desktop proof' -Direction Inbound -Action Allow -Protocol TCP -LocalPort 3389 -RemoteAddress '127.0.0.1'|Out-Null
 '''
 CREATE_USER = r'''
+$subaction='account_preflight'
 if(Get-LocalUser $v.name -ErrorAction SilentlyContinue){throw 'Unowned account exists'}
+$subaction='new_local_user'
 $u=New-LocalUser -Name $v.name -Description $v.marker -Password (ConvertTo-SecureString $v.password -AsPlainText -Force) -PasswordNeverExpires
+$subaction='sid_readback'
 $record=@{name=$u.Name;sid=$u.SID.Value}
+$subaction='sid_journal'
 $record|ConvertTo-Json -Compress|Set-Content -Encoding UTF8 $v.journal
 $record|ConvertTo-Json -Compress
 '''
@@ -264,7 +286,7 @@ def run(args):
     powershell("& icacls $v.path /inheritance:r /grant:r \"$($env:USERDOMAIN)\\$($env:USERNAME):(OI)(CI)F\"|Out-Null;if($LASTEXITCODE){throw 'Private ACL failed'}",{'path':str(private)})
     os.environ.update(private_environment(private))
     snapshot=None;results={};suites=[];users=[];journal=private/'processes.json';rule='RdpilotDesktop-'+secrets.token_hex(8)
-    stage='preflight';failure_code='none';passed=False;setup_attempted=False;roles=[];memberships=[]
+    stage='preflight';failure_detail={};failure_code='none';passed=False;setup_attempted=False;roles=[];memberships=[]
     try:
         snapshot=powershell(PREFLIGHT)
         measure_process_refusal()
@@ -272,18 +294,20 @@ def run(args):
         tree=subprocess.check_output(['git','rev-parse','HEAD^{tree}'],text=True).strip()
         if commit!=args.expected_commit or not all(len(x)==40 and all(c in '0123456789abcdef' for c in x) for x in (commit,tree)):
             raise RuntimeError('Source identity mismatch')
-        bin_dir=Path(args.bin_dir).resolve()
-        hashes={name:hashlib.sha256((bin_dir/(name+'.exe')).read_bytes()).hexdigest() for name in ('rdpilot','rdpilot-daemon','rdpilot-mcp','rdpilot-bridge')}
+        diagnostic=getattr(args,'setup_diagnostic',False)
+        bin_dir=Path(args.bin_dir or '.').resolve()
+        hashes={} if diagnostic else {name:hashlib.sha256((bin_dir/(name+'.exe')).read_bytes()).hexdigest() for name in ('rdpilot','rdpilot-daemon','rdpilot-mcp','rdpilot-bridge')}
         environment={k:snapshot[k] for k in ('os','image_os','image_version')}
         # Values below are from local OS/image metadata, never guest/tool text.
         environment.update(source_commit=commit,source_tree=tree,binary_sha256=hashes,
             auth='NLA/CredSSP; explicit self-signed TLS acceptance',graphics='product default',account_role='standard',
             target='loopback',cua_version='0.34.0',process_identity_refusals_verified=True)
         (artifacts/'environment.json').write_text(json.dumps(environment,indent=2))
-        bundle=private/'bundle';bundle.mkdir();shutil.copyfile(bin_dir/'rdpilot-bridge.exe',bundle/'rdpilot-bridge.exe')
+        bundle=private/'bundle';bundle.mkdir()
+        if not diagnostic:shutil.copyfile(bin_dir/'rdpilot-bridge.exe',bundle/'rdpilot-bridge.exe')
         stage='setup';setup_attempted=True;powershell(SETUP,{'rule':rule})
         deadline=time.monotonic()+45*60
-        for proof in live.CHECKS:
+        for proof in (('cua',) if diagnostic else live.CHECKS):
             stage=proof+'_create_user';users=[];journal=private/(proof+'-processes.json');credentials={}
             for label in (('a',) if proof=='takeover' else ('a','b')):
                 name='rdp'+secrets.token_hex(7)
@@ -309,6 +333,12 @@ def run(args):
                 stage=proof+'_credentials'
                 credentials[label]={'host':'127.0.0.1','port':3389,'username':name,'domain':snapshot['computer'],'password':password}
                 (private/(label+'.json')).write_text(json.dumps(credentials[label]))
+            if diagnostic:
+                suites.append('host_setup')
+                checks=cleanup_suite(users,journal,snapshot['cache'])
+                results['host_setup']=checks;users=[]
+                if not all(checks.values()):raise RuntimeError('Setup cleanup failed')
+                continue
             child_env=dict(os.environ)
             for label,cred in credentials.items():
                 prefix='RDPILOT_TAKE_' if proof=='takeover' else 'RDPILOT_VIEW_'+label.upper()+'_'
@@ -338,6 +368,7 @@ def run(args):
     except BaseException as error:
         passed=False
         failure_code=error.code if isinstance(error,HostActionError) else 'required_gate'
+        failure_detail=error.detail if isinstance(error,HostActionError) else {}
     finally:
         if snapshot is not None:
             if users:
@@ -366,13 +397,13 @@ if($s.State -ne $v.state -or $s.StartMode -ne $v.start_mode){throw 'Service rest
         except OSError:removed=False
         results['private_removed']=removed
         clean=removed and all(all(c.values()) for c in results.values() if isinstance(c,dict))
-        passed=passed and clean and suites==list(live.CHECKS)
+        passed=passed and clean and suites==(['host_setup'] if getattr(args,'setup_diagnostic',False) else list(live.CHECKS))
         if not passed:
             for screenshot in artifacts.glob('*.png'):
                 screenshot.unlink()
         (artifacts/'account-roles.json').write_text(json.dumps({'roles':roles,'memberships':memberships},indent=2))
         (artifacts/'cleanup.json').write_text(json.dumps(results,indent=2))
-        (artifacts/'gate.json').write_text(json.dumps({'status':'passed' if passed else 'failed','failure_stage':'none' if passed else (stage if stage!='none' else 'cleanup'),'completed_suites':suites,'failure_code':failure_code if not passed else 'none'},indent=2))
+        (artifacts/'gate.json').write_text(json.dumps({'mode':'setup_diagnostic' if getattr(args,'setup_diagnostic',False) else 'live', 'status':('setup_passed' if getattr(args,'setup_diagnostic',False) else 'passed') if passed else 'failed','failure_stage':'none' if passed else (stage if stage!='none' else 'cleanup'),'completed_suites':suites,'failure_code':failure_code if not passed else 'none','host_failure':failure_detail if not passed else {}},indent=2))
     print('Hosted desktop gate '+('passed' if passed else 'failed')+'; stage: '+stage,flush=True)
     return 0 if passed else 1
 
@@ -381,6 +412,7 @@ def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output',required=True)
     parser.add_argument('--initialize',action='store_true')
+    parser.add_argument('--setup-diagnostic',action='store_true',help='host setup only; cannot produce a live gate pass')
     parser.add_argument('--bin-dir')
     parser.add_argument('--expected-commit')
     args=parser.parse_args()
