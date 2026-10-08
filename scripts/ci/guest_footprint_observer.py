@@ -219,7 +219,7 @@ class WindowsFile:
         import msvcrt
         fd = msvcrt.open_osfhandle(self.handle, os.O_RDONLY | os.O_BINARY)
         self.transferred = True
-        try:return os.fdopen(fd, 'rb')
+        try:return os.fdopen(fd, 'rb', buffering=0)
         except BaseException:os.close(fd);raise
 
     def close(self):
@@ -240,7 +240,10 @@ class Held:
                 self.native = WindowsFile(self.path)
                 self.native_before = self.native.state()
                 self.file = self.native.stream()
-            else:self.file = files.open_plain(self.path, self.limit)
+            else:
+                fd = os.open(self.path, os.O_RDONLY | getattr(os, 'O_BINARY', 0) | getattr(os, 'O_NOFOLLOW', 0))
+                try:self.file = os.fdopen(fd, 'rb', buffering=0)
+                except BaseException:os.close(fd);raise
             self.check()
             return self
         except BaseException:

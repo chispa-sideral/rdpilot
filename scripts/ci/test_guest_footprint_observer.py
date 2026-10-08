@@ -202,23 +202,33 @@ class ActualFileTests(unittest.TestCase):
     def test_actual_byte_ceiling_zero_exact_and_growth_never_reads_past_cap(self):
         f = self.fixture;path = f.launcher();budget = observer.Budget(0)
         with observer.Held(path, 1024) as held:
+            self.assertIsInstance(held.file, io.FileIO)
             with self.assertRaises(observer.files.BudgetExceeded):budget.read(held, 1024)
             self.assertEqual(held.file.tell(), 0);self.assertEqual(budget.remaining, 0)
+            self.assertEqual(os.lseek(held.file.fileno(), 0, os.SEEK_CUR), 0)
         budget = observer.Budget(len(BRIDGE) + len(CUA));second = f.path/'second';second.write_bytes(CUA)
         with observer.Held(path, 1024) as held:
             self.assertEqual(budget.read(held, 1024), BRIDGE);self.assertEqual(held.file.tell(), len(BRIDGE))
+            self.assertEqual(os.lseek(held.file.fileno(), 0, os.SEEK_CUR), len(BRIDGE))
         with observer.Held(second, 1024) as held:
             self.assertEqual(budget.read(held, 1024), CUA);self.assertEqual(held.file.tell(), len(CUA))
+            self.assertEqual(os.lseek(held.file.fileno(), 0, os.SEEK_CUR), len(CUA))
         self.assertEqual(budget.remaining, 0)
         with observer.Held(second, 1024) as held:
             with self.assertRaises(observer.files.BudgetExceeded):budget.read(held, 1024)
             self.assertEqual(held.file.tell(), 0)
-        budget = observer.Budget(len(BRIDGE))
+            self.assertEqual(os.lseek(held.file.fileno(), 0, os.SEEK_CUR), 0)
+        # Reproduce the exact underlying-descriptor control: 15 held bytes,
+        # six bytes appended, budget15. The kernel descriptor must consume15,
+        # not a buffered prefetch of21; held postmetadata must still refuse it.
+        path.write_bytes(b'123456789012345');budget = observer.Budget(15)
         with self.assertRaises(ValueError):
             with observer.Held(path, 1024) as held:
-                with path.open('ab') as writer:writer.write(b'grew')
-                self.assertEqual(budget.read(held, 1024), BRIDGE)
-                self.assertEqual(held.file.tell(), len(BRIDGE));self.assertEqual(budget.remaining, 0)
+                self.assertIsInstance(held.file, io.FileIO)
+                with path.open('ab') as writer:writer.write(b'abcdef')
+                self.assertEqual(budget.read(held, 1024), b'123456789012345')
+                self.assertEqual(held.file.tell(), 15);self.assertEqual(budget.remaining, 0)
+                self.assertEqual(os.lseek(held.file.fileno(), 0, os.SEEK_CUR), 15)
 
     def test_actual_reparse_escape_and_casefold_controls(self):
         f = self.fixture;f.product()
