@@ -1,5 +1,9 @@
 # Reproduce CI checks
 
+Python helper tests require Python 3.12 and Pillow 12.3.0, including on Windows.
+Use a virtual environment locally and install the exact pin; image-validation
+tests fail if the dependency is missing.
+
 Linux checks use the committed Cargo lockfile:
 
 ```sh
@@ -7,6 +11,7 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo check --workspace --all-targets --locked
 cargo test --workspace --locked
+python3 -m pip install Pillow==12.3.0
 python3 -m unittest discover -s scripts/ci -p 'test_*.py'
 ```
 
@@ -24,6 +29,7 @@ cargo test -p rdpilot-config --locked
 cargo test -p rdpilot-cli --bins --locked
 ./scripts/ci/run-windows-dacl.ps1
 cargo test -p rdpilot-bridge --lib --tests --locked
+python -m pip install Pillow==12.3.0
 python -m unittest discover -s scripts/ci -p 'test_*.py'
 ```
 
@@ -164,3 +170,39 @@ provenance cannot pass the live gate. Release invokes the same required CI.
 For local setup diagnosis, use `--setup-diagnostic` during both initialization
 and execution of `hosted_desktop.py`. Host errors expose only fixed subaction
 and category labels and numeric native/HRESULT codes; raw host stderr stays private.
+
+
+The manual Cua diagnostic optionally accepts `bootstrap_desktop: true` (local
+`--cua-diagnostic --bootstrap-desktop`). It reads only the first disposable
+user's initial bootstrap through an existing read-only loopback viewer. It
+starts alongside connect, adds no readiness barrier, input or product delay,
+and stops before Cua attachment or fixture input. Source-built process hashes,
+fresh account/profile conditions and pre/post native WTS identity bind each
+image; missing or ambiguous binding admits no image. Verify Windows viewer
+operation with an actual run. Sampled pixels cannot prove a full command,
+absence between samples, guest bridge provenance or a failure cause.
+
+Sampling lasts at most 300 seconds, with 19 preset offsets, at most 40 requests
+and 20 selected PNGs. Each is limited to 8 MiB and 16 million decoded pixels;
+aggregate image bytes are capped at 160 MiB. HTTP has a whole three-second
+request deadline plus bounded socket closure. Source checking and full pinned
+Pillow validation run in held host-only children with five-second bounds. Only
+the parent can write images after an open-epoch and unchanged-session check.
+Every child is held before journaling; cancellation stops and joins captures,
+HTTP sockets, WTS/decoder workers and the viewer before attach. Shutdown has a
+40-second total bound, real targeted Windows Ctrl-C, zero exit, listener closure
+and controller/sibling checks; identity-bound fallback never counts as graceful
+success. Unproved quiescence fails the diagnostic and discards all images.
+
+Only this explicit Cua diagnostic may retain failed-run `bootstrap-a-01.png`
+through `bootstrap-a-20.png`, accompanied by `bootstrap-desktop.json`. Both
+selection layers validate the closed source/session/frame/cleanup manifest,
+image hash, structure, dimensions and byte/pixel limits. Secret-scan failure or
+missing/invalid admission removes every diagnostic image. Structured metadata
+excludes SIDs and names. URLs, bearer tokens, raw viewer/HTTP/WTS/errors and
+post-bootstrap frames stay private. An admitted image may render the disposable
+Windows account name; no raster text-redaction guarantee is made.
+The fresh-user source-only bootstrap input boundary provides raster privacy;
+byte scanning alone cannot sanitize arbitrary desktop text. This observer adds
+bounded encoding/read work and never supplies a live-proof pass. Normal CI,
+full Cua assertions and ordinary failed-image selection remain unchanged.

@@ -10,7 +10,7 @@ import subprocess
 import sys
 
 OPERATIONS = {'harness','relay_start','daemon_start','daemon_start_wait','hosts_file','connect_cli','bridge_ready_assertion','live_checks',
-              'endpoint_cleanup','disconnect_cleanup','daemon_cleanup','relay_cleanup','log_cleanup','summary_write','harness_scan','temporary_cleanup','evidence_scan','summary_read','connect_observation','artifact_write'}
+              'endpoint_cleanup','disconnect_cleanup','daemon_cleanup','relay_cleanup','log_cleanup','summary_write','harness_scan','temporary_cleanup','evidence_scan','summary_read','connect_observation','artifact_write','bootstrap_cleanup'}
 CATEGORIES = {'timeout','file_not_found','access_denied','invalid_json','os_error','proof_assertion','other'}
 
 

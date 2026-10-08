@@ -16,6 +16,7 @@ import subprocess
 import sys
 import time
 import acquisition_observer
+import bootstrap_desktop_observer as desktop
 
 HERE = Path(__file__).resolve().parent
 spec = importlib.util.spec_from_file_location('live_proof', HERE/'run-live-proof.py')
@@ -306,6 +307,8 @@ def private_environment(private):
 def mode_for(args):
     setup=getattr(args,'setup_diagnostic',False);cua=getattr(args,'cua_diagnostic',False)
     if setup and cua:raise ValueError('Diagnostic modes are mutually exclusive')
+    if getattr(args, 'bootstrap_desktop', False) and not cua:
+        raise ValueError('Bootstrap observation requires Cua diagnostic')
     return 'setup_diagnostic' if setup else 'cua_diagnostic' if cua else 'live'
 
 
@@ -327,6 +330,7 @@ def run(args):
     powershell("& icacls $v.path /inheritance:r /grant:r \"$($env:USERDOMAIN)\\$($env:USERNAME):(OI)(CI)F\"|Out-Null;if($LASTEXITCODE){throw 'Private ACL failed'}",{'path':str(private)})
     os.environ.update(private_environment(private))
     snapshot=None;results={};suites=[];attempted=[];users=[];journal=private/'processes.json';rule='RdpilotDesktop-'+secrets.token_hex(8);observation_failures=[]
+    observer_source = {}
     stage='preflight';failure_detail={};failure_code='none';passed=False;setup_attempted=False;roles=[];memberships=[];creation_observations=[]
     try:
         snapshot=powershell(PREFLIGHT)
@@ -344,6 +348,9 @@ def run(args):
             auth='NLA/CredSSP; explicit self-signed TLS acceptance',graphics='product default',account_role='standard',
             target='loopback',cua_version='0.34.0',process_identity_refusals_verified=True)
         (artifacts/'environment.json').write_text(json.dumps(environment,indent=2))
+        observer_source = {'source_commit': commit, 'source_tree': tree,
+            'cli_sha256': hashes.get('rdpilot'), 'daemon_sha256': hashes.get('rdpilot-daemon'),
+            'bridge_sha256': hashes.get('rdpilot-bridge')}
         if diagnostic:
             conversion=r'''$secure=ConvertTo-SecureString 'Diagnostic1!FixedHarmlessInput' -AsPlainText -Force
 @{converted=($secure.Length -gt 0);security_module_major=(Get-Command ConvertTo-SecureString).Module.Version.Major}|ConvertTo-Json -Compress'''
@@ -401,6 +408,20 @@ def run(args):
             command=[sys.executable,str(HERE/'run-live-proof.py'),proof,'--bin-dir',str(bin_dir),'--bundle',str(bundle),
                 '--output',str(private/(proof+'-raw')),'--artifacts',str(artifacts),'--source-bridge-sha256',hashes['rdpilot-bridge'],
                 '--journal',str(journal),'--credentials-a',str(private/'a.json'),'--credentials-b',str(private/'b.json')]
+            if getattr(args, 'bootstrap_desktop', False):
+                owned = users[0]
+                powershell(WTS+"if($matched.Count){throw 'Fresh user already has a session'}", owned, 5)
+                powershell(r'''if(Get-CimInstance Win32_UserProfile -Filter "SID='$($v.sid)'"){throw 'Fresh profile already exists'}
+if(Test-Path (Join-Path (Join-Path $env:SystemDrive 'Users') $v.name)){throw 'Fresh profile directory already exists'}''', owned, 5)
+                # Same native enumeration/translation as cleanup; only read active IDs.
+                binding = "$ErrorActionPreference='Stop';$v=$env:RDPILOT_HOST_CONTROL|ConvertFrom-Json;" + WTS.replace(
+                    '$matched+=$s.Id', '$matched+=@{id=$s.Id;state=$s.State}')
+                binding += "@{matches=@($matched)}|ConvertTo-Json -Depth 4 -Compress"
+                handoff = private/'bootstrap-desktop-config.json'
+                handoff.write_text(json.dumps({'source': observer_source, 'sid': owned['sid'],
+                    'username': credentials['a']['username'], 'domain': credentials['a']['domain'],
+                    'wts_script': binding, 'mode': mode, 'fresh_profile_verified': True}))
+                command += ['--bootstrap-desktop', '--bootstrap-desktop-config', str(handoff)]
             remaining=min(900,int(deadline-time.monotonic()))
             if remaining<=0:raise TimeoutError('Work budget expired')
             with (private/(proof+'-console.log')).open('wb') as raw:
@@ -478,8 +499,7 @@ if($s.State -ne $v.state -or $s.StartMode -ne $v.start_mode){throw 'Service rest
         clean=removed and all(all(c.values()) for c in results.values() if isinstance(c,dict))
         passed=passed and clean and suites==expected
         if not passed:
-            for screenshot in artifacts.glob('*.png'):
-                screenshot.unlink()
+            desktop.retain_failed_images(artifacts, observer_source, getattr(args, 'bootstrap_desktop', False))
         (artifacts/'account-roles.json').write_text(json.dumps({'roles':roles,'memberships':memberships,'creation_observations':creation_observations},indent=2))
         (artifacts/'cleanup.json').write_text(json.dumps(results,indent=2))
         (artifacts/'gate.json').write_text(json.dumps({'mode':mode, 'status':{'live':'passed','setup_diagnostic':'setup_passed','cua_diagnostic':'cua_diagnostic_passed'}[mode] if passed else 'failed','failure_stage':'none' if passed else (stage if stage!='none' else 'cleanup'),'attempted_suites':attempted,'completed_suites':suites,'failure_code':failure_code if not passed else 'none','host_failure':failure_detail if not passed else {},'observation_failures':observation_failures},indent=2))
@@ -496,6 +516,7 @@ def main():
     modes.add_argument('--cua-diagnostic',action='store_true',help='full Cua proof only; cannot produce a live gate pass')
     parser.add_argument('--bin-dir')
     parser.add_argument('--expected-commit')
+    parser.add_argument('--bootstrap-desktop', action='store_true', help='private first-A desktop snapshots; Cua diagnostic only')
     args=parser.parse_args()
     if args.initialize:
         initialize(args.output,mode_for(args));return 0

@@ -10,6 +10,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import bootstrap_desktop_observer as desktop
 
 E2E = Path(__file__).resolve().parents[1] / 'e2e'
 CHECKS = {
@@ -139,17 +140,44 @@ async def execute(args):
                     proc.kill()
                     raise
         return proc
-    asyncio.create_subprocess_exec = tracked
     harness_args = argparse.Namespace(bin_dir=args.bin_dir, bundle=args.bundle, output=args.output,
         credentials_a=args.credentials_a, credentials_b=args.credentials_b,
         source_bridge_sha256=args.source_bridge_sha256, cua_version='0.34.0',
         connect_timeout=600, windows_job_test=None, skip_faults=False, fake=False,
         bind='loopback', allow_no_tailnet=True, allow_debug=False, marker_region=None)
-    run = (module.Run if args.proof == 'cua' else module.Proof)(harness_args)
+    observed = getattr(args, 'bootstrap_desktop', False)
+    if observed and args.proof != 'cua':
+        raise ValueError('Bootstrap observation requires Cua diagnostic')
+    config = None
+    run_class = module.Run if args.proof == 'cua' else module.Proof
+    if observed:
+        config_path = Path(args.bootstrap_desktop_config)
+        if not config_path.resolve().is_relative_to(Path(args.output).resolve().parent):
+            raise ValueError('Private observation handoff')
+        config = json.loads(desktop.read_plain(config_path, 16*1024), object_pairs_hook=desktop.files.unique_json)
+        if (set(config) != {'source', 'sid', 'username', 'domain', 'wts_script', 'mode', 'fresh_profile_verified'}
+                or config['mode'] != 'cua_diagnostic' or config['fresh_profile_verified'] is not True
+                or not desktop.source_valid(config['source'])
+                or config['source']['bridge_sha256'] != args.source_bridge_sha256
+                or not isinstance(config['sid'], str) or not re.fullmatch(r'S-1-[0-9-]{1,180}', config['sid'])
+                or not isinstance(config['wts_script'], str) or len(config['wts_script']) > 8192):
+            raise ValueError('Observation handoff')
+        def register(record):
+            records.append(record)
+            journal.write_text(json.dumps(records))
+        def factory(run):
+            if config['username'] != run.credentials['a']['username'] or config['domain'] != run.credentials['a'].get('domain'):
+                raise ValueError('Target identity handoff')
+            return desktop.Observer(run, config, original, process_identity if os.name == 'nt' else lambda pid: None, register, proof_support)
+        run_class = desktop.observed_run(module.Run, factory)
+    elif getattr(args, 'bootstrap_desktop_config', None):
+        raise ValueError('Unexpected observation handoff')
+    run = run_class(harness_args)
     boundary=Path(args.output).resolve().parent
     if not Path(run.temp).resolve().is_relative_to(boundary):
         raise RuntimeError('Harness temporary files escaped private boundary')
     run.check('private_child_temporary_boundary_verified')
+    asyncio.create_subprocess_exec = tracked
     code = 0;error_detail={}
     sentinel = await tracked(sys.executable, '-c', 'import time; time.sleep(3600)') if args.proof != 'cua' else None
     try:
@@ -173,6 +201,9 @@ async def execute(args):
     needles = [str(c['password']).encode() for c in run.credentials.values() if c.get('password')]
     needles += [str(x).encode() for x in getattr(run,'leases',[])]
     needles += [str(x).encode() for x in (getattr(run,'typed',None),getattr(run,'typed_marker',None),getattr(run,'token',None)) if x]
+    observer = getattr(run, 'bootstrap_observer', None)
+    if observer and observer.bearer:
+        needles.append(observer.bearer.encode())
     secondary=[proof_support.select_failure_detail(x) for x in getattr(run,'cleanup_failures',[])]
     if secondary:code=1
     try:
@@ -195,8 +226,18 @@ async def execute(args):
         import shutil
         for p in Path(args.output).glob('*.png'):
             # Harness-selected filenames are local constants; publish only PNGs.
+            if observed and re.fullmatch(r'bootstrap-a-(?:0[1-9]|1[0-9]|20)\.png', p.name):
+                continue  # Diagnostic files use only their separately validated manifest.
             if re.fullmatch(r'[a-zA-Z0-9._-]+\.png',p.name):
                 shutil.copyfile(p, artifact/(args.proof+'-'+p.name))
+    if observed:
+        raw = observer.manifest if observer else None
+        expected = config['source']
+        diagnostic = desktop.safe_manifest(Path(args.output), raw, expected, scanned)
+        import shutil
+        for name in desktop.selected_files(Path(args.output), diagnostic, expected):
+            shutil.copyfile(Path(args.output)/name, artifact/name)
+        (artifact/'bootstrap-desktop.json').write_text(json.dumps(diagnostic, indent=2)+'\n')
     args._failure_stage='harness'
     return 0 if selected['status'] == 'passed' else 1
 
@@ -221,6 +262,8 @@ def main():
     parser.add_argument('--credentials-a')
     parser.add_argument('--credentials-b')
     parser.add_argument('--timeout',type=int,default=900)
+    parser.add_argument('--bootstrap-desktop', action='store_true')
+    parser.add_argument('--bootstrap-desktop-config')
     args=parser.parse_args()
     try:
         return asyncio.run(execute(args))
