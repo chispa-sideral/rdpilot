@@ -55,14 +55,16 @@ def powershell(script, values=None, timeout=30):
  }
  $detail=@{code=$code;subaction=$subaction;exception_category=$category;hresult=$_.Exception.HResult}
  if($null -ne $_.Exception.NativeErrorCode){$detail.native_error=$_.Exception.NativeErrorCode}
- [Console]::Error.Write(($detail|ConvertTo-Json -Compress));exit 1
+ # Windows PowerShell may prepend module-import CLIXML to stderr. Keep the
+ # trusted closed envelope on stdout; the nonzero exit still marks failure.
+ [Console]::Out.Write(($detail|ConvertTo-Json -Compress));exit 1
 }
 '''
     try:result = subprocess.run(['powershell.exe','-NoProfile','-NonInteractive','-EncodedCommand',
         base64.b64encode(source.encode('utf-16le')).decode()], env=env, capture_output=True, timeout=timeout)
     except subprocess.TimeoutExpired:raise HostActionError('timeout')
     if result.returncode:
-        data=result.stderr.decode('ascii',errors='replace').strip()
+        data=result.stdout.decode('utf-8-sig',errors='replace').strip()
         try:detail=json.loads(data)
         except ValueError:detail={}
         raise HostActionError(detail.get('code',data) if isinstance(detail,dict) else 'host_action',detail)

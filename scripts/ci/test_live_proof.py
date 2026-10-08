@@ -124,7 +124,7 @@ class OwnershipTests(unittest.TestCase):
 
     def test_host_action_diagnostics_are_closed_categories(self):
         for raw in ('member_exists','parameter_binding','user_not_found','untrusted-password-lease-token'):
-            child=subprocess.CompletedProcess([],1,b'',raw.encode())
+            child=subprocess.CompletedProcess([],1,raw.encode(),b'#< CLIXML\nprivate module output')
             with patch.object(host.subprocess,'run',return_value=child):
                 with self.assertRaises(host.HostActionError) as caught:host.powershell('trusted-script')
             self.assertIn(caught.exception.code,host.ERROR_CODES)
@@ -132,6 +132,14 @@ class OwnershipTests(unittest.TestCase):
         with patch.object(host.subprocess,'run',side_effect=subprocess.TimeoutExpired('secret-command',1)):
             with self.assertRaises(host.HostActionError) as caught:host.powershell('trusted-script')
         self.assertEqual(caught.exception.code,'timeout')
+
+    def test_closed_error_envelope_survives_windows_stderr_clixml(self):
+        detail={'code':'host_action','subaction':'new_local_user','exception_category':'local_accounts','hresult':-2146233088,'native_error':2224}
+        child=subprocess.CompletedProcess([],1,json.dumps(detail).encode(),b'#< CLIXML\nprivate module output and credential')
+        with patch.object(host.subprocess,'run',return_value=child):
+            with self.assertRaises(host.HostActionError) as caught:host.powershell('trusted-script')
+        self.assertEqual(caught.exception.detail,{key:value for key,value in detail.items() if key!='code'})
+        self.assertNotIn('credential',str(caught.exception))
 
     def test_profile_presence_after_live_run_is_required(self):
         with tempfile.TemporaryDirectory() as directory:
