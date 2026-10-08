@@ -82,12 +82,53 @@ class EarlyHarnessFailureTests(unittest.IsolatedAsyncioTestCase):
         for secondary in (None,'cleanup','scan','scan_false','summary','summary_invalid'):
             with self.subTest(secondary=secondary):await self.inject_failure(secondary)
 
-    async def inject_failure(self,secondary):
+    async def test_extended_primary_survives_all_secondary_boundaries(self):
+        message=('Internal: bridge bootstrap failed: rdpilot-bridge did not start '
+                 '(possible security prompt in the guest, or a bridge that does not speak bridge protocol 2); '
+                 'stages=rdpdr_file_access,launch_input_sent')
+        payload=json.dumps({'error':{'code':'internal','message':message},'private':'private-lease-token'}).encode()
+        expected={'cli_error_code':'internal','producer':'sdk_bootstrap','bootstrap_state':'observed',
+                  'bootstrap_stages':['rdpdr_file_access','launch_input_sent']}
+        for secondary in (None,'cleanup','scan','scan_false','summary','summary_invalid'):
+            with self.subTest(secondary=secondary):await self.inject_failure(secondary,payload,expected)
+        await self.inject_failure(None,payload,observer_error=True)
+        for error in (TimeoutError,asyncio.CancelledError):
+            await self.inject_failure(None,communication_error=error)
+
+    async def test_complete_source_envelopes_through_actual_cli_and_wrapper(self):
+        fixtures=[('internal','Internal: '+prefix+'private-lease-token',producer) for prefix,producer in (
+            ('connection or authentication failed: connect_begin failed: ','sdk_connection'),
+            ('TLS or certificate error: ','sdk_tls'),('bridge bootstrap failed: ','sdk_bootstrap'),
+            ('session/transport error: ','sdk_session'),('invalid configuration: ','sdk_configuration'),
+            ('DVC transport error: ','sdk_dvc'),('bridge rejected the request: ','sdk_bridge_rejection'),
+            ('connect failed: ','daemon_connect'),('io error: ','daemon_io'),
+            ('config resolution failed: ','daemon_configuration'))]
+        fixtures += [('internal','unexpected daemon response: private-lease-token','cli_response'),
+                     ('config','configuration error: private-lease-token','config_other'),
+                     ('internal','secret Internal: bridge bootstrap failed: private-lease-token','unavailable')]
+        fixtures += [(code,prefix+'private-lease-token','unavailable') for code,prefix in (
+            ('missing-config','missing required configuration: '),('transport','transport error: '),
+            ('bundle-unavailable','BundleUnavailable: '),('daemon-unreachable','daemon unreachable: '),
+            ('daemon-incompatible','daemon compatibility version mismatch: '),('duplicate-session','DuplicateSession: '))]
+        fixtures += [('config',f'configuration error: PasswordCommand for {target} failed: '+reason,'password_command')
+                     for target in ('a','b') for reason in ('empty output','output is not valid UTF-8',
+                     'timed out after 30 s','could not start the shell: private-lease-token',
+                     'could not read its output: private-lease-token','could not wait for it: private-lease-token','exit code: 5')]
+        for code,message,producer in fixtures:
+            with self.subTest(producer=producer):
+                observed=await self.inject_failure(None,json.dumps({'error':{'code':code,'message':message}}).encode(),
+                    {'cli_error_code':code,'producer':producer})
+                if producer=='password_command':self.assertNotEqual(observed['password_helper'],'unavailable')
+
+
+    async def inject_failure(self,secondary,payload=None,expected=None,observer_error=False,communication_error=None):
         actions=[]
         class Child:
             pid=42
             def __init__(self,code):self.returncode=code
-            async def communicate(self):return b'',b'secretcredential private-lease-token'
+            async def communicate(self):
+                if communication_error:raise communication_error()
+                return payload or b'',b'secretcredential private-lease-token'
             async def wait(self):return self.returncode
             def terminate(self):
                 actions.append('terminate')
@@ -115,11 +156,29 @@ class EarlyHarnessFailureTests(unittest.IsolatedAsyncioTestCase):
                 if secondary=='summary':(private/'raw/summary.json').unlink()
                 if secondary=='summary_invalid':(private/'raw/summary.json').write_text('private-lease-token')
                 return original_scan(path,needles)
-            with patch.object(tempfile,'tempdir',str(private)),patch.object(asyncio,'create_subprocess_exec',side_effect=spawn),patch.object(live,'scan_files',side_effect=scan),patch.object(live,'process_identity',return_value={'pid':42,'created':'1','image':'fixture'}):
+            sys.path.insert(0,str(live.E2E));import proof_support
+            original_observer=proof_support.cli_observation
+            def observer(data):
+                if observer_error:raise PermissionError('private-lease-token')
+                return original_observer(data)
+            with patch.object(tempfile,'tempdir',str(private)),patch.object(asyncio,'create_subprocess_exec',side_effect=spawn),patch.object(live,'scan_files',side_effect=scan),patch.object(live,'process_identity',return_value={'pid':42,'created':'1','image':'fixture'}),patch.object(proof_support,'cli_observation',side_effect=observer):
                 self.assertEqual(await live.execute(args),1)
             selected=json.loads((root/'artifacts/cua.json').read_text())
             self.assertEqual(selected['status'],'failed')
-            self.assertEqual(selected['harness_failure'],{'operation':'connect_cli','exception_category':'proof_assertion','cli_exit_code':7})
+            base={'operation':'connect_cli','exception_category':'timeout' if communication_error==TimeoutError else 'other' if communication_error else 'proof_assertion'}
+            if not communication_error:base['cli_exit_code']=7
+            self.assertEqual({k:v for k,v in selected['harness_failure'].items() if k!='connect_observation'},base)
+            observed=selected['harness_failure']['connect_observation']
+            if expected:
+                self.assertEqual(observed['daemon'],{'state':'alive'})
+                for target in ('a','b'):self.assertEqual(observed['relays'][target]['accepted'],0)
+                for key,value in expected.items():self.assertEqual(observed[key],value)
+            else:self.assertEqual(observed['cli_error_code'],'unavailable')
+            self.assertEqual(selected['harness_failure'],args._primary_failure)
+            if observer_error:self.assertEqual(observed['observation_state'],'observation_failed')
+            fallback=live.failed_fallback(args,PermissionError('private-lease-token'))
+            self.assertEqual(fallback['harness_failure'],selected['harness_failure'])
+            self.assertNotIn('private-lease-token',json.dumps(fallback))
             self.assertNotIn('a.rdp_bundle_ready',selected['completed_checks'])
             self.assertNotIn('secretcredential',json.dumps(selected))
             self.assertNotIn('private-lease-token',json.dumps(selected))
@@ -128,7 +187,8 @@ class EarlyHarnessFailureTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(any(p.name.startswith('rdpilot-cua-') for p in private.iterdir()))
             if secondary:
                 self.assertTrue(selected['secondary_failures'])
-            if secondary!='summary':self.assertIn('private-lease-token',(private/'raw/summary.json').read_text())
+            if secondary!='summary' and not communication_error:self.assertIn('private-lease-token',(private/'raw/summary.json').read_text())
+            return observed
 
 
 class PinnedCuaConfigurationTests(unittest.TestCase):
@@ -154,7 +214,7 @@ class PinnedCuaConfigurationTests(unittest.TestCase):
 
 
 class OrchestrationModeTests(unittest.TestCase):
-    def measure(self,mode,*,failure=None):
+    def measure(self,mode,*,failure=None,cache_fixture=None):
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory);bins=root/'bin';bins.mkdir();output=root/'out'
             for name in ('rdpilot','rdpilot-daemon','rdpilot-mcp','rdpilot-bridge'):
@@ -183,7 +243,7 @@ class OrchestrationModeTests(unittest.TestCase):
                 pid=42
                 def wait(self,timeout):
                     if failure=='timeout':raise subprocess.TimeoutExpired('private-command',timeout)
-                    return 1 if failure=='harness' else 0
+                    return 1 if failure in ('harness','observer','observer_write') else 0
             def spawn(command,**kwargs):
                 commands.append(command)
                 self.assertIn('run-live-proof.py',command[1])
@@ -202,13 +262,29 @@ class OrchestrationModeTests(unittest.TestCase):
                     if check['check'].endswith('.installed_source_bridge_and_cua_identity'):check['bridge_sha256']=expected
                 if failure=='checks':summary['checks']=[c for c in summary['checks'] if c['check']!='a.actual_cua_stall_bounded_close']
                 if failure=='scan_check':summary['checks']=[c for c in summary['checks'] if c['check']!='evidence_contains_no_credentials']
-                if failure=='harness':summary['status']='failed'
+                if failure in ('harness','observer','observer_write'):summary['status']='failed'
                 (output/'artifacts'/(proof+'.json')).write_text(json.dumps(live.project(proof,summary,0,expected)))
+                if failure=='artifact_missing':(output/'artifacts'/(proof+'.json')).unlink()
+                if failure=='artifact_invalid':(output/'artifacts'/(proof+'.json')).write_text('private-lease-token')
                 Path(option('--journal')).write_text('[]')
                 (output/'artifacts'/'selected.png').write_bytes(b'fixture image')
+                if cache_fixture:cache_fixture(Path(snapshot['cache']), (bins/'rdpilot-bridge.exe').read_bytes())
                 return Child()
+            original_observe=host.acquisition_observer.observe_cache
+            original_write=Path.write_text
+            def observe(cache,expected):
+                actions.append(('observe_cache',None))
+                if failure=='observer':raise PermissionError('private-lease-token')
+                result=original_observe(cache,expected)
+                actions.append(('observed_state',result['state']))
+                return result
+            def write(path,*argv,**kwargs):
+                if path.name=='local-acquisition.json':
+                    actions.append(('acquisition_write',None))
+                    if failure=='observer_write':raise PermissionError('private-lease-token')
+                return original_write(path,*argv,**kwargs)
             def identity(command,**kwargs):return ('2'*40 if command[-1]=='HEAD^{tree}' else ('3'*40 if failure=='identity' else '1'*40))+'\n'
-            with contextlib.redirect_stdout(io.StringIO()),patch.dict(os.environ),patch.object(host,'powershell',side_effect=control),patch.object(host,'measure_process_refusal'),patch.object(host.subprocess,'check_output',side_effect=identity),patch.object(host.subprocess,'Popen',side_effect=spawn),patch.object(live,'process_identity',return_value={'pid':42,'created':'1','image':'owned'}):
+            with contextlib.redirect_stdout(io.StringIO()),patch.dict(os.environ),patch.object(host,'powershell',side_effect=control),patch.object(host,'measure_process_refusal'),patch.object(host.subprocess,'check_output',side_effect=identity),patch.object(host.subprocess,'Popen',side_effect=spawn),patch.object(live,'process_identity',return_value={'pid':42,'created':'1','image':'owned'}),patch.object(host.acquisition_observer,'observe_cache',side_effect=observe),patch.object(Path,'write_text',autospec=True,side_effect=write):
                 code=host.run(args)
             gate=json.loads((output/'artifacts/gate.json').read_text());cleanup=json.loads((output/'artifacts/cleanup.json').read_text())
             self.assertFalse((output/'private').exists())

@@ -115,6 +115,8 @@ def scan_files(root, needles):
 async def execute(args):
     sys.path.insert(0, str(E2E))
     import proof_support
+    args._primary_failure={}
+    args._secondary_failures=[]
     filename = 'run-cua-e2e.py' if args.proof == 'cua' else 'run-' + args.proof + '-proof.py'
     spec = importlib.util.spec_from_file_location('hosted_live_harness', E2E / filename)
     module = importlib.util.module_from_spec(spec)
@@ -155,6 +157,7 @@ async def execute(args):
         code = 1
         primary=getattr(run,'primary_failure',None)
         error_detail=proof_support.select_failure_detail(primary) if primary else failure_detail(error,getattr(run,'failure_operation',None),getattr(run,'failed_cli_exit',None))
+        args._primary_failure=proof_support.select_failure_detail(error_detail)
     finally:
         asyncio.create_subprocess_exec = original
         if sentinel:
@@ -182,6 +185,7 @@ async def execute(args):
     selected = project(args.proof, summary, code if scanned else 1, args.source_bridge_sha256)
     if selected['status']!='passed':selected['harness_failure']=error_detail
     if secondary:selected['secondary_failures']=secondary
+    args._secondary_failures=[proof_support.select_failure_detail(x) for x in secondary]
     artifact = Path(args.artifacts)
     artifact.mkdir(parents=True, exist_ok=True)
     (artifact / (args.proof + '.json')).write_text(json.dumps(selected, indent=2)+'\n')
@@ -192,6 +196,17 @@ async def execute(args):
             if re.fullmatch(r'[a-zA-Z0-9._-]+\.png',p.name):
                 shutil.copyfile(p, artifact/(args.proof+'-'+p.name))
     return 0 if selected['status'] == 'passed' else 1
+
+
+def failed_fallback(args,error):
+    import proof_support
+    selected=project(args.proof,None,1,args.source_bridge_sha256)
+    primary=getattr(args,'_primary_failure',None)
+    selected['harness_failure']=proof_support.select_failure_detail(primary) if primary else failure_detail(error)
+    secondary=[proof_support.select_failure_detail(x) for x in getattr(args,'_secondary_failures',[])]
+    secondary.append(failure_detail(error,'artifact_write'))
+    selected['secondary_failures']=secondary
+    return selected
 
 
 def main():
@@ -207,8 +222,7 @@ def main():
         return asyncio.run(execute(args))
     except BaseException as error:
         Path(args.artifacts).mkdir(parents=True,exist_ok=True)
-        selected=project(args.proof,None,1,args.source_bridge_sha256)
-        selected['harness_failure']=failure_detail(error)
+        selected=failed_fallback(args,error)
         (Path(args.artifacts)/(args.proof+'.json')).write_text(json.dumps(selected))
         return 1
 

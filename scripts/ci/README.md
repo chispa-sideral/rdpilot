@@ -118,6 +118,33 @@ recorded separately. Exception messages stay private. Attempted suites become
 completed only after the full proof and owned cleanup pass. A failed diagnostic
 does not establish RDP incompatibility or successful live guest cleanup.
 
+Failed Cua connects also retain a closed CLI error code and source producer,
+PasswordCommand category or negotiation/finalize substage when the existing
+JSON envelope matches. Only the exact protocol-2 no-start timeout can report
+its recorded bootstrap stages; missing or malformed stages are unavailable.
+The primary snapshot includes each relay's accepted connections, successful
+upstream connections and bytes whose write/drain completed in each direction,
+plus the held daemon's alive/exited state. These describe activity, not
+authenticated RDP or guest execution. Raw messages and packet contents stay private.
+
+Before failed-Cua cleanup removes the initially absent owned cache,
+`local-acquisition.json` records absent, invalid, observation_failed or
+verified_source_bundle. Verification reads only the contained bridge, ZIP and
+manifest, checks the built bridge hash, archive hash, recomputed bundle identity,
+flat archive entries and their actual hashes against the manifest, including
+`cua-driver.exe`. It never extracts or removes files, and local assembly is not
+running guest provenance. Observer failures are supplemental; the failed proof
+stays red and every cleanup action is still attempted.
+
+Diagnostic parsing is limited to 64 KiB of CLI JSON and 16 KiB of message,
+nine unique bootstrap stages and integer counters through 2^63-1. Native
+assembly observation reads at most 16 bundle entries, a 1 MiB manifest,
+64 MiB bridge, 512 MiB archive, 1 MiB central directory, 4,096 archive entries
+and 2 GiB of expanded content. ZIP central metadata is checked before parsing;
+ZIP64 is outside this observer. Exceeding a diagnostic budget yields unavailable/observation_failed;
+these limits do not change product or live-proof acceptance. Unknown labels,
+unsafe/reparse paths and ambiguous assemblies never qualify as verified.
+
 The Python harnesses remain usable against supplied remote Windows credentials;
 they provision nothing. Their existing documented environment variables and
 credential-file interfaces are unchanged. To require source delivery, add

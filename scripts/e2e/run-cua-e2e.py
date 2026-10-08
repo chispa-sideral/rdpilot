@@ -83,6 +83,9 @@ class Relay:
         self.port = int(credentials.get("port", 3389))
         self.streams = set()
         self.server = None
+        self.observation = {'state':'observed','accepted':0,'upstream_connected':0,
+                            'to_upstream_bytes':0,'to_client_bytes':0,
+                            'upstream_failure':'none','copy_failure':'none'}
 
     async def start(self):
         self.server = await asyncio.start_server(self.accept, "127.0.0.1", 0)
@@ -90,22 +93,37 @@ class Relay:
 
     async def accept(self, reader, writer):
         upstream = None
+        self.observation['accepted'] += 1
         try:
             remote, upstream = await asyncio.wait_for(asyncio.open_connection(self.host, self.port), 15)
+            self.observation['upstream_connected'] += 1
             self.streams.update((writer, upstream))
 
-            async def copy(source, dest):
-                while data := await source.read(64 * 1024):
-                    dest.write(data)
-                    await dest.drain()
+            async def copy(source, dest, counter):
+                try:
+                    while data := await source.read(64 * 1024):
+                        dest.write(data)
+                        await dest.drain()
+                        # Count only successfully drained bytes; never retain payloads.
+                        self.observation[counter] += len(data)
+                except OSError:
+                    self.observation['copy_failure']='os_error'
+                    raise
+                except Exception:
+                    self.observation['copy_failure']='unknown'
+                    raise
 
-            tasks = [asyncio.create_task(copy(reader, upstream)), asyncio.create_task(copy(remote, writer))]
+            tasks = [asyncio.create_task(copy(reader, upstream, 'to_upstream_bytes')),
+                     asyncio.create_task(copy(remote, writer, 'to_client_bytes'))]
             _, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
             for task in pending:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
-        except (OSError, asyncio.TimeoutError):
-            pass
+        except (OSError, asyncio.TimeoutError) as error:
+            self.observation['upstream_failure']='timeout' if isinstance(error,TimeoutError) else 'os_error'
+            for key in ('errno','winerror'):
+                value=getattr(error,key,None)
+                if proof_support.bounded_int(value,-(2**31),2**32-1):self.observation[key]=value
         finally:
             for stream in (writer, upstream):
                 if stream is not None:
@@ -294,8 +312,27 @@ class Run:
             raise
         if proc.returncode and not allow_failure:
             self.failed_cli_exit = proc.returncode
-            raise ProofError(self.clean(f"CLI {arguments[0]} failed: {out.decode(errors='replace')} {err.decode(errors='replace')}"))
+            error=ProofError(self.clean(f"CLI {arguments[0]} failed: {out.decode(errors='replace')} {err.decode(errors='replace')}"))
+            if arguments[0]=='connect':self.freeze_connect_failure(error,out)
+            raise error
         return json.loads(out) if out.strip() else {}
+
+    def freeze_connect_failure(self, error, stdout=None):
+        if self.primary_failure is not None:return
+        primary=proof_support.failure_detail(error,self.operation,self.failed_cli_exit)
+        try:
+            observation=proof_support.cli_observation(stdout)
+            observation['relays']={target:proof_support.select_relay_observation(
+                self.relays[target][0].observation if target in self.relays else None) for target in ('a','b')}
+            code=self.daemon.returncode if self.daemon else None
+            observation['daemon']={'state':'alive' if self.daemon and code is None else 'exited' if self.daemon else 'unavailable'}
+            if code is not None:observation['daemon']['exit_code']=code
+            observation['observation_state']='observed'
+            primary['connect_observation']=proof_support.select_connect_observation(observation)
+        except Exception as observation_error:
+            primary['connect_observation']=proof_support.select_connect_observation({'observation_state':'observation_failed'})
+            self.cleanup_failures.append(proof_support.failure_detail(observation_error,'connect_observation'))
+        self.primary_failure=proof_support.select_failure_detail(primary)
 
     def hosts_for_relays(self):
         return self.hosts_file({
@@ -592,7 +629,8 @@ $text=& $exe 'runtime::windows_tests::job_closes_root_and_descendant_created_aft
             self.summary["status"] = "passed"
         except BaseException as error:
             self.failure_operation = self.operation
-            self.primary_failure = proof_support.failure_detail(error,self.operation,self.failed_cli_exit)
+            if self.operation=='connect_cli':self.freeze_connect_failure(error)
+            if self.primary_failure is None:self.primary_failure = proof_support.failure_detail(error,self.operation,self.failed_cli_exit)
             self.summary["status"] = "failed"
             self.summary["failure"] = self.clean(f"{type(error).__name__}: {error}")
             raise

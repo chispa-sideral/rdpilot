@@ -15,6 +15,7 @@ import shutil
 import subprocess
 import sys
 import time
+import acquisition_observer
 
 HERE = Path(__file__).resolve().parent
 spec = importlib.util.spec_from_file_location('live_proof', HERE/'run-live-proof.py')
@@ -325,7 +326,7 @@ def run(args):
     private.mkdir()
     powershell("& icacls $v.path /inheritance:r /grant:r \"$($env:USERDOMAIN)\\$($env:USERNAME):(OI)(CI)F\"|Out-Null;if($LASTEXITCODE){throw 'Private ACL failed'}",{'path':str(private)})
     os.environ.update(private_environment(private))
-    snapshot=None;results={};suites=[];attempted=[];users=[];journal=private/'processes.json';rule='RdpilotDesktop-'+secrets.token_hex(8)
+    snapshot=None;results={};suites=[];attempted=[];users=[];journal=private/'processes.json';rule='RdpilotDesktop-'+secrets.token_hex(8);observation_failures=[]
     stage='preflight';failure_detail={};failure_code='none';passed=False;setup_attempted=False;roles=[];memberships=[];creation_observations=[]
     try:
         snapshot=powershell(PREFLIGHT)
@@ -409,7 +410,27 @@ def run(args):
                 try:code=child.wait(timeout=remaining+30)
                 except subprocess.TimeoutExpired:
                     powershell(STOP_PROCESS,record,15);code=1
-            selected=json.loads((artifacts/(proof+'.json')).read_text()) if (artifacts/(proof+'.json')).exists() else {'status':'failed'}
+            try:
+                selected=json.loads((artifacts/(proof+'.json')).read_text())
+                if not isinstance(selected,dict) or selected.get('status') not in ('passed','failed'):
+                    raise ValueError('Invalid selected status')
+            except Exception:
+                selected={'status':'failed'}
+                observation_failures.append('selected_artifact_read')
+                # Replace an unreadable selected artifact with a closed failure.
+                try:(artifacts/(proof+'.json')).write_text(json.dumps(live.project(proof,None,1,hashes['rdpilot-bridge'])))
+                except Exception:
+                    observation_failures.append('selected_artifact_write')
+                    try:(artifacts/(proof+'.json')).unlink(missing_ok=True)
+                    except OSError:observation_failures.append('selected_artifact_remove')
+            if proof=='cua' and (code or selected['status']!='passed'):
+                # Only the initially absent, run-owned cache; observe before cleanup.
+                try:acquisition=acquisition_observer.observe_cache(snapshot['cache'],hashes['rdpilot-bridge'])
+                except Exception:
+                    acquisition={'state':'observation_failed'}
+                    observation_failures.append('acquisition_observation')
+                try:(artifacts/'local-acquisition.json').write_text(json.dumps(acquisition,indent=2)+'\n')
+                except Exception:observation_failures.append('acquisition_artifact_write')
             stage=proof+'_cleanup'
             try:checks=cleanup_suite(users,journal,snapshot['cache'],require_profiles=(code==0 and selected['status']=='passed'))
             except BaseException:checks={'suite_cleanup':False}
@@ -461,7 +482,7 @@ if($s.State -ne $v.state -or $s.StartMode -ne $v.start_mode){throw 'Service rest
                 screenshot.unlink()
         (artifacts/'account-roles.json').write_text(json.dumps({'roles':roles,'memberships':memberships,'creation_observations':creation_observations},indent=2))
         (artifacts/'cleanup.json').write_text(json.dumps(results,indent=2))
-        (artifacts/'gate.json').write_text(json.dumps({'mode':mode, 'status':{'live':'passed','setup_diagnostic':'setup_passed','cua_diagnostic':'cua_diagnostic_passed'}[mode] if passed else 'failed','failure_stage':'none' if passed else (stage if stage!='none' else 'cleanup'),'attempted_suites':attempted,'completed_suites':suites,'failure_code':failure_code if not passed else 'none','host_failure':failure_detail if not passed else {}},indent=2))
+        (artifacts/'gate.json').write_text(json.dumps({'mode':mode, 'status':{'live':'passed','setup_diagnostic':'setup_passed','cua_diagnostic':'cua_diagnostic_passed'}[mode] if passed else 'failed','failure_stage':'none' if passed else (stage if stage!='none' else 'cleanup'),'attempted_suites':attempted,'completed_suites':suites,'failure_code':failure_code if not passed else 'none','host_failure':failure_detail if not passed else {},'observation_failures':observation_failures},indent=2))
     print('Hosted desktop gate '+('passed' if passed else 'failed')+'; stage: '+stage,flush=True)
     return 0 if passed else 1
 
