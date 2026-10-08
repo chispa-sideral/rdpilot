@@ -141,6 +141,17 @@ class OwnershipTests(unittest.TestCase):
         self.assertEqual(caught.exception.detail,{key:value for key,value in detail.items() if key!='code'})
         self.assertNotIn('credential',str(caught.exception))
 
+    def test_windows_powershell_child_uses_native_module_defaults(self):
+        inherited={'PSMODULEPATH':'incompatible-core-modules','KEEP_PARENT':'unchanged'}
+        child=subprocess.CompletedProcess([],0,b'true',b'')
+        with patch.dict(os.environ,inherited),patch.object(host.subprocess,'run',return_value=child) as run:
+            self.assertTrue(host.powershell('trusted-script'))
+            self.assertFalse(any(key.casefold()=='psmodulepath' for key in run.call_args.kwargs['env']))
+            self.assertEqual(run.call_args.kwargs['env']['KEEP_PARENT'],'unchanged')
+            self.assertEqual(os.environ['PSMODULEPATH'],inherited['PSMODULEPATH'])
+            host.powershell('trusted-script',inherit_module_path=True)
+            self.assertEqual(run.call_args.kwargs['env']['PSMODULEPATH'],inherited['PSMODULEPATH'])
+
     def test_profile_presence_after_live_run_is_required(self):
         with tempfile.TemporaryDirectory() as directory:
             journal=Path(directory)/'pids.json';journal.write_text('[]')

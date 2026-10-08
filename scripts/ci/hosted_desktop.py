@@ -39,8 +39,13 @@ class HostActionError(RuntimeError):
         super().__init__('Private host action failed')
 
 
-def powershell(script, values=None, timeout=30):
+def powershell(script, values=None, timeout=30, *, inherit_module_path=False):
     env = dict(os.environ)
+    # A pwsh parent can export Core modules incompatible with Windows PS 5.1.
+    # Let this native child construct its own standard module search path.
+    if not inherit_module_path:
+        for key in tuple(env):
+            if key.casefold()=='psmodulepath':env.pop(key)
     env['RDPILOT_HOST_CONTROL'] = json.dumps(values or {})
     source = "$ErrorActionPreference='Stop';$v=$env:RDPILOT_HOST_CONTROL|ConvertFrom-Json;$subaction='script';try{"+script+r'''
 }catch{
@@ -329,6 +334,15 @@ def run(args):
             auth='NLA/CredSSP; explicit self-signed TLS acceptance',graphics='product default',account_role='standard',
             target='loopback',cua_version='0.34.0',process_identity_refusals_verified=True)
         (artifacts/'environment.json').write_text(json.dumps(environment,indent=2))
+        if diagnostic:
+            conversion=r'''$secure=ConvertTo-SecureString 'Diagnostic1!FixedHarmlessInput' -AsPlainText -Force
+@{converted=($secure.Length -gt 0);security_module_major=(Get-Command ConvertTo-SecureString).Module.Version.Major}|ConvertTo-Json -Compress'''
+            measurements={}
+            for label,inherited in (('inherited',True),('native_default',False)):
+                try:measurements[label]={'passed':True,**powershell(conversion,inherit_module_path=inherited)}
+                except HostActionError as error:measurements[label]={'passed':False,'failure_code':error.code,'host_failure':error.detail}
+            (artifacts/'security-module-control.json').write_text(json.dumps(measurements,indent=2))
+            if measurements['native_default'].get('converted') is not True:raise RuntimeError('Native Security module conversion failed')
         bundle=private/'bundle';bundle.mkdir()
         if not diagnostic:shutil.copyfile(bin_dir/'rdpilot-bridge.exe',bundle/'rdpilot-bridge.exe')
         stage='setup';setup_attempted=True;powershell(SETUP,{'rule':rule})
