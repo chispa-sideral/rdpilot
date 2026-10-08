@@ -22,10 +22,10 @@ live = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(live)
 
 
-ERROR_CODES={'host_action','member_exists','parameter_binding','group_not_found','user_not_found','access_denied','native_error','timeout','invalid_host_json'}
+ERROR_CODES={'host_action','member_exists','parameter_binding','group_not_found','user_not_found','access_denied','native_error','timeout','invalid_host_json','invalid_password','invalid_name','invalid_parameters','account_exists','internal_error','command_not_found'}
 
-SUBACTIONS={'script','account_preflight','new_local_user','sid_readback','sid_journal'}
-EXCEPTION_CATEGORIES={'access_denied','argument','parameter_binding','local_accounts','io','other'}
+SUBACTIONS={'script','account_preflight','secure_password','new_local_user','sid_readback','sid_journal'}
+EXCEPTION_CATEGORIES={'access_denied','argument','parameter_binding','local_accounts','io','other','action_preference','invocation','security'}
 
 class HostActionError(RuntimeError):
     def __init__(self,code,detail=None):
@@ -33,7 +33,7 @@ class HostActionError(RuntimeError):
         raw=detail if isinstance(detail,dict) else {}
         self.detail={'subaction':raw.get('subaction') if isinstance(raw.get('subaction'),str) and raw.get('subaction') in SUBACTIONS else 'script',
             'exception_category':raw.get('exception_category') if isinstance(raw.get('exception_category'),str) and raw.get('exception_category') in EXCEPTION_CATEGORIES else 'other'}
-        for key in ('hresult','native_error'):
+        for key in ('hresult','native_error','ntstatus'):
             value=raw.get(key)
             if type(value) is int and -(2**31)<=value<2**32:self.detail[key]=value
         super().__init__('Private host action failed')
@@ -44,17 +44,31 @@ def powershell(script, values=None, timeout=30):
     env['RDPILOT_HOST_CONTROL'] = json.dumps(values or {})
     source = "$ErrorActionPreference='Stop';$v=$env:RDPILOT_HOST_CONTROL|ConvertFrom-Json;$subaction='script';try{"+script+r'''
 }catch{
- $code=switch -Wildcard ($_.FullyQualifiedErrorId){
+ # Cmdlets may wrap the actual LocalAccounts error in ActionPreferenceStop.
+ $record=$_
+ for($i=0;$i -lt 4;$i++){
+  $nested=$record.Exception.ErrorRecord
+  if(!$nested -or [object]::ReferenceEquals($nested,$record)){break}
+  $record=$nested
+ }
+ $exception=$record.Exception
+ $code=switch -Wildcard ($record.FullyQualifiedErrorId){
   'MemberExists*'{'member_exists'} '*ParameterBinding*'{'parameter_binding'}
   'GroupNotFound*'{'group_not_found'} 'UserNotFound*'{'user_not_found'}
+  'InvalidPassword*'{'invalid_password'} 'InvalidName*'{'invalid_name'} 'InvalidParameters*'{'invalid_parameters'}
+  'NameInUse*'{'account_exists'} 'UserExists*'{'account_exists'} 'Internal*'{'internal_error'}
+  '*CommandNotFound*'{'command_not_found'}
   '*AccessDenied*'{'access_denied'} '*Win32*'{'native_error'} default{'host_action'}
  }
- $category=switch -Wildcard ($_.Exception.GetType().FullName){
+ $category=switch -Wildcard ($exception.GetType().FullName){
   '*UnauthorizedAccess*'{'access_denied'} '*Argument*'{'argument'} '*ParameterBinding*'{'parameter_binding'}
+  '*ActionPreferenceStop*'{'action_preference'} '*Invocation*'{'invocation'} '*SecurityException'{'security'}
   '*LocalAccounts*'{'local_accounts'} '*IOException*'{'io'} default{'other'}
  }
- $detail=@{code=$code;subaction=$subaction;exception_category=$category;hresult=$_.Exception.HResult}
- if($null -ne $_.Exception.NativeErrorCode){$detail.native_error=$_.Exception.NativeErrorCode}
+ if($exception.GetType().BaseType.FullName -eq 'Microsoft.PowerShell.Commands.LocalAccountsException'){$category='local_accounts'}
+ $detail=@{code=$code;subaction=$subaction;exception_category=$category;hresult=$exception.HResult}
+ if($null -ne $exception.NativeErrorCode){$detail.native_error=$exception.NativeErrorCode}
+ if($null -ne $exception.StatusCode){$detail.ntstatus=[long]$exception.StatusCode}
  # Windows PowerShell may prepend module-import CLIXML to stderr. Keep the
  # trusted closed envelope on stdout; the nonzero exit still marks failure.
  [Console]::Out.Write(($detail|ConvertTo-Json -Compress));exit 1
@@ -126,8 +140,10 @@ New-NetFirewallRule -Name $v.rule -DisplayName 'rdpilot local desktop proof' -Di
 CREATE_USER = r'''
 $subaction='account_preflight'
 if(Get-LocalUser $v.name -ErrorAction SilentlyContinue){throw 'Unowned account exists'}
+$subaction='secure_password'
+$secure=ConvertTo-SecureString $v.password -AsPlainText -Force
 $subaction='new_local_user'
-$u=New-LocalUser -Name $v.name -Description $v.marker -Password (ConvertTo-SecureString $v.password -AsPlainText -Force) -PasswordNeverExpires
+$u=New-LocalUser -Name $v.name -Description $v.marker -Password $secure -PasswordNeverExpires
 $subaction='sid_readback'
 $record=@{name=$u.Name;sid=$u.SID.Value}
 $subaction='sid_journal'
