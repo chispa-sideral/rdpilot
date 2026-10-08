@@ -224,6 +224,19 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaises(TimeoutError):await run.proof_body()
             self.assertEqual(joined,['a']);self.assertEqual(run.operation,'first_a_attach')
 
+    async def test_work_timeout_fixture_reaches_body_with_delayed_native_relay_seam(self):
+        original=policy.run_class
+        with contextlib.ExitStack() as seams:
+            def factory(base):
+                relay=base.execute.__globals__['Relay'];start=relay.start
+                async def delayed(instance):
+                    await asyncio.sleep(0.04)
+                    return await start(instance)
+                seams.enter_context(patch.object(relay,'start',new=delayed))
+                return original(base)
+            with patch.object(policy,'run_class',side_effect=factory):
+                await self.test_work_timeout_keeps_separate_finalizer_and_later_actions()
+
     async def test_work_timeout_keeps_separate_finalizer_and_later_actions(self):
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory);private=root/'private';private.mkdir()
@@ -233,6 +246,7 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
                 credentials_a=str(private/'a.json'),credentials_b=str(private/'b.json'),timeout=100)
             actions=[]
             original=policy.run_class
+            seams=contextlib.ExitStack()
             def factory(base):
                 class Timed(original(base)):
                     work_budget=0.01
@@ -242,8 +256,10 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
                         finally:actions.append('work_joined')
                     async def cli(self,*args,**kwargs):
                         await asyncio.sleep(0.02);actions.append(('disconnect',args[-1]));return {}
+                # This control times proof work, independently of native relay startup.
+                seams.enter_context(patch.object(base.execute.__globals__['Relay'],'start',new=AsyncMock(return_value=12345)))
                 return Timed
-            with patch.object(tempfile,'tempdir',str(private)),patch.object(policy,'run_class',side_effect=factory):
+            with seams,patch.object(tempfile,'tempdir',str(private)),patch.object(policy,'run_class',side_effect=factory):
                 self.assertEqual(await host.live.execute(args),1)
             selected=policy.read_json(root/'artifacts/first_a.json')
             self.assertEqual(selected['harness_failure']['exception_category'],'timeout')
@@ -255,7 +271,7 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
 class HostPolicyTests(unittest.TestCase):
     def measure(self,failure=None):
         with tempfile.TemporaryDirectory() as directory:
-            root=Path(directory);out=root/'out';bins=root/'bin';bins.mkdir()
+            root=Path(directory).resolve();out=root/'out';bins=root/'bin';bins.mkdir()
             for name in ('rdpilot','rdpilot-daemon','rdpilot-mcp','rdpilot-bridge'):(bins/(name+'.exe')).write_bytes(name.encode())
             host.initialize(out,policy.MODE)
             args=argparse.Namespace(output=str(out),bin_dir=str(bins),expected_commit='1'*40,baseline_first_a=True)
@@ -333,6 +349,17 @@ class HostPolicyTests(unittest.TestCase):
             self.assertFalse((out/'private').exists())
             if cleanup_deadlines:self.assertEqual(len(set(cleanup_deadlines)),1)
             return code,policy.read_json(out/'artifacts/gate.json'),policy.read_json(out/'artifacts/cleanup.json') if (out/'artifacts/cleanup.json').exists() else {},policy.read_json(out/'artifacts/first_a.json') if (out/'artifacts/first_a.json').exists() else None,actions
+
+    def test_selected_scan_fixture_is_armed_for_plain_lexical_temporary_alias(self):
+        original=tempfile.TemporaryDirectory
+        @contextlib.contextmanager
+        def aliased(*args,**kwargs):
+            with original(*args,**kwargs) as directory:
+                component=Path(directory)/'component';component.mkdir()
+                yield str(component/'..')
+        with patch.object(tempfile,'TemporaryDirectory',side_effect=aliased):
+            code,gate,*_=self.measure('selected_scan')
+        self.assertEqual(code,1);self.assertEqual(gate['status'],'failed')
 
     def test_same_host_positive_requires_a_profile_and_b_is_cleaned_without_profile(self):
         code,gate,cleanup,selected,actions=self.measure()
