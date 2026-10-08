@@ -37,6 +37,7 @@ CHECKS = {
     'read_only_viewer_has_no_takeover_and_no_write_route',
     'evidence_contains_no_token_credential_lease_or_typed_text', 'windows_console_controller_and_sibling_survived'),
 }
+CHECKS={proof:('private_child_temporary_boundary_verified',)+checks for proof,checks in CHECKS.items()}
 ALLOWED_UNVERIFIED = {
  'cua': {'UAC/secure-desktop behavior is unsupported; no elevation guarantee',
          'Windows Job containment executable not supplied to this run'},
@@ -134,6 +135,10 @@ async def execute(args):
         connect_timeout=600, windows_job_test=None, skip_faults=False, fake=False,
         bind='loopback', allow_no_tailnet=True, allow_debug=False, marker_region=None)
     run = (module.Run if args.proof == 'cua' else module.Proof)(harness_args)
+    boundary=Path(args.output).resolve().parent
+    if not Path(run.temp).resolve().is_relative_to(boundary):
+        raise RuntimeError('Harness temporary files escaped private boundary')
+    run.check('private_child_temporary_boundary_verified')
     code = 0
     sentinel = await tracked(sys.executable, '-c', 'import time; time.sleep(3600)') if args.proof != 'cua' else None
     try:

@@ -245,6 +245,10 @@ def measure_process_refusal():
         child.wait(timeout=5)
 
 
+def private_environment(private):
+    return {**os.environ,**{key:str(Path(private).resolve()) for key in ('TMPDIR','TEMP','TMP')}}
+
+
 def initialize(output):
     output=Path(output)
     output.mkdir(parents=True,exist_ok=False)
@@ -258,7 +262,7 @@ def run(args):
         raise RuntimeError('Initialize new gate output first')
     private.mkdir()
     powershell("& icacls $v.path /inheritance:r /grant:r \"$($env:USERDOMAIN)\\$($env:USERNAME):(OI)(CI)F\"|Out-Null;if($LASTEXITCODE){throw 'Private ACL failed'}",{'path':str(private)})
-    os.environ['TEMP']=os.environ['TMP']=str(private)
+    os.environ.update(private_environment(private))
     snapshot=None;results={};suites=[];users=[];journal=private/'processes.json';rule='RdpilotDesktop-'+secrets.token_hex(8)
     stage='preflight';failure_code='none';passed=False;setup_attempted=False;roles=[];memberships=[]
     try:

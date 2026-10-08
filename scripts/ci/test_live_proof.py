@@ -145,6 +145,16 @@ class OwnershipTests(unittest.TestCase):
             self.assertFalse(results['user_0_profile_was_present'])
             self.assertFalse(results['user_0_profile_guest_removed'])
 
+    def test_real_child_tempfile_stays_in_selected_private_boundary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            private=Path(directory)/'private';private.mkdir()
+            with patch.dict(os.environ,{'TMPDIR':str(Path(directory)/'unowned')}):
+                env=host.private_environment(private)
+            for name in ('TMPDIR','TEMP','TMP'):self.assertEqual(Path(env[name]),private.resolve())
+            child=subprocess.run([sys.executable,'-c','import tempfile; print(tempfile.mkdtemp())'],env=env,capture_output=True,text=True,check=True)
+            self.assertTrue(Path(child.stdout.strip()).resolve().is_relative_to(private.resolve()))
+        for checks in live.CHECKS.values():self.assertIn('private_child_temporary_boundary_verified',checks)
+
     def test_static_build_failure_artifact_is_initialized_before_dependencies(self):
         with tempfile.TemporaryDirectory() as directory:
             output=Path(directory)/'output';host.initialize(output)
