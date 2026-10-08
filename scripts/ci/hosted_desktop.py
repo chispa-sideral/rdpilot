@@ -21,6 +21,7 @@ import guest_footprint_observer as footprint
 import bootstrap_desktop_observer as desktop
 
 HERE = Path(__file__).resolve().parent
+_native_owner=None
 spec = importlib.util.spec_from_file_location('live_proof', HERE/'run-live-proof.py')
 live = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(live)
@@ -88,8 +89,24 @@ def powershell(script, values=None, timeout=30, *, inherit_module_path=False):
  [Console]::Out.Write(($detail|ConvertTo-Json -Compress));exit 1
 }
 '''
-    try:result = subprocess.run(['powershell.exe','-NoProfile','-NonInteractive','-EncodedCommand',
-        base64.b64encode(source.encode('utf-16le')).decode()], env=env, capture_output=True, timeout=timeout)
+    command=['powershell.exe','-NoProfile','-NonInteractive','-EncodedCommand',base64.b64encode(source.encode('utf-16le')).decode()]
+    try:
+        if _native_owner is None:result = subprocess.run(command,env=env,capture_output=True,timeout=timeout)
+        else:
+            import first_a
+            bounded=first_a.remaining(_native_owner['deadline'],timeout)
+            child=subprocess.Popen(command,env=env,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+            try:
+                held_process.register_sync(child,live.process_identity,_native_owner['journal'],_native_owner['records'],timeout=max(0,min(15,_native_owner['deadline']-time.monotonic())))
+            except BaseException as error:
+                if getattr(error,'held_cleanup_failures',()):_native_owner['stop_failed']=True
+                raise
+            try:out,err=child.communicate(timeout=bounded)
+            except BaseException:
+                if held_process.abort_sync(child,max(0,min(15,_native_owner['deadline']-time.monotonic()))):_native_owner['stop_failed']=True
+                raise
+            if len(out)>64*1024 or len(err)>64*1024:raise HostActionError('invalid_host_json')
+            result=subprocess.CompletedProcess(command,child.returncode,out,err)
     except subprocess.TimeoutExpired:raise HostActionError('timeout')
     if result.returncode:
         data=result.stdout.decode('utf-8-sig',errors='replace').strip()
@@ -227,6 +244,22 @@ def cleanup_actions(actions):
     return results
 
 
+def stop_owned_processes(journal, required=False):
+    if required and not journal.exists():raise RuntimeError('Required process journal absent')
+    records=json.loads(journal.read_text()) if journal.exists() else []
+    values = powershell(r'''$ok=$true
+foreach($record in $v.records){try{
+ $p=Get-Process -Id $record.pid -ErrorAction SilentlyContinue
+ if($p){$handle=$p.Handle
+  if($p.StartTime.ToUniversalTime().ToFileTimeUtc().ToString() -ne $record.created -or $p.Path -ine $record.image){throw 'Process identity changed'}
+  $p.Kill();if(!$p.WaitForExit(1000)){throw 'Owned process remains'}
+ }
+}catch{$ok=$false}}
+$ok|ConvertTo-Json
+''', {'records':records},30)
+    if values is not True:raise RuntimeError('Owned process cleanup failed')
+
+
 def cleanup_suite(users, journal, cache, require_profiles=False, *, required_profile_indices=None):
     required = set(range(len(users))) if require_profiles else set()
     if required_profile_indices is not None:
@@ -238,19 +271,7 @@ def cleanup_suite(users, journal, cache, require_profiles=False, *, required_pro
     actions=[]
     profile_presence={}
     def stop_processes():
-        if require_journal and not journal.exists():raise RuntimeError('Required process journal absent')
-        records=json.loads(journal.read_text()) if journal.exists() else []
-        values = powershell(r'''$ok=$true
-foreach($record in $v.records){try{
- $p=Get-Process -Id $record.pid -ErrorAction SilentlyContinue
- if($p){$handle=$p.Handle
-  if($p.StartTime.ToUniversalTime().ToFileTimeUtc().ToString() -ne $record.created -or $p.Path -ine $record.image){throw 'Process identity changed'}
-  $p.Kill();if(!$p.WaitForExit(1000)){throw 'Owned process remains'}
- }
-}catch{$ok=$false}}
-$ok|ConvertTo-Json
-''', {'records':records},30)
-        if values is not True:raise RuntimeError('Owned process cleanup failed')
+        stop_owned_processes(journal,require_journal)
     actions.append(('owned_processes_removed',stop_processes))
     for i,user in enumerate(users):
         def reconcile(user=user):
@@ -299,7 +320,12 @@ foreach($id in $matched){if(![OwnedSessions]::WTSLogoffSession([IntPtr]::Zero,$i
 
 def measure_process_refusal():
     child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(120)'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
-    record=live.process_identity(child.pid)
+    if _native_owner is None:record=live.process_identity(child.pid)
+    else:
+        try:record=held_process.register_sync(child,live.process_identity,_native_owner['journal'],_native_owner['records'])
+        except BaseException as error:
+            if getattr(error,'held_cleanup_failures',()):_native_owner['stop_failed']=True
+            raise
     try:
         for field,value in (('created',str(int(record['created'])+1)),('image','unowned.exe')):
             refused=False
@@ -307,8 +333,13 @@ def measure_process_refusal():
             except RuntimeError:refused=True
             if not refused or child.poll() is not None:raise RuntimeError('Owned process refusal was not proven')
     finally:
-        powershell(STOP_PROCESS,record,15)
-        child.wait(timeout=5)
+        try:
+            powershell(STOP_PROCESS,record,15)
+            child.wait(timeout=5)
+        except BaseException:
+            if _native_owner is not None:
+                if held_process.abort_sync(child,max(0,min(15,_native_owner['deadline']-time.monotonic()))):_native_owner['stop_failed']=True
+            raise
 
 
 def private_environment(private):
@@ -317,16 +348,17 @@ def private_environment(private):
 
 def mode_for(args):
     setup=getattr(args,'setup_diagnostic',False);cua=getattr(args,'cua_diagnostic',False)
-    if setup and cua:raise ValueError('Diagnostic modes are mutually exclusive')
+    baseline=getattr(args,'baseline_first_a',False)
+    if sum(bool(x) for x in (setup,cua,baseline))>1:raise ValueError('Diagnostic modes are mutually exclusive')
     desktop_mode=getattr(args, 'bootstrap_desktop', False);footprint_mode=getattr(args, 'bootstrap_footprint', False)
     if desktop_mode and footprint_mode:raise ValueError('Bootstrap observers are mutually exclusive')
     if (desktop_mode or footprint_mode) and not cua:
         raise ValueError('Bootstrap observation requires Cua diagnostic')
-    return 'setup_diagnostic' if setup else 'cua_diagnostic' if cua else 'live'
+    return 'protected_first_a' if baseline else 'setup_diagnostic' if setup else 'cua_diagnostic' if cua else 'live'
 
 
 def initialize(output,mode='live'):
-    if mode not in ('live','setup_diagnostic','cua_diagnostic'):raise ValueError('Unknown mode')
+    if mode not in ('live','setup_diagnostic','cua_diagnostic','protected_first_a'):raise ValueError('Unknown mode')
     output=Path(output)
     output.mkdir(parents=True,exist_ok=False)
     artifacts=output/'artifacts';artifacts.mkdir()
@@ -334,19 +366,37 @@ def initialize(output,mode='live'):
 
 
 def run(args):
+    global _native_owner
     mode=mode_for(args)
-    expected=['host_setup'] if mode=='setup_diagnostic' else ['cua'] if mode=='cua_diagnostic' else list(live.CHECKS)
+    baseline=mode=='protected_first_a'
+    if baseline:
+        import first_a
+        source=first_a.verify_source(args.expected_commit)
+        parent_deadline=time.monotonic()+first_a.PARENT_SECONDS
+    expected=['first_a'] if baseline else ['host_setup'] if mode=='setup_diagnostic' else ['cua'] if mode=='cua_diagnostic' else list(live.CHECKS)
     output=Path(args.output).resolve();artifacts=output/'artifacts';private=output/'private'
     if not artifacts.is_dir() or private.exists():
         raise RuntimeError('Initialize new gate output first')
+    if baseline:
+        if first_a.read_json(artifacts/'gate.json')!={'mode':first_a.MODE,'status':'failed','failure_stage':'build_or_dependencies'}:
+            raise ValueError('Initialize fresh red baseline')
+        if first_a.read_json(artifacts/'source.json')!=source or {p.name for p in artifacts.iterdir()}!={'gate.json','source.json'}:
+            raise ValueError('Prebuild source binding unavailable')
     private.mkdir()
-    powershell("& icacls $v.path /inheritance:r /grant:r \"$($env:USERDOMAIN)\\$($env:USERNAME):(OI)(CI)F\"|Out-Null;if($LASTEXITCODE){throw 'Private ACL failed'}",{'path':str(private)})
-    os.environ.update(private_environment(private))
+    acl="& icacls $v.path /inheritance:r /grant:r \"$($env:USERDOMAIN)\\$($env:USERNAME):(OI)(CI)F\"|Out-Null;if($LASTEXITCODE){throw 'Private ACL failed'}"
+    if not baseline:
+        powershell(acl,{'path':str(private)})
+        os.environ.update(private_environment(private))
     snapshot=None;results={};suites=[];attempted=[];users=[];journal=private/'processes.json';rule='RdpilotDesktop-'+secrets.token_hex(8);observation_failures=[]
-    wrapper=None;wrapper_joined=True;wrapper_stop_attempted=False
+    wrapper=None;wrapper_joined=True;wrapper_stop_attempted=False;cleanup_started=False
     observer_source = {}
     stage='preflight';failure_detail={};failure_code='none';passed=False;setup_attempted=False;roles=[];memberships=[];creation_observations=[]
     try:
+        if baseline:
+            _native_owner={'journal':private/'native-processes.json','records':[],
+                'deadline':min(parent_deadline,time.monotonic()+600),'stop_failed':False}
+            powershell(acl,{'path':str(private)})
+            os.environ.update(private_environment(private))
         snapshot=powershell(PREFLIGHT)
         measure_process_refusal()
         commit=subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()
@@ -361,7 +411,9 @@ def run(args):
         environment.update(source_commit=commit,source_tree=tree,binary_sha256=hashes,
             auth='NLA/CredSSP; explicit self-signed TLS acceptance',graphics='product default',account_role='standard',
             target='loopback',cua_version='0.34.0',process_identity_refusals_verified=True)
-        (artifacts/'environment.json').write_text(json.dumps(environment,indent=2))
+        if baseline:environment.update(source,recipe='protected-earlier-startup',bounds_seconds={'listener':60,'work':900,'attach':240,'finalizer':60,'wrapper_stop':15,'host_cleanup':600,'parent':2400})
+        if baseline:first_a.write_json(artifacts/'environment.json',environment)
+        else:(artifacts/'environment.json').write_text(json.dumps(environment,indent=2))
         observer_source = {'source_commit': commit, 'source_tree': tree,
             'cli_sha256': hashes.get('rdpilot'), 'daemon_sha256': hashes.get('rdpilot-daemon'),
             'bridge_sha256': hashes.get('rdpilot-bridge')}
@@ -377,6 +429,7 @@ def run(args):
         bundle=private/'bundle';bundle.mkdir()
         if not diagnostic:shutil.copyfile(bin_dir/'rdpilot-bridge.exe',bundle/'rdpilot-bridge.exe')
         stage='setup';setup_attempted=True;powershell(SETUP,{'rule':rule})
+        if baseline:first_a.listener_ready()
         deadline=time.monotonic()+45*60
         for proof in (('cua',) if diagnostic else expected):
             stage=proof+'_create_user';users=[];journal=private/(proof+'-processes.json');credentials={}
@@ -413,6 +466,14 @@ def run(args):
                 if not all(checks.values()):raise RuntimeError('Setup cleanup failed')
                 suites.append('host_setup')
                 continue
+            if baseline:
+                stage='first_a_fresh_accounts'
+                for owned in users:
+                    powershell(WTS+"if($matched.Count){throw 'Fresh user already has a session'}",owned,5)
+                    fresh=powershell(r'''if(Get-CimInstance Win32_UserProfile -Filter "SID='$($v.sid)'"){throw 'Fresh profile already exists'}
+if(Test-Path (Join-Path (Join-Path $env:SystemDrive 'Users') $v.name)){throw 'Fresh profile directory already exists'}
+@{fresh_profile_verified=$true}|ConvertTo-Json -Compress''',owned,5)
+                    if not isinstance(fresh,dict) or set(fresh)!={'fresh_profile_verified'} or fresh['fresh_profile_verified'] is not True:raise RuntimeError('Fresh profile evidence unavailable')
             child_env=dict(os.environ)
             for label,cred in credentials.items():
                 prefix='RDPILOT_TAKE_' if proof=='takeover' else 'RDPILOT_VIEW_'+label.upper()+'_'
@@ -449,7 +510,7 @@ if(Test-Path (Join-Path (Join-Path $env:SystemDrive 'Users') $v.name)){throw 'Fr
                     'username': credentials['a']['username'], 'domain': credentials['a']['domain'],
                     'wts_script': binding, 'mode': mode, 'fresh_profile_verified': True}))
                 command += ['--bootstrap-desktop', '--bootstrap-desktop-config', str(handoff)]
-            remaining=min(900,int(deadline-time.monotonic()))
+            remaining=min(1000,int(parent_deadline-time.monotonic()-first_a.HOST_CLEANUP_SECONDS-15)) if baseline else min(900,int(deadline-time.monotonic()))
             if remaining<=0:raise TimeoutError('Work budget expired')
             with (private/(proof+'-console.log')).open('wb') as raw:
                 child=subprocess.Popen(command,env=child_env,stdout=raw,stderr=raw)
@@ -471,14 +532,18 @@ if(Test-Path (Join-Path (Join-Path $env:SystemDrive 'Users') $v.name)){throw 'Fr
                     if failures:observation_failures.append('wrapper_cleanup')
                     code=1
             try:
-                selected=json.loads((artifacts/(proof+'.json')).read_text())
-                if not isinstance(selected,dict) or selected.get('status') not in ('passed','failed'):
+                selected=first_a.read_json(artifacts/(proof+'.json')) if baseline else json.loads((artifacts/(proof+'.json')).read_text())
+                if not isinstance(selected,dict) or selected.get('status') not in ((first_a.PASSED,'failed') if baseline else ('passed','failed')):
                     raise ValueError('Invalid selected status')
+                if baseline and selected['status']==first_a.PASSED and not first_a.admit(selected,hashes['rdpilot-bridge']):raise ValueError('Baseline positive admission')
+                if baseline and selected['status']=='failed':
+                    selected=first_a.failed_selected(selected)
+                    (artifacts/(proof+'.json')).write_text(json.dumps(selected))
             except Exception:
                 selected={'status':'failed'}
                 observation_failures.append('selected_artifact_read')
                 # Replace an unreadable selected artifact with a closed failure.
-                try:(artifacts/(proof+'.json')).write_text(json.dumps(live.project(proof,None,1,hashes['rdpilot-bridge'])))
+                try:(artifacts/(proof+'.json')).write_text(json.dumps(first_a.project(None,None,1,hashes['rdpilot-bridge'],False) if baseline else live.project(proof,None,1,hashes['rdpilot-bridge'])))
                 except Exception:
                     observation_failures.append('selected_artifact_write')
                     try:(artifacts/(proof+'.json')).unlink(missing_ok=True)
@@ -510,12 +575,25 @@ if(Test-Path (Join-Path (Join-Path $env:SystemDrive 'Users') $v.name)){throw 'Fr
                     try:(artifacts/'guest-footprint.json').write_text(json.dumps(observed,indent=2)+'\n')
                     except Exception:observation_failures.append('guest_footprint_artifact_write')
             stage=proof+'_cleanup'
-            try:checks=cleanup_suite(users,journal,snapshot['cache'],require_profiles=(code==0 and selected['status']=='passed'))
+            if baseline:
+                positive_child=code==0 and selected['status']==first_a.PASSED
+                _native_owner['deadline']=min(parent_deadline,time.monotonic()+first_a.HOST_CLEANUP_SECONDS)
+                cleanup_started=True
+                try:
+                    acquisition=acquisition_observer.observe_cache(snapshot['cache'],hashes['rdpilot-bridge'])
+                    first_a.write_json(artifacts/'local-acquisition.json',acquisition)
+                    if selected['status']==first_a.PASSED:
+                        identity=selected['identity'][0]
+                        if acquisition.get('state')!='verified_source_bundle' or any(acquisition.get(k)!=identity[k] for k in ('bridge_sha256','cua_sha256','cua_version','archive_sha256','bundle_id')):
+                            raise ValueError('Acquisition binding')
+                except BaseException:code=1;observation_failures.append('baseline_acquisition')
+            succeeded=selected['status']==(first_a.PASSED if baseline else 'passed')
+            try:checks=cleanup_suite(users,journal,snapshot['cache'],require_profiles=(not baseline and code==0 and succeeded),required_profile_indices=({0} if positive_child else set()) if baseline else None)
             except BaseException:checks={'suite_cleanup':False}
             results[proof]=checks
             creation_observations.extend({'suite':proof,'present':u.get('creation_present')} for u in users)
             users=[]
-            if code or selected['status']!='passed':
+            if code or not succeeded:
                 stage=proof+'_harness'
                 raise RuntimeError('Required proof or cleanup failed')
             if not all(checks.values()):raise RuntimeError('Required proof or cleanup failed')
@@ -526,6 +604,9 @@ if(Test-Path (Join-Path (Join-Path $env:SystemDrive 'Users') $v.name)){throw 'Fr
         failure_code=error.code if isinstance(error,HostActionError) else 'required_gate'
         failure_detail=error.detail if isinstance(error,HostActionError) else {}
     finally:
+        if baseline and _native_owner is not None:
+            # Cleanup gets its own reserve after setup/child failure too.
+            if not cleanup_started:_native_owner['deadline']=min(parent_deadline,time.monotonic()+first_a.HOST_CLEANUP_SECONDS)
         if wrapper is not None:
             if not wrapper_joined and not wrapper_stop_attempted:
                 wrapper_joined=not held_process.abort_sync(wrapper,15)
@@ -552,18 +633,69 @@ $s=Get-CimInstance Win32_Service -Filter "Name='TermService'"
 if($s.State -ne $v.state -or $s.StartMode -ne $v.start_mode){throw 'Service restoration failed'}
 ''',snapshot['service'],20)))
             results['host']=cleanup_actions(actions)
+        if baseline and _native_owner is not None:
+            results['native']=cleanup_actions([('owned_processes_removed',lambda:stop_owned_processes(_native_owner['journal']))])
+            results['native']['all_stop_joins_verified']=not _native_owner['stop_failed']
+            results['native']['cleanup_within_reserve']=time.monotonic()<=_native_owner['deadline']
+            try:
+                needles=[str(c['password']).encode() for c in locals().get('credentials',{}).values()]
+                scans=[first_a.scan(path,needles,_native_owner['deadline']) for path in private.glob('*-raw')]
+                for path in private.glob('*-console.log'):
+                    scans.append(not any(n in desktop.read_plain(path,16*1024*1024) for n in needles))
+                results['native']['private_evidence_scan']=all(scans)
+            except BaseException:results['native']['private_evidence_scan']=False
         try:
             shutil.rmtree(private)
             removed=not private.exists()
         except OSError:removed=False
         results['private_removed']=removed
+        if baseline and _native_owner is not None:
+            results['native']['cleanup_within_reserve']=time.monotonic()<=_native_owner['deadline']
+            cleanup_deadline=_native_owner['deadline']
+            _native_owner=None
         clean=removed and all(all(c.values()) for c in results.values() if isinstance(c,dict))
         passed=passed and clean and suites==expected
         if not passed:
             desktop.retain_failed_images(artifacts, observer_source, getattr(args, 'bootstrap_desktop', False))
-        (artifacts/'account-roles.json').write_text(json.dumps({'roles':roles,'memberships':memberships,'creation_observations':creation_observations},indent=2))
-        (artifacts/'cleanup.json').write_text(json.dumps(results,indent=2))
-        (artifacts/'gate.json').write_text(json.dumps({'mode':mode, 'status':{'live':'passed','setup_diagnostic':'setup_passed','cua_diagnostic':'cua_diagnostic_passed'}[mode] if passed else 'failed','failure_stage':'none' if passed else (stage if stage!='none' else 'cleanup'),'attempted_suites':attempted,'completed_suites':suites,'failure_code':failure_code if not passed else 'none','host_failure':failure_detail if not passed else {},'observation_failures':observation_failures},indent=2))
+        roles_artifact={'roles':roles,'memberships':memberships,'creation_observations':creation_observations}
+        if baseline:
+            try:
+                first_a.write_json(artifacts/'account-roles.json',roles_artifact)
+                first_a.write_json(artifacts/'cleanup.json',results)
+            except BaseException:passed=False;observation_failures.append('selected_artifact_write')
+        else:
+            (artifacts/'account-roles.json').write_text(json.dumps(roles_artifact,indent=2))
+            (artifacts/'cleanup.json').write_text(json.dumps(results,indent=2))
+        if baseline:
+            try:passed=passed and first_a.scan(artifacts,needles,cleanup_deadline)
+            except BaseException:passed=False;observation_failures.append('selected_scan')
+            if not passed and (artifacts/'first_a.json').exists():
+                try:
+                    item=first_a.read_json(artifacts/'first_a.json')
+                    if item.get('status')==first_a.PASSED:
+                        item.update(status='failed',outcome='inconclusive',failure_stage='cleanup')
+                    first_a.write_json(artifacts/'first_a.json',first_a.failed_selected(item))
+                except BaseException:
+                    try:first_a.write_json(artifacts/'first_a.json',first_a.project(None,None,1,hashes.get('rdpilot-bridge'),False))
+                    except BaseException:
+                        observation_failures.append('selected_artifact_write')
+                        try:(artifacts/'first_a.json').unlink(missing_ok=True)
+                        except OSError:observation_failures.append('stale_child_removal')
+        gate={'mode':mode, 'status':{'live':'passed','setup_diagnostic':'setup_passed','cua_diagnostic':'cua_diagnostic_passed','protected_first_a':'baseline_first_a_qualified'}[mode] if passed else 'failed','failure_stage':'none' if passed else (stage if stage!='none' else 'cleanup'),'attempted_suites':attempted,'completed_suites':suites,'failure_code':failure_code if not passed else 'none','host_failure':failure_detail if not passed else {},'observation_failures':observation_failures}
+        if baseline:
+            try:
+                # Check all existing selected files before atomically publishing green.
+                if not first_a.scan(artifacts,needles,cleanup_deadline):raise ValueError('Selected final scan')
+                first_a.write_json(artifacts/'gate.json',gate,needles=needles)
+            except BaseException:
+                passed=False;gate.update(status='failed',failure_stage='artifact_write_or_scan',failure_code='required_gate')
+                try:first_a.write_json(artifacts/'gate.json',gate)
+                except BaseException:pass
+                try:first_a.write_json(artifacts/'first_a.json',first_a.project(None,None,1,None,False))
+                except BaseException:
+                    try:(artifacts/'first_a.json').unlink(missing_ok=True)
+                    except OSError:observation_failures.append('stale_child_removal')
+        else:(artifacts/'gate.json').write_text(json.dumps(gate,indent=2))
     print('Hosted desktop gate '+('passed' if passed else 'failed')+'; stage: '+stage,flush=True)
     return 0 if passed else 1
 
@@ -575,6 +707,7 @@ def main():
     modes=parser.add_mutually_exclusive_group()
     modes.add_argument('--setup-diagnostic',action='store_true',help='host setup only; cannot produce a live gate pass')
     modes.add_argument('--cua-diagnostic',action='store_true',help='full Cua proof only; cannot produce a live gate pass')
+    modes.add_argument('--baseline-first-a',action='store_true',help='protected-earlier-startup FIRST-A capability only')
     parser.add_argument('--bin-dir')
     parser.add_argument('--expected-commit')
     parser.add_argument('--bootstrap-footprint', action='store_true', help='read-only failed first-A guest files; Cua diagnostic only')

@@ -458,7 +458,7 @@ class OwnershipTests(unittest.TestCase):
         self.assertIn('workflow_dispatch:',workflow)
         self.assertNotIn('  push:',workflow)
         self.assertIn('--setup-diagnostic',workflow)
-        setup=workflow.split('  setup:\n')[1].split('  cua:\n')[0]
+        setup=workflow.split('  setup:\n')[1].split('  baseline:\n')[0]
         self.assertNotIn('cargo build',setup)
         ci=(HERE.parents[1]/'.github/workflows/ci.yml').read_text()
         self.assertNotIn('--setup-diagnostic',ci)

@@ -121,20 +121,15 @@ def admit_zip(file):
     file.seek(0)
 
 
-def verify_entry(path, expected_hash):
-    names=entries(path,3)
-    if {p.name for p in names}!={'manifest.json','rdpilot-bridge.exe',ARCHIVE}:raise ValueError('Bundle contents')
-    with open_plain(path/'manifest.json',MAX_MANIFEST_BYTES) as file:
-        data=file.read(MAX_MANIFEST_BYTES+1)
-        if len(data)>MAX_MANIFEST_BYTES:raise BudgetExceeded()
-        manifest=json.loads(data,object_pairs_hook=unique_json)
+def manifest_identity(manifest, expected_hash):
+    """The same closed canonical identity for host and guest manifests."""
     if not isinstance(manifest,dict) or set(manifest)!={'bundle_id','cua_version','archive_name','archive_sha256','bridge_sha256','files'}:
         raise ValueError('Manifest schema')
-    if (manifest['bundle_id']!=path.name or manifest['cua_version']!='0.34.0' or manifest['archive_name']!=ARCHIVE
+    if (manifest['cua_version']!='0.34.0' or manifest['archive_name']!=ARCHIVE
         or manifest['bridge_sha256']!=expected_hash or not HASH.fullmatch(str(manifest['archive_sha256']))):
         raise ValueError('Manifest identity')
     computed_id='cua-driver-rs-v0.34.0-'+hashlib.sha256((expected_hash+manifest['archive_sha256']).encode('ascii')).hexdigest()[:16]
-    if path.name!=computed_id:raise ValueError('Bundle ID')
+    if manifest['bundle_id']!=computed_id:raise ValueError('Bundle ID')
     files=manifest['files']
     if not isinstance(files,dict) or not files or 'cua-driver.exe' not in files:raise ValueError('File table')
     if len(files)>MAX_ENTRIES:raise BudgetExceeded()
@@ -142,6 +137,20 @@ def verify_entry(path, expected_hash):
         or any(not name_valid(key) or key.lower() in ('manifest.json','rdpilot-bridge.exe')
                or not isinstance(value,str) or not HASH.fullmatch(value) for key,value in files.items())):
         raise ValueError('File table names/hashes')
+    return {'bridge_sha256':expected_hash,'archive_sha256':manifest['archive_sha256'],
+            'cua_sha256':files['cua-driver.exe'],'cua_version':'0.34.0','bundle_id':computed_id}
+
+
+def verify_entry(path, expected_hash):
+    names=entries(path,3)
+    if {p.name for p in names}!={'manifest.json','rdpilot-bridge.exe',ARCHIVE}:raise ValueError('Bundle contents')
+    with open_plain(path/'manifest.json',MAX_MANIFEST_BYTES) as file:
+        data=file.read(MAX_MANIFEST_BYTES+1)
+        if len(data)>MAX_MANIFEST_BYTES:raise BudgetExceeded()
+        manifest=json.loads(data,object_pairs_hook=unique_json)
+    identity=manifest_identity(manifest,expected_hash)
+    if manifest['bundle_id']!=path.name:raise ValueError('Manifest identity')
+    files=manifest['files']
     with open_plain(path/'rdpilot-bridge.exe',MAX_BRIDGE_BYTES) as file:
         if digest(file,MAX_BRIDGE_BYTES)[0]!=expected_hash:raise ValueError('Source bridge hash')
     with open_plain(path/ARCHIVE,MAX_ARCHIVE_BYTES) as file:
@@ -166,8 +175,7 @@ def verify_entry(path, expected_hash):
                 observed[item.filename]=hashed
                 lower_names.add(item.filename.lower())
             if observed!=files:raise ValueError('Archive contents differ from manifest')
-    return {'bridge_sha256':expected_hash,'archive_sha256':manifest['archive_sha256'],
-            'cua_sha256':observed['cua-driver.exe'],'cua_version':'0.34.0','bundle_id':computed_id}
+    return identity
 
 
 def observe_cache(cache, expected_hash):

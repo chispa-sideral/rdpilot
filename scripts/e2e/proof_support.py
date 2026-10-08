@@ -10,7 +10,7 @@ import subprocess
 import sys
 
 OPERATIONS = {'harness','relay_start','daemon_start','daemon_start_wait','hosts_file','connect_cli','bridge_ready_assertion','live_checks',
-              'endpoint_cleanup','disconnect_cleanup','daemon_cleanup','relay_cleanup','log_cleanup','summary_write','harness_scan','temporary_cleanup','evidence_scan','summary_read','connect_observation','artifact_write','bootstrap_cleanup'}
+              'endpoint_cleanup','disconnect_cleanup','daemon_cleanup','relay_cleanup','log_cleanup','summary_write','harness_scan','temporary_cleanup','evidence_scan','summary_read','connect_observation','artifact_write','bootstrap_cleanup','first_a_attach'}
 CATEGORIES = {'timeout','file_not_found','access_denied','invalid_json','os_error','proof_assertion','other'}
 
 
@@ -208,11 +208,13 @@ for($i=0;$i -lt 12;$i++) {
 if(!$bridge -or !$cua){throw 'Installed ancestry unavailable'}
 $root=Split-Path $bridge
 $manifest=Get-Content (Join-Path $root 'manifest.json') -Raw | ConvertFrom-Json
+$transferRoot=Join-Path $env:TEMP 'rdpilot-transfer-root'
+New-Item -ItemType Directory -Force -Path $transferRoot | Out-Null
 @{bridge_sha256=(Get-FileHash $bridge).Hash.ToLower();cua_sha256=(Get-FileHash $cua).Hash.ToLower();
  manifest=$manifest;installed_bundle_id=(Split-Path $root -Leaf);
  installed_under_localappdata=$root.StartsWith((Join-Path $env:LOCALAPPDATA 'rdpilot') + '\',[StringComparison]::OrdinalIgnoreCase);
  session_id=[Diagnostics.Process]::GetCurrentProcess().SessionId} |
- ConvertTo-Json -Depth 20 -Compress | Set-Content -Encoding UTF8 (Join-Path (Join-Path $env:TEMP 'rdpilot-transfer-root') NAME)
+ ConvertTo-Json -Depth 20 -Compress | Set-Content -Encoding UTF8 (Join-Path $transferRoot NAME)
 """.replace('NAME', e2e.psquote(name))
     await endpoint.tool('launch_app', e2e.powershell(script))
     local = run.output / name

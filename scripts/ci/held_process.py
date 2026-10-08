@@ -27,13 +27,14 @@ def abort_sync(child, timeout=15):
 
 
 async def abort_async(child, timeout=5):
+    deadline = time.monotonic() + timeout
     failures = []
     try:
         child.kill()
     except BaseException:
         failures.append('kill')
     try:
-        await asyncio.wait_for(child.wait(), timeout)
+        await asyncio.wait_for(child.wait(), max(0,deadline-time.monotonic()))
     except BaseException:
         failures.append('join')
     return tuple(failures)

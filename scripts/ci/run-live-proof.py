@@ -10,6 +10,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import time
 import bootstrap_desktop_observer as desktop
 import held_process
 
@@ -120,7 +121,11 @@ async def execute(args):
     args._primary_failure={}
     args._secondary_failures=[]
     args._failure_stage='harness'
-    filename = 'run-cua-e2e.py' if args.proof == 'cua' else 'run-' + args.proof + '-proof.py'
+    baseline=args.proof=='first_a'
+    if baseline:
+        import first_a
+        if getattr(args,'bootstrap_desktop',False) or getattr(args,'bootstrap_desktop_config',None):raise ValueError('Baseline observers refused')
+    filename = 'run-cua-e2e.py' if args.proof in ('cua','first_a') else 'run-' + args.proof + '-proof.py'
     spec = importlib.util.spec_from_file_location('hosted_live_harness', E2E / filename)
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
@@ -148,7 +153,7 @@ async def execute(args):
     if observed and args.proof != 'cua':
         raise ValueError('Bootstrap observation requires Cua diagnostic')
     config = None
-    run_class = module.Run if args.proof == 'cua' else module.Proof
+    run_class = first_a.run_class(module.Run) if baseline else module.Run if args.proof == 'cua' else module.Proof
     if observed:
         config_path = Path(args.bootstrap_desktop_config)
         if not config_path.resolve().is_relative_to(Path(args.output).resolve().parent):
@@ -180,8 +185,8 @@ async def execute(args):
     code = 0;error_detail={}
     sentinel = None
     try:
-        sentinel = await tracked(sys.executable, '-c', 'import time; time.sleep(3600)') if args.proof != 'cua' else None
-        await asyncio.wait_for(run.execute(), args.timeout)
+        sentinel = await tracked(sys.executable, '-c', 'import time; time.sleep(3600)') if args.proof not in ('cua','first_a') else None
+        await asyncio.wait_for(run.execute(), first_a.WORK_SECONDS+first_a.FINALIZE_SECONDS+5 if baseline else args.timeout)
     except BaseException as error:
         code = 1
         primary=getattr(run,'primary_failure',None)
@@ -195,8 +200,12 @@ async def execute(args):
             else:
                 code = 1
             if sentinel.returncode is None:
-                sentinel.terminate()
-                await asyncio.wait_for(sentinel.wait(), 5)
+                try:
+                    sentinel.terminate()
+                    await asyncio.wait_for(sentinel.wait(), 5)
+                except BaseException as error:
+                    code=1;args._secondary_failures.append(failure_detail(error,'daemon_cleanup'))
+                    if await held_process.abort_async(sentinel,5):args._secondary_failures.append(failure_detail(RuntimeError(),'daemon_cleanup'))
     # Recheck known secret bytes including leases/typed markers. Raw exceptions stay private.
     needles = [str(c['password']).encode() for c in run.credentials.values() if c.get('password')]
     needles += [str(x).encode() for x in getattr(run,'leases',[])]
@@ -207,21 +216,24 @@ async def execute(args):
     secondary=[proof_support.select_failure_detail(x) for x in args._secondary_failures + getattr(run,'cleanup_failures',[])]
     if secondary:code=1
     try:
-        scanned = scan_files(Path(args.output), needles)
+        scanned = first_a.scan(Path(args.output),needles,time.monotonic()+30) if baseline else scan_files(Path(args.output), needles)
         if not scanned:raise RuntimeError('Private evidence scan failed')
     except BaseException as error:
         scanned=False;code=1;secondary.append(failure_detail(error,'evidence_scan'))
-    try:summary = json.loads((Path(args.output)/'summary.json').read_text())
+    try:summary = first_a.read_json(Path(args.output)/'summary.json') if baseline else json.loads((Path(args.output)/'summary.json').read_text())
     except BaseException as error:
         summary=None;code=1;secondary.append(failure_detail(error,'summary_read'))
-    selected = project(args.proof, summary, code if scanned else 1, args.source_bridge_sha256)
-    if selected['status']!='passed':selected['harness_failure']=error_detail
+    selected = first_a.project(summary,run,code,args.source_bridge_sha256,scanned) if baseline else project(args.proof, summary, code if scanned else 1, args.source_bridge_sha256)
+    succeeded=selected['status']==(first_a.PASSED if baseline else 'passed')
+    if not succeeded:selected['harness_failure']=error_detail
     if secondary:selected['secondary_failures']=secondary
     args._secondary_failures=[proof_support.select_failure_detail(x) for x in secondary]
     args._failure_stage='artifact_write'
     artifact = Path(args.artifacts)
     artifact.mkdir(parents=True, exist_ok=True)
-    (artifact / (args.proof + '.json')).write_text(json.dumps(selected, indent=2)+'\n')
+    if baseline:first_a.write_json(artifact/(args.proof+'.json'),selected)
+    else:(artifact / (args.proof + '.json')).write_text(json.dumps(selected, indent=2)+'\n')
+    if baseline and not first_a.scan(artifact,needles,time.monotonic()+10):raise RuntimeError('Selected baseline evidence scan')
     if selected['status'] == 'passed' and scanned:
         import shutil
         for p in Path(args.output).glob('*.png'):
@@ -239,12 +251,15 @@ async def execute(args):
             shutil.copyfile(Path(args.output)/name, artifact/name)
         (artifact/'bootstrap-desktop.json').write_text(json.dumps(diagnostic, indent=2)+'\n')
     args._failure_stage='harness'
-    return 0 if selected['status'] == 'passed' else 1
+    return 0 if succeeded else 1
 
 
 def failed_fallback(args,error):
     import proof_support
-    selected=project(args.proof,None,1,args.source_bridge_sha256)
+    if args.proof=='first_a':
+        import first_a
+        selected=first_a.project(None,None,1,args.source_bridge_sha256,False)
+    else:selected=project(args.proof,None,1,args.source_bridge_sha256)
     primary=getattr(args,'_primary_failure',None)
     stage='artifact_write' if getattr(args,'_failure_stage',None)=='artifact_write' else 'harness'
     selected['harness_failure']=proof_support.select_failure_detail(primary) if primary else failure_detail(error,stage)
@@ -256,7 +271,7 @@ def failed_fallback(args,error):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('proof', choices=CHECKS)
+    parser.add_argument('proof', choices=(*CHECKS,'first_a'))
     for name in ('bin-dir','bundle','output','artifacts','source-bridge-sha256','journal'):
         parser.add_argument('--'+name, required=True)
     parser.add_argument('--credentials-a')
@@ -270,7 +285,10 @@ def main():
     except BaseException as error:
         Path(args.artifacts).mkdir(parents=True,exist_ok=True)
         selected=failed_fallback(args,error)
-        (Path(args.artifacts)/(args.proof+'.json')).write_text(json.dumps(selected))
+        if args.proof=='first_a':
+            import first_a
+            first_a.write_json(Path(args.artifacts)/(args.proof+'.json'),selected)
+        else:(Path(args.artifacts)/(args.proof+'.json')).write_text(json.dumps(selected))
         return 1
 
 

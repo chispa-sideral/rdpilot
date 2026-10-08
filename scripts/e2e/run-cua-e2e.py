@@ -160,12 +160,13 @@ class Mcp:
         generation = uuid.uuid4().hex[:8]
         self.log = open(self.run.output / f"mcp-{self.target}-{generation}.jsonl", "w")
         stderr = open(self.run.output / f"mcp-{self.target}-{generation}.stderr", "w")
-        self.proc = await asyncio.create_subprocess_exec(
-            str(self.run.bin / "rdpilot-mcp"), "--session", self.target,
-            env=self.run.env, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
-            stderr=stderr, limit=LIMIT + 1024,
-        )
-        stderr.close()
+        try:
+            self.proc = await asyncio.create_subprocess_exec(
+                str(self.run.bin / "rdpilot-mcp"), "--session", self.target,
+                env=self.run.env, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+                stderr=stderr, limit=LIMIT + 1024,
+            )
+        finally:stderr.close()
         result = await self.request("initialize", {
             "protocolVersion": "2024-11-05", "capabilities": {},
             "clientInfo": {"name": "rdpilot-live-proof", "version": "1"},
@@ -221,15 +222,26 @@ class Mcp:
         require(self.proc.returncode != 0, "failed attachment exited as success")
 
     async def stop(self):
-        if self.proc and self.proc.returncode is None:
-            self.proc.stdin.close()
-            try:
-                await asyncio.wait_for(self.proc.wait(), 8)
-            except asyncio.TimeoutError:
-                self.proc.kill()
-                await self.proc.wait()
-        if self.log:
-            self.log.close()
+        try:
+            if self.proc and self.proc.returncode is None:
+                self.proc.stdin.close()
+                def stop_bound(maximum):
+                    return max(0,min(maximum,self.run.cleanup_deadline-time.monotonic())) if hasattr(self.run,'cleanup_budget') else maximum
+                try:
+                    await asyncio.wait_for(self.proc.wait(), stop_bound(8))
+                except BaseException as primary:
+                    failed=False
+                    try:self.proc.kill()
+                    except BaseException as error:
+                        failed=True
+                        self.run.cleanup_failures.append(proof_support.failure_detail(error,'endpoint_cleanup'))
+                    try:await asyncio.wait_for(self.proc.wait(), stop_bound(5))
+                    except BaseException as error:
+                        failed=True
+                        self.run.cleanup_failures.append(proof_support.failure_detail(error,'endpoint_cleanup'))
+                    if failed or not isinstance(primary,TimeoutError):raise
+        finally:
+            if self.log:self.log.close()
 
 
 class Run:
@@ -307,8 +319,11 @@ class Run:
         try:
             out, err = await asyncio.wait_for(proc.communicate(), timeout)
         except BaseException:
-            proc.kill()
-            await proc.wait()
+            try:proc.kill()
+            except BaseException as error:self.cleanup_failures.append(proof_support.failure_detail(error,'disconnect_cleanup'))
+            stop_bound=max(0,min(5,self.cleanup_deadline-time.monotonic())) if hasattr(self,'cleanup_budget') and hasattr(self,'cleanup_deadline') else 5
+            try:await asyncio.wait_for(proc.wait(),stop_bound)
+            except BaseException as error:self.cleanup_failures.append(proof_support.failure_detail(error,'disconnect_cleanup'))
             raise
         if proc.returncode and not allow_failure:
             self.failed_cli_exit = proc.returncode
@@ -349,6 +364,7 @@ class Run:
         require(result.get("bridge_live"), "Connect did not report live bridge")
         self.check(f"{target}.rdp_bundle_ready")
         self.operation = 'live_checks'
+        return result
 
     async def attach(self, target):
         endpoint = Mcp(self, target)
@@ -603,9 +619,9 @@ $text=& $exe 'runtime::windows_tests::job_closes_root_and_descendant_created_aft
 
     async def start_daemon(self, daemon_log):
         self.operation = 'daemon_start'
-        self.daemon = await asyncio.create_subprocess_exec(str(self.bin / "rdpilot-daemon"), env=self.env, stdout=daemon_log, stderr=daemon_log)
+        self.daemon = await asyncio.create_subprocess_exec(str(self.bin / getattr(self,'daemon_executable','rdpilot-daemon')), env=self.env, stdout=daemon_log, stderr=daemon_log)
         self.operation = 'daemon_start_wait'
-        await asyncio.sleep(0.3)
+        await asyncio.sleep(getattr(self,'daemon_start_wait',0.3))
 
     async def proof_body(self):
         for target in ("a", "b"):
@@ -623,15 +639,21 @@ $text=& $exe 'runtime::windows_tests::job_closes_root_and_descendant_created_aft
         else:
             self.summary["unverified"].append("Fault injection explicitly skipped")
 
+    def scan_evidence(self,needles):
+        return not any(needle in path.read_bytes() for path in self.output.rglob("*") if path.is_file() for needle in needles)
+
     async def execute(self):
         daemon_log = open(self.output / "daemon.log", "w")
         try:
-            self.operation = 'relay_start'
-            for target, credentials in self.credentials.items():
-                relay = Relay(credentials)
-                self.relays[target] = (relay, await relay.start())
-            await self.start_daemon(daemon_log)
-            await self.proof_body()
+            async def work():
+                self.operation = 'relay_start'
+                for target, credentials in self.credentials.items():
+                    relay = Relay(credentials)
+                    self.relays[target] = (relay, await relay.start())
+                await self.start_daemon(daemon_log)
+                await self.proof_body()
+            if hasattr(self,'work_budget'):await asyncio.wait_for(work(),self.work_budget)
+            else:await work()
             self.summary["status"] = "passed"
         except BaseException as error:
             self.failure_operation = self.operation
@@ -641,11 +663,17 @@ $text=& $exe 'runtime::windows_tests::job_closes_root_and_descendant_created_aft
             self.summary["failure"] = self.clean(f"{type(error).__name__}: {error}")
             raise
         finally:
+            self.cleanup_deadline=time.monotonic()+getattr(self,'cleanup_budget',float('inf'))
             async def cleanup(stage, action):
-                try:await action()
+                try:
+                    if hasattr(self,'cleanup_budget'):
+                        await asyncio.wait_for(action(),max(0.001,self.cleanup_deadline-time.monotonic()))
+                    else:await action()
                 except BaseException as error:self.cleanup_failures.append(proof_support.failure_detail(error,stage))
             def cleanup_sync(stage, action):
-                try:action()
+                try:
+                    action()
+                    if time.monotonic()>self.cleanup_deadline:raise TimeoutError('Harness cleanup budget')
                 except BaseException as error:self.cleanup_failures.append(proof_support.failure_detail(error,stage))
             for endpoint in self.endpoints.values():
                 await cleanup('endpoint_cleanup',endpoint.stop)
@@ -665,7 +693,7 @@ $text=& $exe 'runtime::windows_tests::job_closes_root_and_descendant_created_aft
             cleanup_sync('summary_write',self.save)
             def scan():
                 needles = [str(c["password"]).encode() for c in self.credentials.values() if c.get("password")]
-                require(not any(needle in path.read_bytes() for path in self.output.rglob("*") if path.is_file() for needle in needles), "Credential in evidence")
+                require(self.scan_evidence(needles), "Credential in evidence")
                 self.check("evidence_contains_no_credentials")
             cleanup_sync('harness_scan',scan)
             cleanup_sync('temporary_cleanup',lambda:shutil.rmtree(self.temp))
