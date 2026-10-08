@@ -3,6 +3,7 @@ import hashlib
 import importlib.util
 import json
 from pathlib import Path
+import re
 import subprocess
 import tempfile
 import unittest
@@ -24,6 +25,8 @@ REAL_RUN = subprocess.run
 class GitHub:
     def __init__(self, draft=None):
         self.release = None if draft is None else {"tag_name": "v0.2.0", "draft": draft, "id": 1}
+        # Releases with other tags, listed before this one.
+        self.others = []
         self.assets = {}
         self.history = []
         self.reads = 0
@@ -48,10 +51,14 @@ class GitHub:
                 return subprocess.CompletedProcess(argv, 0, "HTTP/2.0 200 OK\n\ninvalid JSON", "")
             if isinstance(self.lookup, int):
                 return subprocess.CompletedProcess(argv, 1, f"HTTP/2.0 {self.lookup} Error\n\n{{}}", "")
-            code = 404 if self.release is None else 200
-            body = {} if self.release is None else self.release
-            return subprocess.CompletedProcess(argv, 1 if code == 404 else 0,
-                                               f"HTTP/2.0 {code} Response\r\nContent-Type: application/json\r\n\r\n"
+            # Drafts appear only in the listing, never on the by-tag endpoint.
+            page = re.fullmatch(r"repos/example/rdpilot/releases\?per_page=100&page=(\d+)", argv[-1])
+            if page is None:
+                raise AssertionError(f"Unexpected GitHub API endpoint: {argv[-1]}")
+            listing = self.others + ([] if self.release is None else [self.release])
+            start = (int(page.group(1)) - 1) * 100
+            body = {} if self.lookup == "object" else listing[start:start + 100]
+            return subprocess.CompletedProcess(argv, 0, "HTTP/2.0 200 Response\r\nContent-Type: application/json\r\n\r\n"
                                                + json.dumps(body), "")
         operation = argv[2]
         if operation == "create":
@@ -184,7 +191,7 @@ class PublisherTests(unittest.TestCase):
                     self.assertEqual(gh.mutations(), allowed)
 
     def test_lookup_errors_and_invalid_state_fail_closed(self):
-        for error in (401, 403, 500, "transport", "malformed"):
+        for error in (401, 403, 404, 500, "transport", "malformed", "object"):
             with self.subTest(error=error):
                 gh = GitHub(True)
                 gh.lookup = error
@@ -193,10 +200,29 @@ class PublisherTests(unittest.TestCase):
                 self.assertEqual(gh.mutations(), [])
         for state in ({"tag_name": "v0.2.0", "draft": "true", "id": 1},
                       {"tag_name": "v0.2.0", "draft": True, "id": True},
-                      {"tag_name": "v0.3.0", "draft": True, "id": 1}, []):
+                      {"tag_name": "v0.2.0", "draft": True, "id": 0},
+                      {"tag_name": None, "draft": True, "id": 1}, []):
             with self.subTest(state=state):
                 gh = GitHub(True)
                 gh.release = state
+                with self.assertRaises(publisher.PublishError):
+                    self.run_publisher(gh)
+                self.assertEqual(gh.mutations(), [])
+
+    def test_draft_on_a_later_page_is_resumed(self):
+        gh = GitHub(True)
+        gh.others = [{"tag_name": f"v0.1.{n}", "draft": False, "id": 100 + n} for n in range(100)]
+        self.run_publisher(gh)
+        self.assertIn("repos/example/rdpilot/releases?per_page=100&page=2", [argv[-1] for argv in gh.history])
+        self.assertEqual(gh.mutations(), ["upload", "upload", "edit"])
+
+    def test_duplicate_tag_or_unbounded_listing_refuses(self):
+        duplicate = [{"tag_name": "v0.2.0", "draft": True, "id": 2}]
+        unbounded = [{"tag_name": f"v0.1.{n}", "draft": False, "id": 100 + n} for n in range(1000)]
+        for others in (duplicate, unbounded):
+            with self.subTest(releases=len(others)):
+                gh = GitHub(True)
+                gh.others = others
                 with self.assertRaises(publisher.PublishError):
                     self.run_publisher(gh)
                 self.assertEqual(gh.mutations(), [])

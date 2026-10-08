@@ -101,13 +101,17 @@ class EvidenceTests(unittest.TestCase):
                     self.assertNotIn(secret, artifact + console)
                     self.assertNotIn("tool_result", artifact)
 
-    def test_success_requires_fake_pass_and_successful_scan(self):
+    def test_success_requires_fake_pass_and_every_check(self):
         for proof in offline.CHECKS:
             raw = {"mode": "fake", "status": "passed",
-                   "checks": [{"check": offline.CHECKS[proof][-1], "passed": True}]}
+                   "checks": [{"check": name, "passed": True} for name in offline.CHECKS[proof]]}
             code, artifact, _ = self.exercise(proof, raw, 0)
             self.assertEqual(code, 0)
             self.assertEqual(json.loads(artifact)["status"], "passed")
+            scan_only = {**raw, "checks": [{"check": offline.CHECKS[proof][-1], "passed": True}]}
+            code, artifact, _ = self.exercise(proof, scan_only, 0)
+            self.assertNotEqual(code, 0)
+            self.assertEqual(json.loads(artifact)["status"], "failed")
             code, artifact, _ = self.exercise(proof, {**raw, "mode": "live"}, 0)
             self.assertNotEqual(code, 0)
             self.assertEqual(json.loads(artifact)["mode"], "fake")

@@ -48,6 +48,7 @@ fails if the typed text reaches any evidence file.
 import argparse
 import asyncio
 import base64
+import ctypes
 import http.client
 import importlib.util
 import json
@@ -55,11 +56,14 @@ import os
 from pathlib import Path
 import shutil
 import signal
+import subprocess
+import sys
 import tempfile
 import time
 import uuid
 
 HERE = Path(__file__).resolve().parent
+DAEMON = "rdpilot-daemon.exe" if os.name == "nt" else "rdpilot-daemon"
 TARGETS = ("a", "b")
 # Fake mode views the page's maximum of four sessions at once; "e" is the
 # server-ended session, connected later into a freed panel.
@@ -125,6 +129,17 @@ CANVAS_JS = """
 """
 
 
+# Windows has no SIGINT for another process: this helper joins the viewer's
+# console, ignores Ctrl-C itself and sends Ctrl-C to that console.
+CTRL_C_HELPER = """
+import ctypes, sys
+kernel32 = ctypes.windll.kernel32
+if not (kernel32.AttachConsole(int(sys.argv[1])) and kernel32.SetConsoleCtrlHandler(None, True)):
+    sys.exit(1)
+sys.exit(0 if kernel32.GenerateConsoleCtrlEvent(0, 0) else 1)
+"""
+
+
 class ProofError(Exception):
     pass
 
@@ -140,6 +155,15 @@ def load_cua_e2e():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def view_process_options():
+    """On Windows `rdpilot view` gets its own console for stop_viewer's Ctrl-C,
+    and must not inherit an ignored Ctrl-C from this process."""
+    if os.name != "nt":
+        return {}
+    ctypes.windll.kernel32.SetConsoleCtrlHandler(None, False)
+    return {"creationflags": subprocess.CREATE_NEW_CONSOLE}
 
 
 def credentials_from_env(target):
@@ -321,8 +345,9 @@ class Proof:
             return '"' + str(value).replace("\\", "\\\\").replace('"', '\\"') + '"'
         lines = []
         for target, entry in entries.items():
+            command = self.e2e.password_command(target) if self.e2e else "printenv E2E_PASSWORD_" + target.upper()
             lines += [f"Host {target}", f"  HostName {quote(entry['host'])}", f"  User {quote(entry['username'])}",
-                      f"  PasswordCommand {quote('printenv E2E_PASSWORD_' + target.upper())}"]
+                      f"  PasswordCommand {quote(command)}"]
             if entry.get("port"):
                 lines.append(f"  Port {entry['port']}")
             if entry.get("domain"):
@@ -378,7 +403,8 @@ class Proof:
             args += ["--bind", self.args.bind]
         stderr = open(self.output / "view.stderr", "w")
         self.viewer = await asyncio.create_subprocess_exec(str(self.bin / "rdpilot"), *args, env=self.env,
-                                                           stdout=asyncio.subprocess.PIPE, stderr=stderr)
+                                                           stdout=asyncio.subprocess.PIPE, stderr=stderr,
+                                                           **view_process_options())
         stderr.close()
         text = ""
         deadline = time.monotonic() + 15
@@ -411,7 +437,12 @@ class Proof:
 
     async def stop_viewer(self):
         require(self.viewer.returncode is None, "viewer still running before Ctrl-C")
-        self.viewer.send_signal(signal.SIGINT)
+        if os.name == "nt":
+            helper = await asyncio.create_subprocess_exec(sys.executable, "-c", CTRL_C_HELPER, str(self.viewer.pid),
+                                                          creationflags=subprocess.DETACHED_PROCESS)
+            require(await asyncio.wait_for(helper.wait(), 10) == 0, "Ctrl-C not delivered to rdpilot view")
+        else:
+            self.viewer.send_signal(signal.SIGINT)
         code = await asyncio.wait_for(self.viewer.wait(), 10)
         require(code == 0, f"rdpilot view exit code {code}")
         # The daemon closes the listeners shortly after `rdpilot view` exits.
@@ -975,9 +1006,9 @@ $f.Controls.Add($t);[Windows.Forms.Application]::Run($f)
                 for target in TARGETS:
                     relay = self.e2e.Relay(self.credentials[target])
                     self.relays[target] = (relay, await relay.start())
-            self.daemon = await asyncio.create_subprocess_exec(str(self.bin / "rdpilot-daemon"), env=self.env,
+            self.daemon = await asyncio.create_subprocess_exec(str(self.bin / DAEMON), env=self.env,
                                                                stdout=daemon_log, stderr=daemon_log)
-            await asyncio.sleep(0.3)
+            await asyncio.sleep(1)
             for target in self.targets:
                 await self.connect(target)
             await self.start_viewer()
