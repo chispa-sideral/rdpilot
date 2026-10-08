@@ -95,7 +95,10 @@ class EarlyHarnessFailureTests(unittest.IsolatedAsyncioTestCase):
                 self.returncode=0
             def kill(self):self.returncode=1
         async def spawn(*argv,**kwargs):
-            if len(argv)>1 and argv[1]=='connect':(private/'raw/protected.png').write_bytes(b'private-lease-token')
+            if len(argv)>1 and argv[1]=='connect':
+                hosts=Path(argv[argv.index('-F')+1]).read_text()
+                self.assertEqual(hosts.count('  CuaVersion "cua-driver-rs-v0.34.0"\n'),2)
+                (private/'raw/protected.png').write_bytes(b'private-lease-token')
             return Child(None if Path(argv[0]).name=='rdpilot-daemon' else (7 if argv[1]=='connect' else 0))
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory);private=root/'private';private.mkdir()
@@ -126,6 +129,28 @@ class EarlyHarnessFailureTests(unittest.IsolatedAsyncioTestCase):
             if secondary:
                 self.assertTrue(selected['secondary_failures'])
             if secondary!='summary':self.assertIn('private-lease-token',(private/'raw/summary.json').read_text())
+
+
+class PinnedCuaConfigurationTests(unittest.TestCase):
+    def test_actual_hosts_writers_use_release_tag_and_keep_semantic_version(self):
+        sys.path.insert(0,str(live.E2E))
+        for proof,filename,constructor in (
+            ('cua','run-cua-e2e.py','Run'),
+            ('viewer','run-viewer-proof.py','Proof'),
+            ('takeover','run-takeover-proof.py','Proof'),
+        ):
+            with self.subTest(proof=proof),tempfile.TemporaryDirectory() as directory:
+                spec=importlib.util.spec_from_file_location('pin_'+proof,live.E2E/filename)
+                module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+                writer=object.__new__(getattr(module,constructor))
+                writer.temp=Path(directory)
+                writer.args=argparse.Namespace(cua_version='0.34.0')
+                hosts=writer.hosts_file({'a':{'host':'127.0.0.1','username':'standard'}}).read_text()
+                self.assertIn('  CuaVersion "cua-driver-rs-v0.34.0"\n',hosts)
+                self.assertNotIn('  CuaVersion "0.34.0"',hosts)
+                self.assertEqual(writer.args.cua_version,'0.34.0')
+                writer.args.cua_version=None
+                self.assertNotIn('CuaVersion',writer.hosts_file({'a':{'host':'127.0.0.1','username':'standard'}}).read_text())
 
 
 class OrchestrationModeTests(unittest.TestCase):

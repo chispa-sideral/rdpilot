@@ -122,6 +122,9 @@ The Python harnesses remain usable against supplied remote Windows credentials;
 they provision nothing. Their existing documented environment variables and
 credential-file interfaces are unchanged. To require source delivery, add
 `--bundle <bridge-directory> --source-bridge-sha256 <sha256> --cua-version 0.34.0`.
+The proof harnesses write that semantic version as the explicit
+`CuaVersion cua-driver-rs-v0.34.0` release tag in their hosts files, while the
+guest manifest and provenance checks must still report version `0.34.0`.
 For loopback viewer/takeover use `--bind loopback --allow-no-tailnet`.
 
 Coverage exclusions are explicit: tailnet/cross-machine access, UAC/secure

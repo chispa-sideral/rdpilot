@@ -260,7 +260,7 @@ class Run:
             lines += [f"Host {target}", f"  HostName {quote(entry['host'])}", f"  User {quote(entry['username'])}",
                       f"  PasswordCommand {quote(proof_support.password_command(target))}"]
             if getattr(self.args, "cua_version", None):
-                lines.append(f"  CuaVersion {quote(self.args.cua_version)}")
+                lines.append(f"  CuaVersion {quote('cua-driver-rs-v' + self.args.cua_version)}")
             if entry.get("port"):
                 lines.append(f"  Port {entry['port']}")
             if entry.get("domain"):

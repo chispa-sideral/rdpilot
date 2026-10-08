@@ -444,6 +444,54 @@ async fn auto_download_off_uses_only_the_cache() {
 }
 
 #[tokio::test]
+async fn pinned_version_requires_release_tag_and_preserves_manifest_version() {
+    let version = "0.34.0";
+    let tag = cua_tag(version);
+    let world = World::new(&[]).await;
+    let local = tempfile::tempdir().unwrap();
+    let bridge = b"MZ source bridge";
+    std::fs::write(local.path().join("rdpilot-bridge.exe"), bridge).unwrap();
+    let acquirer = world.acquirer();
+    let error = acquirer
+        .prepare(&request(version, true), Some(local.path()))
+        .await
+        .unwrap_err();
+    assert_eq!(error.component, Component::CuaDriver);
+    assert!(matches!(error.cause, Cause::NoMatchingRelease(_)));
+    assert!(
+        world.stub.hits().is_empty(),
+        "bare version fails before HTTP"
+    );
+
+    let asset = cua_asset(version);
+    let archive = cua_zip(version);
+    let expected = sha(&archive);
+    let prefix = format!("/trycua/cua/releases/download/{tag}");
+    world.stub.set(
+        &format!("{prefix}/checksums.txt"),
+        200,
+        format!("{expected}  {asset}\n"),
+    );
+    world.stub.set(&format!("{prefix}/{asset}"), 200, archive);
+    let bundle = acquirer
+        .prepare(&request(&tag, true), Some(local.path()))
+        .await
+        .unwrap();
+    let installed = manifest(&bundle);
+    assert_eq!(installed.cua_version, version);
+    assert_eq!(installed.archive_sha256, expected);
+    assert_eq!(installed.bridge_sha256, sha(bridge));
+    assert_eq!(
+        world.stub.hits(),
+        vec![
+            format!("{prefix}/checksums.txt"),
+            format!("{prefix}/{asset}")
+        ],
+        "explicit pin does not resolve latest or download a release bridge"
+    );
+}
+
+#[tokio::test]
 async fn development_build_prefers_the_bundle_path_bridge_and_still_downloads_cua() {
     // No release v5.0.0 exists: this daemon is a development build.
     let world = World::new(&["4.0.0"]).await;
