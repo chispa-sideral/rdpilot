@@ -291,7 +291,6 @@ async fn autostart_daemon_survives_teardown_of_the_callers_process_group() {
         .arg("launcher_helper")
         .arg("--nocapture")
         .env(ROLE_ENV, ROLE)
-        .env("RDPILOT_AUTOSTART_RUNTIME", &runtime)
         .env("RDPILOT_AUTOSTART_SOCKET", &socket)
         .env("RDPILOT_AUTOSTART_READY", &ready)
         .env("RDPILOT_AUTOSTART_SHIM", &shim)
@@ -404,9 +403,8 @@ async fn autostart_daemon_survives_teardown_of_the_callers_process_group() {
         .expect("signal owned group before reaping its launcher");
     eprintln!("launcher group teardown completed: {launcher_status}");
 
-    let daemon_exited_after_group_teardown =
-        wait_pidfd(daemon.pidfd.as_raw_fd(), Duration::from_millis(500));
-    let daemon_alive_after_group_teardown = !daemon_exited_after_group_teardown;
+    let daemon_alive_after_group_teardown =
+        !wait_pidfd(daemon.pidfd.as_raw_fd(), Duration::from_millis(500));
     let after = post_teardown_requests(&socket, &session).await;
     let daemon_alive_after_operations = !wait_pidfd(daemon.pidfd.as_raw_fd(), Duration::ZERO);
     eprintln!(
