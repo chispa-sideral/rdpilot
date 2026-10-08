@@ -311,21 +311,48 @@ class ProcessHttpTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.observer.manifest['frames'])
 
     async def test_pending_wts_child_and_lifetime_timer_join_before_any_attach(self):
-        await self.ready()
         pending = asyncio.Event()
+        probes = 0
         async def slow(*argv, **kwargs):
+            nonlocal probes
             if argv[0] == 'powershell.exe':
+                probes += 1
+                if post_frame and probes == 1:
+                    return await self.spawn(*argv, **kwargs)
                 proc = await self.raw_spawn(sys.executable, '-c', 'import time; time.sleep(3600)', **kwargs)
                 self.created.append(proc)
                 self.identities[proc.pid] = {'pid': proc.pid, 'created': '1', 'image': sys.executable}
                 pending.set(); return proc
             return await self.spawn(*argv, **kwargs)
-        self.observer.raw_spawn = slow
-        self.observer.task = asyncio.create_task(self.observer.capture())
-        await pending.wait()
-        self.assertTrue(await self.observer.stop())
-        self.assertTrue(self.observer.task.done()); self.assertFalse(self.observer.manifest['frames'])
-        self.assertTrue(all(p.returncode is not None for p in self.created))
+        for close_epoch in (False, True):
+            for post_frame in (False, True):
+                with self.subTest(close_epoch=close_epoch, post_frame=post_frame):
+                    fresh_temp = self.root/f'pending-{close_epoch}-{post_frame}'; fresh_temp.mkdir(); self.run.temp = fresh_temp
+                    obj = desktop.Observer(self.run, self.config, self.spawn, lambda pid: self.identities[pid], lambda record: None, proof_support)
+                    await obj.start_viewer(); await obj.capture()
+                    self.assertEqual(len(obj.manifest['frames']), 1)
+                    prior = copy.deepcopy(obj.manifest['frames'])
+                    pending.clear(); probes = 0; obj.raw_spawn = slow
+                    obj.task = asyncio.create_task(obj.capture())
+                    await pending.wait()
+                    if close_epoch:
+                        obj.close_epoch()
+                    else:
+                        obj.task.cancel()
+                        with self.assertRaises(asyncio.CancelledError):await obj.task
+                    self.assertTrue(await obj.stop())
+                    self.assertTrue(obj.task.done())
+                    self.assertTrue(all(p.returncode is not None for p in self.created))
+                    self.assertEqual(obj.invalidated, not close_epoch)
+                    self.assertEqual('binding_unavailable' in obj.manifest['events'], not close_epoch)
+                    self.assertNotIn('binding_changed', obj.manifest['events'])
+                    self.assertEqual(obj.manifest['frames'], prior if close_epoch else [])
+                    expected = ['bootstrap-a-01.png'] if close_epoch else []
+                    projected = desktop.safe_manifest(self.output, obj.manifest, self.source)
+                    self.assertEqual(desktop.selected_files(self.output, projected, self.source), expected)
+                    (self.output/'bootstrap-desktop.json').write_text(json.dumps(projected))
+                    self.assertEqual(desktop.retain_failed_images(self.output, self.source, True), expected)
+                    self.assertEqual(sorted(p.name for p in self.output.glob('*.png')), expected)
         # Expiry uses the same joined stop even if the CLI has not returned.
         timer_temp = self.root/'timer-temp'; timer_temp.mkdir(); self.run.temp = timer_temp
         obj = desktop.Observer(self.run, self.config, self.spawn, lambda pid: self.identities[pid], lambda record: None, proof_support)

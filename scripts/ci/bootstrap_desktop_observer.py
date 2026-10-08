@@ -279,7 +279,15 @@ class Observer:
                 base64.b64encode(self.config['wts_script'].encode('utf-16le')).decode(), env=env,
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL, **self.no_window)
             raw = json.loads((await self.child_output(proc)).decode('utf-8-sig'), object_pairs_hook=files.unique_json)
-        except (Exception, asyncio.CancelledError):
+        except asyncio.CancelledError:
+            # Normal outcome shutdown closes the epoch before cancelling a
+            # probe; that cancels new work, not previously admitted evidence.
+            if self.open:
+                self.event('binding_unavailable')
+                if self.session_id is not None:
+                    self.invalidate()
+            raise
+        except Exception:
             self.event('binding_unavailable')
             if self.session_id is not None:
                 self.invalidate()
