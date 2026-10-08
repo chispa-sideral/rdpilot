@@ -302,14 +302,23 @@ def private_environment(private):
     return {**os.environ,**{key:str(Path(private).resolve()) for key in ('TMPDIR','TEMP','TMP')}}
 
 
-def initialize(output):
+def mode_for(args):
+    setup=getattr(args,'setup_diagnostic',False);cua=getattr(args,'cua_diagnostic',False)
+    if setup and cua:raise ValueError('Diagnostic modes are mutually exclusive')
+    return 'setup_diagnostic' if setup else 'cua_diagnostic' if cua else 'live'
+
+
+def initialize(output,mode='live'):
+    if mode not in ('live','setup_diagnostic','cua_diagnostic'):raise ValueError('Unknown mode')
     output=Path(output)
     output.mkdir(parents=True,exist_ok=False)
     artifacts=output/'artifacts';artifacts.mkdir()
-    (artifacts/'gate.json').write_text(json.dumps({'status':'failed','failure_stage':'build_or_dependencies'}))
+    (artifacts/'gate.json').write_text(json.dumps({'mode':mode,'status':'failed','failure_stage':'build_or_dependencies'}))
 
 
 def run(args):
+    mode=mode_for(args)
+    expected=['host_setup'] if mode=='setup_diagnostic' else ['cua'] if mode=='cua_diagnostic' else list(live.CHECKS)
     output=Path(args.output).resolve();artifacts=output/'artifacts';private=output/'private'
     if not artifacts.is_dir() or private.exists():
         raise RuntimeError('Initialize new gate output first')
@@ -325,7 +334,7 @@ def run(args):
         tree=subprocess.check_output(['git','rev-parse','HEAD^{tree}'],text=True).strip()
         if commit!=args.expected_commit or not all(len(x)==40 and all(c in '0123456789abcdef' for c in x) for x in (commit,tree)):
             raise RuntimeError('Source identity mismatch')
-        diagnostic=getattr(args,'setup_diagnostic',False)
+        diagnostic=mode=='setup_diagnostic'
         bin_dir=Path(args.bin_dir or '.').resolve()
         hashes={} if diagnostic else {name:hashlib.sha256((bin_dir/(name+'.exe')).read_bytes()).hexdigest() for name in ('rdpilot','rdpilot-daemon','rdpilot-mcp','rdpilot-bridge')}
         environment={k:snapshot[k] for k in ('os','image_os','image_version')}
@@ -347,7 +356,7 @@ def run(args):
         if not diagnostic:shutil.copyfile(bin_dir/'rdpilot-bridge.exe',bundle/'rdpilot-bridge.exe')
         stage='setup';setup_attempted=True;powershell(SETUP,{'rule':rule})
         deadline=time.monotonic()+45*60
-        for proof in (('cua',) if diagnostic else live.CHECKS):
+        for proof in (('cua',) if diagnostic else expected):
             stage=proof+'_create_user';users=[];journal=private/(proof+'-processes.json');credentials={}
             for label in (('a',) if proof=='takeover' else ('a','b')):
                 name='rdp'+secrets.token_hex(7)
@@ -446,13 +455,13 @@ if($s.State -ne $v.state -or $s.StartMode -ne $v.start_mode){throw 'Service rest
         except OSError:removed=False
         results['private_removed']=removed
         clean=removed and all(all(c.values()) for c in results.values() if isinstance(c,dict))
-        passed=passed and clean and suites==(['host_setup'] if getattr(args,'setup_diagnostic',False) else list(live.CHECKS))
+        passed=passed and clean and suites==expected
         if not passed:
             for screenshot in artifacts.glob('*.png'):
                 screenshot.unlink()
         (artifacts/'account-roles.json').write_text(json.dumps({'roles':roles,'memberships':memberships,'creation_observations':creation_observations},indent=2))
         (artifacts/'cleanup.json').write_text(json.dumps(results,indent=2))
-        (artifacts/'gate.json').write_text(json.dumps({'mode':'setup_diagnostic' if getattr(args,'setup_diagnostic',False) else 'live', 'status':('setup_passed' if getattr(args,'setup_diagnostic',False) else 'passed') if passed else 'failed','failure_stage':'none' if passed else (stage if stage!='none' else 'cleanup'),'attempted_suites':attempted,'completed_suites':suites,'failure_code':failure_code if not passed else 'none','host_failure':failure_detail if not passed else {}},indent=2))
+        (artifacts/'gate.json').write_text(json.dumps({'mode':mode, 'status':{'live':'passed','setup_diagnostic':'setup_passed','cua_diagnostic':'cua_diagnostic_passed'}[mode] if passed else 'failed','failure_stage':'none' if passed else (stage if stage!='none' else 'cleanup'),'attempted_suites':attempted,'completed_suites':suites,'failure_code':failure_code if not passed else 'none','host_failure':failure_detail if not passed else {}},indent=2))
     print('Hosted desktop gate '+('passed' if passed else 'failed')+'; stage: '+stage,flush=True)
     return 0 if passed else 1
 
@@ -461,12 +470,14 @@ def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output',required=True)
     parser.add_argument('--initialize',action='store_true')
-    parser.add_argument('--setup-diagnostic',action='store_true',help='host setup only; cannot produce a live gate pass')
+    modes=parser.add_mutually_exclusive_group()
+    modes.add_argument('--setup-diagnostic',action='store_true',help='host setup only; cannot produce a live gate pass')
+    modes.add_argument('--cua-diagnostic',action='store_true',help='full Cua proof only; cannot produce a live gate pass')
     parser.add_argument('--bin-dir')
     parser.add_argument('--expected-commit')
     args=parser.parse_args()
     if args.initialize:
-        initialize(args.output);return 0
+        initialize(args.output,mode_for(args));return 0
     try:return run(args)
     except BaseException:
         print('Hosted desktop gate failed before setup; safe build-stage artifact retained.')

@@ -8,6 +8,33 @@ import signal
 import subprocess
 import sys
 
+OPERATIONS = {'harness','relay_start','daemon_start','daemon_start_wait','hosts_file','connect_cli','bridge_ready_assertion','live_checks',
+              'endpoint_cleanup','disconnect_cleanup','daemon_cleanup','relay_cleanup','log_cleanup','summary_write','harness_scan','temporary_cleanup','evidence_scan','summary_read'}
+CATEGORIES = {'timeout','file_not_found','access_denied','invalid_json','os_error','proof_assertion','other'}
+
+
+def failure_detail(error, operation=None, cli_exit=None):
+    """Freeze only closed fields; exception messages and payloads stay private."""
+    if isinstance(error, TimeoutError):category='timeout'
+    elif isinstance(error, FileNotFoundError):category='file_not_found'
+    elif isinstance(error, PermissionError):category='access_denied'
+    elif isinstance(error, json.JSONDecodeError):category='invalid_json'
+    elif isinstance(error, OSError):category='os_error'
+    elif type(error).__name__=='ProofError':category='proof_assertion'
+    else:category='other'
+    detail={'operation':operation if isinstance(operation,str) and operation in OPERATIONS else 'harness','exception_category':category}
+    if type(cli_exit) is int and -(2**31)<=cli_exit<2**32:detail['cli_exit_code']=cli_exit
+    return detail
+
+
+def select_failure_detail(raw):
+    raw=raw if isinstance(raw,dict) else {}
+    result={'operation':raw.get('operation') if isinstance(raw.get('operation'),str) and raw['operation'] in OPERATIONS else 'harness',
+            'exception_category':raw.get('exception_category') if isinstance(raw.get('exception_category'),str) and raw['exception_category'] in CATEGORIES else 'other'}
+    value=raw.get('cli_exit_code')
+    if type(value) is int and -(2**31)<=value<2**32:result['cli_exit_code']=value
+    return result
+
 
 def password_command(target):
     name = 'E2E_PASSWORD_' + target.upper()

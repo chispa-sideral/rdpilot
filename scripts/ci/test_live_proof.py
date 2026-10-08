@@ -2,6 +2,9 @@
 import importlib.util
 import argparse
 import asyncio
+import hashlib
+import contextlib
+import io
 import json
 import os
 from pathlib import Path
@@ -75,14 +78,24 @@ class ProjectionTests(unittest.TestCase):
 
 
 class EarlyHarnessFailureTests(unittest.IsolatedAsyncioTestCase):
-    async def test_actual_cua_cli_failure_projects_operation_without_private_text(self):
+    async def test_primary_failure_survives_cleanup_scan_and_missing_summary(self):
+        for secondary in (None,'cleanup','scan','scan_false','summary','summary_invalid'):
+            with self.subTest(secondary=secondary):await self.inject_failure(secondary)
+
+    async def inject_failure(self,secondary):
+        actions=[]
         class Child:
+            pid=42
             def __init__(self,code):self.returncode=code
             async def communicate(self):return b'',b'secretcredential private-lease-token'
             async def wait(self):return self.returncode
-            def terminate(self):self.returncode=0
+            def terminate(self):
+                actions.append('terminate')
+                if secondary=='cleanup':raise PermissionError('private-lease-token')
+                self.returncode=0
             def kill(self):self.returncode=1
         async def spawn(*argv,**kwargs):
+            if len(argv)>1 and argv[1]=='connect':(private/'raw/protected.png').write_bytes(b'private-lease-token')
             return Child(None if Path(argv[0]).name=='rdpilot-daemon' else (7 if argv[1]=='connect' else 0))
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory);private=root/'private';private.mkdir()
@@ -91,7 +104,15 @@ class EarlyHarnessFailureTests(unittest.IsolatedAsyncioTestCase):
             args=argparse.Namespace(proof='cua',bin_dir=str(root/'bin'),bundle=str(root/'bundle'),output=str(private/'raw'),
                 artifacts=str(root/'artifacts'),source_bridge_sha256=HASH,journal=str(private/'processes.json'),
                 credentials_a=str(private/'a.json'),credentials_b=str(private/'b.json'),timeout=10)
-            with patch.object(tempfile,'tempdir',str(private)),patch.object(asyncio,'create_subprocess_exec',side_effect=spawn):
+            original_scan=live.scan_files
+            def scan(path,needles):
+                actions.append('scan')
+                if secondary=='scan':raise PermissionError('private-lease-token')
+                if secondary=='scan_false':return False
+                if secondary=='summary':(private/'raw/summary.json').unlink()
+                if secondary=='summary_invalid':(private/'raw/summary.json').write_text('private-lease-token')
+                return original_scan(path,needles)
+            with patch.object(tempfile,'tempdir',str(private)),patch.object(asyncio,'create_subprocess_exec',side_effect=spawn),patch.object(live,'scan_files',side_effect=scan),patch.object(live,'process_identity',return_value={'pid':42,'created':'1','image':'fixture'}):
                 self.assertEqual(await live.execute(args),1)
             selected=json.loads((root/'artifacts/cua.json').read_text())
             self.assertEqual(selected['status'],'failed')
@@ -99,7 +120,113 @@ class EarlyHarnessFailureTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn('a.rdp_bundle_ready',selected['completed_checks'])
             self.assertNotIn('secretcredential',json.dumps(selected))
             self.assertNotIn('private-lease-token',json.dumps(selected))
-            self.assertIn('private-lease-token',(private/'raw/summary.json').read_text())
+            self.assertFalse(list((root/'artifacts').glob('*.png')))
+            self.assertIn('scan',actions)
+            self.assertFalse(any(p.name.startswith('rdpilot-cua-') for p in private.iterdir()))
+            if secondary:
+                self.assertTrue(selected['secondary_failures'])
+            if secondary!='summary':self.assertIn('private-lease-token',(private/'raw/summary.json').read_text())
+
+
+class OrchestrationModeTests(unittest.TestCase):
+    def measure(self,mode,*,failure=None):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);bins=root/'bin';bins.mkdir();output=root/'out'
+            for name in ('rdpilot','rdpilot-daemon','rdpilot-mcp','rdpilot-bridge'):
+                (bins/(name+'.exe')).write_bytes(name.encode())
+            if failure=='binary':(bins/'rdpilot-mcp.exe').unlink()
+            args=argparse.Namespace(output=str(output),bin_dir=str(bins),expected_commit='1'*40,
+                setup_diagnostic=mode=='setup_diagnostic',cua_diagnostic=mode=='cua_diagnostic')
+            host.initialize(output,mode)
+            self.assertEqual(json.loads((output/'artifacts/gate.json').read_text())['mode'],mode)
+            commands=[];actions=[]
+            snapshot={'cache':str(root/'owned-cache'),'registry':[{'path':'reg0','name':'a','present':True,'value':1},{'path':'reg1','name':'b','present':True,'value':1}],
+                'service':{'state':'Stopped','start_mode':'Manual'},'os':'Windows test boundary','image_os':'fixture','image_version':'fixture','computer':'fixture'}
+            def control(script,values=None,timeout=30,**kwargs):
+                actions.append((script,values))
+                if script==host.PREFLIGHT:return snapshot
+                if script==host.CREATE_USER:return {'name':values['name'],'sid':'S-1-5-21-'+str(len(actions))}
+                if script==host.ENSURE_GROUP:return {'initially_member':False,'membership_verified':True}
+                if script==host.ROLE:return {'rdp_member':True,'users_member':True,'administrator_member':False}
+                if script==host.PROFILE:return {'profile_was_present':failure!='profile','profile_guest_removed':True}
+                if script.startswith('$ok='):return True
+                if "[bool]($p -and $p.Loaded)" in script:return False
+                if "Diagnostic1!FixedHarmlessInput" in script:return {'converted':True,'security_module_major':3}
+                if failure=='host_cleanup' and values and values.get('path')=='reg0':raise host.HostActionError('access_denied')
+                return None
+            class Child:
+                pid=42
+                def wait(self,timeout):
+                    if failure=='timeout':raise subprocess.TimeoutExpired('private-command',timeout)
+                    return 1 if failure=='harness' else 0
+            def spawn(command,**kwargs):
+                commands.append(command)
+                self.assertIn('run-live-proof.py',command[1])
+                proof=command[2]
+                def option(name):return command[command.index(name)+1]
+                expected=hashlib.sha256((bins/'rdpilot-bridge.exe').read_bytes()).hexdigest()
+                self.assertEqual(option('--source-bridge-sha256'),expected)
+                self.assertEqual(Path(option('--bin-dir')),bins)
+                self.assertEqual(list(Path(option('--bundle')).iterdir()),[Path(option('--bundle'))/'rdpilot-bridge.exe'])
+                for key in ('--credentials-a','--credentials-b','--journal','--output'):
+                    self.assertTrue(Path(option(key)).is_relative_to(output/'private'))
+                self.assertEqual(json.loads(Path(option('--credentials-a')).read_text())['host'],'127.0.0.1')
+                self.assertTrue(any('icacls' in script for script,_ in actions))
+                summary=valid_summary(proof)
+                for check in summary['checks']:
+                    if check['check'].endswith('.installed_source_bridge_and_cua_identity'):check['bridge_sha256']=expected
+                if failure=='checks':summary['checks']=[c for c in summary['checks'] if c['check']!='a.actual_cua_stall_bounded_close']
+                if failure=='scan_check':summary['checks']=[c for c in summary['checks'] if c['check']!='evidence_contains_no_credentials']
+                if failure=='harness':summary['status']='failed'
+                (output/'artifacts'/(proof+'.json')).write_text(json.dumps(live.project(proof,summary,0,expected)))
+                Path(option('--journal')).write_text('[]')
+                (output/'artifacts'/'selected.png').write_bytes(b'fixture image')
+                return Child()
+            def identity(command,**kwargs):return ('2'*40 if command[-1]=='HEAD^{tree}' else ('3'*40 if failure=='identity' else '1'*40))+'\n'
+            with contextlib.redirect_stdout(io.StringIO()),patch.dict(os.environ),patch.object(host,'powershell',side_effect=control),patch.object(host,'measure_process_refusal'),patch.object(host.subprocess,'check_output',side_effect=identity),patch.object(host.subprocess,'Popen',side_effect=spawn),patch.object(live,'process_identity',return_value={'pid':42,'created':'1','image':'owned'}):
+                code=host.run(args)
+            gate=json.loads((output/'artifacts/gate.json').read_text());cleanup=json.loads((output/'artifacts/cleanup.json').read_text())
+            self.assertFalse((output/'private').exists())
+            self.assertEqual(gate['mode'],mode)
+            if failure:self.assertFalse((output/'artifacts/selected.png').exists())
+            return code,gate,cleanup,commands,actions
+
+    def test_actual_modes_keep_distinct_required_suites_and_success_labels(self):
+        for mode,expected,status in (('live',['cua','viewer','takeover'],'passed'),('cua_diagnostic',['cua'],'cua_diagnostic_passed'),('setup_diagnostic',['host_setup'],'setup_passed')):
+            with self.subTest(mode=mode):
+                code,gate,cleanup,commands,_=self.measure(mode)
+                self.assertEqual(code,0);self.assertEqual(gate['status'],status)
+                self.assertEqual(gate['attempted_suites'],expected);self.assertEqual(gate['completed_suites'],expected)
+                self.assertEqual([cmd[2] for cmd in commands],[] if mode=='setup_diagnostic' else expected)
+                for proof in expected:
+                    if mode!='setup_diagnostic':self.assertTrue(cleanup[proof]['user_0_profile_was_present'])
+
+    def test_cua_failures_remain_red_and_continue_owned_cleanup(self):
+        for failure in ('binary','identity','checks','scan_check','harness','timeout','profile','host_cleanup'):
+            with self.subTest(failure=failure):
+                code,gate,cleanup,commands,actions=self.measure('cua_diagnostic',failure=failure)
+                self.assertEqual(code,1);self.assertEqual(gate['status'],'failed')
+                self.assertNotIn('viewer',gate['attempted_suites']);self.assertNotIn('takeover',gate['attempted_suites'])
+                if failure!='host_cleanup':self.assertEqual(gate['completed_suites'],[])
+                if failure not in ('binary','identity'):
+                    self.assertIn('service',cleanup['host']);self.assertTrue(cleanup['host']['service'])
+                    self.assertTrue(cleanup['cua']['user_1_account'])
+                if failure in ('checks','scan_check','harness','timeout'):self.assertEqual(gate['failure_stage'],'cua_harness')
+                if failure=='profile':self.assertFalse(cleanup['cua']['user_0_profile_was_present'])
+                if failure=='host_cleanup':self.assertFalse(cleanup['host']['registry_0']);self.assertTrue(cleanup['host']['registry_1'])
+
+    def test_actual_cli_rejects_unknown_or_combined_modes(self):
+        for flags in (['--setup-diagnostic','--cua-diagnostic'],['--unknown-diagnostic']):
+            child=subprocess.run([sys.executable,str(Path(host.__file__)),'--output','unused',*flags],capture_output=True)
+            self.assertNotEqual(child.returncode,0)
+
+    def test_cli_initialization_keeps_diagnostic_label_before_build(self):
+        for flag,mode in (('--cua-diagnostic','cua_diagnostic'),('--setup-diagnostic','setup_diagnostic')):
+            with tempfile.TemporaryDirectory() as directory:
+                output=Path(directory)/'initialized'
+                child=subprocess.run([sys.executable,str(Path(host.__file__)),flag,'--initialize','--output',str(output)],capture_output=True)
+                self.assertEqual(child.returncode,0)
+                self.assertEqual(json.loads((output/'artifacts/gate.json').read_text()),{'mode':mode,'status':'failed','failure_stage':'build_or_dependencies'})
 
 
 class OwnershipTests(unittest.TestCase):
@@ -209,7 +336,8 @@ class OwnershipTests(unittest.TestCase):
         self.assertIn('workflow_dispatch:',workflow)
         self.assertNotIn('  push:',workflow)
         self.assertIn('--setup-diagnostic',workflow)
-        self.assertNotIn('cargo build',workflow)
+        setup=workflow.split('  setup:\n')[1].split('  cua:\n')[0]
+        self.assertNotIn('cargo build',setup)
         ci=(HERE.parents[1]/'.github/workflows/ci.yml').read_text()
         self.assertNotIn('--setup-diagnostic',ci)
         self.assertIn("'setup_passed'",Path(host.__file__).read_text())

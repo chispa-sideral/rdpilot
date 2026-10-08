@@ -97,6 +97,27 @@ sessions, removes unloaded nonspecial owned profiles and guest files, removes
 owned accounts/cache/private files and restores registry/service/firewall state.
 Each cleanup action is bounded and attempted independently.
 
+The manual `Desktop host diagnostics` workflow accepts only `setup` or `cua`.
+Setup checks host preparation and cleanup without RDP. Cua builds the same four
+source executables and runs the complete two-user Cua proof, including faults,
+provenance, recovery, scanning and live profile cleanup, within a 50-minute job.
+It produces `mode: cua_diagnostic` and `status: cua_diagnostic_passed` on success;
+setup produces `setup_diagnostic`/`setup_passed`. Both labels remain diagnostic
+at build-stage initialization. Neither qualifies the required all-three gate,
+release verification or delivery. To run focused Cua locally after the build:
+
+```powershell
+$diagnosticOutput = Join-Path $env:TEMP ('cua-diagnostic-' + [guid]::NewGuid())
+python scripts/ci/hosted_desktop.py --cua-diagnostic --initialize --output $diagnosticOutput
+python scripts/ci/hosted_desktop.py --cua-diagnostic --bin-dir target/x86_64-pc-windows-msvc/release --output $diagnosticOutput --expected-commit (git rev-parse HEAD)
+```
+
+Failure artifacts retain the primary fixed operation, exception category and
+numeric CLI exit before cleanup, with secondary cleanup/scan/summary failures
+recorded separately. Exception messages stay private. Attempted suites become
+completed only after the full proof and owned cleanup pass. A failed diagnostic
+does not establish RDP incompatibility or successful live guest cleanup.
+
 The Python harnesses remain usable against supplied remote Windows credentials;
 they provision nothing. Their existing documented environment variables and
 credential-file interfaces are unchanged. To require source delivery, add
@@ -110,11 +131,6 @@ records image differences without introducing a pixel threshold. Missing
 required checks, unknown exclusions, fake execution, skipped faults or absent
 provenance cannot pass the live gate. Release invokes the same required CI.
 
-`Desktop host setup diagnostic` is a separate manual workflow for setup failures.
-It creates disposable users, verifies their actual group roles and removes them,
-restoring the host with the same owned cleanup. It builds no product binaries and
-runs no RDP, Cua or browser proofs. Its `setup_diagnostic` / `setup_passed` output
-cannot satisfy the required live CI or release gate. The same diagnostic can run
-locally by adding `--setup-diagnostic` to `hosted_desktop.py` after initializing a
-fresh output directory. Failures expose only fixed subaction/category labels and
-numeric native/HRESULT codes; credentials and raw host stderr stay private.
+For local setup diagnosis, use `--setup-diagnostic` during both initialization
+and execution of `hosted_desktop.py`. Host errors expose only fixed subaction
+and category labels and numeric native/HRESULT codes; raw host stderr stays private.

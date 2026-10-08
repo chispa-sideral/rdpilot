@@ -240,6 +240,8 @@ class Run:
         self.operation = 'harness'
         self.failure_operation = None
         self.failed_cli_exit = None
+        self.primary_failure = None
+        self.cleanup_failures = []
         self.summary = {"mode": "live", "status": "running", "checks": self.checks, "unverified": ["UAC/secure-desktop behavior is unsupported; no elevation guarantee"]}
 
     def clean(self, text):
@@ -590,32 +592,41 @@ $text=& $exe 'runtime::windows_tests::job_closes_root_and_descendant_created_aft
             self.summary["status"] = "passed"
         except BaseException as error:
             self.failure_operation = self.operation
+            self.primary_failure = proof_support.failure_detail(error,self.operation,self.failed_cli_exit)
             self.summary["status"] = "failed"
             self.summary["failure"] = self.clean(f"{type(error).__name__}: {error}")
             raise
         finally:
+            async def cleanup(stage, action):
+                try:await action()
+                except BaseException as error:self.cleanup_failures.append(proof_support.failure_detail(error,stage))
+            def cleanup_sync(stage, action):
+                try:action()
+                except BaseException as error:self.cleanup_failures.append(proof_support.failure_detail(error,stage))
             for endpoint in self.endpoints.values():
-                await endpoint.stop()
+                await cleanup('endpoint_cleanup',endpoint.stop)
             for target in self.relays:
-                try:
-                    await self.cli("disconnect", "--session", target, timeout=10, allow_failure=True)
-                except (OSError, asyncio.TimeoutError, ValueError):
-                    pass
-            if self.daemon and self.daemon.returncode is None:
-                self.daemon.terminate()
-                try:
-                    await asyncio.wait_for(self.daemon.wait(), 5)
-                except asyncio.TimeoutError:
-                    self.daemon.kill()
-                    await self.daemon.wait()
+                await cleanup('disconnect_cleanup',lambda target=target:self.cli("disconnect", "--session", target, timeout=10, allow_failure=True))
+            async def stop_daemon():
+                if self.daemon and self.daemon.returncode is None:
+                    self.daemon.terminate()
+                    try:await asyncio.wait_for(self.daemon.wait(), 5)
+                    except asyncio.TimeoutError:
+                        self.daemon.kill()
+                        await asyncio.wait_for(self.daemon.wait(),5)
+            await cleanup('daemon_cleanup',stop_daemon)
             for relay, _ in self.relays.values():
-                await relay.close()
-            daemon_log.close()
-            self.save()
-            needles = [str(c["password"]).encode() for c in self.credentials.values() if c.get("password")]
-            require(not any(needle in path.read_bytes() for path in self.output.rglob("*") if path.is_file() for needle in needles), "Credential in evidence")
-            self.check("evidence_contains_no_credentials")
-            shutil.rmtree(self.temp)
+                await cleanup('relay_cleanup',relay.close)
+            cleanup_sync('log_cleanup',daemon_log.close)
+            cleanup_sync('summary_write',self.save)
+            def scan():
+                needles = [str(c["password"]).encode() for c in self.credentials.values() if c.get("password")]
+                require(not any(needle in path.read_bytes() for path in self.output.rglob("*") if path.is_file() for needle in needles), "Credential in evidence")
+                self.check("evidence_contains_no_credentials")
+            cleanup_sync('harness_scan',scan)
+            cleanup_sync('temporary_cleanup',lambda:shutil.rmtree(self.temp))
+            if self.cleanup_failures and not self.primary_failure:
+                raise ProofError('Live harness cleanup failed')
 
 
 def main():

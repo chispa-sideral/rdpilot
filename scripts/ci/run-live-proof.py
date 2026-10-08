@@ -46,21 +46,13 @@ ALLOWED_UNVERIFIED = {
 }
 HEX = re.compile(r'[a-f0-9]{64}\Z')
 BUNDLE = re.compile(r'cua-driver-rs-v0\.34\.0-[a-f0-9]{16}\Z')
-OPERATIONS = {'harness','relay_start','daemon_start','daemon_start_wait','hosts_file','connect_cli','bridge_ready_assertion','live_checks'}
 
 
 def failure_detail(error, operation=None, cli_exit=None):
     """Only fixed operation/type categories and numeric exit codes cross out."""
-    if isinstance(error, TimeoutError):category='timeout'
-    elif isinstance(error, FileNotFoundError):category='file_not_found'
-    elif isinstance(error, PermissionError):category='access_denied'
-    elif isinstance(error, json.JSONDecodeError):category='invalid_json'
-    elif isinstance(error, OSError):category='os_error'
-    elif type(error).__name__=='ProofError':category='proof_assertion'
-    else:category='other'
-    detail={'operation':operation if isinstance(operation,str) and operation in OPERATIONS else 'harness','exception_category':category}
-    if type(cli_exit) is int and -(2**31)<=cli_exit<2**32:detail['cli_exit_code']=cli_exit
-    return detail
+    sys.path.insert(0,str(E2E))
+    import proof_support
+    return proof_support.failure_detail(error,operation,cli_exit)
 
 
 def project(proof, summary, returncode, expected_hash):
@@ -122,6 +114,7 @@ def scan_files(root, needles):
 
 async def execute(args):
     sys.path.insert(0, str(E2E))
+    import proof_support
     filename = 'run-cua-e2e.py' if args.proof == 'cua' else 'run-' + args.proof + '-proof.py'
     spec = importlib.util.spec_from_file_location('hosted_live_harness', E2E / filename)
     module = importlib.util.module_from_spec(spec)
@@ -160,7 +153,8 @@ async def execute(args):
         await asyncio.wait_for(run.execute(), args.timeout)
     except BaseException as error:
         code = 1
-        error_detail=failure_detail(error,getattr(run,'failure_operation',None),getattr(run,'failed_cli_exit',None))
+        primary=getattr(run,'primary_failure',None)
+        error_detail=proof_support.select_failure_detail(primary) if primary else failure_detail(error,getattr(run,'failure_operation',None),getattr(run,'failed_cli_exit',None))
     finally:
         asyncio.create_subprocess_exec = original
         if sentinel:
@@ -175,10 +169,19 @@ async def execute(args):
     needles = [str(c['password']).encode() for c in run.credentials.values() if c.get('password')]
     needles += [str(x).encode() for x in getattr(run,'leases',[])]
     needles += [str(x).encode() for x in (getattr(run,'typed',None),getattr(run,'typed_marker',None),getattr(run,'token',None)) if x]
-    scanned = scan_files(Path(args.output), needles)
-    summary = json.loads((Path(args.output)/'summary.json').read_text())
+    secondary=[proof_support.select_failure_detail(x) for x in getattr(run,'cleanup_failures',[])]
+    if secondary:code=1
+    try:
+        scanned = scan_files(Path(args.output), needles)
+        if not scanned:raise RuntimeError('Private evidence scan failed')
+    except BaseException as error:
+        scanned=False;code=1;secondary.append(failure_detail(error,'evidence_scan'))
+    try:summary = json.loads((Path(args.output)/'summary.json').read_text())
+    except BaseException as error:
+        summary=None;code=1;secondary.append(failure_detail(error,'summary_read'))
     selected = project(args.proof, summary, code if scanned else 1, args.source_bridge_sha256)
     if selected['status']!='passed':selected['harness_failure']=error_detail
+    if secondary:selected['secondary_failures']=secondary
     artifact = Path(args.artifacts)
     artifact.mkdir(parents=True, exist_ok=True)
     (artifact / (args.proof + '.json')).write_text(json.dumps(selected, indent=2)+'\n')
