@@ -185,23 +185,45 @@ class Mcp:
         await asyncio.wait_for(self.proc.stdin.drain(), 5)
 
     async def request(self, method, params, timeout=65):
+        protected = hasattr(self.run, 'work_budget')
+        if protected:
+            deadline = time.monotonic() + min(timeout, 65)
+        def request_bound(maximum):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError('Protected native request deadline')
+            return min(maximum, remaining)
         self.number += 1
         request_id = f"{self.target}-{self.number}"
         request = {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params}
         self.log.write(self.run.clean(json.dumps({"request": request})) + "\n")
         self.log.flush()
-        await self.send(request)
-        deadline = time.monotonic() + timeout
+        if protected:
+            send_bound = request_bound(5)
+            await asyncio.wait_for(self.send(request), send_bound)
+        else:
+            await self.send(request)
+            deadline = time.monotonic() + timeout
         while True:
-            line = await asyncio.wait_for(self.proc.stdout.readline(), max(0.1, deadline - time.monotonic()))
+            read_bound = request_bound(65) if protected else max(0.1, deadline - time.monotonic())
+            line = await asyncio.wait_for(self.proc.stdout.readline(), read_bound)
+            if protected:
+                request_bound(65)
             require(line, f"{self.target}: MCP EOF during {method}")
             require(len(line) <= LIMIT, "oversized MCP output")
             message = json.loads(line)
             self.log.write(self.run.clean(json.dumps({"method": method, "response": message})) + "\n")
             self.log.flush()
+            if protected:
+                request_bound(65)
             if "method" in message and "id" in message:
                 # We advertised no client request capabilities; fail explicitly.
-                await self.send({"jsonrpc": "2.0", "id": message["id"], "error": {"code": -32601, "message": "client capability not offered"}})
+                refusal = {"jsonrpc": "2.0", "id": message["id"], "error": {"code": -32601, "message": "client capability not offered"}}
+                if protected:
+                    send_bound = request_bound(5)
+                    await asyncio.wait_for(self.send(refusal), send_bound)
+                else:
+                    await self.send(refusal)
                 continue
             if message.get("id") == request_id and "method" not in message:
                 require("error" not in message, f"native {method} error: {message.get('error')}")

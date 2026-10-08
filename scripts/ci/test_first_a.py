@@ -404,6 +404,46 @@ class LocalChildControls(unittest.TestCase):
 
 
 class AsyncLocalChildControls(unittest.IsolatedAsyncioTestCase):
+    async def test_protected_native_request_deadline_includes_unmatched_stream_and_all_sends(self):
+        for stage in ('notifications','initial_send','refusal_send'):
+            with self.subTest(stage=stage):
+                run=SimpleNamespace(work_budget=900,clean=lambda value:value)
+                endpoint=cua.Mcp(run,'a');endpoint.log=io.StringIO();cancelled=[];reads=[];sends=[]
+                async def read():
+                    reads.append(True)
+                    await asyncio.sleep(0)
+                    return json.dumps({'method':'server-request','id':'server'} if stage=='refusal_send' else {'method':'notification'}).encode()+b'\n'
+                async def send(message):
+                    sends.append(message)
+                    if stage=='initial_send' or (stage=='refusal_send' and len(sends)==2):
+                        try:await asyncio.Future()
+                        finally:cancelled.append(True)
+                endpoint.proc=SimpleNamespace(stdout=SimpleNamespace(readline=read));endpoint.send=send
+                start=time.monotonic()
+                with self.assertRaises(TimeoutError):await endpoint.request('initialize',{},timeout=0.01)
+                self.assertLess(time.monotonic()-start,1)
+                if stage=='notifications':self.assertGreater(len(reads),1)
+                else:self.assertEqual(cancelled,[True])
+                if stage=='initial_send':self.assertEqual(reads,[])
+                if stage=='refusal_send':self.assertEqual(len(sends),2)
+                endpoint.log.close()
+
+    async def test_protected_native_request_fixed_65_ceiling_and_default_semantics(self):
+        for protected in (False,True):
+            clock=[0.0];reads=[];run=SimpleNamespace(clean=lambda value:value)
+            if protected:run.work_budget=900
+            endpoint=cua.Mcp(run,'a');endpoint.log=io.StringIO()
+            async def send(message):clock[0]+=20
+            async def read():
+                reads.append(True);clock[0]+=20
+                return json.dumps({'id':'a-1','result':{'serverInfo':{}}} if len(reads)==3 else {'method':'notification'}).encode()+b'\n'
+            endpoint.send=send;endpoint.proc=SimpleNamespace(stdout=SimpleNamespace(readline=read))
+            with patch.object(cua,'time',SimpleNamespace(monotonic=lambda:clock[0])):
+                if protected:
+                    with self.assertRaises(TimeoutError):await endpoint.request('initialize',{},timeout=1000)
+                else:self.assertEqual(await endpoint.request('initialize',{},timeout=65),{'serverInfo':{}})
+            self.assertEqual(clock[0],80);endpoint.log.close()
+
     async def test_actual_cli_child_cancel_and_join_failure_preserve_primary(self):
         original=asyncio.create_subprocess_exec
         for failure in ('cancel','join'):
