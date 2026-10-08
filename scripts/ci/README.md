@@ -228,8 +228,12 @@ reparse paths and hardlinks, and verifies the held local path, identity, size
 and write metadata before and after content reads. It lists at most 16 product
 root entries, counts at most four launchers and four staging directories, reads
 only the one expected bundle, two 1 MiB manifests and three 64 MiB binaries,
-and shares a 194 MiB actual-content budget. Staging contents and other manifest
-assets are not read. One held reader and parent-owned native queries have a
+and shares a strict 194 MiB actual-content budget. Reads that cannot fit the
+remaining budget are refused before consuming bytes. The worker independently
+checks exact source/owner controls and private source/cache anchors against
+normal operating-system roots before reading product content. Staging contents
+and other manifest assets are not read. One held reader and parent-owned native
+queries have a
 30-second total bound with a forced-stop/join reserve. Output is capped while
 received at 16 KiB; private configuration is capped at 2 MiB. Windows admission
 remains to be established by an actual hosted run.
@@ -238,5 +242,7 @@ Only closed source hashes, fixed states/counts and lifetime results are selected
 paths, SIDs, account names, generations, process IDs, wrong digests, manifests
 and raw errors remain private. Unknown worker join records
 `guest_footprint_cleanup` and keeps the diagnostic red while all existing cleanup
-is attempted. Artifact-write failure is supplemental. Original Cua primary and
+is attempted. An unexpected observer exception also selects an unproved join.
+Parent projection rejects inconsistent presence, absence, counts or join flags.
+Artifact-write failure is supplemental. Original Cua primary and
 secondary failures, full assertions and normal CI remain unchanged.

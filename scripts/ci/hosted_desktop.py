@@ -480,7 +480,7 @@ if(Test-Path (Join-Path (Join-Path $env:SystemDrive 'Users') $v.name)){throw 'Fr
                             [str(c['password']).encode() for c in credentials.values()])
                     except BaseException:
                         # A refused observer never interrupts the independent suite cleanup.
-                        observed=footprint.empty()
+                        joined=False;observed=footprint.empty(outcome='cleanup_failed',joined=False)
                         observation_failures.append('guest_footprint_observation')
                     results['guest_footprint']={'worker_joined':joined}
                     if not joined:observation_failures.append('guest_footprint_cleanup')

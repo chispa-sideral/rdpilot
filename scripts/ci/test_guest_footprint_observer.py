@@ -48,6 +48,13 @@ def failure():
                                 'connect_observation': observation}}
 
 
+def reader_command():
+    # Qualified host-only test harness: exercise the actual low-level snapshot in
+    # a real child on temporary files. Strict production worker admission is
+    # exercised separately; no production flag or path rule is relaxed.
+    return [sys.executable, '-c', "import json,os,runpy,sys; from pathlib import Path; sys.path.insert(0,str(Path(os.environ['RDPILOT_TEST_OBSERVER']).parent)); m=runpy.run_path(os.environ['RDPILOT_TEST_OBSERVER']); c=json.load(open(os.environ['RDPILOT_FOOTPRINT_CONFIG'])); print(json.dumps(m['snapshot'](c)))"]
+
+
 def native_profile(path=None):
     expected = 'C:\\Users\\' + OWNED['name']
     return {**OWNED, 'expected': expected, 'profile': None if path is None else {
@@ -64,7 +71,7 @@ class Fixture:
         self.local = self.cache/'bundles'/self.expected['bundle_id'];self.local.mkdir(parents=True)
         (self.local/'manifest.json').write_text(json.dumps(self.manifest))
         self.root = self.profile/'AppData'/'Local'/'rdpilot'
-        self.config = {'source': self.expected, 'profile': str(self.profile), 'cache': str(self.cache)}
+        self.config = {'source': self.expected, 'profile': str(self.profile), 'cache': str(self.cache), 'owned': dict(OWNED)}
 
     def product(self):self.root.mkdir(parents=True, exist_ok=True)
     def launcher(self, name='l0000000000001.exe', data=BRIDGE):
@@ -130,7 +137,7 @@ class SelectionTests(unittest.TestCase):
         for name in ('.staging-01-1', '.staging-1-0', '.staging-18446744073709551616-1', '.staging-1-4294967296'):self.assertFalse(observer.staging_name(name))
         for path in ('\\\\?\\UNC\\server\\share', '\\\\?\\GLOBALROOT\\Device\\x', '\\\\?\\Volume{a}\\x', '\\\\?\\C:\\a\\..\\x'):
             with self.assertRaises((OSError, ValueError)):observer.final_local(path)
-        self.assertEqual(observer.final_local('\\\\?\\C:\\ordinary\\file'), os.path.normcase('C:\\ordinary\\file'))
+        self.assertEqual(observer.final_local('\\\\?\\C:\\ordinary\\file'), 'c:\\ordinary\\file')
 
 
 class ActualFileTests(unittest.TestCase):
@@ -191,6 +198,27 @@ class ActualFileTests(unittest.TestCase):
         self.assertEqual(f.sample()['outcome'], 'invalid')
         (f.local/'manifest.json').write_bytes(b'x' * (observer.MANIFEST_LIMIT + 1))
         self.assertEqual(f.sample()['outcome'], 'budget')
+
+    def test_actual_byte_ceiling_zero_exact_and_growth_never_reads_past_cap(self):
+        f = self.fixture;path = f.launcher();budget = observer.Budget(0)
+        with observer.Held(path, 1024) as held:
+            with self.assertRaises(observer.files.BudgetExceeded):budget.read(held, 1024)
+            self.assertEqual(held.file.tell(), 0);self.assertEqual(budget.remaining, 0)
+        budget = observer.Budget(len(BRIDGE) + len(CUA));second = f.path/'second';second.write_bytes(CUA)
+        with observer.Held(path, 1024) as held:
+            self.assertEqual(budget.read(held, 1024), BRIDGE);self.assertEqual(held.file.tell(), len(BRIDGE))
+        with observer.Held(second, 1024) as held:
+            self.assertEqual(budget.read(held, 1024), CUA);self.assertEqual(held.file.tell(), len(CUA))
+        self.assertEqual(budget.remaining, 0)
+        with observer.Held(second, 1024) as held:
+            with self.assertRaises(observer.files.BudgetExceeded):budget.read(held, 1024)
+            self.assertEqual(held.file.tell(), 0)
+        budget = observer.Budget(len(BRIDGE))
+        with self.assertRaises(ValueError):
+            with observer.Held(path, 1024) as held:
+                with path.open('ab') as writer:writer.write(b'grew')
+                self.assertEqual(budget.read(held, 1024), BRIDGE)
+                self.assertEqual(held.file.tell(), len(BRIDGE));self.assertEqual(budget.remaining, 0)
 
     def test_actual_reparse_escape_and_casefold_controls(self):
         f = self.fixture;f.product()
@@ -275,12 +303,57 @@ class ActualChildTests(unittest.TestCase):
     def test_real_worker_config_and_manifest_handoff(self):
         with tempfile.TemporaryDirectory() as directory:
             f = Fixture(directory);f.launcher();f.bundle();config = f.path/'config.json';config.write_text(json.dumps(f.config))
-            runner = self.runner();env = {**os.environ, 'RDPILOT_FOOTPRINT_CONFIG': str(config)}
-            value = runner.call([sys.executable, observer.__file__], env, 1)
+            runner = self.runner();env = {**os.environ, 'RDPILOT_FOOTPRINT_CONFIG': str(config), 'RDPILOT_TEST_OBSERVER': observer.__file__}
+            value = runner.call(reader_command(), env, 1)
             self.assertEqual(observer.validate(value, f.expected)['candidate_bundle'], 'source_binaries_match')
             self.assertNotIn(str(f.path), json.dumps(value));self.assertTrue(runner.joined)
             config.write_bytes(b'x' * (observer.CONFIG_LIMIT + 1))
             with self.assertRaises(OSError):runner.call([sys.executable, observer.__file__], env, 1)
+
+
+class StrictWorkerAdmissionTests(unittest.TestCase):
+    def test_actual_production_worker_refuses_source_owner_and_path_before_snapshot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            f = Fixture(directory);f.launcher();f.bundle()
+            profile = 'C:\\Users\\' + OWNED['name']
+            local = 'C:\\Users\\runneradmin\\AppData\\Local';cache = local + '\\rdpilot\\cache'
+            base = {'source': f.expected, 'owned': OWNED, 'profile': profile, 'cache': cache}
+            anchors = {'source': f.expected, 'owned': OWNED, 'cache': cache}
+            variants = []
+            for key, value in (('private', SECRET), ('source_commit', SECRET), ('bridge_sha256', 1),
+                               ('cua_version', '99.0.0'), ('bundle_id', '..'), ('cua_sha256', 'f' * 64)):
+                variants.append({**base, 'source': {**f.expected, key: value}})
+            for key, value in (('sid', SECRET), ('name', '../someone'), ('marker', False), ('private', SECRET)):
+                variants.append({**base, 'owned': {**OWNED, key: value}})
+            for value in (str(f.profile), 'C:\\Users\\someone', 'C:\\Users\\.\\' + OWNED['name'],
+                          profile + '\\..', '\\\\server\\share', '\\\\?\\' + profile):
+                variants.append({**base, 'profile': value})
+            for value in (str(f.cache), cache + '\\..', local + '\\other\\cache'):
+                variants.append({**base, 'cache': value})
+            runner = observer.Runner(lambda pid: None, lambda record: None, total=15)
+            self.addCleanup(runner.close)
+            config = f.path/'strict-config.json'
+            env = {**os.environ, 'SystemDrive': 'C:', 'LOCALAPPDATA': local,
+                   'RDPILOT_FOOTPRINT_CONFIG': str(config), 'RDPILOT_FOOTPRINT_ANCHORS': json.dumps(anchors)}
+            for variant in variants:
+                config.write_text(json.dumps(variant))
+                value = runner.call([sys.executable, observer.__file__], env, 2)
+                self.assertEqual(value['outcome'], 'invalid');self.assertIsNone(value['source'])
+                self.assertEqual(value['profile'], 'unavailable');self.assertEqual(value['launcher'], 'unavailable')
+                self.assertNotIn(SECRET, json.dumps(value));self.assertTrue(runner.joined)
+            # Actual process, strict entry and refusal are exercised above. This
+            # structural admission control does not read a synthetic Windows path.
+            with patch.dict(os.environ, env):
+                self.assertEqual(observer.worker_config(base), base)
+                altered = {**anchors, 'source': {**f.expected, 'source_tree': '3' * 40}}
+                with patch.dict(os.environ, {'RDPILOT_FOOTPRINT_ANCHORS': json.dumps(altered)}):
+                    with self.assertRaises(ValueError):observer.worker_config(base)
+                with patch.object(observer, 'snapshot', side_effect=AssertionError('Content must not be read')) as snapshot:
+                    config.write_text(json.dumps({**base, 'source': {**f.expected, 'private': SECRET}}))
+                    with contextlib.redirect_stdout(io.TextIOWrapper(io.BytesIO(), encoding='utf-8')):
+                        self.assertEqual(observer.worker(), 0)
+                    snapshot.assert_not_called()
+            self.assertIsNone(observer.empty({**f.expected, 'private': SECRET})['source'])
 
 
 class ParentTests(unittest.TestCase):
@@ -295,9 +368,14 @@ class ParentTests(unittest.TestCase):
         def read(runner, command, env, seconds):
             self.events.append('worker')
             self.assertTrue(all(c.poll() is not None for c in runner.children))
-            return real(runner, command, env, seconds) if worker is None else worker(runner)
-        # Qualify only the synthetic profile path on POSIX; the real subprocess
-        # and file admission remain active. Windows native binding has separate controls.
+            if worker is None:
+                env = {**env, 'RDPILOT_TEST_OBSERVER': observer.__file__}
+                return real(runner, reader_command(), env, seconds)
+            return worker(runner)
+        # Qualified fixture on every platform: substitute the native profile
+        # binding and invoke the low-level reader in a real child. This fixture
+        # establishes neither production worker admission nor Windows profile
+        # ownership. Separate strict-entry and native held-file controls apply.
         with patch.object(observer, 'query', side_effect=native), patch.object(observer, 'profile_binding', side_effect=lambda value, owned: str(f.profile) if value.get('profile') else None), patch.object(observer.Runner, 'call', read):
             return observer.observe(selected or failure(), 1, f.source, f.acquisition, f.cache, OWNED, fresh, f.path,
                                     (lambda pid: None), (lambda record: None), needles)
@@ -316,6 +394,26 @@ class ParentTests(unittest.TestCase):
         result, joined = self.observe(fresh=False);self.assertEqual(self.events, []);self.assertEqual(result['outcome'], 'unavailable')
         changed = failure();changed['completed_checks'].append('a.rdp_bundle_ready')
         result, joined = self.observe(selected=changed);self.assertEqual(self.events, []);self.assertEqual(result['outcome'], 'ineligible')
+
+    def test_actual_parent_refuses_every_contradictory_worker_state_and_join(self):
+        self.f.launcher();self.f.bundle();valid = observer.snapshot(self.f.config)
+        variants = [
+            {'profile': 'unavailable'}, {'product_directory': 'absent'}, {'launcher_count': 0},
+            {'launcher': 'absent', 'launcher_count': 1}, {'launcher': 'ambiguous', 'launcher_count': 1},
+            {'outcome': 'cleanup_failed'}, {'outcome': 'unavailable'}, {'worker_joined': False},
+            {'profile': 'absent', 'product_directory': 'absent', 'launcher': 'absent',
+             'candidate_bundle': 'absent', 'launcher_count': 0},
+        ]
+        for changes in variants:
+            with self.subTest(changes=changes):
+                result, joined = self.observe(worker=lambda runner: {**valid, **changes})
+                self.assertEqual(result['outcome'], 'unavailable');self.assertTrue(joined)
+                self.assertTrue(result['worker_joined']);self.assertEqual(result['product_directory'], 'unavailable')
+                self.assertEqual(result['launcher_count'], 0)
+        self.assertEqual(self.observe(worker=lambda runner: valid)[0]['candidate_bundle'], 'source_binaries_match')
+        # Partial bundles and an independent missing launcher remain meaningful.
+        partial = {**valid, 'launcher': 'absent', 'launcher_count': 0, 'candidate_bundle': 'partial'}
+        self.assertEqual(self.observe(worker=lambda runner: partial)[0]['candidate_bundle'], 'partial')
 
     def test_native_query_refusal_and_invalid_source_admit_no_content(self):
         f = self.f
@@ -383,7 +481,7 @@ class HostSeamTests(unittest.TestCase):
         for refusal in (None, 'exception', 'artifact', 'join'):
             with self.subTest(refusal=refusal):
                 gate, cleanup = self.measure(refusal)
-                if refusal == 'join':
+                if refusal in ('join', 'exception'):
                     self.assertIn('guest_footprint_cleanup', gate['observation_failures'])
                     self.assertFalse(cleanup['guest_footprint']['worker_joined'])
                 if refusal == 'artifact':self.assertIn('guest_footprint_artifact_write', gate['observation_failures'])

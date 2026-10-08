@@ -66,16 +66,32 @@ def source_identity(source, acquisition):
     if acquisition.get('state') != 'verified_source_bundle' or type(acquisition.get('bundle_count')) is not int or acquisition['bundle_count'] != 1:raise ValueError()
     identity = {k: source.get(k) if k.startswith('source_') else acquisition.get(k) for k in SOURCE_KEYS}
     if source.get('bridge_sha256') != identity['bridge_sha256']:raise ValueError()
+    return validated_source(identity)
+
+
+def validated_source(value):
+    if not isinstance(value, dict) or set(value) != SOURCE_KEYS or any(type(x) is not str for x in value.values()):raise ValueError()
     for key in ('source_commit', 'source_tree'):
-        if not isinstance(identity[key], str) or not re.fullmatch('[a-f0-9]{40}', identity[key]):raise ValueError()
+        if not re.fullmatch('[a-f0-9]{40}', value[key]):raise ValueError()
     for key in ('bridge_sha256', 'archive_sha256', 'cua_sha256'):
-        if not isinstance(identity[key], str) or not files.HASH.fullmatch(identity[key]):raise ValueError()
-    expected = 'cua-driver-rs-v0.34.0-' + hashlib.sha256((identity['bridge_sha256'] + identity['archive_sha256']).encode('ascii')).hexdigest()[:16]
-    if identity['cua_version'] != '0.34.0' or identity['bundle_id'] != expected:raise ValueError()
-    return identity
+        if not files.HASH.fullmatch(value[key]):raise ValueError()
+    expected = 'cua-driver-rs-v0.34.0-' + hashlib.sha256((value['bridge_sha256'] + value['archive_sha256']).encode('ascii')).hexdigest()[:16]
+    if value['cua_version'] != '0.34.0' or value['bundle_id'] != expected:raise ValueError()
+    return dict(value)
+
+
+def owner_control(value):
+    if (not isinstance(value, dict) or set(value) != {'sid', 'name', 'marker'}
+            or any(type(x) is not str for x in value.values())
+            or not re.fullmatch(r'S-1-[0-9-]{1,180}', value['sid'])
+            or not re.fullmatch(r'rdp[a-f0-9]{14}', value['name'])
+            or not re.fullmatch(r'rdpilot-owned-[a-f0-9]{32}', value['marker'])):raise ValueError()
+    return dict(value)
 
 
 def empty(source=None, outcome='unavailable', joined=True):
+    try:source = validated_source(source)
+    except (ValueError, TypeError):source = None
     return {'schema': 1, 'mode': 'cua_diagnostic', 'target': 'a', 'source': source,
             'outcome': outcome, **{k: 'unavailable' for k in STATES},
             'launcher_count': 0, 'staging_count': 0, 'elapsed_ms': 0, 'worker_joined': joined}
@@ -90,8 +106,30 @@ def validate(value, source):
         if not isinstance(value[key], str) or value[key] not in allowed:raise ValueError()
     for key, limit in (('launcher_count', 4), ('staging_count', 4), ('elapsed_ms', 30000)):
         if type(value[key]) is not int or not 0 <= value[key] <= limit:raise ValueError()
-    positive = value['launcher'] == 'source_match' or value['candidate_bundle'] == 'source_binaries_match'
-    if positive and (value['outcome'] != 'observed' or value['profile'] != 'present' or value['product_directory'] != 'present' or not value['worker_joined']):raise ValueError()
+    if source is not None:validated_source(source)
+    elif value['profile'] != 'unavailable':raise ValueError()
+    product = ('product_directory', 'launcher', 'candidate_bundle')
+    counts_zero = value['launcher_count'] == value['staging_count'] == 0
+    unavailable_product = all(value[k] == 'unavailable' for k in product) and counts_zero
+    if value['outcome'] != 'observed':
+        if not unavailable_product:raise ValueError()
+        if value['outcome'] == 'cleanup_failed' and (value['worker_joined'] or value['profile'] != 'unavailable'):raise ValueError()
+    else:
+        if source is None or not value['worker_joined']:raise ValueError()
+        if value['profile'] == 'absent':
+            if not unavailable_product:raise ValueError()
+        elif value['profile'] == 'present':
+            if value['product_directory'] == 'absent':
+                if value['launcher'] != 'absent' or value['candidate_bundle'] != 'absent' or not counts_zero:raise ValueError()
+            elif value['product_directory'] == 'present':
+                launcher = value['launcher'];count = value['launcher_count']
+                if not ((launcher == 'absent' and count == 0)
+                        or (launcher in ('source_match', 'mismatch') and count == 1)
+                        or (launcher == 'ambiguous' and 2 <= count <= 4)):raise ValueError()
+                if value['candidate_bundle'] not in ('absent', 'source_binaries_match', 'partial', 'mismatch'):raise ValueError()
+            else:raise ValueError()
+        else:raise ValueError()
+    if value['profile'] in ('unavailable', 'invalid') and not unavailable_product:raise ValueError()
     return json.loads(json.dumps(value))
 
 
@@ -107,8 +145,35 @@ def ancestors(path):
 def ordinary_local(path):
     """Only ordinary absolute drive paths; do not normalize device namespaces."""
     value = str(path)
-    if not re.fullmatch(r'[A-Za-z]:\\[^:]*', value) or '/' in value or '\\..\\' in value or '\\.\\' in value:raise ValueError()
-    return os.path.normcase(value)
+    if not re.fullmatch(r'[A-Za-z]:\\[^:]*', value) or '/' in value:raise ValueError()
+    parts = value[3:].split('\\')
+    if any(not part or part in ('.', '..') or not files.name_valid(part) for part in parts):raise ValueError()
+    return value.casefold()
+
+
+def worker_config(config):
+    """Production admission uses the private parent's anchors and normal OS roots.
+
+    The low-level snapshot reader is separately testable on owned temporary files;
+    no fixture switch relaxes this worker entry.
+    """
+    if not isinstance(config, dict) or set(config) != {'source', 'profile', 'cache', 'owned'}:raise ValueError()
+    source = validated_source(config['source']);owned = owner_control(config['owned'])
+    raw = os.environ.get('RDPILOT_FOOTPRINT_ANCHORS', '')
+    if len(raw.encode('utf-8')) > OUTPUT_LIMIT:raise ValueError()
+    anchors = json.loads(raw, object_pairs_hook=files.unique_json)
+    if not isinstance(anchors, dict) or set(anchors) != {'source', 'owned', 'cache'}:raise ValueError()
+    if validated_source(anchors['source']) != source or owner_control(anchors['owned']) != owned:raise ValueError()
+    drive = os.environ.get('SystemDrive', '')
+    if not re.fullmatch('[A-Za-z]:', drive):raise ValueError()
+    expected_profile = ordinary_local(drive + '\\Users\\' + owned['name'])
+    if type(config['profile']) is not str or ordinary_local(config['profile']) != expected_profile:raise ValueError()
+    local = os.environ.get('LOCALAPPDATA', '')
+    ordinary_local(local)
+    expected_cache = ordinary_local(local + '\\rdpilot\\cache')
+    if (type(config['cache']) is not str or ordinary_local(config['cache']) != expected_cache
+            or type(anchors['cache']) is not str or ordinary_local(anchors['cache']) != expected_cache):raise ValueError()
+    return {**config, 'source': source, 'owned': owned}
 
 
 def final_local(value):
@@ -206,13 +271,17 @@ class Held:
 class Budget:
     def __init__(self, limit=CONTENT_LIMIT):self.remaining = limit
     def read(self, held, limit, digest=False):
+        # Held size and post-read metadata make an extra EOF/probe read unnecessary.
+        # Refuse before consuming bytes when the remaining aggregate cannot fit it.
+        size = held.before[2]
+        if size > limit or size > self.remaining:raise files.BudgetExceeded()
         total = 0;blocks = [];hashed = hashlib.sha256()
-        while True:
-            count = min(1024 * 1024, limit - total + 1, self.remaining + 1)
+        while total < size:
+            count = min(1024 * 1024, size - total, limit - total, self.remaining)
+            if count <= 0:raise files.BudgetExceeded()
             block = held.file.read(count)
             self.remaining -= len(block);total += len(block)
-            if self.remaining < 0 or total > limit:raise files.BudgetExceeded()
-            if not block:break
+            if not block:raise ValueError()
             if digest:hashed.update(block)
             else:blocks.append(block)
         return hashed.hexdigest() if digest else b''.join(blocks)
@@ -259,9 +328,9 @@ def directory_state(path):
 
 
 def snapshot(config):
-    source = config['source'];result = empty(source);result['profile'] = 'present'
-    budget = Budget()
+    source = None;result = empty();budget = Budget()
     try:
+        source = validated_source(config['source']);result = empty(source);result['profile'] = 'present'
         profile = Path(config['profile']);cache = Path(config['cache'])
         if os.name == 'nt':ordinary_local(profile);ordinary_local(cache)
         ancestors(profile)
@@ -301,9 +370,9 @@ def snapshot(config):
             result['candidate_bundle'] = 'mismatch' if False in matches else 'partial' if missing else 'source_binaries_match'
         if ancestors(root) != lineage or (root.lstat().st_dev, root.lstat().st_ino) != root_identity:raise ValueError()
         result['outcome'] = 'observed'
-    except files.BudgetExceeded:result = empty(source, 'budget');result['profile'] = 'present'
-    except (ValueError, TypeError, KeyError, UnicodeError, RecursionError):result = empty(source, 'invalid');result['profile'] = 'present'
-    except (OSError, RuntimeError):result = empty(source);result['profile'] = 'present'
+    except files.BudgetExceeded:result = empty(source, 'budget');result['profile'] = 'present' if source is not None else 'unavailable'
+    except (ValueError, TypeError, KeyError, UnicodeError, RecursionError):result = empty(source, 'invalid');result['profile'] = 'present' if source is not None else 'unavailable'
+    except (OSError, RuntimeError):result = empty(source);result['profile'] = 'present' if source is not None else 'unavailable'
     return result
 
 
@@ -419,21 +488,21 @@ def observe(selected, code, source, acquisition, cache, owned, fresh, private, i
     try:
         if not eligible(selected, code):return result, True
         expected = source_identity(source, acquisition);result = empty(expected)
-        if (fresh is not True or not isinstance(owned, dict)
-                or not re.fullmatch(r'S-1-[0-9-]{1,180}', str(owned.get('sid', '')))
-                or not re.fullmatch(r'rdp[a-f0-9]{14}', str(owned.get('name', '')))
-                or not re.fullmatch(r'rdpilot-owned-[a-f0-9]{32}', str(owned.get('marker', '')))):raise ValueError()
+        if fresh is not True or not isinstance(owned, dict):raise ValueError()
+        control = owner_control({k: owned.get(k) for k in ('sid', 'name', 'marker')})
         runner = Runner(identity, register)
         before = query(runner, owned);profile = profile_binding(before, owned)
         if profile is None:result['profile'] = 'absent';result['outcome'] = 'observed'
         else:
-            config = json.dumps({'source': expected, 'profile': profile, 'cache': str(cache)}).encode()
+            config = json.dumps({'source': expected, 'profile': profile, 'cache': str(cache), 'owned': control}).encode()
             if len(config) > CONFIG_LIMIT:raise files.BudgetExceeded()
             handoff = Path(private)/'guest-footprint-config.json';handoff.write_bytes(config)
             env = dict(os.environ);env['RDPILOT_FOOTPRINT_CONFIG'] = str(handoff)
+            env['RDPILOT_FOOTPRINT_ANCHORS'] = json.dumps({'source': expected, 'owned': control, 'cache': str(cache)})
             candidate = runner.call([sys.executable, str(Path(__file__).resolve())], env, 15)
             # Every child is already joined before the post-profile query.
             if not runner.joined:raise RuntimeError()
+            if not isinstance(candidate, dict) or candidate.get('worker_joined') is not runner.joined:raise ValueError()
             result = validate(candidate, expected)
         after = query(runner, owned);after_profile = profile_binding(after, owned)
         if (profile != after_profile or any(before[k] != after[k] for k in ('sid', 'name', 'marker', 'expected'))):raise ValueError()
@@ -447,6 +516,7 @@ def observe(selected, code, source, acquisition, cache, owned, fresh, private, i
         if runner:runner.close()
     joined = not runner or runner.joined
     if not joined:result = empty(expected, 'cleanup_failed', False)
+    result['worker_joined'] = joined
     result['elapsed_ms'] = min(30000, int((time.monotonic() - start) * 1000))
     return result, joined
 
@@ -456,9 +526,10 @@ def worker():
         path = Path(os.environ['RDPILOT_FOOTPRINT_CONFIG'])
         with Held(path, CONFIG_LIMIT) as held:
             config = json.loads(Budget(CONFIG_LIMIT).read(held, CONFIG_LIMIT), object_pairs_hook=files.unique_json)
-        if not isinstance(config, dict) or set(config) != {'source', 'profile', 'cache'}:raise ValueError()
-        result = snapshot(config)
-        encoded = json.dumps(validate(result, config['source'])).encode()
+        try:admitted = worker_config(config)
+        except (ValueError, TypeError, KeyError, UnicodeError, RecursionError):admitted = None
+        result = snapshot(admitted) if admitted else empty(outcome='invalid')
+        encoded = json.dumps(validate(result, admitted['source'] if admitted else None)).encode()
         if len(encoded) > OUTPUT_LIMIT:raise ValueError()
         sys.stdout.buffer.write(encoded);return 0
     except BaseException:return 1
