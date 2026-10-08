@@ -279,15 +279,47 @@ class ActualFileTests(unittest.TestCase):
             with observer.Held(path, 1024):pass
 
     def test_actual_file_replacement_and_write_race_invalidate_held_read(self):
-        f = self.fixture;path = f.launcher()
+        f = self.fixture;path = f.launcher();write_completed = False
         with self.assertRaises(ValueError):
             with observer.Held(path, 1024) as held:
-                path.write_bytes(b'changed while held');held.file.read()
-        path.write_bytes(BRIDGE)
+                changed = b'changed while held'
+                self.assertEqual(path.write_bytes(changed), len(changed))
+                self.assertEqual(held.file.read(), changed)
+                self.assertEqual(os.lseek(held.file.fileno(), 0, os.SEEK_CUR), len(changed))
+                write_completed = True
+        self.assertTrue(write_completed)
+        self.assertTrue(held.file.closed)
+        self.assertEqual(path.write_bytes(BRIDGE), len(BRIDGE))
+        replacement_completed = False
         with self.assertRaises(ValueError):
             with observer.Held(path, 1024) as held:
-                replacement = f.path/'replacement';replacement.write_bytes(BRIDGE)
-                os.replace(replacement, path);held.file.read()
+                original_identity = held.before[:2]
+                replacement = f.path/'replacement';parked = f.path/'parked'
+                self.assertFalse(replacement.exists());self.assertFalse(parked.exists())
+                self.assertEqual(replacement.write_bytes(BRIDGE), len(BRIDGE))
+                candidate = replacement.stat();candidate_identity = (candidate.st_dev, candidate.st_ino)
+                self.assertEqual(candidate.st_dev, original_identity[0])
+                self.assertNotEqual(candidate_identity, original_identity)
+                # Rename into vacant same-volume owned names: the held original
+                # stays open without requiring overwrite of an open destination.
+                os.replace(path, parked)
+                self.assertFalse(path.exists())
+                original = parked.stat()
+                self.assertEqual((original.st_dev, original.st_ino), original_identity)
+                os.replace(replacement, path)
+                self.assertFalse(replacement.exists())
+                named = path.stat()
+                self.assertEqual((named.st_dev, named.st_ino), candidate_identity)
+                self.assertNotEqual((named.st_dev, named.st_ino), original_identity)
+                self.assertEqual(named.st_size, held.before[2])
+                self.assertEqual(path.read_bytes(), BRIDGE)
+                descriptor = os.fstat(held.file.fileno())
+                self.assertEqual((descriptor.st_dev, descriptor.st_ino), (original.st_dev, original.st_ino))
+                self.assertEqual(held.file.read(), BRIDGE)
+                self.assertEqual(os.lseek(held.file.fileno(), 0, os.SEEK_CUR), len(BRIDGE))
+                replacement_completed = True
+        self.assertTrue(replacement_completed)
+        self.assertTrue(held.file.closed)
 
     def test_shared_actual_byte_counter_and_manifest_admission(self):
         f = self.fixture;path = f.launcher();budget = observer.Budget(len(BRIDGE))
