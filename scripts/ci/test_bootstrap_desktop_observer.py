@@ -227,20 +227,57 @@ class ProcessHttpTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(list(self.output.glob('*.png')))
 
     async def test_binding_change_discards_prior_admitted_images(self):
-        await self.ready(); await self.observer.capture()
-        self.assertTrue(self.observer.manifest['frames'])
-        async def changed(*argv, **kwargs):
-            if argv[0] == 'powershell.exe':
-                proc = await self.raw_spawn(sys.executable, '-c', 'print(\'{"matches":[{"id":9,"state":0}]}\')', **kwargs)
-                self.created.append(proc)
-                self.identities[proc.pid] = {'pid': proc.pid, 'created': '1', 'image': sys.executable}
-                return proc
-            return await self.spawn(*argv, **kwargs)
-        self.observer.raw_spawn = changed
-        await self.observer.capture()
-        self.assertTrue(self.observer.invalidated)
-        self.assertFalse(list(self.output.glob('*.png')))
-        await self.observer.stop()
+        unavailable = [[], [{'id': 7, 'state': 0}, {'id': 8, 'state': 0}],
+                       'private-marker', [{'id': True, 'state': 0}], ['private-marker'],
+                       [{'id': 7, 'state': 4}]]
+        cases = [(f'envelope-{index}', json.dumps({'matches': matches}), 0)
+                 for index, matches in enumerate(unavailable)]
+        cases += [('changed', '{"matches":[{"id":9,"state":0}]}', 0),
+                  ('extra-envelope', '{"matches":[{"id":7,"state":0}],"private-marker":1}', 0),
+                  ('invalid-json', 'private-marker', 0),
+                  ('duplicate-json', '{"matches":[],"matches":[{"id":7,"state":0}]}', 0),
+                  ('native-refusal', 'private-marker', 1)]
+        for index, (name, body, code) in enumerate(cases):
+            for post_frame in (False, True):
+                with self.subTest(binding=name, post_frame=post_frame):
+                    fresh_temp = self.root/f'binding-{index}-{post_frame}'; fresh_temp.mkdir(); self.run.temp = fresh_temp
+                    obj = desktop.Observer(self.run, self.config, self.spawn, lambda pid: self.identities[pid], lambda record: None, proof_support)
+                    await obj.start_viewer(); await obj.capture()
+                    self.assertEqual(len(obj.manifest['frames']), 1)
+                    self.assertTrue((self.output/'bootstrap-a-01.png').exists())
+                    probes = 0
+                    async def native(*argv, **kwargs):
+                        nonlocal probes
+                        if argv[0] == 'powershell.exe':
+                            probes += 1
+                            if post_frame and probes == 1:
+                                return await self.spawn(*argv, **kwargs)
+                            proc = await self.raw_spawn(sys.executable, '-c', f'print({body!r}); raise SystemExit({code})', **kwargs)
+                            self.created.append(proc)
+                            self.identities[proc.pid] = {'pid': proc.pid, 'created': '1', 'image': sys.executable}
+                            return proc
+                        return await self.spawn(*argv, **kwargs)
+                    obj.raw_spawn = native
+                    try:
+                        await obj.capture()
+                    except ValueError:
+                        self.assertIn(name, ('invalid-json', 'duplicate-json', 'native-refusal'))
+                    self.assertTrue(obj.invalidated)
+                    self.assertEqual(obj.manifest['state'], 'observation_failed')
+                    self.assertFalse(obj.manifest['frames'])
+                    self.assertFalse(list(self.output.glob('*.png')))
+                    self.assertEqual('binding_changed' in obj.manifest['events'], name == 'changed')
+                    self.assertNotIn('private-marker', json.dumps(obj.manifest))
+                    self.assertTrue(await obj.stop())
+                    self.assertTrue(all(p.returncode is not None for p in self.created))
+                    projected = desktop.safe_manifest(self.output, obj.manifest, self.source)
+                    self.assertEqual(desktop.selected_files(self.output, projected, self.source), [])
+                    # Even an accidentally reappearing old image cannot survive
+                    # the independently validating host failed-run finalizer.
+                    (self.output/'bootstrap-a-01.png').write_bytes(png())
+                    (self.output/'bootstrap-desktop.json').write_text(json.dumps(projected))
+                    self.assertEqual(desktop.retain_failed_images(self.output, self.source, True), [])
+                    self.assertFalse(list(self.output.glob('*.png')))
 
     async def test_slow_http_whole_deadline_and_socket_close_on_cancellation(self):
         ended = asyncio.Event(); accepted = asyncio.Event(); tasks = set()
@@ -377,17 +414,28 @@ class ProcessHttpTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_native_binding_envelope_refuses_absent_ambiguous_and_malformed(self):
         original = self.spawn
-        for matches in ([], [{'id': 7, 'state': 0}, {'id': 8, 'state': 0}], [{'id': True, 'state': 0}], 'private-marker'):
+        cases = [(json.dumps({'matches': matches}), 0) for matches in
+                 ([], [{'id': 7, 'state': 0}, {'id': 8, 'state': 0}],
+                  [{'id': True, 'state': 0}], [{'id': 7, 'state': 4}], 'private-marker')]
+        cases += [('private-marker', 0), ('private-marker', 1)]
+        for body, code in cases:
             async def native(*argv, **kwargs):
                 if argv[0] == 'powershell.exe':
-                    proc = await self.raw_spawn(sys.executable, '-c', f'print({json.dumps({"matches":matches})!r})', **kwargs)
+                    proc = await self.raw_spawn(sys.executable, '-c', f'print({body!r}); raise SystemExit({code})', **kwargs)
                     self.created.append(proc)
                     self.identities[proc.pid] = {'pid': proc.pid, 'created': '1', 'image': sys.executable}
                     return proc
                 return await original(*argv, **kwargs)
             self.observer.raw_spawn = native
-            self.assertIsNone(await self.observer.binding())
+            try:
+                self.assertIsNone(await self.observer.binding())
+            except ValueError:
+                self.assertEqual(body, 'private-marker')
+            self.assertIsNone(self.observer.session_id)
+            self.assertFalse(self.observer.invalidated)
+            self.assertEqual(self.observer.manifest['state'], 'unavailable')
             self.assertFalse(self.observer.manifest['frames'])
+            self.assertNotIn('binding_changed', self.observer.manifest['events'])
             self.assertNotIn('private-marker', json.dumps(self.observer.manifest))
         self.assertTrue(await self.observer.stop())
 

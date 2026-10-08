@@ -274,17 +274,23 @@ class Observer:
             if key.casefold() == 'psmodulepath':
                 env.pop(key)
         env['RDPILOT_HOST_CONTROL'] = json.dumps({'sid': self.config['sid']})
-        proc = await self.spawn('powershell.exe', '-NoProfile', '-NonInteractive', '-EncodedCommand',
-            base64.b64encode(self.config['wts_script'].encode('utf-16le')).decode(), env=env,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL, **self.no_window)
-        raw = json.loads((await self.child_output(proc)).decode('utf-8-sig'))
-        matches = raw.get('matches') if isinstance(raw, dict) else None
-        if not isinstance(matches, list) or len(matches) != 1:
+        try:
+            proc = await self.spawn('powershell.exe', '-NoProfile', '-NonInteractive', '-EncodedCommand',
+                base64.b64encode(self.config['wts_script'].encode('utf-16le')).decode(), env=env,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL, **self.no_window)
+            raw = json.loads((await self.child_output(proc)).decode('utf-8-sig'), object_pairs_hook=files.unique_json)
+        except (Exception, asyncio.CancelledError):
+            self.event('binding_unavailable')
             if self.session_id is not None:
-                self.event('binding_changed'); self.invalidate()
-            return None
-        row = matches[0]
-        if not isinstance(row, dict) or set(row) != {'id', 'state'} or not integer(row['id'], 1, 2**31-1) or row['state'] != 0 or type(row['state']) is not int:
+                self.invalidate()
+            raise
+        matches = raw.get('matches') if isinstance(raw, dict) and set(raw) == {'matches'} else None
+        row = matches[0] if isinstance(matches, list) and len(matches) == 1 else None
+        if (not isinstance(row, dict) or set(row) != {'id', 'state'}
+                or not integer(row['id'], 1, 2**31-1) or row['state'] != 0 or type(row['state']) is not int):
+            self.event('binding_unavailable')
+            if self.session_id is not None:
+                self.invalidate()
             return None
         if self.session_id is not None and row['id'] != self.session_id:
             self.event('binding_changed'); self.invalidate(); return None
@@ -395,7 +401,7 @@ class Observer:
         await self.decode(body, width, height)
         after = await self.binding()
         if before != after or not after:
-            self.event('binding_changed'); self.invalidate(); return
+            self.invalidate(); return
         self.admit(seq, width, height, body)
 
     async def start_viewer(self):
