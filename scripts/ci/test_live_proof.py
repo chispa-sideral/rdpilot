@@ -156,7 +156,7 @@ class OwnershipTests(unittest.TestCase):
         for checks in live.CHECKS.values():self.assertIn('private_child_temporary_boundary_verified',checks)
 
     def test_setup_diagnostic_is_separate_from_required_live_gate(self):
-        workflow=(HERE.parents[1]/'.github/workflows/desktop-setup-diagnostic.yml').read_text()
+        workflow=(HERE.parents[1]/'.github/workflows/hosted-desktop-probe.yml').read_text()
         self.assertIn('workflow_dispatch:',workflow)
         self.assertNotIn('  push:',workflow)
         self.assertIn('--setup-diagnostic',workflow)

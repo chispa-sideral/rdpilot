@@ -215,7 +215,9 @@ $ok|ConvertTo-Json
     actions.append(('owned_processes_removed',stop_processes))
     for i,user in enumerate(users):
         def reconcile(user=user):
-            if 'sid' in user:return
+            if 'sid' in user:
+                user['creation_present']=True
+                return
             observed=powershell(r'''
 $u=Get-LocalUser $v.name -ErrorAction SilentlyContinue
 if(!$u){@{absent=$true}|ConvertTo-Json -Compress}else{
@@ -223,6 +225,7 @@ if(!$u){@{absent=$true}|ConvertTo-Json -Compress}else{
  @{name=$u.Name;sid=$u.SID.Value}|ConvertTo-Json -Compress
 }
 ''',user,10)
+            user['creation_present']=not observed.get('absent',False)
             if observed.get('absent'):user['sid']='S-1-0-0'
             else:user.update(observed)
         actions.append(('user_'+str(i)+'_creation_reconciled',reconcile))
@@ -286,7 +289,7 @@ def run(args):
     powershell("& icacls $v.path /inheritance:r /grant:r \"$($env:USERDOMAIN)\\$($env:USERNAME):(OI)(CI)F\"|Out-Null;if($LASTEXITCODE){throw 'Private ACL failed'}",{'path':str(private)})
     os.environ.update(private_environment(private))
     snapshot=None;results={};suites=[];users=[];journal=private/'processes.json';rule='RdpilotDesktop-'+secrets.token_hex(8)
-    stage='preflight';failure_detail={};failure_code='none';passed=False;setup_attempted=False;roles=[];memberships=[]
+    stage='preflight';failure_detail={};failure_code='none';passed=False;setup_attempted=False;roles=[];memberships=[];creation_observations=[]
     try:
         snapshot=powershell(PREFLIGHT)
         measure_process_refusal()
@@ -336,7 +339,9 @@ def run(args):
             if diagnostic:
                 suites.append('host_setup')
                 checks=cleanup_suite(users,journal,snapshot['cache'])
-                results['host_setup']=checks;users=[]
+                results['host_setup']=checks
+                creation_observations.extend({'suite':'host_setup','present':u.get('creation_present')} for u in users)
+                users=[]
                 if not all(checks.values()):raise RuntimeError('Setup cleanup failed')
                 continue
             child_env=dict(os.environ)
@@ -361,7 +366,9 @@ def run(args):
             stage=proof+'_cleanup'
             try:checks=cleanup_suite(users,journal,snapshot['cache'],require_profiles=(code==0 and selected['status']=='passed'))
             except BaseException:checks={'suite_cleanup':False}
-            results[proof]=checks;users=[]
+            results[proof]=checks
+            creation_observations.extend({'suite':proof,'present':u.get('creation_present')} for u in users)
+            users=[]
             if code or selected['status']!='passed' or not all(checks.values()):
                 raise RuntimeError('Required proof or cleanup failed')
         passed=True;stage='none'
@@ -374,6 +381,7 @@ def run(args):
             if users:
                 try:results['unfinished_suite']=cleanup_suite(users,journal,snapshot['cache'])
                 except BaseException:results['unfinished_suite']={'suite_cleanup':False}
+                creation_observations.extend({'suite':'unfinished','present':u.get('creation_present')} for u in users)
             actions=[]
             if setup_attempted:
                 for i,reg in enumerate(snapshot['registry']):
@@ -401,7 +409,7 @@ if($s.State -ne $v.state -or $s.StartMode -ne $v.start_mode){throw 'Service rest
         if not passed:
             for screenshot in artifacts.glob('*.png'):
                 screenshot.unlink()
-        (artifacts/'account-roles.json').write_text(json.dumps({'roles':roles,'memberships':memberships},indent=2))
+        (artifacts/'account-roles.json').write_text(json.dumps({'roles':roles,'memberships':memberships,'creation_observations':creation_observations},indent=2))
         (artifacts/'cleanup.json').write_text(json.dumps(results,indent=2))
         (artifacts/'gate.json').write_text(json.dumps({'mode':'setup_diagnostic' if getattr(args,'setup_diagnostic',False) else 'live', 'status':('setup_passed' if getattr(args,'setup_diagnostic',False) else 'passed') if passed else 'failed','failure_stage':'none' if passed else (stage if stage!='none' else 'cleanup'),'completed_suites':suites,'failure_code':failure_code if not passed else 'none','host_failure':failure_detail if not passed else {}},indent=2))
     print('Hosted desktop gate '+('passed' if passed else 'failed')+'; stage: '+stage,flush=True)
