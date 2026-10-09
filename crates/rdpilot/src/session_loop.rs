@@ -18,13 +18,14 @@
 //! `unwrap`/`expect`/`panic` in non-test code (API-01).
 
 use ironrdp::connector::connection_activation::{
-    ConnectionActivationSequence, ConnectionActivationState,
+    ConnectionActivationFactory, ConnectionActivationState,
 };
+use ironrdp::connector::ConnectionResult;
 use ironrdp::core::WriteBuf;
 use ironrdp::graphics::image_processing::PixelFormat;
 use ironrdp::session::fast_path;
 use ironrdp::session::image::DecodedImage;
-use ironrdp::session::{ActiveStage, ActiveStageOutput};
+use ironrdp::session::{ActiveStage, ActiveStageBuilder, ActiveStageOutput};
 use ironrdp_tokio::{Framed, FramedWrite};
 use tokio::sync::mpsc;
 use tokio::time::{interval, MissedTickBehavior};
@@ -70,7 +71,7 @@ pub(crate) enum RdpInputEvent {
 /// channel-close, or an [`Error`] if a PDU could not be processed or written.
 pub(crate) async fn run(
     framed: ConnectedFramed,
-    connection_result: ironrdp::connector::ConnectionResult,
+    connection_result: ConnectionResult,
     mut input_rx: mpsc::Receiver<RdpInputEvent>,
     frame: SharedFrame,
     bridge: std::sync::Arc<crate::bridge::BridgeShared>,
@@ -83,7 +84,7 @@ pub(crate) async fn run(
         connection_result.desktop_size.height,
     );
 
-    let mut active_stage = ActiveStage::new(connection_result);
+    let (mut active_stage, activation_factory) = active_stage(connection_result);
 
     let mut keepalive = interval(KEEPALIVE_INTERVAL);
     // If a tick is missed (e.g. the loop was busy), fire once and resync rather
@@ -200,13 +201,13 @@ pub(crate) async fn run(
                     let height = u32::from(image.height());
                     frame.write(width, height, image.data().to_vec());
                 }
-                ActiveStageOutput::DeactivateAll(mut activation) => {
+                ActiveStageOutput::DeactivateAll => {
                     // Server resize / share change: run the reactivation sequence
                     // and rebuild the framebuffer at the new size, or screenshots
                     // go stale / wrong-size (Pitfall 2, criterion #4).
                     tokio::select! {
                         _=bridge.shutdown.notified()=>return Ok(()),
-                        outcome=tokio::time::timeout(std::time::Duration::from_secs(10),reactivate(&mut reader,&mut writer,&mut active_stage,&mut image,&mut activation))=>{
+                        outcome=tokio::time::timeout(std::time::Duration::from_secs(10),reactivate(&mut reader,&mut writer,&mut active_stage,&mut image,&activation_factory))=>{
                             outcome.map_err(|_|Error::Session("RDP reactivation deadline exceeded".into()))??;
                         }
                     }
@@ -299,24 +300,58 @@ fn build_request_frame(
         .map_err(|e| Error::dvc(e.to_string()))
 }
 
+/// Build the [`ActiveStage`] for a finalized connection, together with the
+/// factory that creates the sequence for each later Deactivate-All.
+///
+/// The one construction path for production and tests. `message_channel_id`
+/// must be passed through: a server-allocated MCS message channel whose id is
+/// dropped makes the first auto-detect PDU fail as an unexpected channel.
+fn active_stage(connection_result: ConnectionResult) -> (ActiveStage, ConnectionActivationFactory) {
+    let ConnectionResult {
+        io_channel_id,
+        user_channel_id,
+        message_channel_id,
+        share_id,
+        static_channels,
+        enable_server_pointer,
+        pointer_software_rendering,
+        activation_factory,
+        compression_type,
+        ..
+    } = connection_result;
+    let stage = ActiveStageBuilder {
+        static_channels,
+        user_channel_id,
+        io_channel_id,
+        message_channel_id,
+        share_id,
+        compression_type,
+        enable_server_pointer,
+        pointer_software_rendering,
+    }
+    .build();
+    (stage, activation_factory)
+}
+
 /// Run the Deactivation-Reactivation sequence and rebuild the framebuffer.
 ///
-/// Drives the [`ConnectionActivationSequence`](ironrdp::connector::ConnectionActivationSequence)
-/// to `Finalized`, then replaces `image` with a fresh [`DecodedImage`] at the new
-/// desktop size and rebuilds the fast-path processor + share id with the new
-/// channel parameters (Pattern 5).
+/// Creates a [`ConnectionActivationSequence`](ironrdp::connector::connection_activation::ConnectionActivationSequence)
+/// from `activation` and drives it to `Finalized`, then replaces `image` with a
+/// fresh [`DecodedImage`] at the new desktop size and rebuilds the fast-path
+/// processor + share id with the new channel parameters (Pattern 5).
 async fn reactivate(
     reader: &mut Framed<ironrdp_tokio::TokioStream<tokio::io::ReadHalf<UpgradedStream>>>,
     writer: &mut Framed<ironrdp_tokio::TokioStream<tokio::io::WriteHalf<UpgradedStream>>>,
     active_stage: &mut ActiveStage,
     image: &mut DecodedImage,
-    activation: &mut ConnectionActivationSequence,
+    activation: &ConnectionActivationFactory,
 ) -> Result<()> {
     debug!("deactivate-all received; running reactivation sequence");
+    let mut sequence = activation.create();
     let mut buf = WriteBuf::new();
 
     loop {
-        let written = ironrdp_tokio::single_sequence_step_read(reader, activation, &mut buf)
+        let written = ironrdp_tokio::single_sequence_step_read(reader, &mut sequence, &mut buf)
             .await
             .map_err(|e| Error::Session(format!("reactivation step failed: {e}")))?;
 
@@ -328,20 +363,18 @@ async fn reactivate(
         }
 
         if let ConnectionActivationState::Finalized {
-            io_channel_id,
-            user_channel_id,
             desktop_size,
             share_id,
             enable_server_pointer,
             pointer_software_rendering,
-        } = activation.connection_activation_state()
+        } = sequence.connection_activation_state()
         {
             *image =
                 DecodedImage::new(PixelFormat::RgbA32, desktop_size.width, desktop_size.height);
 
             let processor = fast_path::ProcessorBuilder {
-                io_channel_id,
-                user_channel_id,
+                io_channel_id: activation.io_channel_id(),
+                user_channel_id: activation.user_channel_id(),
                 share_id,
                 enable_server_pointer,
                 pointer_software_rendering,
@@ -369,8 +402,8 @@ async fn reactivate(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ironrdp::connector::connection_activation::ConnectionActivationSequence;
-    use ironrdp::connector::{Config, ConnectionResult, Credentials, DesktopSize};
+    use ironrdp::connector::connection_activation::ConnectionActivationFactory;
+    use ironrdp::connector::{Config, Credentials, DesktopSize};
     use ironrdp::core::decode;
     use ironrdp::graphics::image_processing::PixelFormat;
     use ironrdp::pdu::gcc::KeyboardType;
@@ -423,19 +456,20 @@ mod tests {
         ConnectionResult {
             io_channel_id: 1003,
             user_channel_id: 1001,
+            message_channel_id: None,
             share_id: 1,
             static_channels: Default::default(),
             desktop_size: config.desktop_size,
             enable_server_pointer: false,
             pointer_software_rendering: false,
-            connection_activation: ConnectionActivationSequence::new(config, 1003, 1001),
+            activation_factory: ConnectionActivationFactory::new(config, 1003, 1001),
             compression_type: None,
         }
     }
 
     fn active_fixture() -> (ActiveStage, DecodedImage) {
         (
-            ActiveStage::new(connection_result_fixture()),
+            active_stage(connection_result_fixture()).0,
             DecodedImage::new(PixelFormat::RgbA32, 100, 100),
         )
     }

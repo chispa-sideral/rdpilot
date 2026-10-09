@@ -20,7 +20,7 @@
 //! `std::fs`/IO failure maps to an `NtStatus` response, never a panic
 //! (T-05-05).
 //!
-//! Grounded directly in the pinned `ironrdp-rdpdr-0.6.0` source
+//! Grounded directly in the pinned `ironrdp-rdpdr-0.7.0` source
 //! (`src/pdu/efs.rs`, `src/backend/mod.rs`) at execution time -- see the
 //! plan's 05-02-SUMMARY.md "efs.rs read resolution" for the exact
 //! `ServerDriveIoRequest` variant list and `NtStatus` values this module

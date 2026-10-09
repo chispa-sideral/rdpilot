@@ -21,7 +21,7 @@
 //!   registered at the identical connect-time seam, as a SIBLING static channel
 //!   to `DrdynvcClient` — NOT routed through it. `ironrdp_rdpdr::Rdpdr` fully
 //!   implements `SvcProcessor`/`SvcClientProcessor` (verified in the pinned
-//!   `ironrdp-rdpdr-0.6.0` source) and dispatches inbound MS-RDPEFS IRPs to the
+//!   `ironrdp-rdpdr-0.7.0` source) and dispatches inbound MS-RDPEFS IRPs to the
 //!   registered [`crate::rdpdr_backend::RdpilotDriveBackend`] internally —
 //!   `ActiveStage::process` drives it automatically, exactly like the drdynvc
 //!   static channel; no `session_loop.rs` change is needed. Registered only
@@ -79,7 +79,7 @@ pub(crate) type ConnectedFramed = TokioFramed<UpgradedStream>;
 /// Drive the full connect sequence and return the active-session inputs.
 ///
 /// On success the caller owns a [`ConnectionResult`] (desktop size, channel IDs,
-/// reactivation sequence) and the TLS-upgraded [`ConnectedFramed`] ready for the
+/// activation factory) and the TLS-upgraded [`ConnectedFramed`] ready for the
 /// PDU pump. Every failure is mapped to an owned [`Error`] variant; no
 /// credential or certificate material is ever logged.
 pub(crate) async fn connect(
