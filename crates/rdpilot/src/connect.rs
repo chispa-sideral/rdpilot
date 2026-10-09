@@ -21,7 +21,7 @@
 //!   registered at the identical connect-time seam, as a SIBLING static channel
 //!   to `DrdynvcClient` — NOT routed through it. `ironrdp_rdpdr::Rdpdr` fully
 //!   implements `SvcProcessor`/`SvcClientProcessor` (verified in the pinned
-//!   `ironrdp-rdpdr-0.6.0` source) and dispatches inbound MS-RDPEFS IRPs to the
+//!   `ironrdp-rdpdr-0.7.0` source) and dispatches inbound MS-RDPEFS IRPs to the
 //!   registered [`crate::rdpdr_backend::RdpilotDriveBackend`] internally —
 //!   `ActiveStage::process` drives it automatically, exactly like the drdynvc
 //!   static channel; no `session_loop.rs` change is needed. Registered only
@@ -42,7 +42,7 @@ use ironrdp::dvc::DrdynvcClient;
 use ironrdp::pdu::gcc::KeyboardType;
 use ironrdp::pdu::rdp::capability_sets::MajorPlatformType;
 use ironrdp::pdu::rdp::client_info::{PerformanceFlags, TimezoneInfo};
-use ironrdp_rdpdr::Rdpdr;
+use ironrdp_rdpdr::{Rdpdr, RdpdrBackend};
 use ironrdp_tokio::reqwest::ReqwestNetworkClient;
 use ironrdp_tokio::TokioFramed;
 use rustls::client::Resumption;
@@ -79,7 +79,7 @@ pub(crate) type ConnectedFramed = TokioFramed<UpgradedStream>;
 /// Drive the full connect sequence and return the active-session inputs.
 ///
 /// On success the caller owns a [`ConnectionResult`] (desktop size, channel IDs,
-/// reactivation sequence) and the TLS-upgraded [`ConnectedFramed`] ready for the
+/// activation factory) and the TLS-upgraded [`ConnectedFramed`] ready for the
 /// PDU pump. Every failure is mapped to an owned [`Error`] variant; no
 /// credential or certificate material is ever logged.
 pub(crate) async fn connect(
@@ -151,9 +151,7 @@ pub(crate) async fn connect(
             share_root,
             bridge.clone(),
         );
-        let rdpdr = Rdpdr::new(Box::new(drive_backend), "rdpilot".to_owned())
-            .with_drives(Some(vec![(0, "RDPILOT".to_owned())]));
-        connector = connector.with_static_channel(rdpdr);
+        connector = connector.with_static_channel(rdpilot_rdpdr(Box::new(drive_backend)));
 
         // Live-diagnosed bug fix (05-04 live gate, D-5.6/SC2): MS-RDPEFS
         // Appendix A footnote <1> requires "rdpsnd" to be advertised
@@ -427,6 +425,12 @@ mod danger {
     }
 }
 
+/// The `RDPDR` static channel rdpilot registers: one drive, announced as
+/// `RDPILOT`, served by `backend`.
+fn rdpilot_rdpdr(backend: Box<dyn RdpdrBackend>) -> Rdpdr {
+    Rdpdr::new(backend, "rdpilot".to_owned()).with_drives(Some(vec![(0, "RDPILOT".to_owned())]))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -486,5 +490,80 @@ mod tests {
             Err(Error::Tls(_)) => {}
             Err(other) => panic!("unexpected error category from validating path: {other:?}"),
         }
+    }
+
+    /// Encode a Server Client ID Confirm that announces every device at once
+    /// (RDP 5.1 or later).
+    fn server_client_id_confirm() -> Vec<u8> {
+        use ironrdp::core::encode_vec;
+        use ironrdp_rdpdr::pdu::efs::{
+            VersionAndIdPdu, VersionAndIdPduKind, VERSION_MAJOR, VERSION_MINOR_RDP51,
+        };
+        use ironrdp_rdpdr::pdu::RdpdrPdu;
+        encode_vec(&RdpdrPdu::VersionAndIdPdu(VersionAndIdPdu {
+            version_major: VERSION_MAJOR,
+            version_minor: VERSION_MINOR_RDP51,
+            client_id: 1,
+            kind: VersionAndIdPduKind::ServerClientIdConfirm,
+        }))
+        .expect("server client id confirm encodes")
+    }
+
+    /// Offset of `DeviceDataLength` inside an encoded Client Device List
+    /// Announce with one device: shared header (4), device count (4),
+    /// device type (4), device id (4), preferred DOS name (8).
+    const DEVICE_DATA_LENGTH_OFFSET: usize = 24;
+
+    /// Check that an encoded Client Device List Announce carries exactly one
+    /// filesystem device whose `DeviceData` is `RDPILOT` as null-terminated
+    /// UTF-8, the form Windows needs to name the drive `RDPILOT`.
+    fn drive_name_violation(announce: &[u8]) -> Option<String> {
+        const FILESYSTEM: u32 = 0x0000_0008;
+        let word = |at: usize| {
+            announce
+                .get(at..at + 4)
+                .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        };
+        if word(4) != Some(1) {
+            return Some(format!("expected one device, got {:?}", word(4)));
+        }
+        if word(8) != Some(FILESYSTEM) {
+            return Some(format!("expected a filesystem device, got {:?}", word(8)));
+        }
+        let Some(len) = word(DEVICE_DATA_LENGTH_OFFSET) else {
+            return Some("announce ends before DeviceDataLength".to_owned());
+        };
+        let data = announce.get(DEVICE_DATA_LENGTH_OFFSET + 4..);
+        if len != 8 || data != Some(b"RDPILOT\0".as_slice()) {
+            return Some(format!("DeviceDataLength {len}, DeviceData {data:02x?}"));
+        }
+        None
+    }
+
+    /// The drive is announced as `RDPILOT` in null-terminated UTF-8. A later
+    /// IronRDP release that writes the name as UTF-16 makes Windows show the
+    /// drive as `R`; this test fails on that change without a Windows target.
+    #[test]
+    fn the_rdpdr_drive_is_announced_as_null_terminated_utf8_rdpilot() {
+        use ironrdp::svc::SvcProcessor;
+        use ironrdp_rdpdr::NoopRdpdrBackend;
+
+        let mut rdpdr = rdpilot_rdpdr(Box::new(NoopRdpdrBackend));
+        let out = rdpdr
+            .process(&server_client_id_confirm())
+            .expect("the confirm is processed");
+        assert_eq!(out.len(), 1, "one Client Device List Announce");
+        let announce = out[0].encode_unframed_pdu().expect("announce encodes");
+        assert_eq!(drive_name_violation(&announce), None);
+
+        // The checker must reject the UTF-16LE form of the same announce.
+        let utf16: Vec<u8> = "RDPILOT\0"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        let mut mutated = announce[..DEVICE_DATA_LENGTH_OFFSET].to_vec();
+        mutated.extend_from_slice(&u32::try_from(utf16.len()).unwrap().to_le_bytes());
+        mutated.extend_from_slice(&utf16);
+        assert!(drive_name_violation(&mutated).is_some());
     }
 }
