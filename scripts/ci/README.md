@@ -70,7 +70,7 @@ they never create a production release.
 
 The `desktop` job builds the client, daemon, MCP server and bridge in release
 mode and runs the live Cua, viewer and takeover harnesses against the runner's
-own RDP listener. `run-hosted-desktop.ps1 -Proof cua|viewer|takeover` creates
+own RDP listener. `run-hosted-desktop.ps1 -Proof cua|viewer|takeover|perf` creates
 disposable local standard users (Users and Remote Desktop Users, not
 administrators) with random masked passwords, enables RDP with NLA on
 `127.0.0.1:3389`, opens a loopback-only firewall rule and gives the harness a
@@ -92,6 +92,27 @@ To run the same harnesses against another prepared Windows host, use
 `run-takeover-proof.py` with `RDPILOT_VIEW_{A,B}_*` or `RDPILOT_TAKE_*`
 variables, plus `--bundle` with a directory that holds a source-built
 `rdpilot-bridge.exe` and `--allow-no-tailnet` when no tailnet is available.
+
+### Performance workload
+
+`run-hosted-desktop.ps1 -Proof perf` runs `scripts/e2e/run-perf-proof.py`
+for one test user. The workflow input `perf_workload` of the manual
+`workflow_dispatch` trigger starts it: on such a run the `desktop` job builds
+the binaries, installs the browser and runs the performance step, and skips the
+live Cua, viewer and takeover proofs. A push, a pull request and a release
+call never run the step, and the per-push job is unchanged.
+
+The wrapper copies the painter (`scripts/e2e/perf/painter.ps1` and
+`PixelClock.cs`) to a directory that the test user can write and starts it
+from a logon entry of that user. The entry and the directory are removed in
+cleanup; `cleanup.json` has a `painter_removed` readback. The session connects
+with Cua disabled.
+
+The step uploads the `perf-workload-result` artifact (90 days) with
+`perf-result.json` and the raw samples. The offline job runs the same script
+with `--fake` against synthetic frames of a known age
+(`run-offline-proof.py perf`). `docs/performance.md` has the workload
+definitions, the measurement method and the baseline.
 
 Not executed live: the recording proof (three concurrent users and POSIX
 client checks; offline only), tailnet and cross-machine viewing, UAC and the
