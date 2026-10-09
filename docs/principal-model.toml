@@ -1,0 +1,495 @@
+# Operation x principal table. Source of truth for the policy table.
+# Format and use: docs/principal-model.md.
+
+schema = 1
+principals = ["socket_owner", "agent", "human"]
+classes = ["read", "act", "transfer", "admin", "credential-command"]
+decisions = ["allow", "allow-with-lease", "deny"]
+
+[[operation]]
+adapter = "ipc"
+name = "Connect"
+class = "credential-command"
+authentication = ["socket-peer"]
+summary = "Open a session to a host; the request carries the password."
+decision = { socket_owner = "allow", agent = "allow", human = "allow" }
+current = "The CLI resolves Password or PasswordCommand (shell-expanded) and sends the plaintext password in the request; the daemon opens the session."
+delta = "Saved-host connects resolve in the daemon (see connect-saved-host). An explicit password is input only and is never returned to any principal."
+evidence = ["crates/rdpilot-ipc/src/request.rs:7", "crates/rdpilot-ipc/src/request.rs:12", "crates/rdpilot-daemon/src/dispatch.rs:243", "crates/rdpilot-cli/src/verbs/session.rs:47"]
+
+[[operation]]
+adapter = "ipc"
+name = "ConnectAck"
+class = "credential-command"
+authentication = ["socket-peer"]
+summary = "Acknowledge a Connect stream; part of Connect."
+decision = { socket_owner = "allow", agent = "allow", human = "allow" }
+current = "Valid only inside the Connect stream; sent alone it is an error."
+delta = "none"
+evidence = ["crates/rdpilot-ipc/src/request.rs:30", "crates/rdpilot-daemon/src/ipc/mod.rs:196", "crates/rdpilot-daemon/src/dispatch.rs:278"]
+
+[[operation]]
+adapter = "ipc"
+name = "List"
+class = "read"
+authentication = ["socket-peer"]
+summary = "List sessions."
+decision = { socket_owner = "allow", agent = "allow", human = "allow" }
+current = "Served to any owner-only socket peer; no per-request authorization."
+delta = "none"
+evidence = ["crates/rdpilot-ipc/src/request.rs:33", "crates/rdpilot-daemon/src/dispatch.rs:282"]
+
+[[operation]]
+adapter = "ipc"
+name = "Disconnect"
+class = "act"
+authentication = ["socket-peer"]
+summary = "Close a session."
+decision = { socket_owner = "allow", agent = "allow", human = "allow" }
+current = "Served to any socket peer. No HTTP route binds it."
+delta = "None to policy."
+evidence = ["crates/rdpilot-ipc/src/request.rs:34", "crates/rdpilot-daemon/src/dispatch.rs:286"]
+
+[[operation]]
+adapter = "ipc"
+name = "Ping"
+class = "read"
+authentication = ["socket-peer"]
+summary = "Check that a session answers."
+decision = { socket_owner = "allow", agent = "allow", human = "allow" }
+current = "Served to any owner-only socket peer; no per-request authorization."
+delta = "none"
+evidence = ["crates/rdpilot-ipc/src/request.rs:37", "crates/rdpilot-daemon/src/dispatch.rs:290"]
+
+[[operation]]
+adapter = "ipc"
+name = "Screenshot"
+class = "read"
+authentication = ["socket-peer"]
+summary = "Capture one frame of a session."
+decision = { socket_owner = "allow", agent = "allow", human = "allow" }
+current = "Served through Registry::call, which does not check the control lease."
+delta = "none"
+evidence = ["crates/rdpilot-ipc/src/request.rs:40", "crates/rdpilot-daemon/src/dispatch.rs:294"]
+
+[[operation]]
+adapter = "ipc"
+name = "Mouse"
+class = "act"
+authentication = ["socket-peer"]
+summary = "Send one mouse event to a live session."
+decision = { socket_owner = "allow-with-lease", agent = "allow-with-lease", human = "allow-with-lease" }
+current = "Goes through call_acting, which admits the agent only when no human holds the control lease."
+delta = "none"
+evidence = ["crates/rdpilot-ipc/src/request.rs:43", "crates/rdpilot-daemon/src/dispatch.rs:333", "crates/rdpilot-daemon/src/registry.rs:590", "crates/rdpilot-daemon/src/registry.rs:611"]
+
+[[operation]]
+adapter = "ipc"
+name = "Key"
+class = "act"
+authentication = ["socket-peer"]
+summary = "Send one key event to a live session."
+decision = { socket_owner = "allow-with-lease", agent = "allow-with-lease", human = "allow-with-lease" }
+current = "Goes through call_acting, which admits the agent only when no human holds the control lease."
+delta = "none"
+evidence = ["crates/rdpilot-ipc/src/request.rs:47", "crates/rdpilot-daemon/src/dispatch.rs:343", "crates/rdpilot-daemon/src/registry.rs:590", "crates/rdpilot-daemon/src/registry.rs:611"]
+
+[[operation]]
+adapter = "ipc"
+name = "DesktopSize"
+class = "read"
+authentication = ["socket-peer"]
+summary = "Query the remote desktop size."
+decision = { socket_owner = "allow", agent = "allow", human = "allow" }
+current = "Reads the cached size; changes nothing."
+delta = "none"
+evidence = ["crates/rdpilot-ipc/src/request.rs:51", "crates/rdpilot-daemon/src/dispatch.rs:353"]
+
+[[operation]]
+adapter = "ipc"
+name = "Put"
+class = "transfer"
+authentication = ["socket-peer"]
+summary = "Copy a file into the remote session."
+decision = { socket_owner = "allow", agent = "allow", human = "allow" }
+current = "The request carries a daemon-local source path; served through Registry::call, not lease-gated."
+delta = "A human binding never takes a daemon-local path: it sends the file content. The allow decision for human therefore grants no read access to arbitrary daemon files."
+evidence = ["crates/rdpilot-ipc/src/request.rs:54", "crates/rdpilot-daemon/src/dispatch.rs:303"]
+
+[[operation]]
+adapter = "ipc"
+name = "Get"
+class = "transfer"
+authentication = ["socket-peer"]
+summary = "Copy a file out of the remote session."
+decision = { socket_owner = "allow", agent = "allow", human = "allow" }
+current = "The request carries a daemon-local destination path; served through Registry::call, not lease-gated."
+delta = "Content leaving the session lands in the per-session staging area. A human binding never takes a daemon-local path."
+evidence = ["crates/rdpilot-ipc/src/request.rs:59", "crates/rdpilot-daemon/src/dispatch.rs:318"]
+
+[[operation]]
+adapter = "ipc"
+name = "CuaAttach"
+class = "read"
+authentication = ["socket-peer"]
+summary = "Open the Cua stream for a session."
+decision = { socket_owner = "allow", agent = "allow", human = "allow" }
+current = "Intercepted before dispatch. Opening the stream changes nothing; each forwarded call is classified at the Cua gate (see the cua rows)."
+delta = "none"
+evidence = ["crates/rdpilot-ipc/src/request.rs:65", "crates/rdpilot-daemon/src/ipc/mod.rs:96", "crates/rdpilot-daemon/src/dispatch.rs:365"]
+
+[[operation]]
+adapter = "ipc"
+name = "ViewerStart"
+class = "admin"
+authentication = ["socket-peer"]
+summary = "Start the viewer and return its access token."
+decision = { socket_owner = "allow", agent = "allow", human = "deny" }
+current = "Intercepted before dispatch. The response carries the per-start viewer token; the viewer lives only while the IPC connection is held."
+delta = "The viewer outlives the IPC connection. Token issuance moves to the pairing-token-issuance row."
+evidence = ["crates/rdpilot-ipc/src/request.rs:70", "crates/rdpilot-daemon/src/ipc/mod.rs:78", "crates/rdpilot-ipc/src/response.rs:174"]
+
+[[operation]]
+adapter = "ipc"
+name = "Takeover"
+class = "act"
+authentication = ["socket-peer"]
+summary = "End a human control lease."
+decision = { socket_owner = "allow", agent = "allow", human = "allow" }
+current = "Ends any human lease on the session."
+delta = "none"
+evidence = ["crates/rdpilot-ipc/src/request.rs:85", "crates/rdpilot-daemon/src/dispatch.rs:380", "crates/rdpilot-daemon/src/registry.rs:656"]
+
+[[operation]]
+adapter = "ipc"
+name = "RecordStart"
+class = "act"
+authentication = ["socket-peer"]
+summary = "Start recording a session."
+decision = { socket_owner = "allow", agent = "allow", human = "allow" }
+current = "Served to any owner-only socket peer; no per-request authorization."
+delta = "none"
+evidence = ["crates/rdpilot-ipc/src/request.rs:89", "crates/rdpilot-daemon/src/dispatch.rs:371"]
+
+[[operation]]
+adapter = "ipc"
+name = "RecordStop"
+class = "act"
+authentication = ["socket-peer"]
+summary = "Stop recording a session."
+decision = { socket_owner = "allow", agent = "allow", human = "allow" }
+current = "Served to any owner-only socket peer; no per-request authorization."
+delta = "none"
+evidence = ["crates/rdpilot-ipc/src/request.rs:93", "crates/rdpilot-daemon/src/dispatch.rs:374"]
+
+[[operation]]
+adapter = "ipc"
+name = "Annotate"
+class = "act"
+authentication = ["socket-peer"]
+summary = "Add a text annotation to a recording."
+decision = { socket_owner = "allow", agent = "allow", human = "allow" }
+current = "Served to any owner-only socket peer; no per-request authorization."
+delta = "none"
+evidence = ["crates/rdpilot-ipc/src/request.rs:97", "crates/rdpilot-daemon/src/dispatch.rs:375"]
+
+[[operation]]
+adapter = "ipc"
+name = "RecordingList"
+class = "read"
+authentication = ["socket-peer"]
+summary = "List stored recordings."
+decision = { socket_owner = "allow", agent = "allow", human = "allow" }
+current = "Served to any owner-only socket peer; no per-request authorization."
+delta = "none"
+evidence = ["crates/rdpilot-ipc/src/request.rs:102", "crates/rdpilot-daemon/src/dispatch.rs:378"]
+
+[[operation]]
+adapter = "ipc"
+name = "RecordingKeep"
+class = "admin"
+authentication = ["socket-peer"]
+summary = "Mark a recording as kept or releasable."
+decision = { socket_owner = "allow", agent = "allow", human = "allow" }
+current = "Served to any owner-only socket peer; no per-request authorization."
+delta = "none"
+evidence = ["crates/rdpilot-ipc/src/request.rs:104", "crates/rdpilot-daemon/src/dispatch.rs:379"]
+
+[[operation]]
+adapter = "http"
+name = "Document"
+methods = ["GET"]
+path = "/"
+class = "read"
+authentication = ["http-session"]
+summary = "Serve the viewer page."
+decision = { socket_owner = "allow", agent = "allow", human = "allow" }
+current = "The page takes the token from ?token=. Bearer token per viewer start (Authorization header; ?token= for the document), exact Host match, Origin check when present; read-only mode answers 404 to every POST. The token is returned only over the IPC socket."
+delta = "Authenticate with the pairing cookie or a verified Cloudflare Access assertion; answer 401 without either. Apply the exact-authority Origin check to every POST. In Access mode accept the configured public origin(s) in the Host and Origin checks."
+evidence = ["crates/rdpilot-daemon/src/viewer/http.rs:238", "crates/rdpilot-daemon/src/viewer/http.rs:373", "crates/rdpilot-daemon/src/viewer/auth.rs:76"]
+
+[[operation]]
+adapter = "http"
+name = "Sessions"
+methods = ["GET"]
+path = "/api/sessions"
+class = "read"
+authentication = ["http-session"]
+summary = "List sessions."
+decision = { socket_owner = "allow", agent = "allow", human = "allow" }
+current = "Bearer token per viewer start (Authorization header; ?token= for the document), exact Host match, Origin check when present; read-only mode answers 404 to every POST. The token is returned only over the IPC socket."
+delta = "Authenticate with the pairing cookie or a verified Cloudflare Access assertion; answer 401 without either. Apply the exact-authority Origin check to every POST. In Access mode accept the configured public origin(s) in the Host and Origin checks."
+evidence = ["crates/rdpilot-daemon/src/viewer/http.rs:239", "crates/rdpilot-daemon/src/viewer/http.rs:374"]
+
+[[operation]]
+adapter = "http"
+name = "Frame"
+methods = ["GET"]
+path = "/api/sessions/{id}/frame"
+class = "read"
+authentication = ["http-session"]
+summary = "Long-poll for a newer frame."
+decision = { socket_owner = "allow", agent = "allow", human = "allow" }
+current = "Bearer token per viewer start (Authorization header; ?token= for the document), exact Host match, Origin check when present; read-only mode answers 404 to every POST. The token is returned only over the IPC socket."
+delta = "Authenticate with the pairing cookie or a verified Cloudflare Access assertion; answer 401 without either. Apply the exact-authority Origin check to every POST. In Access mode accept the configured public origin(s) in the Host and Origin checks."
+evidence = ["crates/rdpilot-daemon/src/viewer/http.rs:240", "crates/rdpilot-daemon/src/viewer/http.rs:376"]
+
+[[operation]]
+adapter = "http"
+name = "Events"
+methods = ["GET"]
+path = "/api/sessions/{id}/events"
+class = "read"
+authentication = ["http-session"]
+summary = "Read the retained session events."
+decision = { socket_owner = "allow", agent = "allow", human = "allow" }
+current = "Bearer token per viewer start (Authorization header; ?token= for the document), exact Host match, Origin check when present; read-only mode answers 404 to every POST. The token is returned only over the IPC socket."
+delta = "Authenticate with the pairing cookie or a verified Cloudflare Access assertion; answer 401 without either. Apply the exact-authority Origin check to every POST. In Access mode accept the configured public origin(s) in the Host and Origin checks."
+evidence = ["crates/rdpilot-daemon/src/viewer/http.rs:241", "crates/rdpilot-daemon/src/viewer/http.rs:382"]
+
+[[operation]]
+adapter = "http"
+name = "Record"
+methods = ["POST"]
+path = "/api/sessions/{id}/recording"
+class = "act"
+authentication = ["http-session"]
+summary = "Start or stop recording."
+decision = { socket_owner = "allow", agent = "allow", human = "allow" }
+current = "Bearer token per viewer start (Authorization header; ?token= for the document), exact Host match, Origin check when present; read-only mode answers 404 to every POST. The token is returned only over the IPC socket."
+delta = "Authenticate with the pairing cookie or a verified Cloudflare Access assertion; answer 401 without either. Apply the exact-authority Origin check to every POST. In Access mode accept the configured public origin(s) in the Host and Origin checks."
+evidence = ["crates/rdpilot-daemon/src/viewer/http.rs:242", "crates/rdpilot-daemon/src/viewer/http.rs:392"]
+
+[[operation]]
+adapter = "http"
+name = "Annotate"
+methods = ["POST"]
+path = "/api/sessions/{id}/annotations"
+class = "act"
+authentication = ["http-session"]
+summary = "Annotate the recording."
+decision = { socket_owner = "allow", agent = "allow", human = "allow" }
+current = "Bearer token per viewer start (Authorization header; ?token= for the document), exact Host match, Origin check when present; read-only mode answers 404 to every POST. The token is returned only over the IPC socket."
+delta = "Authenticate with the pairing cookie or a verified Cloudflare Access assertion; answer 401 without either. Apply the exact-authority Origin check to every POST. In Access mode accept the configured public origin(s) in the Host and Origin checks."
+evidence = ["crates/rdpilot-daemon/src/viewer/http.rs:243", "crates/rdpilot-daemon/src/viewer/http.rs:398"]
+
+[[operation]]
+adapter = "http"
+name = "Control"
+methods = ["POST"]
+path = "/api/sessions/{id}/control"
+class = "act"
+authentication = ["http-session"]
+summary = "Take or release the control lease. Taking the lease is not itself lease-gated."
+decision = { socket_owner = "allow", agent = "allow", human = "allow" }
+current = "Bearer token per viewer start (Authorization header; ?token= for the document), exact Host match, Origin check when present; read-only mode answers 404 to every POST. The token is returned only over the IPC socket."
+delta = "Authenticate with the pairing cookie or a verified Cloudflare Access assertion; answer 401 without either. Apply the exact-authority Origin check to every POST. In Access mode accept the configured public origin(s) in the Host and Origin checks."
+evidence = ["crates/rdpilot-daemon/src/viewer/http.rs:249", "crates/rdpilot-daemon/src/viewer/http.rs:404", "crates/rdpilot-daemon/src/viewer/auth.rs:129"]
+
+[[operation]]
+adapter = "http"
+name = "Input"
+methods = ["POST"]
+path = "/api/sessions/{id}/input"
+class = "act"
+authentication = ["http-session"]
+summary = "Send input as the lease holder."
+decision = { socket_owner = "allow-with-lease", agent = "allow-with-lease", human = "allow-with-lease" }
+current = "Bearer token per viewer start (Authorization header; ?token= for the document), exact Host match, Origin check when present; read-only mode answers 404 to every POST. The token is returned only over the IPC socket."
+delta = "Authenticate with the pairing cookie or a verified Cloudflare Access assertion; answer 401 without either. Apply the exact-authority Origin check to every POST. In Access mode accept the configured public origin(s) in the Host and Origin checks."
+evidence = ["crates/rdpilot-daemon/src/viewer/http.rs:250", "crates/rdpilot-daemon/src/viewer/http.rs:423", "crates/rdpilot-daemon/src/viewer/auth.rs:129"]
+
+[[operation]]
+adapter = "http"
+name = "Recordings"
+methods = ["GET", "HEAD"]
+path = "/api/recordings"
+class = "read"
+authentication = ["http-session"]
+summary = "List stored recordings."
+decision = { socket_owner = "allow", agent = "allow", human = "allow" }
+current = "Bearer token per viewer start (Authorization header; ?token= for the document), exact Host match, Origin check when present; read-only mode answers 404 to every POST. The token is returned only over the IPC socket."
+delta = "Authenticate with the pairing cookie or a verified Cloudflare Access assertion; answer 401 without either. Apply the exact-authority Origin check to every POST. In Access mode accept the configured public origin(s) in the Host and Origin checks."
+evidence = ["crates/rdpilot-daemon/src/viewer/http.rs:244", "crates/rdpilot-daemon/src/viewer/http.rs:441"]
+
+[[operation]]
+adapter = "http"
+name = "Recording"
+methods = ["GET", "HEAD"]
+path = "/api/recordings/{rid}"
+class = "read"
+authentication = ["http-session"]
+summary = "Read one recording."
+decision = { socket_owner = "allow", agent = "allow", human = "allow" }
+current = "Bearer token per viewer start (Authorization header; ?token= for the document), exact Host match, Origin check when present; read-only mode answers 404 to every POST. The token is returned only over the IPC socket."
+delta = "Authenticate with the pairing cookie or a verified Cloudflare Access assertion; answer 401 without either. Apply the exact-authority Origin check to every POST. In Access mode accept the configured public origin(s) in the Host and Origin checks."
+evidence = ["crates/rdpilot-daemon/src/viewer/http.rs:245", "crates/rdpilot-daemon/src/viewer/http.rs:442"]
+
+[[operation]]
+adapter = "http"
+name = "RecordingEvents"
+methods = ["GET", "HEAD"]
+path = "/api/recordings/{rid}/events"
+class = "read"
+authentication = ["http-session"]
+summary = "Read one recording's events."
+decision = { socket_owner = "allow", agent = "allow", human = "allow" }
+current = "Bearer token per viewer start (Authorization header; ?token= for the document), exact Host match, Origin check when present; read-only mode answers 404 to every POST. The token is returned only over the IPC socket."
+delta = "Authenticate with the pairing cookie or a verified Cloudflare Access assertion; answer 401 without either. Apply the exact-authority Origin check to every POST. In Access mode accept the configured public origin(s) in the Host and Origin checks."
+evidence = ["crates/rdpilot-daemon/src/viewer/http.rs:246", "crates/rdpilot-daemon/src/viewer/http.rs:443"]
+
+[[operation]]
+adapter = "http"
+name = "Segment"
+methods = ["GET", "HEAD"]
+path = "/api/recordings/{rid}/segments/{n}"
+class = "read"
+authentication = ["http-session"]
+summary = "Read one recording segment (range requests)."
+decision = { socket_owner = "allow", agent = "allow", human = "allow" }
+current = "Bearer token per viewer start (Authorization header; ?token= for the document), exact Host match, Origin check when present; read-only mode answers 404 to every POST. The token is returned only over the IPC socket."
+delta = "Authenticate with the pairing cookie or a verified Cloudflare Access assertion; answer 401 without either. Apply the exact-authority Origin check to every POST. In Access mode accept the configured public origin(s) in the Host and Origin checks."
+evidence = ["crates/rdpilot-daemon/src/viewer/http.rs:247", "crates/rdpilot-daemon/src/viewer/http.rs:444"]
+
+[[operation]]
+adapter = "http"
+name = "Keep"
+methods = ["POST"]
+path = "/api/recordings/{rid}/keep"
+class = "admin"
+authentication = ["http-session"]
+summary = "Mark a recording as kept or releasable."
+decision = { socket_owner = "allow", agent = "allow", human = "allow" }
+current = "Bearer token per viewer start (Authorization header; ?token= for the document), exact Host match, Origin check when present; read-only mode answers 404 to every POST. The token is returned only over the IPC socket."
+delta = "Authenticate with the pairing cookie or a verified Cloudflare Access assertion; answer 401 without either. Apply the exact-authority Origin check to every POST. In Access mode accept the configured public origin(s) in the Host and Origin checks."
+evidence = ["crates/rdpilot-daemon/src/viewer/http.rs:248", "crates/rdpilot-daemon/src/viewer/http.rs:435"]
+
+[[operation]]
+adapter = "cua"
+name = "read"
+class = "read"
+authentication = ["socket-peer"]
+summary = "Cua tools that only read state (every READ_ONLY_CUA_TOOLS name except clipboard_read)."
+decision = { socket_owner = "allow", agent = "allow", human = "allow" }
+current = "Always pass the Cua gate. Reached through CuaAttach and the MCP stdio adapter on the socket. No HTTP route reaches Cua (viewer/http.rs:22)."
+delta = "none"
+evidence = ["crates/rdpilot-daemon/src/ipc/cua_gate.rs:34", "crates/rdpilot-daemon/src/ipc/cua_gate.rs:70"]
+
+[[operation]]
+adapter = "cua"
+name = "clipboard_read"
+class = "transfer"
+authentication = ["socket-peer"]
+summary = "Read the remote clipboard."
+decision = { socket_owner = "allow-with-lease", agent = "allow-with-lease", human = "allow-with-lease" }
+current = "Listed in READ_ONLY_CUA_TOOLS, so it passes under a human lease. Reached through CuaAttach and the MCP stdio adapter on the socket. No HTTP route reaches Cua (viewer/http.rs:22)."
+delta = "Remove clipboard_read from the read-only list so that the control lease gates it."
+evidence = ["crates/rdpilot-daemon/src/ipc/cua_gate.rs:37", "crates/rdpilot-daemon/src/ipc/cua_gate.rs:70"]
+
+[[operation]]
+adapter = "cua"
+name = "act"
+class = "act"
+authentication = ["socket-peer"]
+summary = "Every other Cua tool name, including unknown names."
+decision = { socket_owner = "allow-with-lease", agent = "allow-with-lease", human = "allow-with-lease" }
+current = "A name not in READ_ONLY_CUA_TOOLS is acting (is_acting): refused while a human holds the lease unless the call sets takeover true, which ends the lease. An unknown tool is therefore act. Reached through CuaAttach and the MCP stdio adapter on the socket. No HTTP route reaches Cua (viewer/http.rs:22)."
+delta = "none"
+evidence = ["crates/rdpilot-daemon/src/ipc/cua_gate.rs:34", "crates/rdpilot-daemon/src/ipc/cua_gate.rs:70"]
+
+[[operation]]
+adapter = "planned"
+name = "connect-saved-host"
+class = "credential-command"
+authentication = ["socket-peer", "http-session"]
+summary = "Connect a host by saved name; the daemon resolves its credentials."
+decision = { socket_owner = "allow", agent = "allow", human = "allow" }
+current = "Not available. The CLI resolves PasswordCommand (hosts/resolve.rs Source::File versus -o and URL overrides)."
+delta = "The daemon runs PasswordCommand only when the winning value comes from the hosts file (Source::File); -o and URL credential overrides are refused for non-socket principals. ${VAR} expands against the daemon environment, and interactive helpers lose their terminal; both are target-behaviour changes that no test has covered. The password never crosses an adapter."
+evidence = []
+
+[[operation]]
+adapter = "planned"
+name = "catalog-read"
+class = "read"
+authentication = ["socket-peer", "http-session"]
+summary = "Read the saved-host catalog."
+decision = { socket_owner = "allow", agent = "allow", human = "allow" }
+current = "Not available."
+delta = "Never returns Password or PasswordCommand values."
+evidence = []
+
+[[operation]]
+adapter = "planned"
+name = "clipboard"
+class = "transfer"
+authentication = ["socket-peer", "http-session"]
+summary = "Read or write the remote clipboard for a session."
+decision = { socket_owner = "allow-with-lease", agent = "allow-with-lease", human = "allow-with-lease" }
+current = "Cua clipboard_read only (see the cua rows)."
+delta = "Gate by the control lease for every principal."
+evidence = []
+
+[[operation]]
+adapter = "planned"
+name = "print-artifacts-and-downloads"
+class = "transfer"
+authentication = ["socket-peer", "http-session"]
+summary = "Fetch files that left the remote session (print PDFs, Get output)."
+decision = { socket_owner = "allow", agent = "allow", human = "allow" }
+current = "Not available."
+delta = "Files land in a per-session staging area. Every authenticated principal, observers included, may fetch them. A recording keeps them when configured."
+evidence = []
+
+[[operation]]
+adapter = "planned"
+name = "pairing-token-issuance"
+class = "admin"
+authentication = ["socket-peer"]
+summary = "Issue a pairing token for a human."
+decision = { socket_owner = "allow", agent = "allow", human = "deny" }
+current = "The nearest operation is ViewerStart, which returns a per-start viewer token."
+delta = "A separate socket operation, never offered over HTTP."
+evidence = []
+
+[[operation]]
+adapter = "planned"
+name = "pairing-exchange"
+class = "admin"
+authentication = ["pairing-token"]
+summary = "Exchange a pairing token for a browser cookie."
+decision = { socket_owner = "deny", agent = "deny", human = "allow" }
+current = "Not available."
+delta = "The only HTTP operation a caller without a cookie may reach. The token is single-use, short-lived and rate-limited. The exchange creates a human principal; socket principals have no HTTP identity."
+evidence = []
+
+[[operation]]
+adapter = "planned"
+name = "takeover-release"
+class = "act"
+authentication = ["socket-peer", "http-session"]
+summary = "End or release a control lease."
+decision = { socket_owner = "allow", agent = "allow", human = "allow" }
+current = "IPC Takeover and HTTP Control exist; the MCP adapter has no native tool (rdpilot-mcp sends only List and CuaAttach)."
+delta = "Add the native MCP tool when the in-daemon adapter exists."
+evidence = []
