@@ -2116,4 +2116,90 @@ mod tests {
             let _ = std::fs::remove_dir_all(&base);
         }
     }
+
+    /// Reassemble the payload of `chunks` and report the first flag
+    /// violation: the first chunk carries only FIRST, the last only LAST
+    /// (both for a single chunk), every other chunk no flag, and the header
+    /// length is the total payload length. SHOW_PROTOCOL on any chunk is a
+    /// violation.
+    fn chunk_flag_violation(chunks: &[ironrdp::core::WriteBuf]) -> Option<String> {
+        use ironrdp::core::Decode as _;
+        use ironrdp::pdu::rdp::vc::ChannelPduHeader;
+        const FIRST: u32 = 0x1;
+        const LAST: u32 = 0x2;
+        let mut payload_len = 0;
+        let mut total = None;
+        for (index, chunk) in chunks.iter().enumerate() {
+            let mut cursor = ReadCursor::new(chunk.filled());
+            let header = ChannelPduHeader::decode(&mut cursor).expect("chunk header decodes");
+            payload_len += cursor.len();
+            total = Some(header.length as usize);
+            let mut expected = 0;
+            if index == 0 {
+                expected |= FIRST;
+            }
+            if index + 1 == chunks.len() {
+                expected |= LAST;
+            }
+            if header.flags.bits() != expected {
+                return Some(format!(
+                    "chunk {index} has flags {:#x}, expected {expected:#x}",
+                    header.flags.bits()
+                ));
+            }
+        }
+        (total != Some(payload_len))
+            .then(|| format!("header length {total:?}, payload {payload_len}"))
+    }
+
+    /// Open the served file and read `length` bytes through the backend, the
+    /// way the session does, returning the reply message.
+    fn read_reply(backend: &mut RdpilotDriveBackend, length: u32) -> SvcMessage {
+        let created = backend
+            .handle_drive_io_request(ServerDriveIoRequest::ServerCreateDriveRequest(create_req(
+                1,
+                "\\served.bin",
+            )))
+            .expect("create succeeds");
+        let (_, file_id) = create_response_fields(&created[0]);
+        let mut read = backend
+            .handle_drive_io_request(ServerDriveIoRequest::DeviceReadRequest(DeviceReadRequest {
+                device_io_request: dev_io_req(file_id, MajorFunction::Read),
+                length,
+                offset: 0,
+            }))
+            .expect("read succeeds");
+        read.remove(0)
+    }
+
+    /// A read reply larger than one channel chunk is split into FIRST, middle
+    /// and LAST chunks with no implicit SHOW_PROTOCOL. A later IronRDP release
+    /// that adds SHOW_PROTOCOL to fragments breaks Windows file reads; this
+    /// test fails on that change without a Windows target.
+    #[test]
+    fn a_fragmented_read_reply_carries_no_show_protocol_flag() {
+        use ironrdp::svc::{ChannelFlags, StaticVirtualChannel};
+
+        let served_path = write_temp_file(&[0xA5; 4000]);
+        let mut backend =
+            RdpilotDriveBackend::new(served_path.clone(), "served.bin".to_owned(), None);
+
+        let reply = read_reply(&mut backend, 4000);
+        let encoded = reply.encode_unframed_pdu().expect("reply encodes");
+        let chunks = StaticVirtualChannel::chunkify(vec![reply]).expect("reply chunks");
+        assert_eq!(chunks.len(), 3, "4000 bytes span three 1600-byte chunks");
+        assert_eq!(chunk_flag_violation(&chunks), None);
+        let reassembled: Vec<u8> = chunks
+            .iter()
+            .flat_map(|chunk| chunk.filled()[8..].to_vec())
+            .collect();
+        assert_eq!(reassembled, encoded);
+
+        // The checker must reject the same reply with SHOW_PROTOCOL set.
+        let marked = read_reply(&mut backend, 4000).with_flags(ChannelFlags::SHOW_PROTOCOL);
+        let chunks = StaticVirtualChannel::chunkify(vec![marked]).expect("reply chunks");
+        assert!(chunk_flag_violation(&chunks).is_some());
+
+        let _ = std::fs::remove_file(served_path);
+    }
 }
