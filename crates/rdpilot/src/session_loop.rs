@@ -712,4 +712,264 @@ mod tests {
             })
             .await;
     }
+
+    /// Share id the scripted server uses for the reactivation.
+    const REACTIVATION_SHARE_ID: u32 = 0x0001_2000;
+    /// Every peer read and write is bounded so a broken sequence fails
+    /// instead of hanging.
+    const PEER_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+
+    type Peer = ironrdp_tokio::TokioFramed<tokio::io::DuplexStream>;
+    type PeerResult<T> = std::result::Result<T, String>;
+
+    /// A server-to-client Share Control PDU, as an X.224 Data frame carrying
+    /// an MCS Send Data Indication on the I/O channel.
+    fn server_share_control(pdu: ironrdp::pdu::rdp::headers::ShareControlPdu) -> Vec<u8> {
+        use ironrdp::core::encode_vec;
+        use ironrdp::pdu::mcs::SendDataIndication;
+        use ironrdp::pdu::rdp::capability_sets::SERVER_CHANNEL_ID;
+        use ironrdp::pdu::rdp::headers::ShareControlHeader;
+        use ironrdp::pdu::x224::X224;
+
+        let header = ShareControlHeader {
+            share_control_pdu: pdu,
+            pdu_source: SERVER_CHANNEL_ID,
+            share_id: REACTIVATION_SHARE_ID,
+        };
+        encode_vec(&X224(SendDataIndication {
+            initiator_id: SERVER_CHANNEL_ID,
+            channel_id: 1003,
+            user_data: std::borrow::Cow::Owned(encode_vec(&header).expect("header encodes")),
+        }))
+        .expect("send data indication encodes")
+    }
+
+    fn server_share_data(pdu: ironrdp::pdu::rdp::headers::ShareDataPdu) -> Vec<u8> {
+        use ironrdp::pdu::rdp::client_info::CompressionType;
+        use ironrdp::pdu::rdp::headers::{
+            CompressionFlags, ShareControlPdu, ShareDataHeader, StreamPriority,
+        };
+
+        server_share_control(ShareControlPdu::Data(ShareDataHeader {
+            share_data_pdu: pdu,
+            stream_priority: StreamPriority::Medium,
+            compression_flags: CompressionFlags::empty(),
+            compression_type: CompressionType::K8,
+        }))
+    }
+
+    async fn peer_send(peer: &mut Peer, frame: Vec<u8>) -> PeerResult<()> {
+        tokio::time::timeout(PEER_DEADLINE, peer.write_all(&frame))
+            .await
+            .map_err(|_| "peer write deadline".to_owned())?
+            .map_err(|e| format!("peer write: {e}"))
+    }
+
+    /// Read one client PDU and name it: the Confirm Active, or the
+    /// finalization data PDU that follows it.
+    async fn peer_read_client_pdu(peer: &mut Peer) -> PeerResult<&'static str> {
+        use ironrdp::pdu::mcs::SendDataRequest;
+        use ironrdp::pdu::rdp::finalization_messages::ControlAction;
+        use ironrdp::pdu::rdp::headers::{ShareControlHeader, ShareControlPdu, ShareDataPdu};
+        use ironrdp::pdu::x224::X224;
+
+        let (_, frame) = tokio::time::timeout(PEER_DEADLINE, peer.read_pdu())
+            .await
+            .map_err(|_| "peer read deadline".to_owned())?
+            .map_err(|e| format!("peer read: {e}"))?;
+        let request = decode::<X224<SendDataRequest<'_>>>(&frame)
+            .map_err(|e| format!("send data request: {e}"))?
+            .0;
+        if (request.initiator_id, request.channel_id) != (1001, 1003) {
+            return Err(format!(
+                "client PDU on initiator {} channel {}",
+                request.initiator_id, request.channel_id
+            ));
+        }
+        let header = decode::<ShareControlHeader>(&request.user_data)
+            .map_err(|e| format!("share control header: {e}"))?;
+        if header.share_id != REACTIVATION_SHARE_ID {
+            return Err(format!("client PDU share id {:#x}", header.share_id));
+        }
+        match header.share_control_pdu {
+            ShareControlPdu::ClientConfirmActive(_) => Ok("confirm active"),
+            ShareControlPdu::Data(data) => match data.share_data_pdu {
+                ShareDataPdu::Synchronize(_) => Ok("synchronize"),
+                ShareDataPdu::Control(control) => match control.action {
+                    ControlAction::Cooperate => Ok("control cooperate"),
+                    ControlAction::RequestControl => Ok("control request"),
+                    other => Err(format!("unexpected control action {other:?}")),
+                },
+                ShareDataPdu::FontList(_) => Ok("font list"),
+                other => Err(format!("unexpected data PDU {}", other.as_short_name())),
+            },
+            other => Err(format!("unexpected PDU {}", other.as_short_name())),
+        }
+    }
+
+    /// Play the server side of a Deactivation-Reactivation sequence against
+    /// the client: optionally Deactivate All, then Demand Active for a
+    /// `width` x `height` desktop, check the client's Confirm Active and its
+    /// four finalization PDUs in order, and answer with the server
+    /// finalization PDUs.
+    async fn serve_reactivation(
+        peer: &mut Peer,
+        send_deactivate_all: bool,
+        width: u16,
+        height: u16,
+    ) -> PeerResult<()> {
+        use ironrdp::pdu::rdp::capability_sets::{
+            Bitmap, BitmapDrawingFlags, CapabilitySet, DemandActive, General, ServerDemandActive,
+            SERVER_CHANNEL_ID,
+        };
+        use ironrdp::pdu::rdp::finalization_messages::{
+            ControlAction, ControlPdu, FontPdu, SynchronizePdu,
+        };
+        use ironrdp::pdu::rdp::headers::{ServerDeactivateAll, ShareControlPdu, ShareDataPdu};
+
+        if send_deactivate_all {
+            peer_send(
+                peer,
+                server_share_control(ShareControlPdu::ServerDeactivateAll(ServerDeactivateAll)),
+            )
+            .await?;
+        }
+        peer_send(
+            peer,
+            server_share_control(ShareControlPdu::ServerDemandActive(ServerDemandActive {
+                pdu: DemandActive {
+                    source_descriptor: "RDP".to_owned(),
+                    capability_sets: vec![
+                        CapabilitySet::General(General::default()),
+                        CapabilitySet::Bitmap(Bitmap {
+                            pref_bits_per_pix: 32,
+                            desktop_width: width,
+                            desktop_height: height,
+                            desktop_resize_flag: true,
+                            drawing_flags: BitmapDrawingFlags::ALLOW_SKIP_ALPHA,
+                        }),
+                    ],
+                },
+            })),
+        )
+        .await?;
+
+        let mut seen = Vec::new();
+        for _ in 0..5 {
+            seen.push(peer_read_client_pdu(peer).await?);
+        }
+        let expected = [
+            "confirm active",
+            "synchronize",
+            "control cooperate",
+            "control request",
+            "font list",
+        ];
+        if seen != expected {
+            return Err(format!("client PDUs {seen:?}, expected {expected:?}"));
+        }
+
+        for pdu in [
+            ShareDataPdu::Synchronize(SynchronizePdu {
+                target_user_id: 1001,
+            }),
+            ShareDataPdu::Control(ControlPdu {
+                action: ControlAction::Cooperate,
+                grant_id: 0,
+                control_id: 0,
+            }),
+            ShareDataPdu::Control(ControlPdu {
+                action: ControlAction::GrantedControl,
+                grant_id: 1001,
+                control_id: u32::from(SERVER_CHANNEL_ID),
+            }),
+            ShareDataPdu::FontMap(FontPdu::default()),
+        ] {
+            peer_send(peer, server_share_data(pdu)).await?;
+        }
+        Ok(())
+    }
+
+    /// After a Deactivate All and a full reactivation, the loop keeps
+    /// running with a working stage: a queued input event reaches the peer
+    /// as a fast-path frame and the loop stops cleanly on shutdown.
+    #[tokio::test]
+    async fn run_survives_a_deactivate_all_reactivation() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let key = FastPathInputEvent::KeyboardEvent(KeyboardFlags::empty(), 0x1e);
+                let (input_tx, input_rx) = mpsc::channel(2);
+                let (client, server) = tokio::io::duplex(64 * 1024);
+                let framed = ironrdp_tokio::TokioFramed::new(
+                    Box::new(client) as crate::connect::UpgradedStream
+                );
+                let mut peer = ironrdp_tokio::TokioFramed::new(server);
+                let bridge = std::sync::Arc::new(crate::bridge::BridgeShared::new());
+                let shutdown = bridge.clone();
+                let pump = tokio::task::spawn_local(run(
+                    framed,
+                    connection_result_fixture(),
+                    input_rx,
+                    SharedFrame::new(),
+                    bridge,
+                ));
+
+                let observed = async {
+                    serve_reactivation(&mut peer, true, 200, 150).await?;
+                    input_tx
+                        .send(RdpInputEvent::FastPath(vec![key]))
+                        .await
+                        .map_err(|_| "input enqueue failed".to_owned())?;
+                    let (_, frame) = tokio::time::timeout(PEER_DEADLINE, peer.read_pdu())
+                        .await
+                        .map_err(|_| "input frame deadline".to_owned())?
+                        .map_err(|e| format!("input frame read: {e}"))?;
+                    let pdu: FastPathInput =
+                        decode(&frame).map_err(|e| format!("input frame decode: {e}"))?;
+                    if pdu.input_events() != [key] {
+                        return Err(format!("input events {:?}", pdu.input_events()));
+                    }
+                    Ok::<(), String>(())
+                }
+                .await;
+
+                shutdown.shutdown.notify_one();
+                let joined = tokio::time::timeout(PEER_DEADLINE, pump)
+                    .await
+                    .expect("pump join deadline")
+                    .expect("pump task joins");
+                assert!(joined.is_ok(), "run returned an error: {joined:?}");
+                observed.expect("reactivation and input after it");
+            })
+            .await;
+    }
+
+    /// The reactivation rebuilds the framebuffer at the size the server's
+    /// Demand Active announces.
+    #[tokio::test]
+    async fn reactivate_rebuilds_the_framebuffer_at_the_new_desktop_size() {
+        let result = connection_result_fixture();
+        let factory = result.activation_factory.clone();
+        let (mut stage, _) = active_stage(result);
+        let mut image = DecodedImage::new(PixelFormat::RgbA32, 100, 100);
+
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let (mut reader, mut writer) = ironrdp_tokio::split_tokio_framed(
+            ironrdp_tokio::TokioFramed::new(Box::new(client) as crate::connect::UpgradedStream),
+        );
+        let mut peer = ironrdp_tokio::TokioFramed::new(server);
+
+        let (served, reactivated) = tokio::join!(
+            serve_reactivation(&mut peer, false, 200, 150),
+            tokio::time::timeout(
+                PEER_DEADLINE,
+                reactivate(&mut reader, &mut writer, &mut stage, &mut image, &factory),
+            ),
+        );
+        served.expect("scripted server completes the sequence");
+        reactivated
+            .expect("reactivation deadline")
+            .expect("reactivation succeeds");
+        assert_eq!((image.width(), image.height()), (200, 150));
+    }
 }
