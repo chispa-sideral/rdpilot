@@ -14,13 +14,15 @@ use ironrdp_input::Database;
 use rdpilot_bridge_protocol::{FileTransferOp, FileTransferRequest, Message};
 use std::{
     fs,
+    future::Future,
     io::Read,
+    net::SocketAddr,
     path::{Path, PathBuf},
     sync::{atomic::AtomicU64, Arc, Mutex},
     thread::JoinHandle,
     time::Duration,
 };
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 const DOUBLE_CLICK_GAP: Duration = Duration::from_millis(100);
 const DRAG_STEP_GAP: Duration = Duration::from_millis(15);
 const INPUT_CHANNEL_CAPACITY: usize = 16;
@@ -83,56 +85,154 @@ fn sha256_file(path: &Path) -> Result<String> {
     let digest = hasher.finalize();
     Ok(digest.iter().map(|b| format!("{b:02x}")).collect())
 }
-impl Session {
-    pub async fn connect(cfg: &ConnectionConfig) -> Result<Session> {
-        let (connection_result, framed, bridge) = connect::connect(cfg).await?;
+/// What the session thread tells the caller once the handshake is over.
+type Ready = Result<(Arc<BridgeShared>, (u32, u32))>;
 
+/// [`Session::connect`] with the name resolution injected, so a test can stall
+/// or fail it.
+async fn connect_with_resolver(
+    cfg: ConnectionConfig,
+    resolve: impl Future<Output = Result<SocketAddr>> + Send + 'static,
+) -> Result<Session> {
+    let addr = resolve.await?;
+
+    let frame = SharedFrame::new();
+    let (input_tx, input_rx) = mpsc::channel(INPUT_CHANNEL_CAPACITY);
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let share_root = cfg.get_share_root().map(Path::to_path_buf);
+    let cua = cfg.get_bundle_path().is_some();
+
+    let thread_frame = frame.clone();
+    let thread = std::thread::Builder::new()
+        .name("rdpilot-session".to_owned())
+        .spawn(move || run_session_thread(cfg, addr, thread_frame, input_rx, ready_tx))
+        .map_err(|e| Error::Session(format!("could not spawn session thread: {e}")))?;
+
+    // Dropping this future drops `ready_rx`; the session thread sees the
+    // closed channel and ends the handshake.
+    let (bridge, desktop_size) = ready_rx.await.map_err(|_| {
+        Error::Session("session thread ended before the handshake finished".to_owned())
+    })??;
+
+    Ok(Session {
+        thread: Some(thread),
+        input_tx,
+        frame,
+        input_db: Arc::new(Mutex::new(Database::new())),
+        desktop_size,
+        bridge,
+        next_req_id: AtomicU64::new(1),
+        share_root,
+        cua,
+    })
+}
+
+/// Body of the `rdpilot-session` thread: run the handshake, report it through
+/// `ready_tx`, then run the session loop. The handshake ends early when the
+/// caller drops `ready_tx`'s receiver.
+fn run_session_thread(
+    cfg: ConnectionConfig,
+    addr: SocketAddr,
+    frame: SharedFrame,
+    input_rx: mpsc::Receiver<RdpInputEvent>,
+    mut ready_tx: oneshot::Sender<Ready>,
+) -> Result<()> {
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(e) => {
+            let _ = ready_tx.send(Err(Error::Session(format!(
+                "could not start session runtime: {e}"
+            ))));
+            return Ok(());
+        }
+    };
+    runtime.block_on(async move {
+        let connected = tokio::select! {
+            result = connect::connect(&cfg, addr) => Some(result),
+            () = ready_tx.closed() => None,
+        };
+        let (connection_result, framed, bridge) = match connected {
+            None => return Ok(()),
+            Some(Err(error)) => {
+                let _ = ready_tx.send(Err(error));
+                return Ok(());
+            }
+            Some(Ok(connected)) => connected,
+        };
         let desktop_size = (
             u32::from(connection_result.desktop_size.width),
             u32::from(connection_result.desktop_size.height),
         );
+        // A caller that is gone drops `framed`, which closes the connection.
+        if ready_tx.send(Ok((bridge.clone(), desktop_size))).is_err() {
+            return Ok(());
+        }
+        let result = session_loop::run(
+            framed,
+            connection_result,
+            input_rx,
+            frame.clone(),
+            bridge.clone(),
+        )
+        .await;
+        // Passive observers (the live viewer) see the end of the RDP
+        // session even while the registry entry still exists.
+        frame.mark_ended();
+        if let Err(error) = &result {
+            tracing::error!(%error,"RDP session loop ended");
+            bridge.invalidate(&error.to_string());
+        }
+        result
+    })
+}
 
-        let frame = SharedFrame::new();
-        let (input_tx, input_rx) = mpsc::channel(INPUT_CHANNEL_CAPACITY);
+/// The entry point of the session thread. It takes the whole owned config.
+type SessionThreadBody = fn(
+    ConnectionConfig,
+    SocketAddr,
+    SharedFrame,
+    mpsc::Receiver<RdpInputEvent>,
+    oneshot::Sender<Ready>,
+) -> Result<()>;
 
-        let loop_frame = frame.clone();
-        let loop_bridge = bridge.clone();
-        let thread = std::thread::Builder::new()
-            .name("rdpilot-session".to_owned())
-            .spawn(move || -> Result<()> {
-                let runtime = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .map_err(|e| Error::Session(format!("could not start session runtime: {e}")))?;
-                let result = runtime.block_on(session_loop::run(
-                    framed,
-                    connection_result,
-                    input_rx,
-                    loop_frame.clone(),
-                    loop_bridge.clone(),
-                ));
-                // Passive observers (the live viewer) see the end of the RDP
-                // session even while the registry entry still exists.
-                loop_frame.mark_ended();
-                if let Err(error) = &result {
-                    tracing::error!(%error,"RDP session loop ended");
-                    loop_bridge.invalidate(&error.to_string());
-                }
-                result
-            })
-            .map_err(|e| Error::Session(format!("could not spawn session thread: {e}")))?;
+// Fixes at compile time that the whole owned config reaches the session
+// thread, not a part of it.
+const _: SessionThreadBody = run_session_thread;
 
-        Ok(Session {
-            thread: Some(thread),
-            input_tx,
-            frame,
-            input_db: Arc::new(Mutex::new(Database::new())),
-            desktop_size,
-            bridge,
-            next_req_id: AtomicU64::new(1),
-            share_root: cfg.get_share_root().map(Path::to_path_buf),
-            cua: cfg.get_bundle_path().is_some(),
-        })
+impl Session {
+    /// Open an RDP session.
+    ///
+    /// The returned future is `Send + 'static`: the config is cloned at call
+    /// time, so it does not borrow `cfg`. The host name is resolved on the
+    /// caller's runtime; the TCP connect, TLS, CredSSP and finalize steps and
+    /// then the session loop run on the `rdpilot-session` thread's own
+    /// current-thread runtime. The whole moved [`ConnectionConfig`] is the only
+    /// input channel construction reads there, which is where a configured
+    /// channel set belongs.
+    ///
+    /// Dropping the future, or timing it out, at any point aborts the
+    /// handshake and, within a bounded wait, leaves no session and no
+    /// `rdpilot-session` thread. A drop during name resolution leaves no thread
+    /// (none was started); at most one pooled blocking worker of the caller's
+    /// runtime finishes an operating-system lookup already in progress. A
+    /// timeout around the future therefore also bounds the resolution. A caller
+    /// dropped after the handshake finished ends the session loop by closing
+    /// its input channel.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Connect`] when the name cannot be resolved or the handshake
+    /// fails; [`Error::Session`] when the session thread or its runtime cannot
+    /// start, or ends before the handshake finishes.
+    pub fn connect(
+        cfg: &ConnectionConfig,
+    ) -> impl Future<Output = Result<Session>> + Send + 'static {
+        let cfg = cfg.clone();
+        let resolve = connect::resolve(cfg.host().to_owned(), cfg.get_port());
+        connect_with_resolver(cfg, resolve)
     }
 
     pub fn desktop_size(&self) -> (u32, u32) {
@@ -880,5 +980,162 @@ mod tests {
             down: true,
         };
         assert!(handle.send(vec![press]).await.is_err(), "closed channel");
+    }
+}
+
+/// Tests that watch the OS threads of this process for the "rdpilot-session"
+/// thread. They share one lock so the thread counts of two tests never mix;
+/// no other test in this crate spawns that thread.
+#[cfg(all(test, target_os = "linux"))]
+mod connect_thread_tests {
+    use super::*;
+    use std::time::Instant;
+
+    static SESSION_THREAD_TESTS: Mutex<()> = Mutex::new(());
+
+    /// Run `future` on a fresh current-thread runtime while holding the
+    /// shared test lock. The guard never lives across an await.
+    fn locked<F: Future>(future: F) -> F::Output {
+        let _guard = SESSION_THREAD_TESTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(future)
+    }
+
+    fn session_threads() -> usize {
+        std::fs::read_dir("/proc/self/task")
+            .unwrap()
+            .filter_map(|entry| std::fs::read_to_string(entry.unwrap().path().join("comm")).ok())
+            .filter(|comm| comm.trim_end() == "rdpilot-session")
+            .count()
+    }
+
+    async fn wait_for_session_threads(wanted: usize, bound: Duration) -> bool {
+        let deadline = Instant::now() + bound;
+        while session_threads() != wanted {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        true
+    }
+
+    /// A 127.0.0.1 server that accepts every connection and never answers.
+    async fn silent_server() -> ConnectionConfig {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        });
+        ConnectionConfig::new("127.0.0.1", "u", "p").port(port)
+    }
+
+    /// `Session` and its passive views cross threads, and the connect future
+    /// can be spawned on a multi-thread runtime.
+    const _: fn() = || {
+        fn assert_send_sync_static<T: Send + Sync + 'static>() {}
+        fn assert_send_static<T: Send + 'static>(_: T) {}
+        assert_send_sync_static::<Session>();
+        assert_send_sync_static::<FrameWatch>();
+        assert_send_sync_static::<InputHandle>();
+        let cfg = ConnectionConfig::new("host", "user", "password");
+        assert_send_static(Session::connect(&cfg));
+    };
+
+    #[test]
+    fn a_resolver_that_never_answers_creates_no_session_thread() {
+        locked(async {
+            let cfg = ConnectionConfig::new("127.0.0.1", "u", "p");
+            let connect = connect_with_resolver(cfg, std::future::pending());
+            let waited = tokio::time::timeout(Duration::from_millis(200), connect).await;
+            assert!(waited.is_err(), "the resolver never answers");
+            assert_eq!(session_threads(), 0);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert_eq!(session_threads(), 0);
+        });
+    }
+
+    #[test]
+    fn a_resolver_error_is_the_connect_error_and_creates_no_session_thread() {
+        locked(async {
+            let cfg = ConnectionConfig::new("127.0.0.1", "u", "p");
+            let error = connect_with_resolver(
+                cfg,
+                std::future::ready(Err(Error::Connect("address lookup failed".to_owned()))),
+            )
+            .await
+            .err()
+            .unwrap();
+            assert!(matches!(error, Error::Connect(ref m) if m == "address lookup failed"));
+            assert_eq!(session_threads(), 0);
+        });
+    }
+
+    #[test]
+    fn a_failed_handshake_reaches_the_caller_and_ends_the_session_thread() {
+        locked(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            tokio::spawn(async move {
+                while let Ok((stream, _)) = listener.accept().await {
+                    drop(stream);
+                }
+            });
+            let cfg = ConnectionConfig::new("127.0.0.1", "u", "p").port(port);
+            let error = Session::connect(&cfg).await.err().unwrap();
+            assert!(matches!(error, Error::Connect(_)), "{error}");
+            assert!(wait_for_session_threads(0, Duration::from_secs(2)).await);
+        });
+    }
+
+    #[test]
+    fn dropping_the_connect_future_ends_the_session_thread() {
+        locked(async {
+            let cfg = silent_server().await;
+            let mut connect = Box::pin(Session::connect(&cfg));
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while session_threads() != 1 {
+                tokio::select! {
+                    biased;
+                    result = &mut connect => panic!("connect ended: {:?}", result.err()),
+                    () = tokio::time::sleep(Duration::from_millis(5)) => {}
+                }
+                assert!(Instant::now() < deadline, "no rdpilot-session thread");
+            }
+            drop(connect);
+            assert!(
+                wait_for_session_threads(0, Duration::from_secs(2)).await,
+                "the session thread outlived the dropped connect future"
+            );
+        });
+    }
+
+    #[test]
+    fn a_connect_timeout_ends_the_session_thread() {
+        locked(async {
+            let cfg = silent_server().await;
+            let sampler = async { wait_for_session_threads(1, Duration::from_secs(1)).await };
+            let (result, seen) = tokio::join!(
+                tokio::time::timeout(Duration::from_millis(200), Session::connect(&cfg)),
+                sampler
+            );
+            assert!(
+                result.is_err(),
+                "the silent server cannot finish a handshake"
+            );
+            assert!(seen, "no rdpilot-session thread during the connect");
+            assert!(
+                wait_for_session_threads(0, Duration::from_secs(2)).await,
+                "the session thread outlived the timed-out connect future"
+            );
+        });
     }
 }

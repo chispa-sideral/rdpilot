@@ -32,12 +32,12 @@ use rdpilot_daemon::{DaemonError, ManagedSession, ReconciliationSink, Registry, 
 use rdpilot_ipc::SessionLifecycle;
 use sysinfo::{ProcessesToUpdate, System};
 
-type TestFuture<T> = Pin<Box<dyn Future<Output = T>>>;
+type TestFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 /// Like `TestFuture`, but lifetime-parameterized -- required for the
 /// `&self`-based operational `ManagedSession` methods (Phase 13), whose
 /// trait-declared `BoxFuture<'_, T>` ties the returned future's lifetime
 /// to the `&self` borrow (not `'static`, unlike `close`/`connect`).
-type OpFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
+type OpFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// Mimics `rdpilot::Session`'s dedicated-OS-thread-per-session model: a
 /// real `std::thread` spawned on connect, parked (blocked on a channel

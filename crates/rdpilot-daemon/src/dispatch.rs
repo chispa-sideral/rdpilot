@@ -554,7 +554,7 @@ mod tests {
         BoxFuture, DaemonError, ManagedSession, NoopReconciliationSink, SessionConnector,
     };
 
-    type TestFuture<T> = Pin<Box<dyn Future<Output = T>>>;
+    type TestFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 
     /// A fake, immediately-resolving `ManagedSession` — mirrors
     /// `registry.rs`'s own inline test fake (this module cannot reuse that

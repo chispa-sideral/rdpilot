@@ -2,8 +2,7 @@
 //! source at most `max_fps` times per second and hands them to the recorder
 //! through a one-slot, newest-wins mailbox.
 //!
-//! - Runs as a task on the multi-thread runtime (never the IPC `LocalSet`);
-//!   the frame copy and pixel comparison run on a blocking thread.
+//! - Runs as a task on the multi-thread runtime; the frame copy and pixel comparison run on a blocking thread.
 //! - `FrameWatch` raises its sequence number even for identical pixels, so
 //!   every capture is compared with the previous one; an unchanged display
 //!   adds nothing.
@@ -207,7 +206,7 @@ pub(crate) mod tests {
     use std::sync::atomic::AtomicBool;
 
     use super::*;
-    use crate::seams::SendFuture;
+    use crate::seams::BoxFuture;
 
     /// A frame source whose pixels and sequence number tests set directly.
     pub(crate) struct TestFrames {
@@ -257,7 +256,7 @@ pub(crate) mod tests {
         fn status(&self) -> rdpilot::FrameStatus {
             *self.state.borrow()
         }
-        fn changed(&self, after_seq: u64) -> SendFuture<'_, rdpilot::FrameStatus> {
+        fn changed(&self, after_seq: u64) -> BoxFuture<'_, rdpilot::FrameStatus> {
             let mut rx = self.state.subscribe();
             Box::pin(async move {
                 rx.wait_for(|s| s.seq > after_seq || s.ended)

@@ -28,6 +28,12 @@
 //!   when [`ConnectionConfig::get_bundle_path`] is `Some`; when `None`,
 //!   the connect path is byte-for-byte the pre-Phase-5 behavior.
 //!
+//! `connect()` runs on the `rdpilot-session` thread's own runtime, not on the
+//! caller's. `Session::connect` clones the [`ConnectionConfig`], resolves the
+//! host name on the caller's runtime, and moves the whole config to that thread.
+//! Channel construction reads only this moved config, so a channel set that
+//! becomes a config value reaches the connector with no further plumbing.
+//!
 //! Credentials and certificate material are never logged (Security V7, threat
 //! T-02-02). No `unwrap`/`expect`/`panic` in non-test code (API-01).
 
@@ -76,7 +82,14 @@ impl<T: AsyncRead + AsyncWrite> AsyncReadWrite for T {}
 /// connect.
 pub(crate) type ConnectedFramed = TokioFramed<UpgradedStream>;
 
-/// Drive the full connect sequence and return the active-session inputs.
+/// Drive the full connect sequence to the already resolved `addr` and return
+/// the active-session inputs.
+///
+/// This runs on the session thread (see [`crate::session::Session::connect`]),
+/// which moves the whole [`ConnectionConfig`] there: the static and dynamic
+/// channels below are built from that config alone, so a channel set that
+/// becomes a config value needs no other path to the thread. The TLS server
+/// name and CredSSP keep the configured host name; `addr` only picks the peer.
 ///
 /// On success the caller owns a [`ConnectionResult`] (desktop size, channel IDs,
 /// activation factory) and the TLS-upgraded [`ConnectedFramed`] ready for the
@@ -84,13 +97,13 @@ pub(crate) type ConnectedFramed = TokioFramed<UpgradedStream>;
 /// credential or certificate material is ever logged.
 pub(crate) async fn connect(
     cfg: &ConnectionConfig,
+    addr: SocketAddr,
 ) -> Result<(
     ConnectionResult,
     ConnectedFramed,
     std::sync::Arc<crate::bridge::BridgeShared>,
 )> {
     let server_name = cfg.host().to_owned();
-    let addr = resolve_addr(&server_name, cfg.get_port())?;
 
     let tcp_stream = TcpStream::connect(addr)
         .await
@@ -220,12 +233,13 @@ fn format_error_chain(error: &(dyn std::error::Error + 'static)) -> String {
     rendered
 }
 
-/// Resolve `host:port` to a single socket address.
-fn resolve_addr(host: &str, port: u16) -> Result<SocketAddr> {
-    use std::net::ToSocketAddrs as _;
-
-    (host, port)
-        .to_socket_addrs()
+/// Resolve `host:port` to a single socket address on the caller's runtime.
+///
+/// `Session::connect` awaits this before it starts the session thread, so a
+/// dropped connect future leaves no thread behind during resolution.
+pub(crate) async fn resolve(host: String, port: u16) -> Result<SocketAddr> {
+    tokio::net::lookup_host((host.as_str(), port))
+        .await
         .map_err(|e| Error::Connect(format!("address lookup for {host}:{port} failed: {e}")))?
         .next()
         .ok_or_else(|| Error::Connect(format!("no address found for {host}:{port}")))

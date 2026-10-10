@@ -86,8 +86,8 @@ pub use control::SessionControl;
 pub use reconcile::{scan_orphans, seed_into, JsonReconciliationSink, ReconciliationRecord};
 pub use registry::Registry;
 pub use seams::{
-    DaemonError, HumanInput, ManagedCua, ManagedSession, ReconciliationSink, SessionConnector,
-    SessionEntry, ViewFrameSource,
+    CancelCause, DaemonError, HumanInput, ManagedCua, ManagedSession, ReconciliationSink,
+    SessionConnector, SessionEntry, ViewFrameSource,
 };
 pub use server::{run, RunConfig};
 

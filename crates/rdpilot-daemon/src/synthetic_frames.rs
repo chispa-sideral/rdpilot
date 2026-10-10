@@ -9,7 +9,7 @@ use std::time::Duration;
 use rdpilot::{FrameStatus, Screenshot};
 use tokio::sync::watch;
 
-use crate::seams::{SendFuture, ViewFrameSource};
+use crate::seams::{BoxFuture, ViewFrameSource};
 
 #[derive(Default)]
 struct Slot {
@@ -112,7 +112,7 @@ impl ViewFrameSource for SyntheticFrames {
         *self.signal.borrow()
     }
 
-    fn changed(&self, after_seq: u64) -> SendFuture<'_, FrameStatus> {
+    fn changed(&self, after_seq: u64) -> BoxFuture<'_, FrameStatus> {
         let mut rx = self.signal.subscribe();
         Box::pin(async move {
             let observed = match rx.wait_for(|s| s.seq > after_seq || s.ended).await {

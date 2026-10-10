@@ -2,25 +2,18 @@
 //! registry, seeds startup reconciliation orphans, spawns the lifecycle
 //! tasks, and serves accepted+authorized connections (Plan 12-06).
 //!
-//! ## Non-Send execution model
+//! ## Execution model
 //!
-//! `rdpilot::Session::connect`'s returned future is NOT `Send` (`seams.rs`'s
-//! `BoxFuture` doc comment), which makes `Registry::open`/`Registry::close`
-//! (and therefore `ipc::serve_connection`, `lifecycle::idle_reaper`) NOT
-//! `Send` either. [`run`] therefore drives EVERYTHING -- the accept loop,
-//! every per-connection task, and both lifecycle watchers -- inside a
-//! `tokio::task::LocalSet` via `tokio::task::spawn_local`, NEVER a bare
-//! `tokio::spawn` (which requires `F: Send` and would fail to compile
-//! against this crate's own registry/session types, exactly as
-//! `seams.rs`'s doc comment warns). `LocalSet::run_until` works
-//! irrespective of the ambient runtime's flavor (`main.rs`'s
-//! `#[tokio::main]` multi-thread runtime is untouched) -- it just pins
-//! every `spawn_local` task to the single OS thread that polls
-//! `run_until`'s own future.
+//! Every future in this crate is `Send`: `rdpilot::Session::connect` runs the
+//! handshake on the session's own thread, so [`run`] spawns the per-connection
+//! tasks and both lifecycle watchers with a plain `tokio::spawn` onto the
+//! ambient multi-thread runtime of `main.rs`. IPC tasks therefore run in
+//! parallel with each other and with the viewer; shared state sits behind
+//! locks or atomics. [`run`] does not join the connection tasks: they end when
+//! the caller's runtime drops, so a caller other than `main.rs` must keep its
+//! runtime alive for as long as the connections should be served.
 
-use std::future::Future;
 use std::path::PathBuf;
-use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -54,7 +47,7 @@ const TEST_CONNECTOR_ENV: &str = "RDPILOT_DAEMON_TEST_CONNECTOR";
 /// `tokio::time::sleep` that long before resolving -- an env-gated,
 /// TEST-only hook (14-05, MCP-06) that lets a slow daemon round trip be
 /// exercised offline. Absent or unparseable -> `0` (no sleep, identical to
-/// this env being entirely unset). Read ONCE in [`run_inner`] and threaded
+/// this env being entirely unset). Read ONCE in [`run`] and threaded
 /// into every [`FakeTestSession`] the process's [`FakeTestConnector`]
 /// produces -- never consulted anywhere near [`RealConnector`], so the
 /// production connector is untouched (T-14-16).
@@ -159,11 +152,6 @@ impl RunConfig {
 /// Returns [`DaemonError`] if the bind fails for a reason OTHER than
 /// `AddrInUse`, or if the reconciliation sink's path cannot be resolved.
 pub async fn run(config: RunConfig) -> Result<(), DaemonError> {
-    let local = tokio::task::LocalSet::new();
-    local.run_until(run_inner(config)).await
-}
-
-async fn run_inner(config: RunConfig) -> Result<(), DaemonError> {
     let listener = match crate::ipc::bind().await {
         Ok(listener) => listener,
         Err(err) if err.kind() == std::io::ErrorKind::AddrInUse => {
@@ -235,12 +223,12 @@ async fn run_inner(config: RunConfig) -> Result<(), DaemonError> {
     reconcile::seed_into(orphans, &registry);
 
     let shutdown = ShutdownSignal::new();
-    let reaper_handle = tokio::task::spawn_local(lifecycle::idle_reaper(
+    let reaper_handle = tokio::spawn(lifecycle::idle_reaper(
         Arc::clone(&registry),
         config.lifecycle,
         shutdown.clone(),
     ));
-    let watcher_handle = tokio::task::spawn_local(lifecycle::empty_watcher(
+    let watcher_handle = tokio::spawn(lifecycle::empty_watcher(
         Arc::clone(&registry),
         config.lifecycle,
         shutdown.clone(),
@@ -260,7 +248,7 @@ async fn run_inner(config: RunConfig) -> Result<(), DaemonError> {
                         let registry_for_conn = Arc::clone(&registry);
                         let diagnostics_for_conn = diagnostics.clone();
                         let viewer_for_conn = viewer.clone();
-                        tokio::task::spawn_local(async move {
+                        tokio::spawn(async move {
                             crate::ipc::serve_connection(stream, &registry_for_conn, diagnostics_for_conn.as_deref(), Some(&viewer_for_conn)).await;
                         });
                     }
@@ -334,7 +322,7 @@ impl crate::seams::HumanInput for CountingInput {
     fn send(
         &self,
         events: Vec<rdpilot_vocab::RawInput>,
-    ) -> crate::seams::SendFuture<'_, Result<(), DaemonError>> {
+    ) -> crate::seams::BoxFuture<'_, Result<(), DaemonError>> {
         use crate::control::Held;
         use rdpilot_vocab::RawInput;
         let line = {
@@ -374,7 +362,7 @@ impl crate::seams::HumanInput for CountingInput {
 }
 
 impl ManagedSession for FakeTestSession {
-    fn close(self: Box<Self>) -> Pin<Box<dyn Future<Output = Result<(), DaemonError>>>> {
+    fn close(self: Box<Self>) -> BoxFuture<'static, Result<(), DaemonError>> {
         if let Some(frames) = &self.frames {
             frames.end();
         }
@@ -509,7 +497,7 @@ impl SessionConnector for FakeTestConnector {
     fn connect(
         &self,
         cfg: ConnectionConfig,
-    ) -> Pin<Box<dyn Future<Output = Result<Box<dyn ManagedSession>, DaemonError>>>> {
+    ) -> BoxFuture<'static, Result<Box<dyn ManagedSession>, DaemonError>> {
         let slow_ms = self.slow_ms;
         let bootstrap_delay_ms = self.bootstrap_delay_ms;
         let cua = self.cua;
@@ -724,26 +712,24 @@ mod tests {
 
         // Bypasses `ipc::unix::bind` entirely (no socket, no client) --
         // this test exercises the reconciliation-seed + lifecycle-task
-        // assembly `run_inner` performs, run to completion under a bounded
+        // assembly `run` performs, run to completion under a bounded
         // timeout so a regression that fails to self-shut-down fails this
         // test instead of hanging the suite.
-        let local = tokio::task::LocalSet::new();
-        let result = local
-            .run_until(tokio::time::timeout(
-                Duration::from_secs(5),
-                run_inner_without_bind_for_test(config),
-            ))
-            .await;
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_inner_without_bind_for_test(config),
+        )
+        .await;
 
         assert!(
             result.is_ok(),
-            "run_inner's lifecycle assembly must self-shut-down well within the timeout"
+            "run's lifecycle assembly must self-shut-down well within the timeout"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A thin harness mirroring `run_inner`'s post-bind steps (registry +
+    /// A thin harness mirroring `run`'s post-bind steps (registry +
     /// reconciliation-seed + lifecycle-task spawn + shutdown-wait), minus
     /// the `ipc::unix::bind`/accept-loop portion -- this file's own
     /// `#[tokio::test]` above cannot bind a real socket (no unique-per-test
@@ -774,12 +760,12 @@ mod tests {
         reconcile::seed_into(orphans, &registry);
 
         let shutdown = ShutdownSignal::new();
-        let reaper_handle = tokio::task::spawn_local(lifecycle::idle_reaper(
+        let reaper_handle = tokio::spawn(lifecycle::idle_reaper(
             Arc::clone(&registry),
             config.lifecycle,
             shutdown.clone(),
         ));
-        let watcher_handle = tokio::task::spawn_local(lifecycle::empty_watcher(
+        let watcher_handle = tokio::spawn(lifecycle::empty_watcher(
             Arc::clone(&registry),
             config.lifecycle,
             shutdown.clone(),

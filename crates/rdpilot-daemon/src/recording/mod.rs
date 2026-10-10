@@ -7,8 +7,8 @@
 //!   annotate, list, keep). Its callers take only the registry's brief
 //!   outer lock, never a per-session lock, never `touch_generation`: a
 //!   recording action is not session activity.
-//! - Recording file I/O never runs on the IPC `LocalSet` thread: store work
-//!   runs in `spawn_blocking`, the rest on the recorder thread.
+//! - Recording file I/O never runs on the thread of an async IPC task: store
+//!   work runs in `spawn_blocking`, the rest on the recorder thread.
 //! - A recording failure never fails a session or an agent operation.
 
 pub(crate) mod capture;
@@ -636,7 +636,7 @@ thread_local! {
     static IPC_THREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// Mark the current thread as the IPC `LocalSet` thread (tests).
+/// Mark the current thread as the thread of an async IPC task (tests).
 #[cfg(test)]
 pub(crate) fn mark_ipc_thread() {
     IPC_THREAD.with(|t| t.set(true));
