@@ -183,7 +183,7 @@ The table satisfies these rules, row by row:
 | `decision` | One value per principal. |
 | `current` | Behaviour of the daemon today. |
 | `delta` | The change needed to reach the target, or `none`. |
-| `evidence` | `path:line` entries for `current`. Empty only for planned rows. |
+| `evidence` | `path:line` entries for `current`, as of commit `7a353e6`. Empty only for planned rows. |
 
 A decision is the policy for that principal and that operation, whether or not
 an adapter reaches it today. `current` and `delta` state reachability.
