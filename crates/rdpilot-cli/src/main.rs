@@ -12,6 +12,8 @@
 mod cli;
 mod connect;
 mod exit_codes;
+#[cfg(test)]
+mod golden_tests;
 mod password_command;
 mod render;
 mod verbs;

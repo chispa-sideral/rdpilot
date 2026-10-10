@@ -123,7 +123,7 @@ fn wire_button(b: ButtonArg) -> WireButton {
 /// [`CliError::Internal`] with a legible message naming the offending token
 /// if `name` does not match any known key (T-13-17: no silent drop, no
 /// panic).
-fn parse_key_name(name: &str) -> Result<WireKey, CliError> {
+pub(crate) fn parse_key_name(name: &str) -> Result<WireKey, CliError> {
     rdpilot_ipc::parse_wire_key(name).map_err(CliError::Internal)
 }
 

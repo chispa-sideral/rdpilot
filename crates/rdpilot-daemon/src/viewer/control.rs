@@ -172,12 +172,12 @@ pub(crate) async fn post_control(
 }
 
 #[derive(Deserialize)]
-struct InputBody {
+pub(crate) struct InputBody {
     lease: String,
     generation: u64,
     width: u32,
     height: u32,
-    events: Vec<HumanEvent>,
+    pub(crate) events: Vec<HumanEvent>,
 }
 
 /// `POST /api/sessions/{id}/input`.

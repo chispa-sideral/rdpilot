@@ -44,7 +44,7 @@ pub(crate) use bind::{
     bind_listeners, is_tailnet_range, select_tailnet_address, Interface, TailnetSelection,
 };
 #[cfg(test)]
-pub(crate) use control::RateLimits;
+pub(crate) use control::{InputBody, RateLimits};
 #[cfg(test)]
 pub(crate) use frames::Encoded;
 pub(crate) use http::{serve, Limits, ServerState, ViewerHandle};

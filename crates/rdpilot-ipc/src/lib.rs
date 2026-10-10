@@ -59,6 +59,8 @@ mod request;
 mod response;
 mod session_id;
 mod transfer;
+#[cfg(test)]
+mod wire_golden_tests;
 // `transport`'s framing primitives (`read_frame`/`write_frame`/
 // `TransportError`) are cross-platform (Plan 15-05 fix: `rdpilot-daemon`'s
 // Windows IPC path needs them too, exercised via the generic
