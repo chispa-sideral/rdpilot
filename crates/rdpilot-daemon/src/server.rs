@@ -28,8 +28,9 @@ use crate::reconcile::{self, JsonReconciliationSink};
 use crate::recording::RecordingService;
 use crate::registry::{Registry, ViewerRegistry};
 use crate::seams::{
-    BoxFuture, BundleSource, DaemonError, ManagedCua, ManagedSession, RealConnector,
-    ReconciliationSink, SessionConnector, ViewFrameSource,
+    connect_deadline, BoxFuture, BundleSource, DaemonError, DeadlineConnector, ManagedCua,
+    ManagedSession, RealConnector, ReconciliationSink, SessionConnector, ViewFrameSource,
+    CONNECT_DEADLINE_ENV,
 };
 use crate::synthetic_frames::SyntheticFrames;
 use crate::viewer::ViewerGate;
@@ -87,6 +88,12 @@ const TEST_CUA_ENV: &str = "RDPILOT_DAEMON_TEST_CUA";
 /// buttons held now. Never key codes or coordinates. Read only when the fake
 /// connector is selected; unreachable by [`RealConnector`].
 const TEST_INPUT_LOG_ENV: &str = "RDPILOT_DAEMON_TEST_INPUT_LOG";
+
+/// When set (to a file path) alongside [`TEST_CONNECTOR_ENV`], every connect
+/// of the [`FakeTestConnector`] stays in flight until that file exists, so a
+/// test can hold a connect in the `Connecting` state. Read only when the
+/// fake connector is selected; unreachable by [`RealConnector`].
+const TEST_CONNECT_GATE_PATH_ENV: &str = "RDPILOT_DAEMON_TEST_CONNECT_GATE_PATH";
 
 /// The env var overriding [`RunConfig`]'s reconciliation-state sink path
 /// (test injection point -- production always resolves the platform
@@ -194,10 +201,18 @@ pub async fn run(config: RunConfig) -> Result<(), DaemonError> {
             frames: std::env::var(TEST_FRAMES_ENV).is_ok(),
             cua: std::env::var(TEST_CUA_ENV).is_ok(),
             input_log: std::env::var_os(TEST_INPUT_LOG_ENV).map(PathBuf::from),
+            connect_gate: std::env::var_os(TEST_CONNECT_GATE_PATH_ENV).map(PathBuf::from),
         })
     } else {
         Arc::new(RealConnector)
     };
+
+    // The deadline bounds the connect itself, for the real and the fake
+    // connector alike; the bridge bootstrap runs after it.
+    let connector: Arc<dyn SessionConnector> = Arc::new(DeadlineConnector {
+        inner: connector,
+        deadline: connect_deadline(std::env::var(CONNECT_DEADLINE_ENV).ok().as_deref()),
+    });
 
     let recordings = RecordingService::from_config();
     let registry = Arc::new(
@@ -491,6 +506,8 @@ struct FakeTestConnector {
     cua: bool,
     /// See [`TEST_INPUT_LOG_ENV`].
     input_log: Option<PathBuf>,
+    /// See [`TEST_CONNECT_GATE_PATH_ENV`].
+    connect_gate: Option<PathBuf>,
 }
 
 impl SessionConnector for FakeTestConnector {
@@ -532,7 +549,14 @@ impl SessionConnector for FakeTestConnector {
             }
             frames
         });
+        let connect_gate = self.connect_gate.clone();
         Box::pin(async move {
+            if let Some(gate) = connect_gate {
+                // Cancellation-safe: dropping the future stops the poll.
+                while !gate.exists() {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            }
             Ok(Box::new(FakeTestSession {
                 slow_ms,
                 bootstrap_delay_ms,
@@ -750,6 +774,7 @@ mod tests {
             frames: false,
             cua: false,
             input_log: None,
+            connect_gate: None,
         });
         let registry = Arc::new(Registry::new(
             connector,

@@ -11,9 +11,10 @@
 //!   registry is re-locked briefly to upgrade the placeholder, but only the
 //!   placeholder of the same attempt; on failure it is re-locked briefly to
 //!   remove the claim (so a retry with the same name can succeed). Removing
-//!   the placeholder cancels the connect. This is the ONLY correct way to
-//!   make "N simultaneous same-name connects yield exactly one live
-//!   session" true.
+//!   the placeholder cancels the connect; a `Disconnect` is the one caller
+//!   that removes another future's placeholder, and it sends the cause.
+//!   This is the ONLY correct way to make "N simultaneous same-name
+//!   connects yield exactly one live session" true.
 //! - **Close-not-drop teardown** ([`Registry::close`]): every code path
 //!   that removes a `Live` entry from the map extracts the owned session
 //!   and awaits its `close()` — it never lets the removed value simply go
@@ -188,6 +189,21 @@ fn connect_cancelled() -> DaemonError {
     DaemonError::Connect("connect cancelled before the session was registered".to_owned())
 }
 
+/// The error of a connect that a `Disconnect` cancelled on purpose. It maps to
+/// the wire code `internal`.
+fn cancelled_by(cause: CancelCause) -> DaemonError {
+    match cause {
+        CancelCause::Disconnect => {
+            DaemonError::Connect("connect cancelled by disconnect".to_owned())
+        }
+    }
+}
+
+/// What the connect task hands to [`Registry::open_tracked`]: the session
+/// together with the cancel receiver of its placeholder, so a promotion that
+/// finds the placeholder gone can read why, or the error of the connect.
+type Delivered = Result<(Box<dyn ManagedSession>, oneshot::Receiver<CancelCause>), DaemonError>;
+
 /// Held by [`Registry::open_tracked`] while it waits for the connect task.
 /// When the `open_tracked` future is dropped in that wait (the IPC peer left,
 /// or a timeout elapsed), it removes the placeholder of its attempt, which
@@ -198,7 +214,7 @@ fn connect_cancelled() -> DaemonError {
 struct ConnectGuard<'a> {
     registry: &'a Registry,
     lease: ConnectLease,
-    rx: oneshot::Receiver<Result<Box<dyn ManagedSession>, DaemonError>>,
+    rx: oneshot::Receiver<Delivered>,
     armed: bool,
 }
 
@@ -211,7 +227,7 @@ impl Drop for ConnectGuard<'_> {
         // After `close`, a send fails and the connect task closes its own
         // session; a send that happened before is drained here.
         self.rx.close();
-        if let Ok(Ok(session)) = self.rx.try_recv() {
+        if let Ok(Ok((session, _))) = self.rx.try_recv() {
             close_detached(session);
         }
     }
@@ -447,16 +463,24 @@ impl Registry {
 
         // The connect runs on its own task so that removing the placeholder
         // can cancel it: the placeholder owns the cancel handle, and the task
-        // stops when the handle is dropped or sent a cause. A session whose
-        // delivery fails (the receiver is gone) is closed here, never dropped.
+        // stops when the handle is dropped or sent a cause. A cause becomes the
+        // error of the connect; a dropped handle needs no answer. A session
+        // whose delivery fails (the receiver is gone) is closed here, never
+        // dropped. The biased order lets a cause that was sent win over a
+        // connect that is ready at the same time.
         let connect = self.connector.connect(cfg);
-        let (result_tx, result_rx) = oneshot::channel();
+        let (result_tx, result_rx) = oneshot::channel::<Delivered>();
         tokio::spawn(async move {
             tokio::select! {
                 biased;
-                _ = &mut cancel_rx => {}
+                cause = &mut cancel_rx => {
+                    if let Ok(cause) = cause {
+                        let _ = result_tx.send(Err(cancelled_by(cause)));
+                    }
+                }
                 result = connect => {
-                    if let Err(Ok(session)) = result_tx.send(result) {
+                    let result = result.map(|session| (session, cancel_rx));
+                    if let Err(Ok((session, _))) = result_tx.send(result) {
                         let _ = session.close().await;
                     }
                 }
@@ -474,8 +498,8 @@ impl Registry {
         let delivered = (&mut guard.rx).await;
         // The wait is over: every exit below settles the placeholder itself.
         guard.armed = false;
-        let session = match delivered {
-            Ok(Ok(session)) => session,
+        let (session, mut cancel_rx) = match delivered {
+            Ok(Ok(delivered)) => delivered,
             Ok(Err(error)) => {
                 self.cancel_connecting(&lease);
                 return Err(error);
@@ -550,7 +574,12 @@ impl Registry {
             drop(ended_watch);
             drop((events, control));
             let _ = session.close().await;
-            return Err(connect_cancelled());
+            // A Disconnect sends its cause before the lock that removed the
+            // placeholder is released, so it is already here.
+            return Err(match cancel_rx.try_recv() {
+                Ok(cause) => cancelled_by(cause),
+                Err(_) => connect_cancelled(),
+            });
         }
         self.sink.record_open(&id, &host, &now_wall);
         let recording = match record {
@@ -571,23 +600,28 @@ impl Registry {
     /// a removed `Live` entry drop bare (research Pattern 2, DAEMON-01's
     /// critical invariant).
     ///
+    /// A connect still in flight is cancelled instead: its placeholder is
+    /// removed, the connect task is told why, and the pending connect fails
+    /// with "connect cancelled by disconnect". No record is written, because
+    /// none was. The call returns before the connect future is dropped.
+    ///
     /// # Errors
     ///
-    /// Returns [`DaemonError::SessionNotFound`] if `id` has no entry,
-    /// [`DaemonError::StillConnecting`] if `id`'s connect is still in
-    /// flight (the in-flight connect is never interrupted — the
-    /// `Connecting` placeholder stays in place, untouched, so its promotion
-    /// still finds it), or the underlying close/join error.
+    /// Returns [`DaemonError::SessionNotFound`] if `id` has no entry, or the
+    /// underlying close/join error.
     pub async fn close(&self, id: &SessionId) -> Result<(), DaemonError> {
         self.close_with(id, CloseReason::Disconnect).await
     }
 
     /// Like [`Registry::close`], for the idle reaper: a recording of the
-    /// session ends with the reason `idle_reap`.
+    /// session ends with the reason `idle_reap`. The reaper closes by name
+    /// after a snapshot, so a connect in flight is never cancelled here: it
+    /// may be a later attempt that reused the name of a reaped session.
     ///
     /// # Errors
     ///
-    /// As for [`Registry::close`].
+    /// As for [`Registry::close`], plus [`DaemonError::StillConnecting`] if
+    /// `id`'s connect is still in flight (the placeholder stays untouched).
     pub async fn close_idle(&self, id: &SessionId) -> Result<(), DaemonError> {
         self.close_with(id, CloseReason::IdleReap).await
     }
@@ -596,11 +630,19 @@ impl Registry {
         let entry = {
             #[allow(clippy::expect_used)] // A poisoned registry mutex is unrecoverable.
             let mut guard = self.sessions.lock().expect("registry mutex poisoned");
-            // Inspect and remove under this one lock. A connect in flight is
-            // never interrupted here: its placeholder stays, with its attempt
-            // and cancel handle, so the promotion still finds it.
+            // Inspect and remove under this one lock.
             if matches!(guard.get(id), Some(SessionEntry::Connecting { .. })) {
-                return Err(DaemonError::StillConnecting(id.as_str().to_owned()));
+                if reason != CloseReason::Disconnect {
+                    return Err(DaemonError::StillConnecting(id.as_str().to_owned()));
+                }
+                // Cancel the connect: remove its placeholder and say why
+                // while the lock is held, so a promotion that finds the
+                // placeholder gone also finds the cause. The name is free
+                // when the lock drops.
+                if let Some(SessionEntry::Connecting { cancel, .. }) = guard.remove(id) {
+                    let _ = cancel.send(CancelCause::Disconnect);
+                }
+                return Ok(());
             }
             guard.remove(id) // extract, don't let it drop in this scope
         };
@@ -642,7 +684,7 @@ impl Registry {
                 }
             }
             Some(SessionEntry::Connecting { .. }) => {
-                // Unreachable: a placeholder is rejected under the lock above.
+                // Unreachable: a placeholder is handled under the lock above.
                 Err(DaemonError::StillConnecting(id.as_str().to_owned()))
             }
             Some(SessionEntry::Orphaned { .. }) => {
@@ -1575,7 +1617,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn close_on_a_still_connecting_id_is_rejected_and_the_placeholder_survives() {
+    async fn close_on_a_still_connecting_id_cancels_it_and_removes_the_placeholder() {
         let registry = Registry::new(
             Arc::new(FakeConnector::succeeding()),
             Arc::new(NoopReconciliationSink),
@@ -1584,15 +1626,36 @@ mod tests {
         // without actually running a connect, to exercise `close`'s
         // still-connecting branch in isolation.
         let id = SessionId::from_str("web").expect("non-empty literal");
-        registry
+        let (_, mut cancel_rx) = registry
             .claim(&id)
             .expect("claim should succeed on an empty registry");
 
-        let result = registry.close(&id).await;
+        registry
+            .close(&id)
+            .await
+            .expect("a Disconnect cancels the connect in flight");
+        assert_eq!(registry.len(), 0, "the placeholder is removed");
+        assert_eq!(cancel_rx.try_recv(), Ok(CancelCause::Disconnect));
+    }
+
+    #[tokio::test]
+    async fn close_idle_on_a_still_connecting_id_is_rejected_and_the_placeholder_survives() {
+        let registry = Registry::new(
+            Arc::new(FakeConnector::succeeding()),
+            Arc::new(NoopReconciliationSink),
+        );
+        let id = SessionId::from_str("web").expect("non-empty literal");
+        let (attempt, mut cancel_rx) = registry
+            .claim(&id)
+            .expect("claim should succeed on an empty registry");
+
+        // The idle reaper closes by name after a snapshot, so it must never
+        // cancel a later attempt that reused the name.
+        let result = registry.close_idle(&id).await;
         assert!(matches!(result, Err(DaemonError::StillConnecting(name)) if name == "web"));
-        // The placeholder must survive the rejected close (put back), not
-        // be lost — the map must still show exactly one entry.
         assert_eq!(registry.len(), 1);
+        assert_eq!(connecting_attempt(&registry, "web"), Some(attempt));
+        assert!(cancel_rx.try_recv().is_err(), "no cause was sent");
     }
 
     #[tokio::test]
@@ -2094,24 +2157,144 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn disconnect_of_a_connecting_id_leaves_the_placeholder_and_the_connect() {
+    async fn disconnect_of_a_connecting_id_cancels_the_connect_and_frees_the_name() {
+        let (registry, calls, closes) = gated_registry(2);
+        let open = start_open(&registry, "s").await;
+        until("the connect started", || flag(&calls[0].started)).await;
+        let first_attempt = connecting_attempt(&registry, "s").expect("a placeholder");
+
+        let id = SessionId::from_str("s").expect("non-empty literal");
+        registry
+            .close(&id)
+            .await
+            .expect("a Disconnect cancels the connect in flight");
+        assert_eq!(connecting_attempt(&registry, "s"), None);
+        assert_eq!(registry.len(), 0, "the claim is gone at once");
+        // The Ack precedes the drop of the connect future.
+        until("the connect future was dropped", || flag(&calls[0].dropped)).await;
+        assert!(!flag(&calls[0].delivered));
+
+        let error = open.await.expect_err("the cancelled connect fails");
+        assert!(
+            matches!(&error, DaemonError::Connect(m) if m == "connect cancelled by disconnect"),
+            "{error:?}"
+        );
+        assert_eq!(
+            rdpilot_ipc::WireError::from(error).code,
+            rdpilot_ipc::WireErrorCode::Internal
+        );
+        assert_eq!(closes.load(Ordering::SeqCst), 0);
+        assert_eq!(registry.len(), 0);
+
+        // The name is free: a second connect with it claims and completes.
+        let second = start_open(&registry, "s").await;
+        until("the second connect started", || flag(&calls[1].started)).await;
+        let second_attempt = connecting_attempt(&registry, "s").expect("a new placeholder");
+        assert!(second_attempt > first_attempt);
+        calls[1].gate.add_permits(1);
+        let (lease, _) = second.await.expect("the second connect succeeds");
+        assert_eq!(lease.generation, second_attempt);
+        assert_eq!(live_generation(&registry, "s"), Some(second_attempt));
+    }
+
+    #[tokio::test]
+    async fn disconnect_while_connecting_leaves_an_independent_live_session() {
+        let (registry, calls, closes) = gated_registry(2);
+        let keep = start_open(&registry, "keep").await;
+        until("the first connect started", || flag(&calls[0].started)).await;
+        calls[0].gate.add_permits(1);
+        let (keep_lease, _) = keep.await.expect("the first connect succeeds");
+
+        let victim = start_open(&registry, "victim").await;
+        until("the second connect started", || flag(&calls[1].started)).await;
+        let victim_id = SessionId::from_str("victim").expect("non-empty literal");
+        registry
+            .close(&victim_id)
+            .await
+            .expect("a Disconnect cancels the connect in flight");
+        assert!(victim.await.is_err());
+
+        assert_eq!(
+            live_generation(&registry, "keep"),
+            Some(keep_lease.generation)
+        );
+        assert_eq!(closes.load(Ordering::SeqCst), 0);
+        registry
+            .call(&keep_lease.id, |session| session.ping())
+            .await
+            .expect("the independent session still answers");
+        assert_eq!(registry.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn disconnect_in_the_promotion_window_names_the_disconnect() {
         let (registry, calls, closes) = gated_registry(1);
         let open = start_open(&registry, "s").await;
         until("the connect started", || flag(&calls[0].started)).await;
-        let attempt = connecting_attempt(&registry, "s").expect("a placeholder");
 
-        let id = SessionId::from_str("s").expect("non-empty literal");
-        let result = registry.close(&id).await;
-        assert!(matches!(result, Err(DaemonError::StillConnecting(name)) if name == "s"));
-        assert_eq!(connecting_attempt(&registry, "s"), Some(attempt));
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        assert!(!flag(&calls[0].dropped), "the connect was not cancelled");
-
+        // The session is delivered, but `open_tracked` has not promoted it
+        // yet: the placeholder is still there when the Disconnect arrives.
         calls[0].gate.add_permits(1);
-        let (lease, _) = open.await.expect("the later promotion succeeds");
-        assert_eq!(lease.generation, attempt);
-        assert_eq!(live_generation(&registry, "s"), Some(attempt));
+        until("the session was delivered", || flag(&calls[0].delivered)).await;
+        let id = SessionId::from_str("s").expect("non-empty literal");
+        registry
+            .close(&id)
+            .await
+            .expect("a Disconnect cancels the connect in flight");
+
+        let error = open.await.expect_err("the cancelled connect fails");
+        assert!(
+            matches!(&error, DaemonError::Connect(m) if m == "connect cancelled by disconnect"),
+            "{error:?}"
+        );
+        until("the delivered session was closed", || {
+            closes.load(Ordering::SeqCst) == 1
+        })
+        .await;
+        assert_eq!(registry.len(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn connect_deadline_ends_a_hung_connect_and_frees_the_name() {
+        let (connector, calls, closes) = gated(2);
+        let registry = Registry::new(
+            Arc::new(crate::seams::DeadlineConnector {
+                inner: connector,
+                deadline: crate::seams::DEFAULT_CONNECT_DEADLINE,
+            }),
+            Arc::new(NoopReconciliationSink),
+        );
+        let began = tokio::time::Instant::now();
+
+        let error = registry
+            .open_tracked(Some("s".to_owned()), "h".to_owned(), test_cfg(), None)
+            .await
+            .expect_err("a connect that is never released times out");
+
+        let waited = began.elapsed();
+        assert!(
+            waited >= Duration::from_secs(60) && waited < Duration::from_secs(61),
+            "{waited:?}"
+        );
+        assert!(
+            matches!(&error, DaemonError::Connect(m) if m == "connect timed out after 60s"),
+            "{error:?}"
+        );
+        assert_eq!(
+            rdpilot_ipc::WireError::from(error).code,
+            rdpilot_ipc::WireErrorCode::Internal
+        );
+        assert!(flag(&calls[0].dropped), "the connect future was dropped");
+        assert_eq!(registry.len(), 0);
         assert_eq!(closes.load(Ordering::SeqCst), 0);
+
+        // The name is free again.
+        calls[1].gate.add_permits(1);
+        let (lease, _) = registry
+            .open_tracked(Some("s".to_owned()), "h".to_owned(), test_cfg(), None)
+            .await
+            .expect("the name connects again");
+        assert_eq!(live_generation(&registry, "s"), Some(lease.generation));
     }
 
     /// A guard that holds a delivered session, as if its `open_tracked` future
@@ -2121,12 +2304,15 @@ mod tests {
         closes: &Arc<AtomicU32>,
     ) -> ConnectGuard<'a> {
         let id = SessionId::from_str("s").expect("non-empty literal");
-        let (attempt, _cancel_rx) = registry.claim(&id).expect("claim");
+        let (attempt, cancel_rx) = registry.claim(&id).expect("claim");
         let (tx, rx) = oneshot::channel();
         assert!(tx
-            .send(Ok(Box::new(FakeSession {
-                closes: Arc::clone(closes),
-            }) as Box<dyn ManagedSession>))
+            .send(Ok((
+                Box::new(FakeSession {
+                    closes: Arc::clone(closes),
+                }) as Box<dyn ManagedSession>,
+                cancel_rx,
+            )))
             .is_ok());
         ConnectGuard {
             registry,
