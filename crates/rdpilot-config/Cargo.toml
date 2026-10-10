@@ -8,6 +8,7 @@ description = "Configuration for rdpilot: ssh_config-style hosts file and rdp://
 repository = "https://github.com/marcfargas/rdpilot"
 
 [dependencies]
+rdpilot-vocab = { path = "../rdpilot-vocab" }
 serde = { version = "1", features = ["derive"] }
 config = { version = "0.15.25", default-features = false, features = ["toml"] }
 directories = "6.0.0"

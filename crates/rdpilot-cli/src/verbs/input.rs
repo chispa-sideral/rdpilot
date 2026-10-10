@@ -1,13 +1,14 @@
 //! `click`/`scroll`/`drag`/`type`/`key`/`launch`/`foreground` — CLI-02's
 //! input + launch verbs. Each is a thin invoke-and-exit `rdpilot-ipc`
-//! client: build the appropriate `WireMouseAction`/`WireKeyAction`, round-trip
+//! client: build the appropriate `MouseAction`/`KeyAction`, round-trip
 //! exactly one `Request`/`WireResponse` frame pair against a required
 //! `--session` (D-29), and render the SPECIFIC response variant it expects
 //! (table by default, `--json` opt-in).
 
-use rdpilot_ipc::{Request, WireButton, WireKey, WireKeyAction, WireMouseAction, WireResponse};
+use rdpilot_ipc::{Request, WireResponse};
+use rdpilot_vocab::{Key, KeyAction, MouseAction};
 
-use crate::cli::{ButtonArg, ClickArgs, DragArgs, KeyArgs, ScrollArgs, TypeArgs};
+use crate::cli::{ClickArgs, DragArgs, KeyArgs, ScrollArgs, TypeArgs};
 use crate::connect::round_trip;
 use crate::exit_codes::CliError;
 use crate::render::print_json;
@@ -20,15 +21,15 @@ use crate::render::print_json;
 /// otherwise; or a transport/auto-start failure.
 pub async fn click(args: ClickArgs, json: bool) -> Result<(), CliError> {
     let session = args.session.parse().map_err(CliError::Internal)?;
-    let button = wire_button(args.button);
+    let button = args.button;
     let action = if args.double {
-        WireMouseAction::DoubleClick {
+        MouseAction::DoubleClick {
             x: args.x,
             y: args.y,
             button,
         }
     } else {
-        WireMouseAction::Click {
+        MouseAction::Click {
             x: args.x,
             y: args.y,
             button,
@@ -45,7 +46,7 @@ pub async fn click(args: ClickArgs, json: bool) -> Result<(), CliError> {
 /// otherwise; or a transport/auto-start failure.
 pub async fn scroll(args: ScrollArgs, json: bool) -> Result<(), CliError> {
     let session = args.session.parse().map_err(CliError::Internal)?;
-    let action = WireMouseAction::Scroll {
+    let action = MouseAction::Scroll {
         x: args.x,
         y: args.y,
         dy: args.dy,
@@ -61,8 +62,8 @@ pub async fn scroll(args: ScrollArgs, json: bool) -> Result<(), CliError> {
 /// otherwise; or a transport/auto-start failure.
 pub async fn drag(args: DragArgs, json: bool) -> Result<(), CliError> {
     let session = args.session.parse().map_err(CliError::Internal)?;
-    let button = wire_button(args.button);
-    let action = WireMouseAction::Drag {
+    let button = args.button;
+    let action = MouseAction::Drag {
         from_x: args.from_x,
         from_y: args.from_y,
         to_x: args.to_x,
@@ -80,7 +81,7 @@ pub async fn drag(args: DragArgs, json: bool) -> Result<(), CliError> {
 /// otherwise; or a transport/auto-start failure.
 pub async fn type_text(args: TypeArgs, json: bool) -> Result<(), CliError> {
     let session = args.session.parse().map_err(CliError::Internal)?;
-    let action = WireKeyAction::Type(args.text);
+    let action = KeyAction::Type(args.text);
     expect_ack(round_trip(Request::Key { session, action }).await?, json)
 }
 
@@ -93,38 +94,26 @@ pub async fn type_text(args: TypeArgs, json: bool) -> Result<(), CliError> {
 /// own error otherwise; or a transport/auto-start failure.
 pub async fn key(args: KeyArgs, json: bool) -> Result<(), CliError> {
     let session = args.session.parse().map_err(CliError::Internal)?;
-    let keys: Vec<WireKey> = args
+    let keys: Vec<Key> = args
         .combo
         .split(',')
         .map(parse_key_name)
         .collect::<Result<_, _>>()?;
-    let action = WireKeyAction::Combo(keys);
+    let action = KeyAction::Combo(keys);
     expect_ack(round_trip(Request::Key { session, action }).await?, json)
 }
 
-/// The CLI spelling of `rdpilot_ipc::WireButton` -> the wire type itself.
-fn wire_button(b: ButtonArg) -> WireButton {
-    match b {
-        ButtonArg::Left => WireButton::Left,
-        ButtonArg::Right => WireButton::Right,
-        ButtonArg::Middle => WireButton::Middle,
-    }
-}
-
-/// Parse one `--combo` key name (case-insensitive, matching
-/// `rdpilot_ipc::WireKey`'s variant spellings) into a [`WireKey`].
+/// Parse one `--combo` key name (case-insensitive) into a [`Key`].
 ///
-/// Delegates to `rdpilot_ipc::parse_wire_key` — the ONE canonical key-name
-/// table shared with the (future) MCP surface (research "Don't Hand-Roll");
-/// this CLI no longer holds its own copy.
+/// Delegates to `rdpilot_vocab::parse_key_name`, the one key-name table.
 ///
 /// # Errors
 ///
 /// [`CliError::Internal`] with a legible message naming the offending token
 /// if `name` does not match any known key (T-13-17: no silent drop, no
 /// panic).
-fn parse_key_name(name: &str) -> Result<WireKey, CliError> {
-    rdpilot_ipc::parse_wire_key(name).map_err(CliError::Internal)
+pub(crate) fn parse_key_name(name: &str) -> Result<Key, CliError> {
+    rdpilot_vocab::parse_key_name(name).map_err(CliError::Internal)
 }
 
 /// Interpret a round-tripped [`WireResponse`] that every input/launch verb

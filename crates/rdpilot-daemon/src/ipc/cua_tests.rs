@@ -149,7 +149,7 @@ impl ManagedSession for FakeSession {
 /// What a gated session saw, in order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Seen {
-    Human(crate::control::HumanEvent),
+    Human(rdpilot_vocab::RawInput),
     Cua,
 }
 
@@ -163,7 +163,7 @@ struct GatedSink {
 impl crate::seams::HumanInput for GatedSink {
     fn send(
         &self,
-        events: Vec<crate::control::HumanEvent>,
+        events: Vec<rdpilot_vocab::RawInput>,
     ) -> crate::seams::SendFuture<'_, Result<(), DaemonError>> {
         Box::pin(async move {
             drop(self.gate.acquire().await.unwrap());
@@ -531,7 +531,7 @@ async fn native_verbs_record_name_outcome_and_duration_only() {
                 &registry,
                 Request::Mouse {
                     session: session(),
-                    action: rdpilot_ipc::WireMouseAction::Move { x: 4242, y: 4343 },
+                    action: rdpilot::MouseAction::Move { x: 4242, y: 4343 },
                 },
             )
             .await;
@@ -539,7 +539,7 @@ async fn native_verbs_record_name_outcome_and_duration_only() {
                 &registry,
                 Request::Key {
                     session: session(),
-                    action: rdpilot_ipc::WireKeyAction::Type(MARKER.into()),
+                    action: rdpilot::KeyAction::Type(MARKER.into()),
                 },
             )
             .await;
@@ -762,7 +762,7 @@ async fn an_acting_cua_call_after_a_release_waits_for_the_releases() {
             let mut client = server(registry.clone(), 4096);
             attach(&mut client, id.clone()).await;
             let _ = read_frame::<_, CuaStreamFrame>(&mut client).await.unwrap();
-            let shift = |down| crate::control::HumanEvent::Key {
+            let shift = |down| rdpilot_vocab::RawInput::Key {
                 code: 0x2A,
                 extended: false,
                 down,

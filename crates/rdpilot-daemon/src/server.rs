@@ -333,9 +333,10 @@ type InputCounts = (u64, std::collections::BTreeSet<crate::control::Held>);
 impl crate::seams::HumanInput for CountingInput {
     fn send(
         &self,
-        events: Vec<crate::control::HumanEvent>,
+        events: Vec<rdpilot_vocab::RawInput>,
     ) -> crate::seams::SendFuture<'_, Result<(), DaemonError>> {
-        use crate::control::{Held, HumanEvent};
+        use crate::control::Held;
+        use rdpilot_vocab::RawInput;
         let line = {
             let mut state = match self.state.lock() {
                 Ok(guard) => guard,
@@ -344,13 +345,13 @@ impl crate::seams::HumanInput for CountingInput {
             for event in &events {
                 state.0 += 1;
                 let (held, down) = match *event {
-                    HumanEvent::Key {
+                    RawInput::Key {
                         code,
                         extended,
                         down,
                     } => (Held::Key { code, extended }, down),
-                    HumanEvent::Button { button, down } => (Held::Button(button), down),
-                    HumanEvent::Move { .. } | HumanEvent::Wheel { .. } => continue,
+                    RawInput::Button { button, down } => (Held::Button(button), down),
+                    RawInput::PointerMove { .. } | RawInput::Wheel { .. } => continue,
                 };
                 if down {
                     state.1.insert(held);
@@ -946,21 +947,21 @@ mod tests {
 
     #[tokio::test]
     async fn fake_input_logs_counts_only() {
-        use crate::control::HumanEvent;
         use crate::seams::HumanInput;
+        use rdpilot_vocab::RawInput;
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("input.jsonl");
         let input = CountingInput {
             log: log.clone(),
             state: std::sync::Mutex::default(),
         };
-        let key = |down| HumanEvent::Key {
+        let key = |down| RawInput::Key {
             code: 0x2A,
             extended: false,
             down,
         };
         input
-            .send(vec![HumanEvent::Move { x: 777, y: 555 }, key(true)])
+            .send(vec![RawInput::PointerMove { x: 777, y: 555 }, key(true)])
             .await
             .unwrap();
         input.send(vec![key(false)]).await.unwrap();

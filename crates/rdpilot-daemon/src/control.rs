@@ -37,6 +37,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rdpilot_ipc::{WireController, WireControllerKind};
+use rdpilot_vocab::{PointerButton, RawInput};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Notify;
 
@@ -59,46 +60,10 @@ pub(crate) const INPUT_SEND_TIMEOUT: Duration = Duration::from_secs(2);
 /// Lease ends remembered per session for loss notices.
 const RECENT_ENDS: usize = 16;
 
-/// A mouse button a human can press in the viewer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PointerButton {
-    Left,
-    Middle,
-    Right,
-    X1,
-    X2,
-}
-
-/// One human input event. Coordinates are framebuffer pixels.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum HumanEvent {
-    Move {
-        x: u16,
-        y: u16,
-    },
-    Button {
-        button: PointerButton,
-        down: bool,
-    },
-    Wheel {
-        vertical: bool,
-        units: i16,
-    },
-    Key {
-        code: u8,
-        extended: bool,
-        down: bool,
-    },
-}
-
-impl HumanEvent {
-    /// Pointer events are fenced by frame geometry (except the release of
-    /// a held button); key events are not.
-    fn is_pointer(&self) -> bool {
-        !matches!(self, HumanEvent::Key { .. })
-    }
+/// Pointer events are fenced by frame geometry (except the release of a held
+/// button); key events are not.
+fn is_pointer(event: &RawInput) -> bool {
+    !matches!(event, RawInput::Key { .. })
 }
 
 /// A key or button pressed by the human holder and not yet released.
@@ -109,13 +74,13 @@ pub(crate) enum Held {
 }
 
 impl Held {
-    fn release(self) -> HumanEvent {
+    fn release(self) -> RawInput {
         match self {
-            Held::Button(button) => HumanEvent::Button {
+            Held::Button(button) => RawInput::Button {
                 button,
                 down: false,
             },
-            Held::Key { code, extended } => HumanEvent::Key {
+            Held::Key { code, extended } => RawInput::Key {
                 code,
                 extended,
                 down: false,
@@ -864,7 +829,7 @@ impl SessionControl {
         lease: &str,
         generation: u64,
         geometry: (u32, u32),
-        events: Vec<HumanEvent>,
+        events: Vec<RawInput>,
     ) -> Result<InputReport, InputError> {
         let mut report = InputReport {
             applied: 0,
@@ -896,7 +861,7 @@ impl SessionControl {
                         return Ok(report);
                     }
                 };
-                let off_frame = event.is_pointer()
+                let off_frame = is_pointer(&event)
                     && !geometry_matches(&event, geometry, current)
                     && !releases_held_button(&holder.held, &event);
                 if off_frame {
@@ -1003,12 +968,12 @@ repeat this call with \"takeover\": true to take control",
     )
 }
 
-fn geometry_matches(event: &HumanEvent, aimed: (u32, u32), current: Option<(u32, u32)>) -> bool {
+fn geometry_matches(event: &RawInput, aimed: (u32, u32), current: Option<(u32, u32)>) -> bool {
     if current != Some(aimed) {
         return false;
     }
     match *event {
-        HumanEvent::Move { x, y } => u32::from(x) < aimed.0 && u32::from(y) < aimed.1,
+        RawInput::PointerMove { x, y } => u32::from(x) < aimed.0 && u32::from(y) < aimed.1,
         _ => true,
     }
 }
@@ -1027,20 +992,20 @@ async fn until_signalled<T>(notify: &Notify, mut ready: impl FnMut() -> Option<T
 }
 
 /// Whether `event` releases a button the holder holds.
-fn releases_held_button(held: &BTreeSet<Held>, event: &HumanEvent) -> bool {
-    matches!(*event, HumanEvent::Button { button, down: false } if held.contains(&Held::Button(button)))
+fn releases_held_button(held: &BTreeSet<Held>, event: &RawInput) -> bool {
+    matches!(*event, RawInput::Button { button, down: false } if held.contains(&Held::Button(button)))
 }
 
-fn track(held: &mut BTreeSet<Held>, event: &HumanEvent) {
+fn track(held: &mut BTreeSet<Held>, event: &RawInput) {
     match *event {
-        HumanEvent::Button { button, down } => {
+        RawInput::Button { button, down } => {
             if down {
                 held.insert(Held::Button(button));
             } else {
                 held.remove(&Held::Button(button));
             }
         }
-        HumanEvent::Key {
+        RawInput::Key {
             code,
             extended,
             down,
@@ -1052,15 +1017,17 @@ fn track(held: &mut BTreeSet<Held>, event: &HumanEvent) {
                 held.remove(&key);
             }
         }
-        HumanEvent::Move { .. } | HumanEvent::Wheel { .. } => {}
+        RawInput::PointerMove { .. } | RawInput::Wheel { .. } => {}
     }
 }
 
 /// Keep only the last of each run of consecutive pointer moves.
-fn coalesce(events: Vec<HumanEvent>) -> Vec<HumanEvent> {
-    let mut out: Vec<HumanEvent> = Vec::with_capacity(events.len());
+fn coalesce(events: Vec<RawInput>) -> Vec<RawInput> {
+    let mut out: Vec<RawInput> = Vec::with_capacity(events.len());
     for event in events {
-        if let (Some(HumanEvent::Move { .. }), HumanEvent::Move { .. }) = (out.last(), event) {
+        if let (Some(RawInput::PointerMove { .. }), RawInput::PointerMove { .. }) =
+            (out.last(), event)
+        {
             out.pop();
         }
         out.push(event);

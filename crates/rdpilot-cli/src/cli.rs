@@ -2,7 +2,9 @@
 
 use std::path::PathBuf;
 
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::builder::{PossibleValue, PossibleValuesParser, TypedValueParser};
+use clap::{Args, Parser, Subcommand};
+use rdpilot_vocab::Button;
 
 /// `rdpilot` — a thin CLI client for the `rdpilot-daemon` session registry.
 #[derive(Debug, Parser)]
@@ -259,16 +261,13 @@ pub enum InputCmd {
     Key(KeyArgs),
 }
 
-/// A mouse button — the CLI spelling of `rdpilot_ipc::WireButton`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-#[value(rename_all = "kebab-case")]
-pub enum ButtonArg {
-    /// The left (primary) mouse button.
-    Left,
-    /// The right (secondary/context-menu) mouse button.
-    Right,
-    /// The middle (wheel) mouse button.
-    Middle,
+/// The `--button` value parser: the names and help lines of
+/// [`Button::CLI_VALUES`], matched case-sensitively, yielding a [`Button`].
+fn button_parser() -> impl TypedValueParser<Value = Button> {
+    PossibleValuesParser::new(
+        Button::CLI_VALUES.map(|(_, name, help)| PossibleValue::new(name).help(help)),
+    )
+    .try_map(|name| Button::from_cli_name(&name).ok_or_else(|| format!("unknown button '{name}'")))
 }
 
 /// `input click --session <id> --x <n> --y <n> [--button <button>] [--double]`.
@@ -284,8 +283,8 @@ pub struct ClickArgs {
     #[arg(long)]
     pub y: u16,
     /// The button to click (default: left).
-    #[arg(long, value_enum, default_value = "left")]
-    pub button: ButtonArg,
+    #[arg(long, value_parser = button_parser(), default_value = "left")]
+    pub button: Button,
     /// Double-click instead of a single click.
     #[arg(long)]
     pub double: bool,
@@ -328,8 +327,8 @@ pub struct DragArgs {
     #[arg(long = "to-y")]
     pub to_y: u16,
     /// The button to drag with (default: left).
-    #[arg(long, value_enum, default_value = "left")]
-    pub button: ButtonArg,
+    #[arg(long, value_parser = button_parser(), default_value = "left")]
+    pub button: Button,
 }
 
 /// `input type --session <id> --text <string>`.

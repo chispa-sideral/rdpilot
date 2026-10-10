@@ -9,6 +9,7 @@ repository = "https://github.com/marcfargas/rdpilot"
 
 [dependencies]
 rdpilot-bridge-protocol = { path = "../rdpilot-bridge-protocol" }
+rdpilot-vocab = { path = "../rdpilot-vocab" }
 # IronRDP: umbrella facade at 0.17, member crates at their independent versions.
 # Uniform "0.14" pins will NOT resolve (member crates are at 0.10/0.9/0.8/0.2).
 # Versions verified against crates.io 2026-10-09 (see 02-RESEARCH.md).

@@ -15,18 +15,18 @@ use crate::seams::{HumanInput, SendFuture, ViewFrameSource};
 /// Records every event it is sent, in order.
 #[derive(Default)]
 pub(crate) struct Sink {
-    pub(crate) sent: Mutex<Vec<HumanEvent>>,
+    pub(crate) sent: Mutex<Vec<RawInput>>,
 }
 
 impl HumanInput for Sink {
-    fn send(&self, events: Vec<HumanEvent>) -> SendFuture<'_, Result<(), DaemonError>> {
+    fn send(&self, events: Vec<RawInput>) -> SendFuture<'_, Result<(), DaemonError>> {
         self.sent.lock().unwrap().extend(events);
         Box::pin(async { Ok(()) })
     }
 }
 
 impl Sink {
-    fn take(&self) -> Vec<HumanEvent> {
+    fn take(&self) -> Vec<RawInput> {
         std::mem::take(&mut *self.sent.lock().unwrap())
     }
 }
@@ -87,8 +87,8 @@ fn kinds(events: &SessionEvents) -> Vec<EventKind> {
     events.after(0).events.into_iter().map(|e| e.kind).collect()
 }
 
-fn key(code: u8, down: bool) -> HumanEvent {
-    HumanEvent::Key {
+fn key(code: u8, down: bool) -> RawInput {
+    RawInput::Key {
         code,
         extended: false,
         down,
@@ -174,8 +174,8 @@ async fn agent_takeover_releases_held_keys_and_is_a_no_op_under_agent_control() 
             7,
             (800, 600),
             vec![
-                HumanEvent::Move { x: 5, y: 5 },
-                HumanEvent::Button {
+                RawInput::PointerMove { x: 5, y: 5 },
+                RawInput::Button {
                     button: PointerButton::Left,
                     down: true,
                 },
@@ -192,7 +192,7 @@ async fn agent_takeover_releases_held_keys_and_is_a_no_op_under_agent_control() 
     f.control.discharge(transition).await;
     let sent = f.sink.take();
     assert!(sent.contains(&key(SHIFT, false)));
-    assert!(sent.contains(&HumanEvent::Button {
+    assert!(sent.contains(&RawInput::Button {
         button: PointerButton::Left,
         down: false
     }));
@@ -457,12 +457,12 @@ async fn fencing_drops_old_geometry_and_old_generations_and_coalesces_moves() {
             7,
             (800, 600),
             vec![
-                HumanEvent::Move { x: 1, y: 1 },
-                HumanEvent::Move { x: 2, y: 2 },
-                HumanEvent::Move { x: 3, y: 3 },
+                RawInput::PointerMove { x: 1, y: 1 },
+                RawInput::PointerMove { x: 2, y: 2 },
+                RawInput::PointerMove { x: 3, y: 3 },
                 key(0x1E, true),
                 key(0x1E, false),
-                HumanEvent::Move { x: 900, y: 3 },
+                RawInput::PointerMove { x: 900, y: 3 },
             ],
         )
         .await
@@ -472,7 +472,7 @@ async fn fencing_drops_old_geometry_and_old_generations_and_coalesces_moves() {
     assert_eq!(
         f.sink.take(),
         vec![
-            HumanEvent::Move { x: 3, y: 3 },
+            RawInput::PointerMove { x: 3, y: 3 },
             key(0x1E, true),
             key(0x1E, false)
         ]
@@ -487,8 +487,8 @@ async fn fencing_drops_old_geometry_and_old_generations_and_coalesces_moves() {
             7,
             (800, 600),
             vec![
-                HumanEvent::Move { x: 4, y: 4 },
-                HumanEvent::Wheel {
+                RawInput::PointerMove { x: 4, y: 4 },
+                RawInput::Wheel {
                     vertical: true,
                     units: 120,
                 },
@@ -510,8 +510,8 @@ async fn fencing_drops_old_geometry_and_old_generations_and_coalesces_moves() {
     assert_eq!(f.sink.take(), vec![key(0x1E, true)]);
 }
 
-fn left(down: bool) -> HumanEvent {
-    HumanEvent::Button {
+fn left(down: bool) -> RawInput {
+    RawInput::Button {
         button: PointerButton::Left,
         down,
     }
@@ -524,7 +524,7 @@ fn left(down: bool) -> HumanEvent {
 async fn geometry_fencing_never_leaves_a_button_down() {
     let f = fixture();
     let grant = take(&f, 3).await;
-    let press = vec![HumanEvent::Move { x: 5, y: 5 }, left(true)];
+    let press = vec![RawInput::PointerMove { x: 5, y: 5 }, left(true)];
     let report = f
         .control
         .input(&grant.lease, 7, (800, 600), press.clone())
@@ -568,7 +568,7 @@ async fn geometry_fencing_never_leaves_a_button_down() {
             &grant.lease,
             7,
             (1024, 768),
-            vec![HumanEvent::Move { x: 6, y: 6 }, left(false)],
+            vec![RawInput::PointerMove { x: 6, y: 6 }, left(false)],
         )
         .await
         .unwrap();
@@ -745,7 +745,7 @@ async fn closing_a_session_ends_its_lease_with_releases() {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Rec {
     /// A human event (or a release) reached the session's input channel.
-    Human(HumanEvent),
+    Human(RawInput),
     /// The agent's native action reached the session.
     Agent,
 }
@@ -775,7 +775,7 @@ impl GatedSink {
 }
 
 impl HumanInput for GatedSink {
-    fn send(&self, events: Vec<HumanEvent>) -> SendFuture<'_, Result<(), DaemonError>> {
+    fn send(&self, events: Vec<RawInput>) -> SendFuture<'_, Result<(), DaemonError>> {
         Box::pin(async move {
             drop(self.gate.acquire().await.unwrap());
             self.log

@@ -24,11 +24,12 @@ use std::time::Instant;
 
 use hyper::{Response, StatusCode};
 use rdpilot_ipc::SessionId;
+use rdpilot_vocab::RawInput;
 use serde::Deserialize;
 
 use super::http::{empty, Body};
 use super::replay::json;
-use crate::control::{HumanEvent, NotHeld, TakeError, BUSY_MESSAGE};
+use crate::control::{NotHeld, TakeError, BUSY_MESSAGE};
 use crate::registry::{ControlRefusal, ViewerControl};
 
 /// Most events per input request.
@@ -172,12 +173,12 @@ pub(crate) async fn post_control(
 }
 
 #[derive(Deserialize)]
-struct InputBody {
+pub(crate) struct InputBody {
     lease: String,
     generation: u64,
     width: u32,
     height: u32,
-    events: Vec<HumanEvent>,
+    pub(crate) events: Vec<RawInput>,
 }
 
 /// `POST /api/sessions/{id}/input`.

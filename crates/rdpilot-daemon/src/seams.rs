@@ -30,6 +30,7 @@ use std::time::Instant;
 
 use rdpilot::{ConnectionConfig, Session};
 use rdpilot_ipc::{SessionId, SessionLifecycle, SessionStatus};
+use rdpilot_vocab::RawInput;
 
 /// A boxed, pinned future — the manual "boxed async fn in a dyn trait"
 /// shape used by [`SessionConnector::connect`] and [`ManagedSession::close`].
@@ -180,10 +181,7 @@ pub trait ManagedSession: Send + 'static {
 pub trait HumanInput: Send + Sync + 'static {
     /// Send `events` in order; resolves once the session's input channel
     /// took them.
-    fn send(
-        &self,
-        events: Vec<crate::control::HumanEvent>,
-    ) -> SendFuture<'_, Result<(), DaemonError>>;
+    fn send(&self, events: Vec<RawInput>) -> SendFuture<'_, Result<(), DaemonError>>;
 }
 
 /// A future that is `Send`, for frame-source waits run on the daemon's
@@ -224,44 +222,12 @@ impl ViewFrameSource for rdpilot::FrameWatch {
 }
 
 impl HumanInput for rdpilot::InputHandle {
-    fn send(
-        &self,
-        events: Vec<crate::control::HumanEvent>,
-    ) -> SendFuture<'_, Result<(), DaemonError>> {
-        let raw = events.into_iter().map(raw_input).collect();
+    fn send(&self, events: Vec<RawInput>) -> SendFuture<'_, Result<(), DaemonError>> {
         Box::pin(async move {
-            rdpilot::InputHandle::send(self, raw)
+            rdpilot::InputHandle::send(self, events)
                 .await
                 .map_err(DaemonError::Sdk)
         })
-    }
-}
-
-/// The SDK form of a human input event.
-fn raw_input(event: crate::control::HumanEvent) -> rdpilot::RawInput {
-    use crate::control::{HumanEvent, PointerButton};
-    match event {
-        HumanEvent::Move { x, y } => rdpilot::RawInput::PointerMove { x, y },
-        HumanEvent::Button { button, down } => rdpilot::RawInput::Button {
-            button: match button {
-                PointerButton::Left => rdpilot::PointerButton::Left,
-                PointerButton::Middle => rdpilot::PointerButton::Middle,
-                PointerButton::Right => rdpilot::PointerButton::Right,
-                PointerButton::X1 => rdpilot::PointerButton::X1,
-                PointerButton::X2 => rdpilot::PointerButton::X2,
-            },
-            down,
-        },
-        HumanEvent::Wheel { vertical, units } => rdpilot::RawInput::Wheel { vertical, units },
-        HumanEvent::Key {
-            code,
-            extended,
-            down,
-        } => rdpilot::RawInput::Key {
-            code,
-            extended,
-            down,
-        },
     }
 }
 

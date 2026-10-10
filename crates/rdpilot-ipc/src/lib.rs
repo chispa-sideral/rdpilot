@@ -21,11 +21,14 @@
 //!   on `rdpilot-config`, so a `Credentials`-shaped type structurally cannot
 //!   enter the wire graph.
 //!
+//! The input, recording-trigger and error-code types that requests and errors
+//! carry (`MouseAction`, `KeyAction`, `Key`, `RecordingTrigger`,
+//! `WireErrorCode`) live in `rdpilot-vocab`, a crate with `serde` as its only
+//! dependency; this crate re-exports `WireErrorCode`.
+//!
 //! The `rdpilot::Error -> WireErrorCode` mapping is deliberately **not**
-//! defined here (Decision 1, Phase 11 scope) — only the `WireError`/
-//! `WireErrorCode` *types* are. The mapping function lives in the Phase 12
-//! daemon crate, the only consumer that legitimately depends on both
-//! `rdpilot` and `rdpilot-ipc`.
+//! defined here: it lives in the daemon crate, the only consumer that
+//! depends on both `rdpilot` and `rdpilot-ipc`.
 
 // Per-crate opt-in (matches `rdpilot`'s `lib.rs` convention) — inner
 // attributes scope to this crate's compilation unit, including its inline
@@ -54,11 +57,12 @@ pub fn daemon_incompatible_message(observed: Option<u32>) -> String {
 }
 
 mod error;
-mod input;
 mod request;
 mod response;
 mod session_id;
 mod transfer;
+#[cfg(test)]
+mod wire_golden_tests;
 // `transport`'s framing primitives (`read_frame`/`write_frame`/
 // `TransportError`) are cross-platform (Plan 15-05 fix: `rdpilot-daemon`'s
 // Windows IPC path needs them too, exercised via the generic
@@ -69,8 +73,7 @@ mod transfer;
 pub mod transport;
 
 pub use error::{WireError, WireErrorCode};
-pub use input::{parse_wire_key, WireButton, WireKey, WireKeyAction, WireMouseAction};
-pub use request::{Request, SessionScoped, WireRecordTrigger, WireViewerBind};
+pub use request::{Request, SessionScoped, WireViewerBind};
 pub use response::{
     SessionLifecycle, SessionStatus, ViewerToken, WireController, WireControllerKind,
     WireRecording, WireRecordingState, WireResponse,

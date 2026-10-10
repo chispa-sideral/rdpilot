@@ -79,8 +79,10 @@ mod viewer;
 mod viewer_tests;
 #[cfg(windows)]
 mod win_acl;
+#[cfg(test)]
+mod wire_golden_tests;
 
-pub use control::{HumanEvent, PointerButton, SessionControl};
+pub use control::SessionControl;
 pub use reconcile::{scan_orphans, seed_into, JsonReconciliationSink, ReconciliationRecord};
 pub use registry::Registry;
 pub use seams::{

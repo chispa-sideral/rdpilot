@@ -31,8 +31,8 @@ mod viewer;
 
 pub use paths::{cache_dir, config_dir, config_file_path, home_dir, hosts_file_path};
 pub use recording::{
-    resolve_recording, HostRecording, RecordTrigger, RecordingConfig, DEFAULT_BUDGET_MIB,
-    DEFAULT_MAX_FPS, MAX_MAX_FPS, MIN_MAX_FPS,
+    resolve_recording, HostRecording, RecordingConfig, DEFAULT_BUDGET_MIB, DEFAULT_MAX_FPS,
+    MAX_MAX_FPS, MIN_MAX_FPS,
 };
 pub use resolve::{resolve, share_root_or_default};
 pub use resolved::{ConfigError, ResolvedConfig};
