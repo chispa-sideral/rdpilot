@@ -414,15 +414,9 @@ mod tests {
         fn connect(
             &self,
             _cfg: rdpilot::ConnectionConfig,
-        ) -> std::pin::Pin<
-            Box<
-                dyn std::future::Future<
-                    Output = Result<
-                        Box<dyn crate::seams::ManagedSession>,
-                        crate::seams::DaemonError,
-                    >,
-                >,
-            >,
+        ) -> crate::seams::BoxFuture<
+            'static,
+            Result<Box<dyn crate::seams::ManagedSession>, crate::seams::DaemonError>,
         > {
             Box::pin(async { Err(crate::seams::DaemonError::Connect("unused".to_owned())) })
         }

@@ -10,7 +10,7 @@ use rdpilot_ipc::WireControllerKind;
 
 use super::*;
 use crate::events::{EventKind, SessionEvents};
-use crate::seams::{HumanInput, SendFuture, ViewFrameSource};
+use crate::seams::{BoxFuture, HumanInput, ViewFrameSource};
 
 /// Records every event it is sent, in order.
 #[derive(Default)]
@@ -19,7 +19,7 @@ pub(crate) struct Sink {
 }
 
 impl HumanInput for Sink {
-    fn send(&self, events: Vec<RawInput>) -> SendFuture<'_, Result<(), DaemonError>> {
+    fn send(&self, events: Vec<RawInput>) -> BoxFuture<'_, Result<(), DaemonError>> {
         self.sent.lock().unwrap().extend(events);
         Box::pin(async { Ok(()) })
     }
@@ -38,7 +38,7 @@ impl ViewFrameSource for Frames {
     fn status(&self) -> rdpilot::FrameStatus {
         rdpilot::FrameStatus::default()
     }
-    fn changed(&self, _after: u64) -> SendFuture<'_, rdpilot::FrameStatus> {
+    fn changed(&self, _after: u64) -> BoxFuture<'_, rdpilot::FrameStatus> {
         Box::pin(std::future::pending())
     }
     fn capture(&self) -> Option<(u64, rdpilot::Screenshot)> {
@@ -775,7 +775,7 @@ impl GatedSink {
 }
 
 impl HumanInput for GatedSink {
-    fn send(&self, events: Vec<RawInput>) -> SendFuture<'_, Result<(), DaemonError>> {
+    fn send(&self, events: Vec<RawInput>) -> BoxFuture<'_, Result<(), DaemonError>> {
         Box::pin(async move {
             drop(self.gate.acquire().await.unwrap());
             self.log

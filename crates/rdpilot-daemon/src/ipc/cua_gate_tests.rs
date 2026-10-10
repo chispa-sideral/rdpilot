@@ -13,13 +13,13 @@ use rdpilot_vocab::RawInput;
 use super::*;
 use crate::control::TakeError;
 use crate::events::{EventKind, EventSource, SessionEvents};
-use crate::seams::{DaemonError, HumanInput, SendFuture};
+use crate::seams::{BoxFuture, DaemonError, HumanInput};
 
 #[derive(Default)]
 struct Sink(Mutex<Vec<RawInput>>);
 
 impl HumanInput for Sink {
-    fn send(&self, events: Vec<RawInput>) -> SendFuture<'_, Result<(), DaemonError>> {
+    fn send(&self, events: Vec<RawInput>) -> BoxFuture<'_, Result<(), DaemonError>> {
         self.0.lock().unwrap().extend(events);
         Box::pin(async { Ok(()) })
     }

@@ -738,8 +738,8 @@ async fn everything_created_is_owner_only() {
     walk(&fx.recordings_root());
 }
 
-/// Recording file I/O never runs on the IPC thread: this test's thread
-/// stands for it, and the store checks where it runs.
+/// Recording file I/O never runs on the thread of an async IPC task: this
+/// test's thread stands for it, and the store checks where it runs.
 #[tokio::test]
 async fn no_recording_file_io_on_the_ipc_thread() {
     let fx = fx("rec-thread");

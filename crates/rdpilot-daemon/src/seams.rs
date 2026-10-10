@@ -32,33 +32,17 @@ use rdpilot::{ConnectionConfig, Session};
 use rdpilot_ipc::{SessionId, SessionLifecycle, SessionStatus};
 use rdpilot_vocab::RawInput;
 
-/// A boxed, pinned future — the manual "boxed async fn in a dyn trait"
+/// A boxed, pinned, `Send` future: the manual "boxed async fn in a dyn trait"
 /// shape used by [`SessionConnector::connect`] and [`ManagedSession::close`].
 ///
-/// Deliberately NOT `+ Send`: a compile-probe during this plan's authoring
-/// confirmed `rdpilot::Session::connect`'s returned future is NOT `Send`
-/// (root cause: the same higher-ranked `&dyn PduHint`-across-`.await`
-/// limitation `crates/rdpilot/src/session.rs`'s own doc comment documents
-/// for the reactivation step of the session loop — it turns out to reach
-/// the initial connect handshake too, not only the ongoing loop). Since a
-/// `dyn Future` trait object erases auto-trait information unless declared
-/// on the object type itself, requiring `+ Send` here would make
-/// `RealConnector` (the production, real-`rdpilot`-backed implementation)
-/// impossible to implement at all.
-///
-/// **Consequence for callers (Plan 12-03 `registry.rs` / Plan 12-04
-/// `dispatch.rs` / Plan 12-06 `server.rs`):** any async code path that
-/// `.await`s a `SessionConnector::connect`/`ManagedSession::close` call
-/// (directly or via `Registry::open`/`Registry::close`) must run on a
-/// single-threaded Tokio context — a `tokio::task::LocalSet` +
-/// `spawn_local`, NOT a bare `tokio::spawn` on the default multi-threaded
-/// runtime, which requires `Send` futures. This is a workload-appropriate
-/// constraint (research: "session counts are small... human-scale
-/// connect/disconnect/list traffic, not thousands of req/s") and mirrors
-/// `rdpilot::Session`'s own established pattern of sidestepping this exact
-/// HRTB limitation via a dedicated single-threaded execution context rather
-/// than fighting it.
-pub(crate) type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
+/// `+ Send` so the registry, the IPC server and the viewer all run on the
+/// daemon's multi-thread runtime with a plain `tokio::spawn`.
+/// `rdpilot::Session::connect` returns a `Send` future because the handshake
+/// runs on the session's own thread, so [`RealConnector`] can implement the
+/// seam. A boxed trait-object future erases auto-trait information unless
+/// the object type declares it, so every boxed future in this crate names
+/// `Send` explicitly.
+pub(crate) type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// Abstracts the owned, live session handle's close contract.
 ///
@@ -66,7 +50,7 @@ pub(crate) type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
 /// exactly (research Pattern 2): `close` takes `self` by value (via
 /// `Box<Self>`, since this is used behind `dyn`) and returns once the
 /// session's background thread has been joined — never a bare drop.
-pub trait ManagedSession: Send + 'static {
+pub trait ManagedSession: Send + Sync + 'static {
     /// Gracefully close the session, awaiting the background thread's join.
     ///
     /// # Errors
@@ -82,12 +66,8 @@ pub trait ManagedSession: Send + 'static {
     // Every method below mirrors an `rdpilot::Session` method 1:1 (research
     // "Session Method Contract"), returning the same manual `BoxFuture`
     // shape as `close` for the same dyn-compatibility reason (native
-    // async-fn-in-trait is not usable here). None of these futures carry a
-    // `+ Send` bound — see this module's `BoxFuture` doc comment: the real
-    // `Session`'s futures are not `Send`, so adding the bound here would
-    // make `impl ManagedSession for Session` (below) impossible to write.
-    // Dispatch wiring onto these methods is deferred to Plan 13-04 — this
-    // plan only builds the seam + the storage/`Registry::call` shape.
+    // async-fn-in-trait is not usable here). Every returned future is `Send`
+    // (see this module's `BoxFuture` doc comment).
 
     /// Acquire an owned stream. The registry releases its locks before forwarding it.
     fn attach_cua(&self) -> BoxFuture<'_, Result<Box<dyn ManagedCua>, DaemonError>> {
@@ -175,18 +155,14 @@ pub trait ManagedSession: Send + 'static {
     }
 }
 
-/// Sends human input events to one session without the per-session lock
-/// and without the IPC `LocalSet`. Implementations apply them through the
-/// same input state as the agent's native input.
+/// Sends human input events to one session without the per-session lock.
+/// Implementations apply them through the same input state as the agent's
+/// native input.
 pub trait HumanInput: Send + Sync + 'static {
     /// Send `events` in order; resolves once the session's input channel
     /// took them.
-    fn send(&self, events: Vec<RawInput>) -> SendFuture<'_, Result<(), DaemonError>>;
+    fn send(&self, events: Vec<RawInput>) -> BoxFuture<'_, Result<(), DaemonError>>;
 }
-
-/// A future that is `Send`, for frame-source waits run on the daemon's
-/// multi-thread runtime by the viewer.
-pub(crate) type SendFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// Read-only access to one session's latest framebuffer for the live viewer.
 ///
@@ -197,7 +173,7 @@ pub trait ViewFrameSource: Send + Sync + 'static {
     /// The latest sequence number and ended flag.
     fn status(&self) -> rdpilot::FrameStatus;
     /// Wait until a frame newer than `after_seq` exists or the source ends.
-    fn changed(&self, after_seq: u64) -> SendFuture<'_, rdpilot::FrameStatus>;
+    fn changed(&self, after_seq: u64) -> BoxFuture<'_, rdpilot::FrameStatus>;
     /// Copy the latest frame with its sequence number (`None` before the first frame).
     fn capture(&self) -> Option<(u64, rdpilot::Screenshot)>;
     /// The current frame size (`None` before the first frame).
@@ -210,7 +186,7 @@ impl ViewFrameSource for rdpilot::FrameWatch {
     fn status(&self) -> rdpilot::FrameStatus {
         rdpilot::FrameWatch::status(self)
     }
-    fn changed(&self, after_seq: u64) -> SendFuture<'_, rdpilot::FrameStatus> {
+    fn changed(&self, after_seq: u64) -> BoxFuture<'_, rdpilot::FrameStatus> {
         Box::pin(rdpilot::FrameWatch::changed(self, after_seq))
     }
     fn capture(&self) -> Option<(u64, rdpilot::Screenshot)> {
@@ -222,7 +198,7 @@ impl ViewFrameSource for rdpilot::FrameWatch {
 }
 
 impl HumanInput for rdpilot::InputHandle {
-    fn send(&self, events: Vec<RawInput>) -> SendFuture<'_, Result<(), DaemonError>> {
+    fn send(&self, events: Vec<RawInput>) -> BoxFuture<'_, Result<(), DaemonError>> {
         Box::pin(async move {
             rdpilot::InputHandle::send(self, events)
                 .await
@@ -371,6 +347,12 @@ impl ReconciliationSink for NoopReconciliationSink {
     fn record_closed(&self, _id: &SessionId) {}
 }
 
+/// Why a pending connect was cancelled on purpose. Cancelling by dropping the
+/// handle needs no cause, so no cause exists yet; a cause is added together
+/// with the code that sends it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelCause {}
+
 /// The registry's per-session map value (Plan 12-03).
 pub enum SessionEntry {
     /// A name/id has been atomically claimed under the registry lock but
@@ -380,6 +362,15 @@ pub enum SessionEntry {
     Connecting {
         /// When the claim was made (for stuck-connect diagnostics).
         claimed_at: Instant,
+        /// The identity of this connect attempt, drawn when the name is
+        /// claimed. It becomes the generation of the `Live` entry, and every
+        /// removal or promotion compares it, so a stale attempt never touches
+        /// a later claim of the same name.
+        attempt: u64,
+        /// The cancel handle of the spawned connect task. Dropping it, which
+        /// removing this entry does, cancels the connect; a sent
+        /// [`CancelCause`] names why.
+        cancel: tokio::sync::oneshot::Sender<CancelCause>,
     },
     /// A live, connected session.
     Live {

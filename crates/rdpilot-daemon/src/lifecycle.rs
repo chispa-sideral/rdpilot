@@ -232,6 +232,10 @@ pub async fn empty_watcher(
             _ = interval.tick() => {
                 if registry.is_empty() {
                     tokio::time::sleep(cfg.empty_grace).await;
+                    // A claim on another worker can land between this check
+                    // and `fire`. That window is the one the grace period
+                    // already leaves open: a connect admitted after the last
+                    // check is cancelled and its session closed at exit.
                     if registry.is_empty() {
                         shutdown.fire();
                         return;
@@ -259,7 +263,7 @@ mod tests {
         BoxFuture, DaemonError, ManagedSession, NoopReconciliationSink, SessionConnector,
     };
 
-    type TestFuture<T> = Pin<Box<dyn Future<Output = T>>>;
+    type TestFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 
     /// A fake, immediately-resolving `ManagedSession` -- mirrors
     /// `registry.rs`'s own inline test fake (private to that module's own
@@ -366,19 +370,9 @@ mod tests {
         }
     }
 
-    // `idle_reaper` awaits `Registry::close`, which awaits a
-    // `ManagedSession::close` boxed future that is deliberately NOT `Send`
-    // (`seams.rs`'s `BoxFuture` doc comment: `rdpilot::Session::connect`'s
-    // real future is not `Send`, so `RealConnector` could not exist if the
-    // trait required it). That non-`Send`-ness means `idle_reaper`'s own
-    // future is not `Send` either, so it cannot be handed to `tokio::spawn`
-    // (which requires `F: Send`) -- exactly the constraint `server.rs`
-    // (Plan 12-06) must respect via `LocalSet`/`spawn_local` rather than a
-    // bare `tokio::spawn`. These tests honor that same constraint by
-    // driving `idle_reaper` and its own timing/assertion future CONCURRENTLY
+    // `idle_reaper` and its timing/assertion future are driven concurrently
     // within the SAME task via `tokio::join!` (which polls both futures
-    // cooperatively without spawning either onto another thread, so neither
-    // needs to be `Send`) instead of spawning a second task.
+    // cooperatively), so these tests need no second task.
 
     #[tokio::test]
     async fn idle_reaper_closes_a_stale_session_via_registry_close_not_a_bare_remove() {

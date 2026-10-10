@@ -46,7 +46,7 @@ impl crate::seams::HumanInput for InputLog {
     fn send(
         &self,
         events: Vec<rdpilot_vocab::RawInput>,
-    ) -> crate::seams::SendFuture<'_, Result<(), DaemonError>> {
+    ) -> crate::seams::BoxFuture<'_, Result<(), DaemonError>> {
         self.0.lock().unwrap().extend(events);
         Box::pin(async { Ok(()) })
     }
@@ -1046,116 +1046,112 @@ async fn session_list_reflects_connect_and_close() {
 /// viewing never refreshes the session's activity.
 #[tokio::test]
 async fn viewing_needs_no_session_lock_and_never_touches_activity() {
-    let local = tokio::task::LocalSet::new();
-    local
-        .run_until(async {
-            let fx = Fixture::new();
-            let (id, frames) = fx.open("alpha").await;
-            let server = fx.serve_loopback(fast_limits()).await;
-            let addr = server.addr();
-            let registry = Arc::clone(&fx.registry);
-            let busy_id = id.clone();
-            let busy = tokio::task::spawn_local(async move {
-                registry
-                    .call(&busy_id, |_s| {
-                        Box::pin(async {
-                            tokio::time::sleep(Duration::from_secs(3)).await;
-                            Ok(())
-                        })
+    async {
+        let fx = Fixture::new();
+        let (id, frames) = fx.open("alpha").await;
+        let server = fx.serve_loopback(fast_limits()).await;
+        let addr = server.addr();
+        let registry = Arc::clone(&fx.registry);
+        let busy_id = id.clone();
+        let busy = tokio::spawn(async move {
+            registry
+                .call(&busy_id, |_s| {
+                    Box::pin(async {
+                        tokio::time::sleep(Duration::from_secs(3)).await;
+                        Ok(())
                     })
-                    .await
-            });
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            let idle_before = fx.registry.live_idle_durations()[0].1;
-            let started = Instant::now();
-            let mut seq = 0;
-            for tick in 0..3 {
-                frames.publish_solid(16, 16, tick);
-                let reply = api(addr, &frame_path(id.as_str(), seq)).await;
-                assert_eq!(reply.status, 200);
-                seq = reply.header("x-frame-seq").unwrap().parse().unwrap();
-            }
-            assert!(
-                started.elapsed() < Duration::from_secs(2),
-                "frames waited for the session lock"
-            );
-            let idle_after = fx.registry.live_idle_durations()[0].1;
-            assert!(idle_after >= idle_before + started.elapsed() - Duration::from_millis(20));
-            busy.await.unwrap().unwrap();
-        })
-        .await;
+                })
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let idle_before = fx.registry.live_idle_durations()[0].1;
+        let started = Instant::now();
+        let mut seq = 0;
+        for tick in 0..3 {
+            frames.publish_solid(16, 16, tick);
+            let reply = api(addr, &frame_path(id.as_str(), seq)).await;
+            assert_eq!(reply.status, 200);
+            seq = reply.header("x-frame-seq").unwrap().parse().unwrap();
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "frames waited for the session lock"
+        );
+        let idle_after = fx.registry.live_idle_durations()[0].1;
+        assert!(idle_after >= idle_before + started.elapsed() - Duration::from_millis(20));
+        busy.await.unwrap().unwrap();
+    }
+    .await;
 }
 
 /// With a viewer long-polling the session, the idle reaper still closes it
 /// on schedule, and the empty-registry watcher still fires.
 #[tokio::test]
 async fn an_open_viewer_changes_neither_idle_reaping_nor_self_shutdown() {
-    let local = tokio::task::LocalSet::new();
-    local
-        .run_until(async {
-            let fx = Fixture::new();
-            let opened = Instant::now();
-            let (id, frames) = fx.open("alpha").await;
-            frames.spawn_animation();
-            let server = fx.serve_loopback(fast_limits()).await;
-            let addr = server.addr();
-            let viewer_id = id.clone();
-            let viewer = tokio::spawn(async move {
-                let mut seq = 0;
-                let mut frames_seen = 0;
-                loop {
-                    let reply = api(addr, &frame_path(viewer_id.as_str(), seq)).await;
-                    match reply.status {
-                        200 => {
-                            frames_seen += 1;
-                            seq = reply.header("x-frame-seq").unwrap().parse().unwrap();
-                        }
-                        204 => {}
-                        _ => return (frames_seen, reply.status),
+    async {
+        let fx = Fixture::new();
+        let opened = Instant::now();
+        let (id, frames) = fx.open("alpha").await;
+        frames.spawn_animation();
+        let server = fx.serve_loopback(fast_limits()).await;
+        let addr = server.addr();
+        let viewer_id = id.clone();
+        let viewer = tokio::spawn(async move {
+            let mut seq = 0;
+            let mut frames_seen = 0;
+            loop {
+                let reply = api(addr, &frame_path(viewer_id.as_str(), seq)).await;
+                match reply.status {
+                    200 => {
+                        frames_seen += 1;
+                        seq = reply.header("x-frame-seq").unwrap().parse().unwrap();
                     }
+                    204 => {}
+                    _ => return (frames_seen, reply.status),
                 }
-            });
-            let cfg = LifecycleConfig {
-                idle_timeout: Duration::from_millis(800),
-                empty_grace: Duration::from_millis(300),
-                reap_interval: Duration::from_millis(50),
-            };
-            let shutdown = ShutdownSignal::new();
-            let reaper = tokio::task::spawn_local(lifecycle::idle_reaper(
-                Arc::clone(&fx.registry),
-                cfg,
-                shutdown.clone(),
-            ));
-            let watcher = tokio::task::spawn_local(lifecycle::empty_watcher(
-                Arc::clone(&fx.registry),
-                cfg,
-                shutdown.clone(),
-            ));
-            while !fx.registry.is_empty() {
-                assert!(opened.elapsed() < Duration::from_secs(5), "never reaped");
-                tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            let reaped_after = opened.elapsed();
-            assert!(
-                reaped_after >= cfg.idle_timeout,
-                "reaped early: {reaped_after:?}"
-            );
-            assert!(
-                reaped_after <= cfg.idle_timeout + Duration::from_millis(400),
-                "reaped late: {reaped_after:?}"
-            );
-            let emptied = Instant::now();
-            tokio::time::timeout(Duration::from_secs(3), shutdown.wait())
-                .await
-                .expect("self-shutdown still fires with a viewer open");
-            assert!(emptied.elapsed() <= cfg.empty_grace + Duration::from_millis(400));
-            let (frames_seen, final_status) = viewer.await.unwrap();
-            assert!(frames_seen >= 2, "viewer saw {frames_seen} frames");
-            assert_eq!(final_status, 410);
-            let _ = reaper.await;
-            let _ = watcher.await;
-        })
-        .await;
+        });
+        let cfg = LifecycleConfig {
+            idle_timeout: Duration::from_millis(800),
+            empty_grace: Duration::from_millis(300),
+            reap_interval: Duration::from_millis(50),
+        };
+        let shutdown = ShutdownSignal::new();
+        let reaper = tokio::spawn(lifecycle::idle_reaper(
+            Arc::clone(&fx.registry),
+            cfg,
+            shutdown.clone(),
+        ));
+        let watcher = tokio::spawn(lifecycle::empty_watcher(
+            Arc::clone(&fx.registry),
+            cfg,
+            shutdown.clone(),
+        ));
+        while !fx.registry.is_empty() {
+            assert!(opened.elapsed() < Duration::from_secs(5), "never reaped");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let reaped_after = opened.elapsed();
+        assert!(
+            reaped_after >= cfg.idle_timeout,
+            "reaped early: {reaped_after:?}"
+        );
+        assert!(
+            reaped_after <= cfg.idle_timeout + Duration::from_millis(400),
+            "reaped late: {reaped_after:?}"
+        );
+        let emptied = Instant::now();
+        tokio::time::timeout(Duration::from_secs(3), shutdown.wait())
+            .await
+            .expect("self-shutdown still fires with a viewer open");
+        assert!(emptied.elapsed() <= cfg.empty_grace + Duration::from_millis(400));
+        let (frames_seen, final_status) = viewer.await.unwrap();
+        assert!(frames_seen >= 2, "viewer saw {frames_seen} frames");
+        assert_eq!(final_status, 410);
+        let _ = reaper.await;
+        let _ = watcher.await;
+    }
+    .await;
 }
 
 // --- Structure --------------------------------------------------------------

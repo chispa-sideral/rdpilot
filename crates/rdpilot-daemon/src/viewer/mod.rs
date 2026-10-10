@@ -19,8 +19,8 @@
 //!   operation in flight finish.
 //! - Read-only mode serves no POST route at all.
 //! - All tasks run on the multi-thread runtime (`tokio::spawn`), and frame
-//!   capture and PNG encoding run in `spawn_blocking`: nothing runs on the
-//!   IPC `LocalSet` thread or on an RDP session thread.
+//!   capture and PNG encoding run in `spawn_blocking`: nothing runs on an
+//!   RDP session thread.
 //! - The token is never logged. `Token`'s `Debug` is redacted.
 
 mod auth;

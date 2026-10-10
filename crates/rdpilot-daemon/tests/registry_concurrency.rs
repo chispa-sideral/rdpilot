@@ -8,19 +8,10 @@
 //! compilation unit only), so ordinary `.expect()`/`.unwrap()` calls below
 //! are fine, mirroring the established codebase convention.
 //!
-//! `Registry::open`/`close` await `SessionConnector`/`ManagedSession`
-//! futures that are deliberately NOT `Send` (see
-//! `rdpilot-daemon/src/seams.rs`'s `BoxFuture` doc comment — a real
-//! constraint discovered while implementing `RealConnector` against
-//! `rdpilot::Session::connect`). A plain `tokio::spawn` therefore cannot
-//! host a task that awaits `registry.open(..)` (it requires a `Send`
-//! future). This file instead drives its concurrent tasks via
-//! `tokio::task::LocalSet` + `spawn_local`, which explicitly supports
-//! `!Send` futures — still genuinely concurrent/interleaved (cooperative
-//! multitasking across `.await` points on one OS thread), which is exactly
-//! what proves the atomic-insert race: the fake connector's `sleep`-then-
-//! succeed shape widens the window so every task reaches the claim step
-//! before any of them completes its connect.
+//! The tests spawn their concurrent tasks with `tokio::spawn` on a
+//! multi-thread runtime, so the claims genuinely race on different threads;
+//! the fake connector's `sleep`-then-succeed shape widens the window so every
+//! task reaches the claim step before any of them completes its connect.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -31,12 +22,12 @@ use rdpilot::ConnectionConfig;
 use rdpilot_daemon::{DaemonError, ManagedSession, ReconciliationSink, Registry, SessionConnector};
 use rdpilot_ipc::SessionLifecycle;
 
-type TestFuture<T> = Pin<Box<dyn Future<Output = T>>>;
+type TestFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 /// Like `TestFuture`, but lifetime-parameterized -- required for the
 /// `&self`-based operational `ManagedSession` methods (Phase 13), whose
 /// trait-declared `BoxFuture<'_, T>` ties the returned future's lifetime
 /// to the `&self` borrow (not `'static`, unlike `close`/`connect`).
-type OpFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
+type OpFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 struct FakeSession;
 
@@ -131,7 +122,7 @@ fn test_cfg() -> ConnectionConfig {
 /// N=16 simultaneous same-name `open` calls: exactly one must win, the
 /// other 15 must cleanly fail with `DuplicateSession`, and the registry
 /// must hold exactly one entry afterward.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn n_simultaneous_same_name_connects_yield_exactly_one_winner() {
     const N: usize = 16;
 
@@ -140,26 +131,20 @@ async fn n_simultaneous_same_name_connects_yield_exactly_one_winner() {
         Arc::new(NoopSink),
     ));
 
-    let local = tokio::task::LocalSet::new();
-    let results: Vec<Result<rdpilot_ipc::SessionId, DaemonError>> = local
-        .run_until(async {
-            let mut handles = Vec::with_capacity(N);
-            for _ in 0..N {
-                let registry = Arc::clone(&registry);
-                let cfg = test_cfg();
-                handles.push(tokio::task::spawn_local(async move {
-                    registry
-                        .open(Some("same-name".to_owned()), "10.0.0.5".to_owned(), cfg)
-                        .await
-                }));
-            }
-            let mut results = Vec::with_capacity(N);
-            for handle in handles {
-                results.push(handle.await.expect("spawned task must not panic"));
-            }
-            results
-        })
-        .await;
+    let mut handles = Vec::with_capacity(N);
+    for _ in 0..N {
+        let registry = Arc::clone(&registry);
+        let cfg = test_cfg();
+        handles.push(tokio::spawn(async move {
+            registry
+                .open(Some("same-name".to_owned()), "10.0.0.5".to_owned(), cfg)
+                .await
+        }));
+    }
+    let mut results: Vec<Result<rdpilot_ipc::SessionId, DaemonError>> = Vec::with_capacity(N);
+    for handle in handles {
+        results.push(handle.await.expect("spawned task must not panic"));
+    }
 
     let ok_count = results.iter().filter(|r| r.is_ok()).count();
     let duplicate_count = results
@@ -188,7 +173,7 @@ async fn n_simultaneous_same_name_connects_yield_exactly_one_winner() {
 /// distinct auto-generated ids and N live entries — no collisions leak
 /// through the SAME atomic-claim path `generate_auto_id`'s retry loop
 /// reuses.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn n_simultaneous_unnamed_connects_yield_n_distinct_auto_ids() {
     const N: usize = 16;
 
@@ -197,24 +182,18 @@ async fn n_simultaneous_unnamed_connects_yield_n_distinct_auto_ids() {
         Arc::new(NoopSink),
     ));
 
-    let local = tokio::task::LocalSet::new();
-    let results: Vec<Result<rdpilot_ipc::SessionId, DaemonError>> = local
-        .run_until(async {
-            let mut handles = Vec::with_capacity(N);
-            for _ in 0..N {
-                let registry = Arc::clone(&registry);
-                let cfg = test_cfg();
-                handles.push(tokio::task::spawn_local(async move {
-                    registry.open(None, "10.0.0.5".to_owned(), cfg).await
-                }));
-            }
-            let mut results = Vec::with_capacity(N);
-            for handle in handles {
-                results.push(handle.await.expect("spawned task must not panic"));
-            }
-            results
-        })
-        .await;
+    let mut handles = Vec::with_capacity(N);
+    for _ in 0..N {
+        let registry = Arc::clone(&registry);
+        let cfg = test_cfg();
+        handles.push(tokio::spawn(async move {
+            registry.open(None, "10.0.0.5".to_owned(), cfg).await
+        }));
+    }
+    let mut results: Vec<Result<rdpilot_ipc::SessionId, DaemonError>> = Vec::with_capacity(N);
+    for handle in handles {
+        results.push(handle.await.expect("spawned task must not panic"));
+    }
 
     let ids: std::collections::HashSet<String> = results
         .into_iter()

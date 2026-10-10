@@ -548,8 +548,8 @@ impl Drop for WatchTask {
 }
 
 /// Record `session_ended` once when `frame` reports that the session loop
-/// ended. Runs on the multi-thread runtime (`tokio::spawn`), never on the
-/// IPC `LocalSet`; the returned handle aborts it.
+/// ended. Runs on the multi-thread runtime (`tokio::spawn`); the returned
+/// handle aborts it.
 pub(crate) fn watch_session_end(
     frame: Arc<dyn ViewFrameSource>,
     events: Arc<SessionEvents>,
@@ -1386,7 +1386,7 @@ mod tests {
         fn status(&self) -> rdpilot::FrameStatus {
             *self.0.borrow()
         }
-        fn changed(&self, after_seq: u64) -> crate::seams::SendFuture<'_, rdpilot::FrameStatus> {
+        fn changed(&self, after_seq: u64) -> crate::seams::BoxFuture<'_, rdpilot::FrameStatus> {
             let mut rx = self.0.subscribe();
             Box::pin(async move {
                 let status = rx

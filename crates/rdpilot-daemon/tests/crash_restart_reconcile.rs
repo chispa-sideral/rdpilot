@@ -36,12 +36,12 @@ use rdpilot_daemon::{
 };
 use rdpilot_ipc::SessionLifecycle;
 
-type TestFuture<T> = Pin<Box<dyn Future<Output = T>>>;
+type TestFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 /// Like `TestFuture`, but lifetime-parameterized -- required for the
 /// `&self`-based operational `ManagedSession` methods (Phase 13), whose
 /// trait-declared `BoxFuture<'_, T>` ties the returned future's lifetime
 /// to the `&self` borrow (not `'static`, unlike `close`/`connect`).
-type OpFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
+type OpFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// A fake, immediately-resolving `ManagedSession` — this test is about the
 /// disk record + surfacing, not about a real OS thread (the thread-owning

@@ -7,11 +7,13 @@
 //! - **Atomic claim-then-connect** ([`Registry::open`]): a name/id is
 //!   reserved under the registry [`Mutex`] synchronously — no `.await`
 //!   while the lock is held — released, THEN the slow async
-//!   [`SessionConnector::connect`] runs. On success the registry is
-//!   re-locked briefly to upgrade the placeholder; on failure it is
-//!   re-locked briefly to remove the claim (so a retry with the same name
-//!   can succeed). This is the ONLY correct way to make "N simultaneous
-//!   same-name connects yield exactly one live session" true.
+//!   [`SessionConnector::connect`] runs on its own task. On success the
+//!   registry is re-locked briefly to upgrade the placeholder, but only the
+//!   placeholder of the same attempt; on failure it is re-locked briefly to
+//!   remove the claim (so a retry with the same name can succeed). Removing
+//!   the placeholder cancels the connect. This is the ONLY correct way to
+//!   make "N simultaneous same-name connects yield exactly one live
+//!   session" true.
 //! - **Close-not-drop teardown** ([`Registry::close`]): every code path
 //!   that removes a `Live` entry from the map extracts the owned session
 //!   and awaits its `close()` — it never lets the removed value simply go
@@ -34,12 +36,13 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use rdpilot::ConnectionConfig;
 use rdpilot_ipc::{SessionId, SessionLifecycle, SessionStatus};
 use rdpilot_vocab::RawInput;
+use tokio::sync::oneshot;
 
 use crate::control::{
     EndReason, Grant, InputError, InputReport, NotHeld, SessionControl, TakeError,
@@ -47,8 +50,8 @@ use crate::control::{
 use crate::events::{CloseReason, EventSource, RecordingTrigger, SessionEvents};
 use crate::recording::{RecordingService, Target};
 use crate::seams::{
-    BoxFuture, BundleSource, DaemonError, ManagedSession, NoBundleSource, ReconciliationSink,
-    SessionConnector, SessionEntry, ViewFrameSource,
+    BoxFuture, BundleSource, CancelCause, DaemonError, ManagedSession, NoBundleSource,
+    ReconciliationSink, SessionConnector, SessionEntry, ViewFrameSource,
 };
 
 /// Word lists for [`generate_auto_id`] (D-29: short, human-legible
@@ -179,6 +182,73 @@ pub(crate) struct ConnectLease {
     generation: u64,
 }
 
+/// The error of a connect whose placeholder was removed before its session
+/// was registered. It maps to the wire code `internal`.
+fn connect_cancelled() -> DaemonError {
+    DaemonError::Connect("connect cancelled before the session was registered".to_owned())
+}
+
+/// Held by [`Registry::open_tracked`] while it waits for the connect task.
+/// When the `open_tracked` future is dropped in that wait (the IPC peer left,
+/// or a timeout elapsed), it removes the placeholder of its attempt, which
+/// cancels the connect, and closes a session that was already delivered, so
+/// no session is dropped bare. Its scope is the `Connecting` entry only: a
+/// future dropped after promotion leaves its `Live` entry to the lease-based
+/// cleanup.
+struct ConnectGuard<'a> {
+    registry: &'a Registry,
+    lease: ConnectLease,
+    rx: oneshot::Receiver<Result<Box<dyn ManagedSession>, DaemonError>>,
+    armed: bool,
+}
+
+impl Drop for ConnectGuard<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.registry.cancel_connecting(&self.lease);
+        // After `close`, a send fails and the connect task closes its own
+        // session; a send that happened before is drained here.
+        self.rx.close();
+        if let Ok(Ok(session)) = self.rx.try_recv() {
+            close_detached(session);
+        }
+    }
+}
+
+/// Close `session` without awaiting it, from a synchronous `Drop`. The close
+/// runs on a short-lived thread with its own runtime, so it does not depend on
+/// the state of the caller's runtime: it works inside a running runtime, with
+/// no runtime, and while a runtime shuts down (a task spawned then is dropped
+/// unpolled). If the thread or its runtime cannot start, the session drops,
+/// which stops it on a best-effort basis.
+///
+/// The thread is detached. A process that exits right after drops the thread
+/// together with the session thread and its socket.
+fn close_detached(session: Box<dyn ManagedSession>) {
+    let spawned = std::thread::Builder::new()
+        .name("rdpilot-close".to_owned())
+        .spawn(move || {
+            match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => {
+                    if let Err(error) = runtime.block_on(session.close()) {
+                        eprintln!("rdpilot-daemon: closing a cancelled connect failed: {error}");
+                    }
+                }
+                Err(error) => {
+                    eprintln!("rdpilot-daemon: could not start a runtime to close a cancelled connect: {error}");
+                }
+            }
+        });
+    if let Err(error) = spawned {
+        eprintln!("rdpilot-daemon: could not start a thread to close a cancelled connect: {error}");
+    }
+}
+
 impl Registry {
     /// Construct an empty registry over the given (injectable — production
     /// wiring in Plan 12-06, fakes in tests) connector and reconciliation
@@ -259,18 +329,44 @@ impl Registry {
     /// The ENTIRE lock scope is synchronous (no `.await` inside) — this is
     /// what makes the claim atomic w.r.t. every other concurrent caller
     /// (research Pattern 1). Returns `Err(DuplicateSession)` if `id` is
-    /// already claimed (`Connecting`), live, or orphaned.
-    fn claim(&self, id: &SessionId) -> Result<(), DaemonError> {
+    /// already claimed (`Connecting`), live, or orphaned. On success it
+    /// returns the attempt identity drawn for this claim and the receiver
+    /// side of the placeholder's cancel handle. The number is drawn only for
+    /// a claim that succeeds.
+    fn claim(&self, id: &SessionId) -> Result<(u64, oneshot::Receiver<CancelCause>), DaemonError> {
         #[allow(clippy::expect_used)] // A poisoned registry mutex is unrecoverable.
         let mut guard = self.sessions.lock().expect("registry mutex poisoned");
         match guard.entry(id.clone()) {
             Entry::Occupied(_) => Err(DaemonError::DuplicateSession(id.as_str().to_owned())),
             Entry::Vacant(slot) => {
+                let attempt = self.next_generation.fetch_add(1, Ordering::Relaxed);
+                let (cancel, cancel_rx) = oneshot::channel();
                 slot.insert(SessionEntry::Connecting {
                     claimed_at: Instant::now(),
+                    attempt,
+                    cancel,
                 });
-                Ok(())
+                Ok((attempt, cancel_rx))
             }
+        }
+    }
+
+    /// Remove the `Connecting` placeholder of `lease`, and nothing else: an
+    /// entry that is gone, `Live`, `Orphaned`, or a `Connecting` of a later
+    /// attempt under the same name stays. Dropping the placeholder drops its
+    /// cancel handle, which cancels the connect task. Returns whether it
+    /// removed the placeholder.
+    ///
+    /// Locks with poison recovery: the connect guard calls this from a
+    /// `Drop`, where a panic during unwinding would abort the process.
+    pub(crate) fn cancel_connecting(&self, lease: &ConnectLease) -> bool {
+        let mut guard = self.sessions.lock().unwrap_or_else(PoisonError::into_inner);
+        match guard.get(&lease.id) {
+            Some(SessionEntry::Connecting { attempt, .. }) if *attempt == lease.generation => {
+                guard.remove(&lease.id);
+                true
+            }
+            _ => false,
         }
     }
 
@@ -278,7 +374,9 @@ impl Registry {
     /// with a freshly minted pair on collision — reusing [`Registry::claim`],
     /// the SAME atomic insert path a caller-supplied name uses (research
     /// "Don't Hand-Roll": no second "generate and hope" code path).
-    fn claim_with_auto_id(&self) -> Result<SessionId, DaemonError> {
+    fn claim_with_auto_id(
+        &self,
+    ) -> Result<(SessionId, u64, oneshot::Receiver<CancelCause>), DaemonError> {
         for _ in 0..AUTO_ID_MAX_ATTEMPTS {
             let candidate = generate_auto_id();
             let Ok(id) = SessionId::from_str(&candidate) else {
@@ -288,8 +386,8 @@ impl Registry {
                 // from `rdpilot`).
                 continue;
             };
-            if self.claim(&id).is_ok() {
-                return Ok(id);
+            if let Ok((attempt, cancel_rx)) = self.claim(&id) {
+                return Ok((id, attempt, cancel_rx));
             }
         }
         Err(DaemonError::Connect(
@@ -306,7 +404,13 @@ impl Registry {
     /// Returns [`DaemonError::DuplicateSession`] if `name` is already
     /// claimed/live/orphaned, or the connector's error (mapped through
     /// [`DaemonError`]) if the connect itself fails — in which case the
-    /// claim is released so a retry with the same name can succeed.
+    /// claim is released so a retry with the same name can succeed. A connect
+    /// whose placeholder was removed before its session was registered fails
+    /// with [`DaemonError::Connect`], and its session is closed.
+    ///
+    /// Dropping the returned future while the connect is pending removes the
+    /// placeholder, cancels the connect and closes a session that was already
+    /// delivered.
     pub async fn open(
         &self,
         name: Option<String>,
@@ -327,85 +431,140 @@ impl Registry {
         cfg: ConnectionConfig,
         record: Option<RecordingTrigger>,
     ) -> Result<(ConnectLease, Option<Result<String, String>>), DaemonError> {
-        let id = match &name {
+        let (id, attempt, mut cancel_rx) = match &name {
             Some(n) => {
                 let id = SessionId::from_str(n).map_err(DaemonError::Connect)?;
-                self.claim(&id)?;
-                id
+                let (attempt, cancel_rx) = self.claim(&id)?;
+                (id, attempt, cancel_rx)
             }
             None => self.claim_with_auto_id()?,
         }; // claim() has already released the lock by this point — nothing
            // is held across the `.await` below.
+        let lease = ConnectLease {
+            id: id.clone(),
+            generation: attempt,
+        };
 
-        match self.connector.connect(cfg).await {
-            Ok(session) => {
-                let frame = session.frame_source();
-                let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
-                let events = Arc::new(SessionEvents::new(&id, generation, frame.clone()));
-                let control = Arc::new(SessionControl::new(
-                    id.as_str(),
-                    generation,
-                    Arc::clone(&events),
-                    frame.clone(),
-                    session.human_input(),
-                ));
-                let ended_watch = frame.clone().map(|frame| {
-                    crate::events::watch_session_end(
+        // The connect runs on its own task so that removing the placeholder
+        // can cancel it: the placeholder owns the cancel handle, and the task
+        // stops when the handle is dropped or sent a cause. A session whose
+        // delivery fails (the receiver is gone) is closed here, never dropped.
+        let connect = self.connector.connect(cfg);
+        let (result_tx, result_rx) = oneshot::channel();
+        tokio::spawn(async move {
+            tokio::select! {
+                biased;
+                _ = &mut cancel_rx => {}
+                result = connect => {
+                    if let Err(Ok(session)) = result_tx.send(result) {
+                        let _ = session.close().await;
+                    }
+                }
+            }
+        });
+        // Built before the first `.await`, so the placeholder is released and
+        // a delivered session is closed wherever this future is dropped.
+        let mut guard = ConnectGuard {
+            registry: self,
+            lease: lease.clone(),
+            rx: result_rx,
+            armed: true,
+        };
+
+        let delivered = (&mut guard.rx).await;
+        // The wait is over: every exit below settles the placeholder itself.
+        guard.armed = false;
+        let session = match delivered {
+            Ok(Ok(session)) => session,
+            Ok(Err(error)) => {
+                self.cancel_connecting(&lease);
+                return Err(error);
+            }
+            // The task ended without a result: the placeholder was removed
+            // (the cancel), or the connect task panicked.
+            Err(_) => {
+                self.cancel_connecting(&lease);
+                return Err(connect_cancelled());
+            }
+        };
+
+        let frame = session.frame_source();
+        let generation = attempt;
+        let events = Arc::new(SessionEvents::new(&id, generation, frame.clone()));
+        let control = Arc::new(SessionControl::new(
+            id.as_str(),
+            generation,
+            Arc::clone(&events),
+            frame.clone(),
+            session.human_input(),
+        ));
+        let ended_watch = frame.clone().map(|frame| {
+            crate::events::watch_session_end(frame, Arc::clone(&events), Arc::clone(&control))
+        });
+        // A single wall-clock capture shared by the entry's
+        // `connected_since_wall`/`last_activity_wall` and the
+        // reconciliation sink's `record_open` call below — avoids
+        // two independent `SystemTime::now()` reads racing apart
+        // by a few milliseconds for what is conceptually one event.
+        let now_wall = iso8601_now();
+        let not_promoted = {
+            #[allow(clippy::expect_used)] // A poisoned registry mutex is unrecoverable.
+            let mut guard = self.sessions.lock().expect("registry mutex poisoned");
+            // Promote only the placeholder of this attempt. The check and the
+            // insert share one lock scope with no `.await` in between.
+            if matches!(
+                guard.get(&id),
+                Some(SessionEntry::Connecting { attempt: current, .. }) if *current == attempt
+            ) {
+                guard.insert(
+                    id.clone(),
+                    SessionEntry::Live {
+                        session: Arc::new(tokio::sync::Mutex::new(Some(session))),
+                        generation,
+                        status: SessionLifecycle::Live,
+                        connected_since: Instant::now(),
+                        connected_since_wall: now_wall.clone(),
+                        name,
+                        host: host.clone(),
+                        last_activity: Instant::now(),
+                        cua_leases: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                         frame,
-                        Arc::clone(&events),
-                        Arc::clone(&control),
-                    )
-                });
-                // A single wall-clock capture shared by the entry's
-                // `connected_since_wall`/`last_activity_wall` and the
-                // reconciliation sink's `record_open` call below — avoids
-                // two independent `SystemTime::now()` reads racing apart
-                // by a few milliseconds for what is conceptually one event.
-                let now_wall = iso8601_now();
-                {
-                    #[allow(clippy::expect_used)] // A poisoned registry mutex is unrecoverable.
-                    let mut guard = self.sessions.lock().expect("registry mutex poisoned");
-                    guard.insert(
-                        id.clone(),
-                        SessionEntry::Live {
-                            session: Arc::new(tokio::sync::Mutex::new(Some(session))),
-                            generation,
-                            status: SessionLifecycle::Live,
-                            connected_since: Instant::now(),
-                            connected_since_wall: now_wall.clone(),
-                            name,
-                            host: host.clone(),
-                            last_activity: Instant::now(),
-                            cua_leases: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-                            frame,
-                            events,
-                            ended_watch,
-                            control,
-                            last_activity_wall: now_wall.clone(),
-                        },
-                    );
-                } // guard dropped here — never held across the .await below
-                self.sink.record_open(&id, &host, &now_wall);
-                let recording = match record {
-                    Some(trigger) => Some(match self.recording_target(&id) {
-                        Ok(target) => self
-                            .recordings
-                            .start(target, trigger, EventSource::Cli)
-                            .await
-                            .map(|started| started.id),
-                        Err(e) => Err(e.to_string()),
-                    }),
-                    None => None,
-                };
-                Ok((ConnectLease { id, generation }, recording))
+                        events,
+                        ended_watch,
+                        control,
+                        last_activity_wall: now_wall.clone(),
+                    },
+                );
+                None
+            } else {
+                Some((session, ended_watch, events, control))
             }
-            Err(e) => {
-                #[allow(clippy::expect_used)] // A poisoned registry mutex is unrecoverable.
-                let mut guard = self.sessions.lock().expect("registry mutex poisoned");
-                guard.remove(&id); // release the claim so a retry can succeed
-                Err(e)
-            }
+        }; // guard dropped here — never held across the .await below
+        if let Some((session, ended_watch, events, control)) = not_promoted {
+            // The placeholder was removed while the session was in flight.
+            // The session was never registered, so its watcher must not
+            // report an end; then close it, awaited. If this future is
+            // dropped during that close, the session drops mid-close; its
+            // synchronous part has already run (as in `ConnectGuard::drop`)
+            // and no entry is left to clean up.
+            drop(ended_watch);
+            drop((events, control));
+            let _ = session.close().await;
+            return Err(connect_cancelled());
         }
+        self.sink.record_open(&id, &host, &now_wall);
+        let recording = match record {
+            Some(trigger) => Some(match self.recording_target(&id) {
+                Ok(target) => self
+                    .recordings
+                    .start(target, trigger, EventSource::Cli)
+                    .await
+                    .map(|started| started.id),
+                Err(e) => Err(e.to_string()),
+            }),
+            None => None,
+        };
+        Ok((lease, recording))
     }
 
     /// Close `id`: extract the entry, then await its `close()` — never let
@@ -417,8 +576,8 @@ impl Registry {
     /// Returns [`DaemonError::SessionNotFound`] if `id` has no entry,
     /// [`DaemonError::StillConnecting`] if `id`'s connect is still in
     /// flight (the in-flight connect is never interrupted — the
-    /// `Connecting` placeholder is put back so its upgrade/rollback re-lock
-    /// still finds its slot), or the underlying close/join error.
+    /// `Connecting` placeholder stays in place, untouched, so its promotion
+    /// still finds it), or the underlying close/join error.
     pub async fn close(&self, id: &SessionId) -> Result<(), DaemonError> {
         self.close_with(id, CloseReason::Disconnect).await
     }
@@ -437,6 +596,12 @@ impl Registry {
         let entry = {
             #[allow(clippy::expect_used)] // A poisoned registry mutex is unrecoverable.
             let mut guard = self.sessions.lock().expect("registry mutex poisoned");
+            // Inspect and remove under this one lock. A connect in flight is
+            // never interrupted here: its placeholder stays, with its attempt
+            // and cancel handle, so the promotion still finds it.
+            if matches!(guard.get(id), Some(SessionEntry::Connecting { .. })) {
+                return Err(DaemonError::StillConnecting(id.as_str().to_owned()));
+            }
             guard.remove(id) // extract, don't let it drop in this scope
         };
 
@@ -476,13 +641,8 @@ impl Registry {
                     }
                 }
             }
-            Some(SessionEntry::Connecting { claimed_at }) => {
-                // A connect is in flight for this id — do not interrupt it.
-                // Put the placeholder back so Registry::open's own
-                // upgrade/rollback re-lock still finds its slot.
-                #[allow(clippy::expect_used)] // A poisoned registry mutex is unrecoverable.
-                let mut guard = self.sessions.lock().expect("registry mutex poisoned");
-                guard.insert(id.clone(), SessionEntry::Connecting { claimed_at });
+            Some(SessionEntry::Connecting { .. }) => {
+                // Unreachable: a placeholder is rejected under the lock above.
                 Err(DaemonError::StillConnecting(id.as_str().to_owned()))
             }
             Some(SessionEntry::Orphaned { .. }) => {
@@ -1178,25 +1338,31 @@ mod tests {
     use std::future::Future;
     use std::pin::Pin;
     use std::sync::atomic::{AtomicBool, AtomicU32};
+    use std::time::Duration;
 
     use rdpilot_ipc::SessionLifecycle;
 
     use super::*;
     use crate::seams::{ManagedSession, NoopReconciliationSink, SessionConnector};
 
-    type TestFuture<T> = Pin<Box<dyn Future<Output = T>>>;
+    type TestFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 
     /// A fake, immediately-resolving `ManagedSession` (no real OS thread —
     /// the thread-owning fake used by the DAEMON-01 soak proof lives in
     /// `tests/thread_leak_soak.rs`, Task 3).
     struct FakeSession {
-        closed: Arc<AtomicBool>,
+        closes: Arc<AtomicU32>,
     }
 
     impl ManagedSession for FakeSession {
+        /// Counts when the returned future is polled, not when `close` is
+        /// called: a future that is dropped unpolled closes nothing.
         fn close(self: Box<Self>) -> TestFuture<Result<(), DaemonError>> {
-            self.closed.store(true, Ordering::SeqCst);
-            Box::pin(async { Ok(()) })
+            let closes = Arc::clone(&self.closes);
+            Box::pin(async move {
+                closes.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
         }
         fn describe(&self) -> SessionLifecycle {
             SessionLifecycle::Live
@@ -1296,7 +1462,7 @@ mod tests {
                     Err(DaemonError::Connect("fake connect failure".to_owned()))
                 } else {
                     Ok(Box::new(FakeSession {
-                        closed: Arc::new(AtomicBool::new(false)),
+                        closes: Arc::new(AtomicU32::new(0)),
                     }) as Box<dyn ManagedSession>)
                 }
             })
@@ -1647,5 +1813,385 @@ mod tests {
             ids.len() > 1,
             "20 calls should not all collide on one word pair: {ids:?}"
         );
+    }
+
+    // --- Cancelling a pending connect (S1) -------------------------------
+
+    /// What the test sees of one gated connect call.
+    #[derive(Clone)]
+    struct GatedCall {
+        /// Releases the connect: add a permit.
+        gate: Arc<tokio::sync::Semaphore>,
+        /// The connect future was polled at least once.
+        started: Arc<AtomicBool>,
+        /// The connect future finished with a session.
+        delivered: Arc<AtomicBool>,
+        /// The connect future was dropped (finished or not).
+        dropped: Arc<AtomicBool>,
+    }
+
+    struct SetOnDrop(Arc<AtomicBool>);
+    impl Drop for SetOnDrop {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// A connector whose n-th `connect` waits on the n-th call's gate. Every
+    /// session it delivers adds to one shared close count.
+    struct GatedConnector {
+        calls: Mutex<std::collections::VecDeque<GatedCall>>,
+        closes: Arc<AtomicU32>,
+    }
+
+    fn gated(calls: usize) -> (Arc<GatedConnector>, Vec<GatedCall>, Arc<AtomicU32>) {
+        let handles: Vec<GatedCall> = (0..calls)
+            .map(|_| GatedCall {
+                gate: Arc::new(tokio::sync::Semaphore::new(0)),
+                started: Arc::new(AtomicBool::new(false)),
+                delivered: Arc::new(AtomicBool::new(false)),
+                dropped: Arc::new(AtomicBool::new(false)),
+            })
+            .collect();
+        let closes = Arc::new(AtomicU32::new(0));
+        let connector = Arc::new(GatedConnector {
+            calls: Mutex::new(handles.iter().cloned().collect()),
+            closes: Arc::clone(&closes),
+        });
+        (connector, handles, closes)
+    }
+
+    impl SessionConnector for GatedConnector {
+        fn connect(
+            &self,
+            _cfg: ConnectionConfig,
+        ) -> TestFuture<Result<Box<dyn ManagedSession>, DaemonError>> {
+            #[allow(clippy::expect_used)]
+            let call = self
+                .calls
+                .lock()
+                .expect("test mutex")
+                .pop_front()
+                .expect("more connects than gated calls");
+            let closes = Arc::clone(&self.closes);
+            // Owned by the future from the start, so an unpolled future that
+            // is dropped sets it too.
+            let dropped = SetOnDrop(call.dropped);
+            Box::pin(async move {
+                let _dropped = dropped;
+                call.started.store(true, Ordering::SeqCst);
+                #[allow(clippy::expect_used)]
+                call.gate
+                    .acquire()
+                    .await
+                    .expect("gate is never closed")
+                    .forget();
+                call.delivered.store(true, Ordering::SeqCst);
+                Ok(Box::new(FakeSession { closes }) as Box<dyn ManagedSession>)
+            })
+        }
+    }
+
+    fn gated_registry(calls: usize) -> (Arc<Registry>, Vec<GatedCall>, Arc<AtomicU32>) {
+        let (connector, handles, closes) = gated(calls);
+        let registry = Arc::new(Registry::new(connector, Arc::new(NoopReconciliationSink)));
+        (registry, handles, closes)
+    }
+
+    type Opened = Result<(ConnectLease, Option<Result<String, String>>), DaemonError>;
+
+    /// Poll `open_tracked` for `name` exactly once and hand back the pinned,
+    /// unfinished future.
+    async fn start_open<'a>(
+        registry: &'a Registry,
+        name: &str,
+    ) -> Pin<Box<dyn Future<Output = Opened> + Send + 'a>> {
+        let mut open: Pin<Box<dyn Future<Output = Opened> + Send + 'a>> = Box::pin(
+            registry.open_tracked(Some(name.to_owned()), "h".to_owned(), test_cfg(), None),
+        );
+        tokio::select! {
+            biased;
+            _ = &mut open => panic!("the gated connect cannot have finished"),
+            () = std::future::ready(()) => {}
+        }
+        open
+    }
+
+    async fn until(what: &str, mut condition: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !condition() {
+            assert!(std::time::Instant::now() < deadline, "timed out: {what}");
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    }
+
+    fn flag(flag: &Arc<AtomicBool>) -> bool {
+        flag.load(Ordering::SeqCst)
+    }
+
+    fn connecting_attempt(registry: &Registry, name: &str) -> Option<u64> {
+        let id = SessionId::from_str(name).expect("non-empty literal");
+        #[allow(clippy::expect_used)]
+        let guard = registry.sessions.lock().expect("registry mutex poisoned");
+        match guard.get(&id) {
+            Some(SessionEntry::Connecting { attempt, .. }) => Some(*attempt),
+            _ => None,
+        }
+    }
+
+    fn live_generation(registry: &Registry, name: &str) -> Option<u64> {
+        let id = SessionId::from_str(name).expect("non-empty literal");
+        #[allow(clippy::expect_used)]
+        let guard = registry.sessions.lock().expect("registry mutex poisoned");
+        match guard.get(&id) {
+            Some(SessionEntry::Live { generation, .. }) => Some(*generation),
+            _ => None,
+        }
+    }
+
+    fn lease_of(name: &str, attempt: u64) -> ConnectLease {
+        ConnectLease {
+            id: SessionId::from_str(name).expect("non-empty literal"),
+            generation: attempt,
+        }
+    }
+
+    #[tokio::test]
+    async fn dropping_open_tracked_mid_connect_removes_the_placeholder_and_the_connect() {
+        let (registry, calls, closes) = gated_registry(1);
+        let open = start_open(&registry, "s").await;
+        until("the connect started", || flag(&calls[0].started)).await;
+        assert_eq!(registry.len(), 1);
+
+        drop(open);
+
+        assert_eq!(registry.len(), 0, "the placeholder is gone at once");
+        until("the connect future was dropped", || flag(&calls[0].dropped)).await;
+        assert!(!flag(&calls[0].delivered));
+        assert_eq!(closes.load(Ordering::SeqCst), 0);
+        registry
+            .claim(&SessionId::from_str("s").expect("non-empty literal"))
+            .expect("the name can be claimed again");
+    }
+
+    #[tokio::test]
+    async fn a_session_delivered_after_the_placeholder_was_cancelled_is_closed_once() {
+        let (registry, calls, closes) = gated_registry(1);
+        let open = start_open(&registry, "s").await;
+        until("the connect started", || flag(&calls[0].started)).await;
+        let attempt = connecting_attempt(&registry, "s").expect("a placeholder");
+
+        // The session is delivered before the placeholder is cancelled, and
+        // only then does `open_tracked` see it.
+        calls[0].gate.add_permits(1);
+        until("the session was delivered", || flag(&calls[0].delivered)).await;
+        assert!(registry.cancel_connecting(&lease_of("s", attempt)));
+
+        let error = open.await.expect_err("a cancelled connect fails");
+        assert!(
+            matches!(&error, DaemonError::Connect(m) if m == "connect cancelled before the session was registered"),
+            "{error:?}"
+        );
+        assert_eq!(closes.load(Ordering::SeqCst), 1);
+        assert_eq!(registry.len(), 0, "nothing was inserted");
+    }
+
+    #[tokio::test]
+    async fn a_stale_attempt_never_touches_the_placeholder_or_live_entry_of_a_later_attempt() {
+        let (registry, calls, closes) = gated_registry(2);
+
+        // Attempt 1 delivers its session, then loses its placeholder.
+        let first = start_open(&registry, "s").await;
+        until("attempt 1 started", || flag(&calls[0].started)).await;
+        let first_attempt = connecting_attempt(&registry, "s").expect("attempt 1");
+        calls[0].gate.add_permits(1);
+        until("attempt 1 delivered", || flag(&calls[0].delivered)).await;
+        assert!(registry.cancel_connecting(&lease_of("s", first_attempt)));
+
+        // Attempt 2 claims the same name and is held.
+        let second = start_open(&registry, "s").await;
+        until("attempt 2 started", || flag(&calls[1].started)).await;
+        let second_attempt = connecting_attempt(&registry, "s").expect("attempt 2");
+        assert_ne!(first_attempt, second_attempt);
+
+        // Attempt 1 finishes: it closes its session and leaves attempt 2 alone.
+        assert!(first.await.is_err());
+        assert_eq!(closes.load(Ordering::SeqCst), 1);
+        assert_eq!(connecting_attempt(&registry, "s"), Some(second_attempt));
+        assert!(!registry.cancel_connecting(&lease_of("s", first_attempt)));
+        assert_eq!(connecting_attempt(&registry, "s"), Some(second_attempt));
+
+        // Attempt 2 completes and is promoted under its own attempt.
+        calls[1].gate.add_permits(1);
+        let (lease, _) = second.await.expect("attempt 2 succeeds");
+        assert_eq!(lease.generation, second_attempt);
+        assert_eq!(live_generation(&registry, "s"), Some(second_attempt));
+        assert_eq!(closes.load(Ordering::SeqCst), 1, "attempt 2 stays open");
+        assert!(!registry.cancel_connecting(&lease_of("s", first_attempt)));
+        assert_eq!(live_generation(&registry, "s"), Some(second_attempt));
+    }
+
+    #[tokio::test]
+    async fn a_dropped_stale_future_leaves_the_live_entry_of_a_later_attempt() {
+        let (registry, calls, closes) = gated_registry(2);
+        let first = start_open(&registry, "s").await;
+        until("attempt 1 started", || flag(&calls[0].started)).await;
+        let first_attempt = connecting_attempt(&registry, "s").expect("attempt 1");
+        calls[0].gate.add_permits(1);
+        until("attempt 1 delivered", || flag(&calls[0].delivered)).await;
+        assert!(registry.cancel_connecting(&lease_of("s", first_attempt)));
+
+        let second = start_open(&registry, "s").await;
+        until("attempt 2 started", || flag(&calls[1].started)).await;
+        calls[1].gate.add_permits(1);
+        let (lease, _) = second.await.expect("attempt 2 succeeds");
+
+        // Attempt 1's future is dropped without being polled again: its guard
+        // removes nothing of attempt 2, and closes the session it was handed.
+        drop(first);
+        until("attempt 1's session was closed", || {
+            closes.load(Ordering::SeqCst) == 1
+        })
+        .await;
+        assert_eq!(live_generation(&registry, "s"), Some(lease.generation));
+        assert_eq!(registry.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_lease_generation_is_the_attempt_drawn_at_the_claim() {
+        let (registry, calls, _closes) = gated_registry(1);
+        let open = start_open(&registry, "s").await;
+        until("the connect started", || flag(&calls[0].started)).await;
+        let attempt = connecting_attempt(&registry, "s").expect("a placeholder");
+
+        calls[0].gate.add_permits(1);
+        let (lease, _) = open.await.expect("the connect succeeds");
+
+        assert_eq!(lease.generation, attempt);
+        assert_eq!(live_generation(&registry, "s"), Some(attempt));
+    }
+
+    #[tokio::test]
+    async fn a_session_delivered_to_a_dropped_open_tracked_is_closed_once() {
+        let (registry, calls, closes) = gated_registry(1);
+        let open = start_open(&registry, "s").await;
+        until("the connect started", || flag(&calls[0].started)).await;
+
+        calls[0].gate.add_permits(1);
+        until("the session was delivered", || flag(&calls[0].delivered)).await;
+        drop(open);
+
+        until("the delivered session was closed", || {
+            closes.load(Ordering::SeqCst) >= 1
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(closes.load(Ordering::SeqCst), 1, "closed exactly once");
+        assert_eq!(registry.len(), 0);
+        registry
+            .claim(&SessionId::from_str("s").expect("non-empty literal"))
+            .expect("the name can be claimed again");
+    }
+
+    #[tokio::test]
+    async fn disconnect_of_a_connecting_id_leaves_the_placeholder_and_the_connect() {
+        let (registry, calls, closes) = gated_registry(1);
+        let open = start_open(&registry, "s").await;
+        until("the connect started", || flag(&calls[0].started)).await;
+        let attempt = connecting_attempt(&registry, "s").expect("a placeholder");
+
+        let id = SessionId::from_str("s").expect("non-empty literal");
+        let result = registry.close(&id).await;
+        assert!(matches!(result, Err(DaemonError::StillConnecting(name)) if name == "s"));
+        assert_eq!(connecting_attempt(&registry, "s"), Some(attempt));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!flag(&calls[0].dropped), "the connect was not cancelled");
+
+        calls[0].gate.add_permits(1);
+        let (lease, _) = open.await.expect("the later promotion succeeds");
+        assert_eq!(lease.generation, attempt);
+        assert_eq!(live_generation(&registry, "s"), Some(attempt));
+        assert_eq!(closes.load(Ordering::SeqCst), 0);
+    }
+
+    /// A guard that holds a delivered session, as if its `open_tracked` future
+    /// were dropped just now.
+    fn guard_with_delivered_session<'a>(
+        registry: &'a Registry,
+        closes: &Arc<AtomicU32>,
+    ) -> ConnectGuard<'a> {
+        let id = SessionId::from_str("s").expect("non-empty literal");
+        let (attempt, _cancel_rx) = registry.claim(&id).expect("claim");
+        let (tx, rx) = oneshot::channel();
+        assert!(tx
+            .send(Ok(Box::new(FakeSession {
+                closes: Arc::clone(closes),
+            }) as Box<dyn ManagedSession>))
+            .is_ok());
+        ConnectGuard {
+            registry,
+            lease: ConnectLease {
+                id,
+                generation: attempt,
+            },
+            rx,
+            armed: true,
+        }
+    }
+
+    fn wait_for_closes(closes: &Arc<AtomicU32>, wanted: u32) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while closes.load(Ordering::SeqCst) != wanted {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "close count {} != {wanted}",
+                closes.load(Ordering::SeqCst)
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    #[test]
+    fn the_guard_closes_a_delivered_session_when_dropped_outside_any_runtime() {
+        let registry = Registry::new(
+            Arc::new(FakeConnector::succeeding()),
+            Arc::new(NoopReconciliationSink),
+        );
+        let closes = Arc::new(AtomicU32::new(0));
+        let guard = guard_with_delivered_session(&registry, &closes);
+        assert!(tokio::runtime::Handle::try_current().is_err());
+
+        drop(guard);
+
+        wait_for_closes(&closes, 1);
+        assert_eq!(registry.len(), 0);
+    }
+
+    #[test]
+    fn the_guard_closes_a_delivered_session_while_its_runtime_shuts_down() {
+        let registry = Arc::new(Registry::new(
+            Arc::new(FakeConnector::succeeding()),
+            Arc::new(NoopReconciliationSink),
+        ));
+        let closes = Arc::new(AtomicU32::new(0));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        // The task owns the guard and never finishes; the runtime drops it.
+        // A task spawned from the guard's `Drop` at that point is dropped
+        // unpolled, so the close must not depend on the runtime.
+        let task_registry = Arc::clone(&registry);
+        let task_closes = Arc::clone(&closes);
+        runtime.spawn(async move {
+            let _guard = guard_with_delivered_session(&task_registry, &task_closes);
+            std::future::pending::<()>().await;
+        });
+        runtime.block_on(tokio::task::yield_now());
+        assert_eq!(closes.load(Ordering::SeqCst), 0);
+
+        drop(runtime);
+
+        wait_for_closes(&closes, 1);
     }
 }

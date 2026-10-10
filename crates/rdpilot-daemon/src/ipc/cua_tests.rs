@@ -164,7 +164,7 @@ impl crate::seams::HumanInput for GatedSink {
     fn send(
         &self,
         events: Vec<rdpilot_vocab::RawInput>,
-    ) -> crate::seams::SendFuture<'_, Result<(), DaemonError>> {
+    ) -> crate::seams::BoxFuture<'_, Result<(), DaemonError>> {
         Box::pin(async move {
             drop(self.gate.acquire().await.unwrap());
             self.log
@@ -209,7 +209,7 @@ impl SessionConnector for Connector {
 }
 fn server(registry: Arc<Registry>, capacity: usize) -> tokio::io::DuplexStream {
     let (client, daemon) = tokio::io::duplex(capacity);
-    tokio::task::spawn_local(async move {
+    tokio::spawn(async move {
         serve_connection(daemon, &registry, None, None).await;
     });
     client
@@ -257,7 +257,7 @@ async fn native_ping(registry: Arc<Registry>, id: rdpilot_ipc::SessionId) {
 
 #[tokio::test]
 async fn streaming_releases_both_locks_preserves_partial_frames_and_invalidates_old_incarnations() {
-    tokio::task::LocalSet::new().run_until(async {
+    async {
   let registry=Arc::new(Registry::new(Arc::new(Connector),Arc::new(NoopReconciliationSink)));
   let a=open(&registry,"a").await; let b=open(&registry,"b").await;
   let mut ca=server(registry.clone(),512); let old=attach(&mut ca,a.clone()).await;
@@ -287,112 +287,109 @@ async fn streaming_releases_both_locks_preserves_partial_frames_and_invalidates_
   let message=json!({"id":"b","result":{"only":"b"}});
   write_frame(&mut cb,&CuaStreamFrame::Message{message:message.clone()}).await.unwrap();
   assert_eq!(read_frame::<_,CuaStreamFrame>(&mut cb).await.unwrap(),CuaStreamFrame::Message{message});
- }).await;
+ }.await;
 }
 
 #[tokio::test]
 async fn caller_eof_releases_attachment_and_backpressure_does_not_hold_session_lock() {
-    tokio::task::LocalSet::new()
-        .run_until(async {
-            let registry = Arc::new(Registry::new(
-                Arc::new(Connector),
-                Arc::new(NoopReconciliationSink),
-            ));
-            let id = open(&registry, "a").await;
-            let mut client = server(registry.clone(), 256);
-            attach(&mut client, id.clone()).await;
-            let _ = read_frame::<_, CuaStreamFrame>(&mut client).await.unwrap();
+    async {
+        let registry = Arc::new(Registry::new(
+            Arc::new(Connector),
+            Arc::new(NoopReconciliationSink),
+        ));
+        let id = open(&registry, "a").await;
+        let mut client = server(registry.clone(), 256);
+        attach(&mut client, id.clone()).await;
+        let _ = read_frame::<_, CuaStreamFrame>(&mut client).await.unwrap();
+        write_frame(
+            &mut client,
+            &CuaStreamFrame::Message {
+                message: json!({"data":"x".repeat(50_000)}),
+            },
+        )
+        .await
+        .unwrap();
+        // The server is now blocked writing the large reply to this deliberately unread socket.
+        native_ping(registry.clone(), id.clone()).await;
+        drop(client);
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+            let mut next = server(registry.clone(), 1024);
             write_frame(
-                &mut client,
-                &CuaStreamFrame::Message {
-                    message: json!({"data":"x".repeat(50_000)}),
-                },
-            )
-            .await
-            .unwrap();
-            // The server is now blocked writing the large reply to this deliberately unread socket.
-            native_ping(registry.clone(), id.clone()).await;
-            drop(client);
-            for _ in 0..20 {
-                tokio::task::yield_now().await;
-                let mut next = server(registry.clone(), 1024);
-                write_frame(
-                    &mut next,
-                    &Request::CuaAttach {
-                        session: id.clone(),
-                    },
-                )
-                .await
-                .unwrap();
-                if matches!(
-                    read_frame::<_, WireResponse>(&mut next).await.unwrap(),
-                    WireResponse::CuaAttached { .. }
-                ) {
-                    return;
-                }
-            }
-            panic!("caller EOF did not release attachment");
-        })
-        .await;
-}
-
-#[tokio::test(start_paused = true)]
-async fn stalled_attachment_write_times_out_without_blocking_native_control() {
-    tokio::task::LocalSet::new()
-        .run_until(async {
-            let registry = Arc::new(Registry::new(
-                Arc::new(Connector),
-                Arc::new(NoopReconciliationSink),
-            ));
-            let id = open(&registry, "stall").await;
-            let mut client = server(registry.clone(), 1024);
-            attach(&mut client, id.clone()).await;
-            let _ = read_frame::<_, CuaStreamFrame>(&mut client).await.unwrap();
-            write_frame(
-                &mut client,
-                &CuaStreamFrame::Message {
-                    message: json!({"stall":true}),
-                },
-            )
-            .await
-            .unwrap();
-            native_ping(registry.clone(), id).await;
-            assert!(matches!(
-                read_frame::<_, CuaStreamFrame>(&mut client).await.unwrap(),
-                CuaStreamFrame::Closed { .. }
-            ));
-        })
-        .await;
-}
-
-#[tokio::test]
-async fn failed_acknowledgement_releases_provisional_attachment() {
-    tokio::task::LocalSet::new()
-        .run_until(async {
-            let registry = Arc::new(Registry::new(
-                Arc::new(Connector),
-                Arc::new(NoopReconciliationSink),
-            ));
-            let id = open(&registry, "ack").await;
-            let mut client = server(registry.clone(), 1024);
-            write_frame(
-                &mut client,
+                &mut next,
                 &Request::CuaAttach {
                     session: id.clone(),
                 },
             )
             .await
             .unwrap();
-            drop(client);
-            // Run the provisional acquisition and failed ACK to completion.
-            for _ in 0..10 {
-                tokio::task::yield_now().await;
+            if matches!(
+                read_frame::<_, WireResponse>(&mut next).await.unwrap(),
+                WireResponse::CuaAttached { .. }
+            ) {
+                return;
             }
-            assert_eq!(registry.live_idle_durations().len(), 1);
-            let mut fresh = server(registry.clone(), 1024);
-            attach(&mut fresh, id).await;
-        })
-        .await;
+        }
+        panic!("caller EOF did not release attachment");
+    }
+    .await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn stalled_attachment_write_times_out_without_blocking_native_control() {
+    async {
+        let registry = Arc::new(Registry::new(
+            Arc::new(Connector),
+            Arc::new(NoopReconciliationSink),
+        ));
+        let id = open(&registry, "stall").await;
+        let mut client = server(registry.clone(), 1024);
+        attach(&mut client, id.clone()).await;
+        let _ = read_frame::<_, CuaStreamFrame>(&mut client).await.unwrap();
+        write_frame(
+            &mut client,
+            &CuaStreamFrame::Message {
+                message: json!({"stall":true}),
+            },
+        )
+        .await
+        .unwrap();
+        native_ping(registry.clone(), id).await;
+        assert!(matches!(
+            read_frame::<_, CuaStreamFrame>(&mut client).await.unwrap(),
+            CuaStreamFrame::Closed { .. }
+        ));
+    }
+    .await;
+}
+
+#[tokio::test]
+async fn failed_acknowledgement_releases_provisional_attachment() {
+    async {
+        let registry = Arc::new(Registry::new(
+            Arc::new(Connector),
+            Arc::new(NoopReconciliationSink),
+        ));
+        let id = open(&registry, "ack").await;
+        let mut client = server(registry.clone(), 1024);
+        write_frame(
+            &mut client,
+            &Request::CuaAttach {
+                session: id.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        drop(client);
+        // Run the provisional acquisition and failed ACK to completion.
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(registry.live_idle_durations().len(), 1);
+        let mut fresh = server(registry.clone(), 1024);
+        attach(&mut fresh, id).await;
+    }
+    .await;
 }
 
 use crate::events::{CallOutcome, EventKind, EventSource};
@@ -430,8 +427,7 @@ async fn wait_for_kind(log: &crate::events::SessionEvents, want: fn(&EventKind) 
 
 #[tokio::test]
 async fn cua_stream_records_calls_and_forwards_messages_unchanged() {
-    tokio::task::LocalSet::new()
-        .run_until(async {
+    async {
             let registry = Arc::new(Registry::new(
                 Arc::new(Connector),
                 Arc::new(NoopReconciliationSink),
@@ -492,7 +488,7 @@ async fn cua_stream_records_calls_and_forwards_messages_unchanged() {
             let serialized = serde_json::to_string(&page).unwrap();
             assert!(!serialized.contains(MARKER));
             assert!(!serialized.contains("\"e\""), "JSON-RPC ids are never stored");
-        })
+        }
         .await;
 }
 
@@ -510,101 +506,100 @@ async fn native(registry: &Arc<Registry>, request: Request) -> WireResponse {
 
 #[tokio::test]
 async fn native_verbs_record_name_outcome_and_duration_only() {
-    tokio::task::LocalSet::new()
-        .run_until(async {
-            let registry = Arc::new(Registry::new(
-                Arc::new(Connector),
-                Arc::new(NoopReconciliationSink),
-            ));
-            let id = open(&registry, "verbs").await;
-            let log = registry.events(&id).unwrap();
-            let session = || id.clone();
-            native(&registry, Request::List {}).await;
-            native(&registry, Request::Ping { session: session() }).await;
-            assert!(
-                log.after(0).events.is_empty(),
-                "list and ping record nothing"
-            );
+    async {
+        let registry = Arc::new(Registry::new(
+            Arc::new(Connector),
+            Arc::new(NoopReconciliationSink),
+        ));
+        let id = open(&registry, "verbs").await;
+        let log = registry.events(&id).unwrap();
+        let session = || id.clone();
+        native(&registry, Request::List {}).await;
+        native(&registry, Request::Ping { session: session() }).await;
+        assert!(
+            log.after(0).events.is_empty(),
+            "list and ping record nothing"
+        );
 
-            native(&registry, Request::Screenshot { session: session() }).await;
-            native(
-                &registry,
-                Request::Mouse {
-                    session: session(),
-                    action: rdpilot::MouseAction::Move { x: 4242, y: 4343 },
-                },
-            )
-            .await;
-            native(
-                &registry,
-                Request::Key {
-                    session: session(),
-                    action: rdpilot::KeyAction::Type(MARKER.into()),
-                },
-            )
-            .await;
-            native(&registry, Request::DesktopSize { session: session() }).await;
-            let failed = native(
-                &registry,
-                Request::Put {
-                    session: session(),
-                    local_path: format!("/tmp/fail-{MARKER}"),
-                    remote_name: MARKER.into(),
-                },
-            )
-            .await;
-            assert!(matches!(failed, WireResponse::Error(e) if e.message.contains(MARKER)));
-            native(
-                &registry,
-                Request::Get {
-                    session: session(),
-                    remote_name: MARKER.into(),
-                    local_path: format!("/tmp/{MARKER}"),
-                },
-            )
-            .await;
-            // An unknown session records nothing anywhere.
-            native(
-                &registry,
-                Request::Screenshot {
-                    session: "missing".parse().unwrap(),
-                },
-            )
-            .await;
-
-            let page = log.after(0);
-            assert!(page.events.iter().all(|e| e.source == EventSource::Cli));
-            let finished: Vec<(String, CallOutcome)> = page
-                .events
-                .iter()
-                .filter_map(|e| match &e.kind {
-                    EventKind::CallFinished { name, outcome, .. } => Some((name.clone(), *outcome)),
-                    _ => None,
-                })
-                .collect();
-            let ok = CallOutcome::Ok;
-            assert_eq!(
-                finished,
-                vec![
-                    ("screenshot".into(), ok),
-                    ("mouse".into(), ok),
-                    ("key".into(), ok),
-                    ("desktop_size".into(), ok),
-                    ("put".into(), CallOutcome::Error),
-                    ("get".into(), ok),
-                ]
-            );
-            assert_eq!(page.events.len(), 12, "one start and one finish per verb");
-            let serialized = serde_json::to_string(&page).unwrap();
-            assert!(!serialized.contains(MARKER));
-            assert!(!serialized.contains("4242") && !serialized.contains("4343"));
-
-            let weak = Arc::downgrade(&log);
-            drop(log);
-            native(&registry, Request::Disconnect { session: session() }).await;
-            assert!(weak.upgrade().is_none(), "disconnect drops the log");
-        })
+        native(&registry, Request::Screenshot { session: session() }).await;
+        native(
+            &registry,
+            Request::Mouse {
+                session: session(),
+                action: rdpilot::MouseAction::Move { x: 4242, y: 4343 },
+            },
+        )
         .await;
+        native(
+            &registry,
+            Request::Key {
+                session: session(),
+                action: rdpilot::KeyAction::Type(MARKER.into()),
+            },
+        )
+        .await;
+        native(&registry, Request::DesktopSize { session: session() }).await;
+        let failed = native(
+            &registry,
+            Request::Put {
+                session: session(),
+                local_path: format!("/tmp/fail-{MARKER}"),
+                remote_name: MARKER.into(),
+            },
+        )
+        .await;
+        assert!(matches!(failed, WireResponse::Error(e) if e.message.contains(MARKER)));
+        native(
+            &registry,
+            Request::Get {
+                session: session(),
+                remote_name: MARKER.into(),
+                local_path: format!("/tmp/{MARKER}"),
+            },
+        )
+        .await;
+        // An unknown session records nothing anywhere.
+        native(
+            &registry,
+            Request::Screenshot {
+                session: "missing".parse().unwrap(),
+            },
+        )
+        .await;
+
+        let page = log.after(0);
+        assert!(page.events.iter().all(|e| e.source == EventSource::Cli));
+        let finished: Vec<(String, CallOutcome)> = page
+            .events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                EventKind::CallFinished { name, outcome, .. } => Some((name.clone(), *outcome)),
+                _ => None,
+            })
+            .collect();
+        let ok = CallOutcome::Ok;
+        assert_eq!(
+            finished,
+            vec![
+                ("screenshot".into(), ok),
+                ("mouse".into(), ok),
+                ("key".into(), ok),
+                ("desktop_size".into(), ok),
+                ("put".into(), CallOutcome::Error),
+                ("get".into(), ok),
+            ]
+        );
+        assert_eq!(page.events.len(), 12, "one start and one finish per verb");
+        let serialized = serde_json::to_string(&page).unwrap();
+        assert!(!serialized.contains(MARKER));
+        assert!(!serialized.contains("4242") && !serialized.contains("4343"));
+
+        let weak = Arc::downgrade(&log);
+        drop(log);
+        native(&registry, Request::Disconnect { session: session() }).await;
+        assert!(weak.upgrade().is_none(), "disconnect drops the log");
+    }
+    .await;
 }
 
 /// With a recording on, Cua messages still cross unchanged (each `exchange`
@@ -612,8 +607,7 @@ async fn native_verbs_record_name_outcome_and_duration_only() {
 /// argument, result or error text.
 #[tokio::test]
 async fn cua_forwarding_is_unchanged_while_recording() {
-    tokio::task::LocalSet::new()
-        .run_until(async {
+    async {
             let root = crate::recording::store::tests::temp_root("cua-rec");
             let service = crate::recording::RecordingService::fixed(
                 crate::recording::StorageSettings {
@@ -656,7 +650,7 @@ async fn cua_forwarding_is_unchanged_while_recording() {
             assert!(!raw.contains(MARKER));
             assert!(!raw.contains("arguments"));
             let _ = std::fs::remove_dir_all(root);
-        })
+        }
         .await;
 }
 
@@ -667,8 +661,7 @@ async fn cua_forwarding_is_unchanged_while_recording() {
 /// The refused call is recorded as an error in the activity log.
 #[tokio::test]
 async fn the_stream_gates_acting_calls_under_a_human_lease() {
-    tokio::task::LocalSet::new()
-        .run_until(async {
+    async {
             let registry = Arc::new(Registry::new(
                 Arc::new(Connector),
                 Arc::new(NoopReconciliationSink),
@@ -734,7 +727,7 @@ async fn the_stream_gates_acting_calls_under_a_human_lease() {
             assert_eq!(refused, crate::events::CallOutcome::Error);
             assert!(events.iter().any(|e| e.source == crate::events::EventSource::Cua
                 && matches!(e.kind, crate::events::EventKind::ControlTakenOver { .. })));
-        })
+        }
         .await;
 }
 
@@ -743,8 +736,7 @@ async fn the_stream_gates_acting_calls_under_a_human_lease() {
 /// Cua only after the press and its release.
 #[tokio::test]
 async fn an_acting_cua_call_after_a_release_waits_for_the_releases() {
-    tokio::task::LocalSet::new()
-        .run_until(async {
+    async {
             let gated = Arc::new(GatedSink {
                 log: std::sync::Mutex::new(Vec::new()),
                 gate: tokio::sync::Semaphore::new(0),
@@ -771,7 +763,7 @@ async fn an_acting_cua_call_after_a_release_waits_for_the_releases() {
                 let viewer = viewer.clone();
                 let id = id.clone();
                 let lease = grant.lease.clone();
-                tokio::task::spawn_local(async move {
+                tokio::spawn(async move {
                     viewer
                         .input(&id, &lease, grant.generation, (1, 1), vec![shift(true)])
                         .await
@@ -782,7 +774,7 @@ async fn an_acting_cua_call_after_a_release_waits_for_the_releases() {
                 let viewer = viewer.clone();
                 let id = id.clone();
                 let lease = grant.lease.clone();
-                tokio::task::spawn_local(async move { viewer.release(&id, &lease).await })
+                tokio::spawn(async move { viewer.release(&id, &lease).await })
             };
             tokio::task::yield_now().await;
             write_frame(
@@ -808,6 +800,6 @@ async fn an_acting_cua_call_after_a_release_waits_for_the_releases() {
                 *gated.log.lock().unwrap(),
                 vec![Seen::Human(shift(true)), Seen::Human(shift(false)), Seen::Cua]
             );
-        })
+        }
         .await;
 }
