@@ -24,8 +24,7 @@ use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
 use rdpilot::ConnectionConfig;
 use rdpilot_ipc::{
-    Request, TransferOutcome as WireTransferOutcome, WireButton, WireKey, WireKeyAction,
-    WireMouseAction, WireRecordTrigger, WireRecordingState, WireResponse,
+    Request, TransferOutcome as WireTransferOutcome, WireRecordingState, WireResponse,
     IPC_COMPATIBILITY_VERSION,
 };
 
@@ -73,15 +72,6 @@ pub(crate) struct ConnectFields {
     pub(crate) cua_auto_download: bool,
     pub(crate) connect_ack: bool,
     pub(crate) record: Option<RecordingTrigger>,
-}
-
-/// The daemon's trigger for a wire trigger.
-fn trigger(record: WireRecordTrigger) -> RecordingTrigger {
-    match record {
-        WireRecordTrigger::GlobalConfig => RecordingTrigger::Config,
-        WireRecordTrigger::HostConfig => RecordingTrigger::Host,
-        WireRecordTrigger::ConnectFlag => RecordingTrigger::ConnectFlag,
-    }
 }
 
 /// Open a session. With `cua_enabled`, `bundles` must supply a verified
@@ -268,7 +258,7 @@ pub(crate) async fn dispatch_for_ipc(
                     cua_version,
                     cua_auto_download,
                     connect_ack,
-                    record: record.map(trigger),
+                    record,
                 },
                 diagnostics,
                 registry.bundle_source(),
@@ -331,7 +321,6 @@ pub(crate) async fn dispatch_for_ipc(
             }
         }
         Request::Mouse { session, action } => {
-            let action = sdk_mouse_action(action);
             match registry
                 .call_acting(&session, move |s| s.send_mouse(action))
                 .await
@@ -341,7 +330,6 @@ pub(crate) async fn dispatch_for_ipc(
             }
         }
         Request::Key { session, action } => {
-            let action = sdk_key_action(action);
             match registry
                 .call_acting(&session, move |s| s.send_key(action))
                 .await
@@ -541,131 +529,6 @@ fn resolve_identity_config() -> Result<rdpilot_config::ResolvedConfig, DaemonErr
 fn screenshot_to_base64(shot: &rdpilot::Screenshot) -> Result<String, DaemonError> {
     let png = shot.to_png().map_err(DaemonError::Sdk)?;
     Ok(BASE64_STANDARD.encode(png))
-}
-
-/// Wire `WireButton` -> SDK `rdpilot::Button`.
-fn sdk_button(b: WireButton) -> rdpilot::Button {
-    match b {
-        WireButton::Left => rdpilot::Button::Left,
-        WireButton::Right => rdpilot::Button::Right,
-        WireButton::Middle => rdpilot::Button::Middle,
-    }
-}
-
-/// Wire `WireMouseAction` -> SDK `rdpilot::MouseAction`.
-fn sdk_mouse_action(a: WireMouseAction) -> rdpilot::MouseAction {
-    match a {
-        WireMouseAction::Move { x, y } => rdpilot::MouseAction::Move { x, y },
-        WireMouseAction::Click { x, y, button } => rdpilot::MouseAction::Click {
-            x,
-            y,
-            button: sdk_button(button),
-        },
-        WireMouseAction::DoubleClick { x, y, button } => rdpilot::MouseAction::DoubleClick {
-            x,
-            y,
-            button: sdk_button(button),
-        },
-        WireMouseAction::Scroll { x, y, dy } => rdpilot::MouseAction::Scroll { x, y, dy },
-        WireMouseAction::Drag {
-            from_x,
-            from_y,
-            to_x,
-            to_y,
-            button,
-        } => rdpilot::MouseAction::Drag {
-            from_x,
-            from_y,
-            to_x,
-            to_y,
-            button: sdk_button(button),
-        },
-    }
-}
-
-/// Wire `WireKey` -> SDK `rdpilot::Key` (full 1:1 67-variant match — see
-/// `rdpilot-ipc::input`'s own doc comment for the exact variant-count
-/// provenance).
-fn sdk_key(k: WireKey) -> rdpilot::Key {
-    match k {
-        WireKey::Ctrl => rdpilot::Key::Ctrl,
-        WireKey::Alt => rdpilot::Key::Alt,
-        WireKey::Shift => rdpilot::Key::Shift,
-        WireKey::A => rdpilot::Key::A,
-        WireKey::B => rdpilot::Key::B,
-        WireKey::C => rdpilot::Key::C,
-        WireKey::D => rdpilot::Key::D,
-        WireKey::E => rdpilot::Key::E,
-        WireKey::F => rdpilot::Key::F,
-        WireKey::G => rdpilot::Key::G,
-        WireKey::H => rdpilot::Key::H,
-        WireKey::I => rdpilot::Key::I,
-        WireKey::J => rdpilot::Key::J,
-        WireKey::K => rdpilot::Key::K,
-        WireKey::L => rdpilot::Key::L,
-        WireKey::M => rdpilot::Key::M,
-        WireKey::N => rdpilot::Key::N,
-        WireKey::O => rdpilot::Key::O,
-        WireKey::P => rdpilot::Key::P,
-        WireKey::Q => rdpilot::Key::Q,
-        WireKey::R => rdpilot::Key::R,
-        WireKey::S => rdpilot::Key::S,
-        WireKey::T => rdpilot::Key::T,
-        WireKey::U => rdpilot::Key::U,
-        WireKey::V => rdpilot::Key::V,
-        WireKey::W => rdpilot::Key::W,
-        WireKey::X => rdpilot::Key::X,
-        WireKey::Y => rdpilot::Key::Y,
-        WireKey::Z => rdpilot::Key::Z,
-        WireKey::Digit0 => rdpilot::Key::Digit0,
-        WireKey::Digit1 => rdpilot::Key::Digit1,
-        WireKey::Digit2 => rdpilot::Key::Digit2,
-        WireKey::Digit3 => rdpilot::Key::Digit3,
-        WireKey::Digit4 => rdpilot::Key::Digit4,
-        WireKey::Digit5 => rdpilot::Key::Digit5,
-        WireKey::Digit6 => rdpilot::Key::Digit6,
-        WireKey::Digit7 => rdpilot::Key::Digit7,
-        WireKey::Digit8 => rdpilot::Key::Digit8,
-        WireKey::Digit9 => rdpilot::Key::Digit9,
-        WireKey::F1 => rdpilot::Key::F1,
-        WireKey::F2 => rdpilot::Key::F2,
-        WireKey::F3 => rdpilot::Key::F3,
-        WireKey::F4 => rdpilot::Key::F4,
-        WireKey::F5 => rdpilot::Key::F5,
-        WireKey::F6 => rdpilot::Key::F6,
-        WireKey::F7 => rdpilot::Key::F7,
-        WireKey::F8 => rdpilot::Key::F8,
-        WireKey::F9 => rdpilot::Key::F9,
-        WireKey::F10 => rdpilot::Key::F10,
-        WireKey::F11 => rdpilot::Key::F11,
-        WireKey::F12 => rdpilot::Key::F12,
-        WireKey::Enter => rdpilot::Key::Enter,
-        WireKey::Esc => rdpilot::Key::Esc,
-        WireKey::Tab => rdpilot::Key::Tab,
-        WireKey::Space => rdpilot::Key::Space,
-        WireKey::Backspace => rdpilot::Key::Backspace,
-        WireKey::Delete => rdpilot::Key::Delete,
-        WireKey::Up => rdpilot::Key::Up,
-        WireKey::Down => rdpilot::Key::Down,
-        WireKey::Left => rdpilot::Key::Left,
-        WireKey::Right => rdpilot::Key::Right,
-        WireKey::Home => rdpilot::Key::Home,
-        WireKey::End => rdpilot::Key::End,
-        WireKey::PageUp => rdpilot::Key::PageUp,
-        WireKey::PageDown => rdpilot::Key::PageDown,
-        WireKey::Insert => rdpilot::Key::Insert,
-        WireKey::Win => rdpilot::Key::Win,
-    }
-}
-
-/// Wire `WireKeyAction` -> SDK `rdpilot::KeyAction`.
-fn sdk_key_action(a: WireKeyAction) -> rdpilot::KeyAction {
-    match a {
-        WireKeyAction::Type(s) => rdpilot::KeyAction::Type(s),
-        WireKeyAction::Combo(keys) => {
-            rdpilot::KeyAction::Combo(keys.into_iter().map(sdk_key).collect())
-        }
-    }
 }
 
 /// SDK `rdpilot::TransferOutcome` -> wire mirror `rdpilot_ipc::TransferOutcome`.
@@ -1093,7 +956,7 @@ mod tests {
     async fn mouse_returns_ack() {
         let registry = test_registry();
         let session = connected_session(&registry).await;
-        let action = WireMouseAction::Move { x: 1, y: 2 };
+        let action = rdpilot::MouseAction::Move { x: 1, y: 2 };
         let response = dispatch(&registry, Request::Mouse { session, action }).await;
         assert!(
             matches!(response, WireResponse::Ack),
@@ -1120,11 +983,11 @@ mod tests {
         for request in [
             Request::Key {
                 session: session.clone(),
-                action: WireKeyAction::Type("hi".into()),
+                action: rdpilot::KeyAction::Type("hi".into()),
             },
             Request::Mouse {
                 session: session.clone(),
-                action: WireMouseAction::Move { x: 1, y: 2 },
+                action: rdpilot::MouseAction::Move { x: 1, y: 2 },
             },
         ] {
             match dispatch(&registry, request).await {
@@ -1184,7 +1047,7 @@ mod tests {
             }
             other => panic!("expected TakenOver, got {other:?}"),
         }
-        let action = WireKeyAction::Type("hi".into());
+        let action = rdpilot::KeyAction::Type("hi".into());
         assert!(matches!(
             dispatch(&registry, Request::Key { session, action }).await,
             WireResponse::Ack
@@ -1216,7 +1079,7 @@ mod tests {
     async fn key_returns_ack() {
         let registry = test_registry();
         let session = connected_session(&registry).await;
-        let action = WireKeyAction::Type("hi".to_owned());
+        let action = rdpilot::KeyAction::Type("hi".to_owned());
         let response = dispatch(&registry, Request::Key { session, action }).await;
         assert!(
             matches!(response, WireResponse::Ack),

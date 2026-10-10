@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/rdpilot", "crates/rdpilot-ipc", "crates/rdpilot-config", "crates/rdpilot-daemon", "crates/rdpilot-cli", "crates/rdpilot-mcp", "crates/rdpilot-bridge-protocol", "crates/rdpilot-bridge"]
+members = ["crates/rdpilot", "crates/rdpilot-ipc", "crates/rdpilot-config", "crates/rdpilot-daemon", "crates/rdpilot-cli", "crates/rdpilot-mcp", "crates/rdpilot-bridge-protocol", "crates/rdpilot-bridge", "crates/rdpilot-vocab"]
 resolver = "2"
 
 [workspace.package]

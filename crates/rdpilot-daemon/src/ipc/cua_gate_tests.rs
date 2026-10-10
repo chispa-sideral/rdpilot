@@ -8,16 +8,18 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
+use rdpilot_vocab::RawInput;
+
 use super::*;
-use crate::control::{HumanEvent, TakeError};
+use crate::control::TakeError;
 use crate::events::{EventKind, EventSource, SessionEvents};
 use crate::seams::{DaemonError, HumanInput, SendFuture};
 
 #[derive(Default)]
-struct Sink(Mutex<Vec<HumanEvent>>);
+struct Sink(Mutex<Vec<RawInput>>);
 
 impl HumanInput for Sink {
-    fn send(&self, events: Vec<HumanEvent>) -> SendFuture<'_, Result<(), DaemonError>> {
+    fn send(&self, events: Vec<RawInput>) -> SendFuture<'_, Result<(), DaemonError>> {
         self.0.lock().unwrap().extend(events);
         Box::pin(async { Ok(()) })
     }
@@ -200,7 +202,7 @@ async fn takeover_true_ends_the_lease_with_releases_before_forwarding() {
             &grant.lease,
             grant.generation,
             (0, 0),
-            vec![HumanEvent::Key {
+            vec![RawInput::Key {
                 code: 0x2A,
                 extended: false,
                 down: true,
@@ -216,7 +218,7 @@ async fn takeover_true_ends_the_lease_with_releases_before_forwarding() {
     f.control.discharge(transition).await;
     assert_eq!(
         *f.sink.0.lock().unwrap(),
-        vec![HumanEvent::Key {
+        vec![RawInput::Key {
             code: 0x2A,
             extended: false,
             down: false

@@ -13,6 +13,7 @@ use std::path::PathBuf;
 
 use config::Config;
 use directories::BaseDirs;
+use rdpilot_vocab::RecordingTrigger;
 use serde::Deserialize;
 
 use crate::resolved::ConfigError;
@@ -34,17 +35,6 @@ pub struct HostRecording {
     pub host: String,
     /// Record sessions to this host (`true`) or not (`false`).
     pub enabled: bool,
-}
-
-/// Why a session records from connect.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RecordTrigger {
-    /// `[recording] enabled = true`.
-    GlobalConfig,
-    /// A matching `[[recording.hosts]]` entry.
-    HostConfig,
-    /// `rdpilot connect --record`.
-    ConnectFlag,
 }
 
 /// The resolved `[recording]` settings.
@@ -97,18 +87,18 @@ impl RecordingConfig {
     /// `[[recording.hosts]]` entry whose `host` equals `target` (ASCII
     /// case-insensitive), then `enabled`. `None` means off.
     #[must_use]
-    pub fn switch_for(&self, target: &str, flag: Option<bool>) -> Option<RecordTrigger> {
+    pub fn switch_for(&self, target: &str, flag: Option<bool>) -> Option<RecordingTrigger> {
         if let Some(on) = flag {
-            return on.then_some(RecordTrigger::ConnectFlag);
+            return on.then_some(RecordingTrigger::ConnectFlag);
         }
         if let Some(entry) = self
             .hosts
             .iter()
             .find(|h| h.host.eq_ignore_ascii_case(target))
         {
-            return entry.enabled.then_some(RecordTrigger::HostConfig);
+            return entry.enabled.then_some(RecordingTrigger::Host);
         }
-        self.enabled.then_some(RecordTrigger::GlobalConfig)
+        self.enabled.then_some(RecordingTrigger::Config)
     }
 
     /// The configured directory, or `<local data dir>/rdpilot/recordings`.
@@ -318,11 +308,11 @@ mod tests {
         assert_eq!(cfg.hosts[0].host, "vm.example.com");
         assert_eq!(
             cfg.switch_for("vm.example.com", None),
-            Some(RecordTrigger::HostConfig)
+            Some(RecordingTrigger::Host)
         );
         assert_eq!(
             cfg.switch_for("10.0.0.5", None),
-            Some(RecordTrigger::HostConfig)
+            Some(RecordingTrigger::Host)
         );
         assert_eq!(cfg.switch_for("vm", None), None);
         Ok(())
@@ -337,16 +327,13 @@ mod tests {
         )?;
         assert_eq!(
             cfg.switch_for("other", None),
-            Some(RecordTrigger::GlobalConfig)
+            Some(RecordingTrigger::Config)
         );
         assert_eq!(cfg.switch_for("quiet", None), None);
-        assert_eq!(
-            cfg.switch_for("loud", None),
-            Some(RecordTrigger::HostConfig)
-        );
+        assert_eq!(cfg.switch_for("loud", None), Some(RecordingTrigger::Host));
         assert_eq!(
             cfg.switch_for("quiet", Some(true)),
-            Some(RecordTrigger::ConnectFlag)
+            Some(RecordingTrigger::ConnectFlag)
         );
         assert_eq!(cfg.switch_for("loud", Some(false)), None);
         assert_eq!(cfg.switch_for("other", Some(false)), None);
@@ -355,7 +342,7 @@ mod tests {
         assert_eq!(off.switch_for("any", None), None);
         assert_eq!(
             off.switch_for("any", Some(true)),
-            Some(RecordTrigger::ConnectFlag)
+            Some(RecordingTrigger::ConnectFlag)
         );
         Ok(())
     }
@@ -367,10 +354,7 @@ mod tests {
             "[[recording.hosts]]\nhost = \"Lab-VM\"\nenabled = true\n\
              [[recording.hosts]]\nhost = \"lab-vm\"\nenabled = false",
         )?;
-        assert_eq!(
-            cfg.switch_for("LAB-vm", None),
-            Some(RecordTrigger::HostConfig)
-        );
+        assert_eq!(cfg.switch_for("LAB-vm", None), Some(RecordingTrigger::Host));
         Ok(())
     }
 
@@ -387,11 +371,11 @@ mod tests {
         let other = Target::parse("rdps://lab-vm.example.com")?;
         assert_eq!(
             cfg.switch_for(alias.name(), None),
-            Some(RecordTrigger::HostConfig)
+            Some(RecordingTrigger::Host)
         );
         assert_eq!(
             cfg.switch_for(url.name(), None),
-            Some(RecordTrigger::HostConfig)
+            Some(RecordingTrigger::Host)
         );
         assert_eq!(cfg.switch_for(other.name(), None), None);
         Ok(())

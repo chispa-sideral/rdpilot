@@ -3043,6 +3043,7 @@ dependencies = [
  "ironrdp-tls",
  "ironrdp-tokio",
  "rdpilot-bridge-protocol",
+ "rdpilot-vocab",
  "rustls",
  "rustls-native-certs",
  "serde",
@@ -3089,6 +3090,7 @@ dependencies = [
  "clap",
  "rdpilot-config",
  "rdpilot-ipc",
+ "rdpilot-vocab",
  "serde",
  "serde_json",
  "tokio",
@@ -3102,6 +3104,7 @@ dependencies = [
  "directories",
  "glob",
  "percent-encoding",
+ "rdpilot-vocab",
  "serde",
  "tempfile",
  "thiserror",
@@ -3128,6 +3131,7 @@ dependencies = [
  "rdpilot-bridge-protocol",
  "rdpilot-config",
  "rdpilot-ipc",
+ "rdpilot-vocab",
  "reqwest",
  "rustls",
  "rustls-native-certs",
@@ -3149,6 +3153,7 @@ name = "rdpilot-ipc"
 version = "0.2.0"
 dependencies = [
  "directories",
+ "rdpilot-vocab",
  "serde",
  "serde_json",
  "thiserror",
@@ -3163,6 +3168,14 @@ dependencies = [
  "rdpilot-ipc",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "rdpilot-vocab"
+version = "0.2.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

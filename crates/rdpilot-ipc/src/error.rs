@@ -1,15 +1,14 @@
-//! [`WireError`] / [`WireErrorCode`] — the D-28 wire error taxonomy.
+//! [`WireError`] — the wire error: a fixed [`WireErrorCode`] plus a message.
 //!
-//! Only the *types* live here (Decision 1, Phase 11 scope): the
-//! `rdpilot::Error -> WireErrorCode` mapping is intentionally NOT defined in
-//! this crate. Implementing it as `impl From<&rdpilot::Error> for
-//! WireErrorCode` would force `rdpilot-ipc` — and therefore every CLI/MCP
-//! client binary that links it — to depend on `rdpilot`, pulling in
-//! IronRDP/rustls/tokio-full and breaking the thin-client invariant (D-17).
-//! That mapping function lives in the Phase 12 daemon crate instead, which
-//! is the only consumer that legitimately depends on both `rdpilot` and
+//! The code set itself lives in `rdpilot-vocab` and is re-exported here. The
+//! `rdpilot::Error -> WireErrorCode` mapping is not defined in this crate:
+//! `impl From<&rdpilot::Error> for WireErrorCode` would force `rdpilot-ipc`,
+//! and so every CLI and MCP client binary that links it, to depend on
+//! `rdpilot` and pull in IronRDP, rustls and tokio-full. That mapping lives in
+//! the daemon crate, the only consumer that depends on both `rdpilot` and
 //! `rdpilot-ipc`.
 
+pub use rdpilot_vocab::WireErrorCode;
 use serde::{Deserialize, Serialize};
 
 use crate::response::WireController;
@@ -41,62 +40,6 @@ impl WireError {
             controller: None,
         }
     }
-}
-
-/// The D-28 fixed wire error code set, plus an `internal` catch-all
-/// (Decision 3) for the ~9 SDK [`rdpilot::Error`] variants outside D-28's
-/// five fixed codes (e.g. `Connect`, `Tls`, `Decode`, `Session`,
-/// `CoordinateOutOfBounds`, `Dvc`, `Bootstrap`, `BridgeRejected`, `Config`).
-///
-/// `#[non_exhaustive]`: Phase 11 ships exactly six variants; Phase 12 adds a
-/// seventh (`DuplicateSession`); a future phase may need a more granular
-/// code without this being a breaking wire change for existing consumers
-/// matching exhaustively today.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-#[non_exhaustive]
-pub enum WireErrorCode {
-    /// The requested session id has no corresponding live session
-    /// (daemon-only concept — no `rdpilot::Error` equivalent).
-    /// Wire string: `session-not-found`.
-    SessionNotFound,
-    /// The daemon process could not be reached over local IPC (daemon-only
-    /// concept — no `rdpilot::Error` equivalent). Wire string:
-    /// `daemon-unreachable`.
-    DaemonUnreachable,
-    /// A file-transfer (`Put`/`Get`) operation failed for a reason other
-    /// than a path-traversal rejection or a checksum mismatch. Wire string:
-    /// `transfer-failed`.
-    TransferFailed,
-    /// Maps 1:1 from `rdpilot::Error::PathTraversal`. Wire string:
-    /// `path-traversal`.
-    PathTraversal,
-    /// Maps 1:1 from `rdpilot::Error::ChecksumMismatch`. Wire string:
-    /// `checksum-mismatch`.
-    ChecksumMismatch,
-    /// Catch-all (Decision 3) for every `rdpilot::Error` variant outside the
-    /// five fixed D-28 codes above. Wire string: `internal`.
-    Internal,
-    /// A `Connect` request's caller-supplied (or auto-generated) session
-    /// name/id collided with an already-live or in-flight-connecting
-    /// session (daemon-only concept — no `rdpilot::Error` equivalent;
-    /// SESSION-04). Produced by the registry's atomic-insert collision path
-    /// (Plan 12-03). Wire string: `duplicate-session`.
-    DuplicateSession,
-    /// A recording request that cannot be done: the session is not
-    /// recording, the annotation is empty or over 4 KiB, the recording is
-    /// busy, or the recording id is unknown. Wire string: `recording`.
-    Recording,
-    /// A `Connect` with Cua enabled failed before the RDP logon because the
-    /// rdpilot-bridge or the Cua driver could not be obtained or verified
-    /// (daemon-only concept). The message names the component, version,
-    /// architecture, cause and fixes. Wire string: `bundle-unavailable`.
-    BundleUnavailable,
-    /// Agent input (native Mouse or Key) was refused because a human viewer
-    /// holds the session's control lease. The message names the holder and
-    /// the takeover command; [`WireError::controller`] carries the facts.
-    /// Wire string: `human-control`.
-    HumanControl,
 }
 
 #[cfg(test)]

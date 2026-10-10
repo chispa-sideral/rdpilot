@@ -24,6 +24,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use rdpilot_ipc::SessionId;
+/// What started a recording; its serde and manifest spellings are declared
+/// with the type in `rdpilot-vocab`.
+pub(crate) use rdpilot_vocab::RecordingTrigger;
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 
@@ -63,36 +66,6 @@ pub enum EventSource {
     Viewer,
     /// The daemon itself (recording lifecycle).
     Daemon,
-}
-
-/// What started a recording.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RecordingTrigger {
-    /// `[recording] enabled` in `config.toml`.
-    Config,
-    /// A `[[recording.hosts]]` entry.
-    Host,
-    /// `rdpilot connect --record`.
-    ConnectFlag,
-    /// `rdpilot record start`.
-    Cli,
-    /// The viewer page's Start recording control.
-    Viewer,
-}
-
-impl RecordingTrigger {
-    /// The manifest spelling.
-    #[must_use]
-    pub fn as_str(self) -> &'static str {
-        match self {
-            RecordingTrigger::Config => "config",
-            RecordingTrigger::Host => "host",
-            RecordingTrigger::ConnectFlag => "connect_flag",
-            RecordingTrigger::Cli => "cli",
-            RecordingTrigger::Viewer => "viewer",
-        }
-    }
 }
 
 /// Why a recording stopped.

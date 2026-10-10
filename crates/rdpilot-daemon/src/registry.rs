@@ -39,9 +39,10 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use rdpilot::ConnectionConfig;
 use rdpilot_ipc::{SessionId, SessionLifecycle, SessionStatus};
+use rdpilot_vocab::RawInput;
 
 use crate::control::{
-    EndReason, Grant, HumanEvent, InputError, InputReport, NotHeld, SessionControl, TakeError,
+    EndReason, Grant, InputError, InputReport, NotHeld, SessionControl, TakeError,
 };
 use crate::events::{CloseReason, EventSource, RecordingTrigger, SessionEvents};
 use crate::recording::{RecordingService, Target};
@@ -1085,7 +1086,7 @@ impl ViewerControl {
         lease: &str,
         generation: u64,
         geometry: (u32, u32),
-        events: Vec<HumanEvent>,
+        events: Vec<RawInput>,
     ) -> Result<InputReport, ControlRefusal> {
         self.control(id)?
             .input(lease, generation, geometry, events)

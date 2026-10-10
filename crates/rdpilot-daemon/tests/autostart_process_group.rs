@@ -15,8 +15,9 @@ use std::time::{Duration, Instant};
 
 use rdpilot_ipc::{
     connect_existing, connect_or_spawn, read_frame, write_frame, Request, SessionLifecycle,
-    WireKey, WireKeyAction, WireResponse,
+    WireResponse,
 };
+use rdpilot_vocab::{Key, KeyAction};
 use tokio::net::UnixStream;
 
 const ROLE_ENV: &str = "RDPILOT_AUTOSTART_GROUP_HELPER";
@@ -460,7 +461,7 @@ async fn post_teardown_requests(
         &mut stream,
         Request::Key {
             session: session.clone(),
-            action: WireKeyAction::Combo(vec![WireKey::Win, WireKey::R]),
+            action: KeyAction::Combo(vec![Key::Win, Key::R]),
         },
     )
     .await?;

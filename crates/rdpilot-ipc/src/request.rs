@@ -1,5 +1,6 @@
 //! Explicitly target-bound daemon management, native recovery and transfer requests.
-use crate::{SessionId, WireKeyAction, WireMouseAction};
+use crate::SessionId;
+use rdpilot_vocab::{KeyAction, MouseAction, RecordingTrigger};
 use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op")]
@@ -24,8 +25,8 @@ pub enum Request {
         /// Record this session from connect, and why; `None` means off.
         /// The CLI resolves it from `--record`/`--no-record`, the per-host
         /// list and the global switch.
-        #[serde(default)]
-        record: Option<WireRecordTrigger>,
+        #[serde(default, with = "rdpilot_vocab::connect_record")]
+        record: Option<RecordingTrigger>,
     },
     ConnectAck {
         session: SessionId,
@@ -42,11 +43,11 @@ pub enum Request {
     },
     Mouse {
         session: SessionId,
-        action: WireMouseAction,
+        action: MouseAction,
     },
     Key {
         session: SessionId,
-        action: WireKeyAction,
+        action: KeyAction,
     },
     DesktopSize {
         session: SessionId,
@@ -107,16 +108,6 @@ pub enum Request {
     },
 }
 
-/// Why a session records from connect.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum WireRecordTrigger {
-    /// `[recording] enabled`.
-    GlobalConfig,
-    /// A `[[recording.hosts]]` entry for the target.
-    HostConfig,
-    /// `rdpilot connect --record`.
-    ConnectFlag,
-}
 /// Which addresses the live viewer binds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WireViewerBind {
@@ -259,7 +250,7 @@ mod tests {
         assert!(matches!(
             req,
             Request::Connect {
-                record: Some(WireRecordTrigger::HostConfig),
+                record: Some(RecordingTrigger::Host),
                 ..
             }
         ));

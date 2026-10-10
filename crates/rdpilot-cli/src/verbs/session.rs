@@ -5,8 +5,7 @@
 //! expects (table by default, `--json` opt-in).
 
 use rdpilot_ipc::{
-    Request, SessionLifecycle, WireController, WireControllerKind, WireRecordTrigger,
-    WireRecordingState, WireResponse,
+    Request, SessionLifecycle, WireController, WireControllerKind, WireRecordingState, WireResponse,
 };
 
 use rdpilot_config::hosts::expand_password_command;
@@ -32,12 +31,7 @@ pub async fn connect(args: ConnectArgs, json: bool) -> Result<(), CliError> {
     // The switch is keyed on the target as given (alias or URL host).
     let record = rdpilot_config::resolve_recording()
         .map_err(|e| CliError::Config(e.to_string()))?
-        .switch_for(host.target().name(), args.record_flag())
-        .map(|trigger| match trigger {
-            rdpilot_config::RecordTrigger::GlobalConfig => WireRecordTrigger::GlobalConfig,
-            rdpilot_config::RecordTrigger::HostConfig => WireRecordTrigger::HostConfig,
-            rdpilot_config::RecordTrigger::ConnectFlag => WireRecordTrigger::ConnectFlag,
-        });
+        .switch_for(host.target().name(), args.record_flag());
 
     let username = host.user().ok_or_else(|| {
         CliError::MissingConfig(format!(

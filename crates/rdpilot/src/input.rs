@@ -1,201 +1,37 @@
-//! Owned input vocabulary (`MouseAction`, `KeyAction`, `Button`, `Key`, D-3.1).
+//! The input vocabulary of the SDK and its translation into IronRDP input.
 //!
-//! Every public type here is an owned SDK type (D-09): no `ironrdp`/
-//! `FastPathInputEvent`/`Scancode` type ever appears in a public field or
-//! signature. A later commit in this same plan adds the crate-internal pure
-//! translation from these types into `ironrdp_input::Operation` batches; that
-//! translation is the only code in the crate allowed to construct
-//! `ironrdp_input::Operation`s (`Session`, a later plan, just calls it and
-//! forwards the result to `ironrdp_input::Database::apply`).
+//! The types (`MouseAction`, `KeyAction`, `Button`, `Key`, `PointerButton`,
+//! `RawInput`) live in `rdpilot-vocab`, which has no IronRDP dependency, and
+//! are re-exported here as the SDK API. No `ironrdp` type (`Operation`,
+//! `Scancode`, `FastPathInputEvent`) appears in a public field or signature.
+//!
+//! The pure translation from those types into `ironrdp_input::Operation`
+//! batches is the only code in the crate that constructs `Operation`s;
+//! `Session` calls it and forwards the result to
+//! `ironrdp_input::Database::apply`.
 
 #[cfg(test)]
 use crate::error::Error;
 use ironrdp_input::{MouseButton, MousePosition, Operation, Scancode, WheelRotations};
 
-/// A mouse button used by [`MouseAction::Click`], [`MouseAction::DoubleClick`],
-/// and [`MouseAction::Drag`] (D-3.1).
-///
-/// Only the three buttons the v1 computer-use vocabulary needs; X1/X2
-/// (browser back/forward) are out of scope this phase.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Button {
-    /// The left (primary) mouse button.
-    Left,
-    /// The right (secondary/context-menu) mouse button.
-    Right,
-    /// The middle (wheel) mouse button.
-    Middle,
-}
+pub use rdpilot_vocab::{Button, Key, KeyAction, MouseAction, PointerButton, RawInput};
 
-/// A logical key for [`KeyAction::Combo`] (D-3.1).
-///
-/// Named virtual keys, not raw scancodes — [`Key`] never leaks an
-/// `ironrdp_input::Scancode` (D-09). Covers the computer-use key set: the
-/// three modifiers, `A`-`Z`, `Digit0`-`Digit9`, `F1`-`F12`, common control
-/// keys, and the arrow/navigation cluster.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[allow(missing_docs)] // self-explanatory variants naming physical keys
-pub enum Key {
-    Ctrl,
-    Alt,
-    Shift,
-    A,
-    B,
-    C,
-    D,
-    E,
-    F,
-    G,
-    H,
-    I,
-    J,
-    K,
-    L,
-    M,
-    N,
-    O,
-    P,
-    Q,
-    R,
-    S,
-    T,
-    U,
-    V,
-    W,
-    X,
-    Y,
-    Z,
-    Digit0,
-    Digit1,
-    Digit2,
-    Digit3,
-    Digit4,
-    Digit5,
-    Digit6,
-    Digit7,
-    Digit8,
-    Digit9,
-    F1,
-    F2,
-    F3,
-    F4,
-    F5,
-    F6,
-    F7,
-    F8,
-    F9,
-    F10,
-    F11,
-    F12,
-    Enter,
-    Esc,
-    Tab,
-    Space,
-    Backspace,
-    Delete,
-    Up,
-    Down,
-    Left,
-    Right,
-    Home,
-    End,
-    PageUp,
-    PageDown,
-    Insert,
-    /// The left Windows/GUI key (D-5.1: expresses a Win+R launch sequence).
-    /// A terminal key, not a modifier -- `is_modifier(Win)` stays false.
-    Win,
-}
-
-impl Key {
-    /// Whether this key is a held modifier (Ctrl/Alt/Shift) rather than a
-    /// terminal key. Drives [`KeyAction::Combo`]'s press/release ordering
-    /// (D-3.5): [`combo_operations`] partitions a `Combo` on this predicate.
-    fn is_modifier(self) -> bool {
-        matches!(self, Key::Ctrl | Key::Alt | Key::Shift)
-    }
+/// Whether `key` is a held modifier (Ctrl/Alt/Shift) rather than a terminal
+/// key. Drives [`KeyAction::Combo`]'s press/release ordering:
+/// [`combo_operations`] partitions a `Combo` on this predicate. `Win` is a
+/// terminal key.
+fn is_modifier(key: Key) -> bool {
+    matches!(key, Key::Ctrl | Key::Alt | Key::Shift)
 }
 
 /// Map a [`Key`] to its IBM PC/AT Scan Code Set 1 byte.
 ///
-/// Hand-written `match` over a decades-stable public standard — no crate
-/// solves "named virtual key -> outgoing Set-1 scancode byte for RDP
-/// injection" (03-RESEARCH.md "Don't Hand-Roll"); the available scancode
-/// crates decode the opposite direction (incoming hardware PS/2 streams for
-/// embedded kernels). Extended (`E0`-prefixed) keys pass `extended = true`.
+/// The table lives in `rdpilot-vocab` ([`Key::set1_scancode`]); this wraps
+/// it in the IronRDP scancode type. Extended (`E0`-prefixed) keys pass
+/// `extended = true`.
 pub(crate) fn scancode(key: Key) -> Scancode {
-    let (extended, code) = match key {
-        Key::Ctrl => (false, 0x1D),
-        Key::Shift => (false, 0x2A),
-        Key::Alt => (false, 0x38),
-        Key::A => (false, 0x1E),
-        Key::B => (false, 0x30),
-        Key::C => (false, 0x2E),
-        Key::D => (false, 0x20),
-        Key::E => (false, 0x12),
-        Key::F => (false, 0x21),
-        Key::G => (false, 0x22),
-        Key::H => (false, 0x23),
-        Key::I => (false, 0x17),
-        Key::J => (false, 0x24),
-        Key::K => (false, 0x25),
-        Key::L => (false, 0x26),
-        Key::M => (false, 0x32),
-        Key::N => (false, 0x31),
-        Key::O => (false, 0x18),
-        Key::P => (false, 0x19),
-        Key::Q => (false, 0x10),
-        Key::R => (false, 0x13),
-        Key::S => (false, 0x1F),
-        Key::T => (false, 0x14),
-        Key::U => (false, 0x16),
-        Key::V => (false, 0x2F),
-        Key::W => (false, 0x11),
-        Key::X => (false, 0x2D),
-        Key::Y => (false, 0x15),
-        Key::Z => (false, 0x2C),
-        Key::Digit0 => (false, 0x0B),
-        Key::Digit1 => (false, 0x02),
-        Key::Digit2 => (false, 0x03),
-        Key::Digit3 => (false, 0x04),
-        Key::Digit4 => (false, 0x05),
-        Key::Digit5 => (false, 0x06),
-        Key::Digit6 => (false, 0x07),
-        Key::Digit7 => (false, 0x08),
-        Key::Digit8 => (false, 0x09),
-        Key::Digit9 => (false, 0x0A),
-        Key::F1 => (false, 0x3B),
-        Key::F2 => (false, 0x3C),
-        Key::F3 => (false, 0x3D),
-        Key::F4 => (false, 0x3E),
-        Key::F5 => (false, 0x3F),
-        Key::F6 => (false, 0x40),
-        Key::F7 => (false, 0x41),
-        Key::F8 => (false, 0x42),
-        Key::F9 => (false, 0x43),
-        Key::F10 => (false, 0x44),
-        Key::F11 => (false, 0x57),
-        Key::F12 => (false, 0x58),
-        Key::Enter => (false, 0x1C),
-        Key::Esc => (false, 0x01),
-        Key::Tab => (false, 0x0F),
-        Key::Space => (false, 0x39),
-        Key::Backspace => (false, 0x0E),
-        Key::Delete => (true, 0x53),
-        Key::Up => (true, 0x48),
-        Key::Down => (true, 0x50),
-        Key::Left => (true, 0x4B),
-        Key::Right => (true, 0x4D),
-        Key::Home => (true, 0x47),
-        Key::End => (true, 0x4F),
-        Key::PageUp => (true, 0x49),
-        Key::PageDown => (true, 0x51),
-        Key::Insert => (true, 0x52),
-        // Set-1 left Windows/GUI key: extended byte 0x5B (05-02 RESEARCH
-        // Pitfall 3; D-5.1's Win+R launch sequence).
-        Key::Win => (true, 0x5B),
-    };
-    Scancode::from_u8(extended, code)
+    let set1 = key.set1_scancode();
+    Scancode::from_u8(set1.extended, set1.code)
 }
 
 /// Map an owned [`Button`] to `ironrdp_input::MouseButton`. `Middle` shares
@@ -377,7 +213,7 @@ pub(crate) fn key_operations(action: &KeyAction) -> Vec<Operation> {
 /// empty (but well-formed) sequence, never a panic.
 fn combo_operations(keys: &[Key]) -> Vec<Operation> {
     let (modifiers, others): (Vec<Key>, Vec<Key>) =
-        keys.iter().copied().partition(|k| k.is_modifier());
+        keys.iter().copied().partition(|k| is_modifier(*k));
     let mut ops = Vec::with_capacity((modifiers.len() + others.len()) * 2);
     for &k in &modifiers {
         ops.push(Operation::KeyPressed(scancode(k)));
@@ -392,140 +228,6 @@ fn combo_operations(keys: &[Key]) -> Vec<Operation> {
         ops.push(Operation::KeyReleased(scancode(k)));
     }
     ops
-}
-
-/// An owned mouse action (D-3.1). Coordinates are `u16`, matching the native
-/// RDP wire width (`ironrdp_input::MousePosition`); `dy` is `i16`, matching
-/// `ironrdp_input::WheelRotations::rotation_units` (positive = scroll up /
-/// away from the user, per `WM_MOUSEWHEEL`'s documented sign convention).
-///
-/// Horizontal scroll is deliberately absent (Deferred, D-3.3).
-#[derive(Clone, Debug, PartialEq)]
-pub enum MouseAction {
-    /// Move the pointer to `(x, y)` with no button state change.
-    Move {
-        /// Target x, in physical virtual-desktop pixels.
-        x: u16,
-        /// Target y, in physical virtual-desktop pixels.
-        y: u16,
-    },
-    /// Move to `(x, y)` then press and release `button` once.
-    Click {
-        /// Target x, in physical virtual-desktop pixels.
-        x: u16,
-        /// Target y, in physical virtual-desktop pixels.
-        y: u16,
-        /// The button to click.
-        button: Button,
-    },
-    /// Two [`Click`](MouseAction::Click)-equivalent sequences at `(x, y)`,
-    /// separated by a short inter-click delay (D-3.7; the delay itself is
-    /// applied by `Session::send_mouse` in a later plan, not here).
-    DoubleClick {
-        /// Target x, in physical virtual-desktop pixels.
-        x: u16,
-        /// Target y, in physical virtual-desktop pixels.
-        y: u16,
-        /// The button to double-click.
-        button: Button,
-    },
-    /// Move to `(x, y)` then scroll vertically by `dy` (D-3.3): a signed
-    /// count of `WHEEL_DELTA` (120-unit) notches, positive = away from the
-    /// user. `|dy| > 255` is transparently split into multiple in-range wheel
-    /// operations by the translation added later in this plan (Pitfall 1) —
-    /// never silently wrapped.
-    Scroll {
-        /// Target x, in physical virtual-desktop pixels.
-        x: u16,
-        /// Target y, in physical virtual-desktop pixels.
-        y: u16,
-        /// Signed scroll amount in `WHEEL_DELTA` (120-unit) notches.
-        dy: i16,
-    },
-    /// Press `button` at `(from_x, from_y)`, move through several
-    /// interpolated intermediate points, then release at `(to_x, to_y)`
-    /// (D-3.8).
-    Drag {
-        /// Drag start x, in physical virtual-desktop pixels.
-        from_x: u16,
-        /// Drag start y, in physical virtual-desktop pixels.
-        from_y: u16,
-        /// Drag end x, in physical virtual-desktop pixels.
-        to_x: u16,
-        /// Drag end y, in physical virtual-desktop pixels.
-        to_y: u16,
-        /// The button held during the drag.
-        button: Button,
-    },
-}
-
-impl MouseAction {
-    /// Every `(x, y)` pair this action targets, for the caller's coordinate
-    /// bounds check (`Session::send_mouse`, a later plan; SC#4).
-    ///
-    /// `Move`/`Click`/`DoubleClick`/`Scroll` yield exactly one pair; `Drag`
-    /// yields both its `from` and `to` endpoints.
-    pub fn coordinates(&self) -> Vec<(u16, u16)> {
-        match *self {
-            MouseAction::Move { x, y }
-            | MouseAction::Click { x, y, .. }
-            | MouseAction::DoubleClick { x, y, .. }
-            | MouseAction::Scroll { x, y, .. } => vec![(x, y)],
-            MouseAction::Drag {
-                from_x,
-                from_y,
-                to_x,
-                to_y,
-                ..
-            } => vec![(from_x, from_y), (to_x, to_y)],
-        }
-    }
-}
-
-/// An owned keyboard action (D-3.1).
-#[derive(Clone, Debug, PartialEq)]
-pub enum KeyAction {
-    /// Type literal text, one Unicode code point at a time
-    /// (`Operation::UnicodeKeyPressed`/`Released` — layout-independent,
-    /// correct for arbitrary/non-ASCII text; cannot express held modifiers).
-    Type(String),
-    /// Press a combination of keys via scancodes, in order, then release them
-    /// in reverse order (D-3.5) — the only path that can express held
-    /// modifiers like Ctrl+A or Alt+F4.
-    Combo(Vec<Key>),
-}
-
-/// A pointer button a viewer can press, including the browser X buttons.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PointerButton {
-    /// The left (primary) button.
-    Left,
-    /// The middle (wheel) button.
-    Middle,
-    /// The right (secondary) button.
-    Right,
-    /// The first extra button (typically Back).
-    X1,
-    /// The second extra button (typically Forward).
-    X2,
-}
-
-/// One raw input event for a daemon-side human input path: a physical key
-/// position (Set-1 scancode) or a pointer event in framebuffer pixels.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RawInput {
-    /// Move the pointer to `(x, y)`.
-    PointerMove { x: u16, y: u16 },
-    /// Press or release a pointer button at the current position.
-    Button { button: PointerButton, down: bool },
-    /// Rotate the wheel by `units` (120 per notch) at the current position.
-    Wheel { vertical: bool, units: i16 },
-    /// Press or release the key with Set-1 scancode `code`.
-    Key {
-        code: u8,
-        extended: bool,
-        down: bool,
-    },
 }
 
 /// Translate raw events into `ironrdp_input` operations, in order.

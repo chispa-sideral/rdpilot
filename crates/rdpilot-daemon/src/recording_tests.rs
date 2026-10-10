@@ -8,9 +8,9 @@ use std::time::Duration;
 
 use rdpilot::ConnectionConfig;
 use rdpilot_ipc::{
-    Request, SessionId, SessionLifecycle, WireErrorCode, WireRecordTrigger, WireRecordingState,
-    WireResponse,
+    Request, SessionId, SessionLifecycle, WireErrorCode, WireRecordingState, WireResponse,
 };
+use rdpilot_vocab::RecordingTrigger;
 
 use crate::dispatch::dispatch;
 use crate::events::CuaCallTracker;
@@ -156,7 +156,7 @@ impl Fx {
         &self,
         name: &str,
         host: &str,
-        record: Option<WireRecordTrigger>,
+        record: Option<RecordingTrigger>,
     ) -> WireResponse {
         dispatch(
             &self.registry,
@@ -273,9 +273,7 @@ async fn a_session_with_recording_off_writes_nothing() {
 #[tokio::test]
 async fn connect_with_a_trigger_records_from_connect() {
     let fx = fx("rec-connect");
-    let response = fx
-        .connect("web", "h", Some(WireRecordTrigger::HostConfig))
-        .await;
+    let response = fx.connect("web", "h", Some(RecordingTrigger::Host)).await;
     let WireResponse::Connected {
         recording: WireRecordingState::On { id },
         ..
@@ -455,7 +453,7 @@ async fn annotations_are_written_with_source_or_refused_without_writing() {
 #[tokio::test]
 async fn keep_list_and_totals_survive_a_fresh_service() {
     let fx = fx("rec-keep");
-    fx.connect("web", "h", Some(WireRecordTrigger::ConnectFlag))
+    fx.connect("web", "h", Some(RecordingTrigger::ConnectFlag))
         .await;
     fx.run(Request::Disconnect {
         session: sid("web"),
@@ -549,7 +547,7 @@ async fn keep_list_and_totals_survive_a_fresh_service() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn idle_reap_and_aborted_connects_close_with_their_reason() {
     let fx = fx("rec-reap");
-    fx.connect("web", "h", Some(WireRecordTrigger::ConnectFlag))
+    fx.connect("web", "h", Some(RecordingTrigger::ConnectFlag))
         .await;
     fx.registry.close_idle(&sid("web")).await.unwrap();
     fx.settle().await;
@@ -574,7 +572,7 @@ async fn strip_events_are_persisted_with_the_live_fields_and_no_arguments() {
     );
     fx.run(Request::Key {
         session: sid("web"),
-        action: rdpilot_ipc::WireKeyAction::Type(MARKER.into()),
+        action: rdpilot::KeyAction::Type(MARKER.into()),
     })
     .await;
     let log = fx.registry.events(&sid("web")).unwrap();
@@ -628,7 +626,7 @@ async fn strip_events_are_persisted_with_the_live_fields_and_no_arguments() {
 #[tokio::test]
 async fn recording_actions_are_not_session_activity() {
     let fx = fx("rec-passive");
-    fx.connect("web", "h", Some(WireRecordTrigger::ConnectFlag))
+    fx.connect("web", "h", Some(RecordingTrigger::ConnectFlag))
         .await;
     let before = fx.registry.list()[0].last_activity.clone();
     tokio::time::sleep(Duration::from_millis(60)).await;
@@ -664,14 +662,14 @@ async fn recording_actions_are_not_session_activity() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn frames_become_segments_and_frameless_sessions_record_events_only() {
     let fx = fx("rec-frames");
-    fx.connect("web", "h", Some(WireRecordTrigger::ConnectFlag))
+    fx.connect("web", "h", Some(RecordingTrigger::ConnectFlag))
         .await;
     let frames = Arc::clone(&fx.connector.frames.lock().unwrap()[0]);
     for v in 0..4_u8 {
         frames.paint(v * 40 + 1);
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
-    fx.connect("bare", "noframes", Some(WireRecordTrigger::ConnectFlag))
+    fx.connect("bare", "noframes", Some(RecordingTrigger::ConnectFlag))
         .await;
     fx.run(Request::DesktopSize {
         session: sid("bare"),
@@ -707,7 +705,7 @@ async fn frames_become_segments_and_frameless_sessions_record_events_only() {
 async fn everything_created_is_owner_only() {
     use std::os::unix::fs::PermissionsExt;
     let fx = fx("rec-perms");
-    fx.connect("web", "h", Some(WireRecordTrigger::ConnectFlag))
+    fx.connect("web", "h", Some(RecordingTrigger::ConnectFlag))
         .await;
     let (id, _) = changed(
         &fx.run(Request::RecordingKeep {
@@ -746,7 +744,7 @@ async fn everything_created_is_owner_only() {
 async fn no_recording_file_io_on_the_ipc_thread() {
     let fx = fx("rec-thread");
     mark_ipc_thread();
-    fx.connect("web", "h", Some(WireRecordTrigger::ConnectFlag))
+    fx.connect("web", "h", Some(RecordingTrigger::ConnectFlag))
         .await;
     fx.run(Request::RecordStop {
         session: sid("web"),
@@ -774,7 +772,7 @@ async fn no_recording_file_io_on_the_ipc_thread() {
 #[tokio::test]
 async fn startup_finalizes_leftovers() {
     let fx = fx("rec-startup");
-    fx.connect("web", "h", Some(WireRecordTrigger::ConnectFlag))
+    fx.connect("web", "h", Some(RecordingTrigger::ConnectFlag))
         .await;
     let dir = fx.recording_dirs()[0].clone();
     // Another service over the same root (a new daemon) with no active
@@ -829,7 +827,7 @@ async fn a_start_during_another_recordings_close_keeps_its_segment() {
             ..FakeFactory::default()
         },
     );
-    fx.connect("one", "h", Some(WireRecordTrigger::ConnectFlag))
+    fx.connect("one", "h", Some(RecordingTrigger::ConnectFlag))
         .await;
     fx.connect("two", "h", None).await;
     let frames = Arc::clone(&fx.connector.frames.lock().unwrap()[0]);

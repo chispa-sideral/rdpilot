@@ -40,12 +40,12 @@ struct FramedSession {
 
 /// Records human input events in order.
 #[derive(Default)]
-struct InputLog(Mutex<Vec<crate::control::HumanEvent>>);
+struct InputLog(Mutex<Vec<rdpilot_vocab::RawInput>>);
 
 impl crate::seams::HumanInput for InputLog {
     fn send(
         &self,
-        events: Vec<crate::control::HumanEvent>,
+        events: Vec<rdpilot_vocab::RawInput>,
     ) -> crate::seams::SendFuture<'_, Result<(), DaemonError>> {
         self.0.lock().unwrap().extend(events);
         Box::pin(async { Ok(()) })
@@ -2055,7 +2055,7 @@ impl Fixture {
         )
     }
 
-    fn input_log(&self, name: &str) -> Vec<crate::control::HumanEvent> {
+    fn input_log(&self, name: &str) -> Vec<rdpilot_vocab::RawInput> {
         self.connector.inputs.lock().unwrap()[name]
             .0
             .lock()
@@ -2199,7 +2199,7 @@ async fn a_tab_takes_types_moves_releases_and_sees_why_it_lost_the_lease() {
     let log = fx.input_log("alpha");
     assert_eq!(
         log.last(),
-        Some(&crate::control::HumanEvent::Key {
+        Some(&rdpilot_vocab::RawInput::Key {
             code: 0x2A,
             extended: false,
             down: false
