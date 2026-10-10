@@ -4,7 +4,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use rdpilot_ipc::{Request, SessionLifecycle, WireResponse};
+use rdpilot_ipc::{Request, SessionLifecycle, WireErrorCode, WireResponse};
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
 
@@ -15,8 +15,10 @@ async fn write_frame<T: serde::Serialize>(stream: &mut UnixStream, value: &T) {
 }
 
 async fn read_frame(stream: &mut UnixStream) -> WireResponse {
-    rdpilot_ipc::read_frame(stream)
+    // Bounded, so a regression fails the test instead of hanging it.
+    tokio::time::timeout(Duration::from_secs(5), rdpilot_ipc::read_frame(stream))
         .await
+        .expect("a response within 5 s")
         .expect("read test response")
 }
 
@@ -32,6 +34,10 @@ fn root(label: &str) -> PathBuf {
 }
 
 fn spawn(root: &Path) -> std::process::Child {
+    spawn_with(root, &[])
+}
+
+fn spawn_with(root: &Path, extra_env: &[(&str, &str)]) -> std::process::Child {
     let runtime = root.join("run");
     std::fs::create_dir_all(&runtime).expect("runtime dir");
     std::process::Command::new(env!("CARGO_BIN_EXE_rdpilot-daemon"))
@@ -43,6 +49,7 @@ fn spawn(root: &Path) -> std::process::Child {
             root.join("connect-gate"),
         )
         .env("RDPILOT_DAEMON_IDLE_TIMEOUT_MS", "600000")
+        .envs(extra_env.iter().copied())
         .spawn()
         .expect("spawn fake daemon")
 }
@@ -194,5 +201,115 @@ async fn post_write_cancellation_preserves_an_independent_live_control_session()
     drop(observer);
     drop(control);
     stop(&mut daemon);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+async fn list(stream: &mut UnixStream) -> Vec<rdpilot_ipc::SessionStatus> {
+    write_frame(stream, &Request::List {}).await;
+    match read_frame(stream).await {
+        WireResponse::SessionList { sessions, .. } => sessions,
+        other => panic!("expected a session list, got {other:?}"),
+    }
+}
+
+async fn wait_until_connecting(observer: &mut UnixStream, name: &str) {
+    for _ in 0..250 {
+        if list(observer)
+            .await
+            .iter()
+            .any(|s| s.id == name && s.status == SessionLifecycle::Connecting)
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("{name} never showed as Connecting");
+}
+
+/// After a failed connect: nothing is listed or recorded, the name connects
+/// again once the gate opens, and a restarted daemon finds no orphan.
+async fn assert_name_free_then_restart_clean(
+    root: &Path,
+    daemon: &mut std::process::Child,
+    observer: &mut UnixStream,
+    name: &str,
+    extra_env: &[(&str, &str)],
+) {
+    let path = socket(root);
+    assert!(list(observer).await.is_empty());
+    assert!(rdpilot_daemon::scan_orphans(&root.join("sessions.json")).is_empty());
+
+    release_connect(root);
+    let mut again = connect(&path).await;
+    let session = acknowledge(&mut again, name).await;
+    write_frame(&mut again, &Request::Disconnect { session }).await;
+    assert!(matches!(read_frame(&mut again).await, WireResponse::Ack));
+    drop(again);
+
+    stop(daemon);
+    let mut restarted = spawn_with(root, extra_env);
+    let mut observer = connect(&path).await;
+    assert!(list(&mut observer).await.is_empty());
+    drop(observer);
+    stop(&mut restarted);
+}
+
+#[tokio::test]
+async fn disconnect_of_a_connecting_session_acks_fails_the_connect_and_frees_the_name() {
+    let root = root("disconnect");
+    let mut daemon = spawn(&root);
+    let path = socket(&root);
+
+    let mut held = connect(&path).await;
+    write_frame(&mut held, &request("held")).await;
+    let mut observer = connect(&path).await;
+    wait_until_connecting(&mut observer, "held").await;
+
+    write_frame(
+        &mut observer,
+        &Request::Disconnect {
+            session: "held".parse().expect("non-empty id"),
+        },
+    )
+    .await;
+    assert!(matches!(read_frame(&mut observer).await, WireResponse::Ack));
+
+    match read_frame(&mut held).await {
+        WireResponse::Error(error) => {
+            assert_eq!(error.code, WireErrorCode::Internal);
+            assert!(
+                error.message.contains("cancelled by disconnect"),
+                "{}",
+                error.message
+            );
+        }
+        other => panic!("expected the connect to fail, got {other:?}"),
+    }
+    drop(held);
+
+    assert_name_free_then_restart_clean(&root, &mut daemon, &mut observer, "held", &[]).await;
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn connect_deadline_expiry_fails_the_connect_and_frees_the_name() {
+    let root = root("deadline");
+    let env = [("RDPILOT_DAEMON_CONNECT_DEADLINE_MS", "300")];
+    let mut daemon = spawn_with(&root, &env);
+    let path = socket(&root);
+
+    let mut slow = connect(&path).await;
+    write_frame(&mut slow, &request("slow")).await;
+    match read_frame(&mut slow).await {
+        WireResponse::Error(error) => {
+            assert_eq!(error.code, WireErrorCode::Internal);
+            assert!(error.message.contains("timed out"), "{}", error.message);
+        }
+        other => panic!("expected the connect to time out, got {other:?}"),
+    }
+    drop(slow);
+
+    let mut observer = connect(&path).await;
+    assert_name_free_then_restart_clean(&root, &mut daemon, &mut observer, "slow", &env).await;
     let _ = std::fs::remove_dir_all(root);
 }

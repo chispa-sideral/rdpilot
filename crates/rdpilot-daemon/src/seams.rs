@@ -26,7 +26,7 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use rdpilot::{ConnectionConfig, Session};
 use rdpilot_ipc::{SessionId, SessionLifecycle, SessionStatus};
@@ -320,6 +320,53 @@ impl SessionConnector for RealConnector {
     }
 }
 
+/// How long a connect may run before the daemon gives up. It covers name
+/// resolution and the RDP handshake; the bridge bootstrap runs after the
+/// connect and is not bounded by it.
+pub(crate) const DEFAULT_CONNECT_DEADLINE: Duration = Duration::from_secs(60);
+
+/// Override of [`DEFAULT_CONNECT_DEADLINE`] in milliseconds, for tests. It is
+/// undocumented and has no CLI flag or config key.
+pub(crate) const CONNECT_DEADLINE_ENV: &str = "RDPILOT_DAEMON_CONNECT_DEADLINE_MS";
+
+/// The connect deadline for the override value `value` (the content of
+/// [`CONNECT_DEADLINE_ENV`], if set): a millisecond count above zero, or
+/// [`DEFAULT_CONNECT_DEADLINE`] when absent, unparsable or zero (zero would
+/// time every connect out at once).
+pub(crate) fn connect_deadline(value: Option<&str>) -> Duration {
+    value
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|ms| *ms > 0)
+        .map_or(DEFAULT_CONNECT_DEADLINE, Duration::from_millis)
+}
+
+/// A [`SessionConnector`] that bounds the connect of `inner` to `deadline`.
+/// When the time is up it drops the connect future, which ends the handshake
+/// and the name resolution, and fails with a [`DaemonError::Connect`].
+pub(crate) struct DeadlineConnector {
+    pub(crate) inner: Arc<dyn SessionConnector>,
+    pub(crate) deadline: Duration,
+}
+
+impl SessionConnector for DeadlineConnector {
+    fn connect(
+        &self,
+        cfg: ConnectionConfig,
+    ) -> BoxFuture<'static, Result<Box<dyn ManagedSession>, DaemonError>> {
+        let connect = self.inner.connect(cfg);
+        let deadline = self.deadline;
+        Box::pin(async move {
+            tokio::time::timeout(deadline, connect)
+                .await
+                .unwrap_or_else(|_| {
+                    Err(DaemonError::Connect(format!(
+                        "connect timed out after {deadline:?}"
+                    )))
+                })
+        })
+    }
+}
+
 /// Lets the registry (Plan 12-03) emit session-state transitions without
 /// knowing about disk persistence (Plan 12-05 provides the real JSON-disk
 /// implementation).
@@ -348,10 +395,13 @@ impl ReconciliationSink for NoopReconciliationSink {
 }
 
 /// Why a pending connect was cancelled on purpose. Cancelling by dropping the
-/// handle needs no cause, so no cause exists yet; a cause is added together
-/// with the code that sends it.
+/// handle needs no cause; a cause is added together with the code that sends
+/// it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CancelCause {}
+pub enum CancelCause {
+    /// A `Disconnect` named the session while its connect was in flight.
+    Disconnect,
+}
 
 /// The registry's per-session map value (Plan 12-03).
 pub enum SessionEntry {
@@ -369,7 +419,8 @@ pub enum SessionEntry {
         attempt: u64,
         /// The cancel handle of the spawned connect task. Dropping it, which
         /// removing this entry does, cancels the connect; a sent
-        /// [`CancelCause`] names why.
+        /// [`CancelCause`] names why. A `Disconnect` removes the entry and
+        /// sends [`CancelCause::Disconnect`] under the registry lock.
         cancel: tokio::sync::oneshot::Sender<CancelCause>,
     },
     /// A live, connected session.
@@ -534,9 +585,8 @@ pub enum DaemonError {
     /// The requested session id has no corresponding entry in the registry.
     #[error("no such session \"{0}\"")]
     SessionNotFound(String),
-    /// A disconnect was requested for a session whose connect is still in
-    /// flight (research Pattern 2) — the in-flight connect is never
-    /// interrupted.
+    /// An operation other than `Disconnect` named a session whose connect is
+    /// still in flight. A `Disconnect` cancels the connect instead.
     #[error("session \"{0}\" is still connecting")]
     StillConnecting(String),
     /// An underlying `rdpilot` SDK error. `rdpilot::Error`'s own `Display`
@@ -650,6 +700,16 @@ mod tests {
     fn real_connector_implements_session_connector() {
         let connector = RealConnector;
         _assert_real_connector_is_a_session_connector(&connector);
+    }
+
+    #[test]
+    fn connect_deadline_defaults_to_sixty_seconds_and_takes_a_positive_override() {
+        let default = Duration::from_secs(60);
+        assert_eq!(connect_deadline(None), default);
+        assert_eq!(connect_deadline(Some("x")), default);
+        assert_eq!(connect_deadline(Some("0")), default);
+        assert_eq!(connect_deadline(Some("-5")), default);
+        assert_eq!(connect_deadline(Some("250")), Duration::from_millis(250));
     }
 
     #[test]
