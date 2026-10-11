@@ -28,7 +28,8 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo check --workspace --all-targets --locked
-      - run: cargo test --workspace --locked
+      - name: Rust workspace tests
+        run: cargo test --workspace --locked
       - name: Python for CI helper tests
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
@@ -47,8 +48,10 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-      - run: cargo test -p rdpilot-config --locked
-      - run: cargo test -p rdpilot-cli --bins --locked
+      - name: Config unit tests
+        run: cargo test -p rdpilot-config --locked
+      - name: CLI unit tests
+        run: cargo test -p rdpilot-cli --bins --locked
 
   windows-dacl:
     name: Windows DACL
@@ -75,7 +78,8 @@ jobs:
           python-version: '3.12'
       - name: CI and publisher failure-injection tests
         run: python -m unittest discover -s scripts/ci -p 'test_*.py'
-      - shell: pwsh
+      - name: Live daemon DACL tests
+        shell: pwsh
         run: ./scripts/ci/run-windows-dacl.ps1
 
       - name: Windows bridge and containment tests
@@ -178,6 +182,43 @@ jobs:
         with:
           name: desktop-proof-evidence
           path: ${{ runner.temp }}/hosted-desktop-evidence
+          retention-days: 7
+          if-no-files-found: error
+
+  evidence-matrix:
+    name: Evidence matrix (report only)
+    if: ${{ always() }}
+    needs: [linux, windows, windows-dacl, offline, desktop]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Report only: a failure here must not fail the called workflow of a release.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - name: Artifacts of this run
+        continue-on-error: true
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: ${{ runner.temp }}/ci-artifacts
+      - name: Render the evidence matrix
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          NEEDS_JSON: ${{ toJSON(needs) }}
+          CALLER_WORKFLOW_REF: ${{ github.workflow_ref }}
+          JOB_WORKFLOW_REF: ${{ job.workflow_ref }}
+        run: python scripts/ci/evidence-matrix.py render --artifacts "$RUNNER_TEMP/ci-artifacts" --output "$RUNNER_TEMP/evidence-matrix"
+      - name: Evidence matrix artifact
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: evidence-matrix
+          path: ${{ runner.temp }}/evidence-matrix
           retention-days: 7
           if-no-files-found: error
 
