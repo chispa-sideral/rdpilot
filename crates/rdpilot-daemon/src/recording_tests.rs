@@ -7,9 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use rdpilot::ConnectionConfig;
-use rdpilot_ipc::{
-    Request, SessionId, SessionLifecycle, WireErrorCode, WireRecordingState, WireResponse,
-};
+use rdpilot_ipc::{Request, SessionId, WireErrorCode, WireRecordingState, WireResponse};
 use rdpilot_vocab::RecordingTrigger;
 
 use crate::dispatch::dispatch;
@@ -26,8 +24,11 @@ use crate::seams::{
 const MARKER: &str = "RECMARKER-5d1e";
 const PASSWORD: &str = "PASSWORD-9c2b";
 
+type LifecycleTx = Arc<tokio::sync::watch::Sender<rdpilot::SessionState>>;
+
 struct Session {
     frames: Option<Arc<TestFrames>>,
+    lifecycle: LifecycleTx,
 }
 
 impl ManagedSession for Session {
@@ -37,8 +38,8 @@ impl ManagedSession for Session {
         }
         Box::pin(async { Ok(()) })
     }
-    fn describe(&self) -> SessionLifecycle {
-        SessionLifecycle::Live
+    fn lifecycle(&self) -> tokio::sync::watch::Receiver<rdpilot::SessionState> {
+        self.lifecycle.subscribe()
     }
     fn screenshot(&self) -> BoxFuture<'_, Result<rdpilot::Screenshot, DaemonError>> {
         Box::pin(async {
@@ -89,6 +90,8 @@ impl ManagedSession for Session {
 #[derive(Default)]
 struct Connector {
     frames: Mutex<Vec<Arc<TestFrames>>>,
+    /// Every delivered session's lifecycle, by host.
+    lifecycles: Mutex<Vec<(String, LifecycleTx)>>,
 }
 
 impl SessionConnector for Connector {
@@ -101,7 +104,20 @@ impl SessionConnector for Connector {
             self.frames.lock().unwrap().push(Arc::clone(&f));
             f
         });
-        Box::pin(async move { Ok(Box::new(Session { frames }) as Box<dyn ManagedSession>) })
+        let lifecycle = Arc::new(
+            tokio::sync::watch::channel(rdpilot::SessionState {
+                lifecycle: rdpilot::Lifecycle::Live,
+                desktop_size: (16, 12),
+            })
+            .0,
+        );
+        self.lifecycles
+            .lock()
+            .unwrap()
+            .push((cfg.host().to_owned(), Arc::clone(&lifecycle)));
+        Box::pin(
+            async move { Ok(Box::new(Session { frames, lifecycle }) as Box<dyn ManagedSession>) },
+        )
     }
 }
 
@@ -390,6 +406,68 @@ async fn start_and_stop_on_a_running_session() {
     assert_eq!(last["reason"], "requested");
     // Stopped recordings are no longer listed as the session's recording.
     assert_eq!(fx.registry.list()[0].recording, None);
+}
+
+impl Fx {
+    /// The server ends the session connected to `host`.
+    fn server_end(&self, host: &str) {
+        let lifecycles = self.connector.lifecycles.lock().unwrap();
+        let (_, lifecycle) = lifecycles.iter().rev().find(|(h, _)| h == host).unwrap();
+        lifecycle.send_modify(|state| {
+            state.lifecycle =
+                rdpilot::Lifecycle::Ended(rdpilot::EndCause::ServerEnded("fake server end".into()));
+        });
+    }
+}
+
+/// A session that has ended cannot start a recording (IPC and viewer); a
+/// recording started before the end can still be annotated and stopped.
+#[tokio::test]
+async fn a_disconnected_session_refuses_a_recording_start_and_finishes_one_in_progress() {
+    let fx = fx("rec-ended");
+    fx.connect("web", "h", None).await;
+    fx.connect("idle", "h2", None).await;
+    let (id, was) = changed(
+        &fx.run(Request::RecordStart {
+            session: sid("web"),
+        })
+        .await,
+    );
+    assert!(was);
+    fx.server_end("h");
+    fx.server_end("h2");
+
+    for name in ["web", "idle"] {
+        match fx.run(Request::RecordStart { session: sid(name) }).await {
+            WireResponse::Error(e) => {
+                assert_eq!(e.code, WireErrorCode::SessionNotFound, "{name}");
+                assert!(e.message.contains("ended"), "{}", e.message);
+            }
+            other => panic!("expected an error for {name}, got {other:?}"),
+        }
+    }
+    let viewer = crate::registry::ViewerRegistry::new(Arc::clone(&fx.registry));
+    match viewer.record_start(&sid("idle")).await {
+        Err(crate::registry::Refusal::NoSession(message)) => {
+            assert!(message.contains("ended"), "{message}");
+        }
+        other => panic!("expected NoSession, got {other:?}"),
+    }
+
+    let noted = fx
+        .run(Request::Annotate {
+            session: sid("web"),
+            text: "after the end".into(),
+        })
+        .await;
+    assert!(changed(&noted).1, "{noted:?}");
+    let (stopped, was) = changed(
+        &fx.run(Request::RecordStop {
+            session: sid("web"),
+        })
+        .await,
+    );
+    assert_eq!((stopped, was), (id, true));
 }
 
 #[tokio::test]

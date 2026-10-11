@@ -53,9 +53,9 @@ impl From<DaemonError> for WireError {
         let message = err.to_string();
         let code = match &err {
             DaemonError::DuplicateSession(_) => WireErrorCode::DuplicateSession,
-            DaemonError::SessionNotFound(_) | DaemonError::StillConnecting(_) => {
-                WireErrorCode::SessionNotFound
-            }
+            DaemonError::SessionNotFound(_)
+            | DaemonError::StillConnecting(_)
+            | DaemonError::SessionEnded { .. } => WireErrorCode::SessionNotFound,
             DaemonError::Sdk(e) => wire_code_for_sdk_error(e),
             DaemonError::Connect(_) => WireErrorCode::Internal,
             DaemonError::Io(_) => WireErrorCode::Internal,
@@ -168,6 +168,10 @@ mod tests {
         let cases = [
             DaemonError::SessionNotFound("brave-otter".to_owned()),
             DaemonError::StillConnecting("brave-otter".to_owned()),
+            DaemonError::SessionEnded {
+                id: "brave-otter".to_owned(),
+                cause: "the server ended the session: logoff".to_owned(),
+            },
         ];
         for err in cases {
             let wire: WireError = err.into();

@@ -35,6 +35,7 @@ use crate::connect::{ConnectedFramed, UpgradedStream};
 use crate::error::{Error, Result};
 use crate::framebuffer::SharedFrame;
 use crate::keepalive::{null_input_event, KEEPALIVE_INTERVAL};
+use crate::lifecycle::{EndCause, LifecycleOwner};
 
 /// Control/input events the [`Session`](crate::Session) sends into the loop.
 ///
@@ -64,18 +65,54 @@ pub(crate) enum RdpInputEvent {
 }
 
 /// Run the active-session pump until the connection terminates or the input
-/// channel closes.
+/// channel closes, then end `lifecycle`.
 ///
 /// Owns `framed` (the TLS-upgraded transport), the input channel receiver, and a
 /// write handle to the shared frame. Returns `Ok(())` on a clean terminate /
 /// channel-close, or an [`Error`] if a PDU could not be processed or written.
+///
+/// The end cause: a server Terminate ends the lifecycle as
+/// [`EndCause::ServerEnded`] when it arrives; an error ends it as
+/// [`EndCause::Error`]; every other exit (shutdown, closed input channel) is
+/// caused by a close or drop of the session and ends it as
+/// [`EndCause::ClientClosed`]. The first cause wins, so a close that already
+/// ended the lifecycle keeps its cause.
 pub(crate) async fn run(
+    framed: ConnectedFramed,
+    connection_result: ConnectionResult,
+    input_rx: mpsc::Receiver<RdpInputEvent>,
+    frame: SharedFrame,
+    bridge: std::sync::Arc<crate::bridge::BridgeShared>,
+    lifecycle: LifecycleOwner,
+) -> Result<()> {
+    let result = run_loop(
+        framed,
+        connection_result,
+        input_rx,
+        frame,
+        bridge,
+        &lifecycle,
+    )
+    .await;
+    match &result {
+        Ok(()) => lifecycle.end(EndCause::ClientClosed),
+        Err(error) => lifecycle.end(EndCause::Error(error.to_string())),
+    }
+    result
+}
+
+async fn run_loop(
     framed: ConnectedFramed,
     connection_result: ConnectionResult,
     mut input_rx: mpsc::Receiver<RdpInputEvent>,
     frame: SharedFrame,
     bridge: std::sync::Arc<crate::bridge::BridgeShared>,
+    lifecycle: &LifecycleOwner,
 ) -> Result<()> {
+    lifecycle.set_desktop_size((
+        u32::from(connection_result.desktop_size.width),
+        u32::from(connection_result.desktop_size.height),
+    ));
     let (mut reader, mut writer) = ironrdp_tokio::split_tokio_framed(framed);
 
     let mut image = DecodedImage::new(
@@ -209,11 +246,16 @@ pub(crate) async fn run(
                         _=bridge.shutdown.notified()=>return Ok(()),
                         outcome=tokio::time::timeout(std::time::Duration::from_secs(10),reactivate(&mut reader,&mut writer,&mut active_stage,&mut image,&activation_factory))=>{
                             outcome.map_err(|_|Error::Session("RDP reactivation deadline exceeded".into()))??;
+                            lifecycle.set_desktop_size((
+                                u32::from(image.width()),
+                                u32::from(image.height()),
+                            ));
                         }
                     }
                 }
                 ActiveStageOutput::Terminate(reason) => {
                     debug!(%reason, "session terminated by server");
+                    lifecycle.end(EndCause::ServerEnded(reason.to_string()));
                     bridge.invalidate(&format!("RDP server ended session: {reason}"));
                     terminate = true;
                 }
@@ -399,8 +441,9 @@ async fn reactivate(
     Ok(())
 }
 
+/// The scripted RDP server side and fixtures, shared with the session tests.
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use ironrdp::connector::connection_activation::ConnectionActivationFactory;
     use ironrdp::connector::{Config, Credentials, DesktopSize};
@@ -414,7 +457,7 @@ mod tests {
     use ironrdp::session::image::DecodedImage;
     use ironrdp_input::Database;
 
-    fn connection_result_fixture() -> ConnectionResult {
+    pub(crate) fn connection_result_fixture() -> ConnectionResult {
         let config = Config {
             credentials: Credentials::UsernamePassword {
                 username: "synthetic".into(),
@@ -618,12 +661,15 @@ mod tests {
                 let mut peer = ironrdp_tokio::TokioFramed::new(server);
                 let bridge = std::sync::Arc::new(crate::bridge::BridgeShared::new());
                 let shutdown = bridge.clone();
+                let frame = SharedFrame::new();
+                let lifecycle = LifecycleOwner::new(frame.clone(), (100, 100));
                 let pump = tokio::task::spawn_local(run(
                     framed,
                     connection_result_fixture(),
                     input_rx,
-                    SharedFrame::new(),
+                    frame,
                     bridge,
+                    lifecycle,
                 ));
 
                 let observed = tokio::time::timeout(std::time::Duration::from_secs(15), async {
@@ -717,10 +763,10 @@ mod tests {
     const REACTIVATION_SHARE_ID: u32 = 0x0001_2000;
     /// Every peer read and write is bounded so a broken sequence fails
     /// instead of hanging.
-    const PEER_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+    pub(crate) const PEER_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
 
-    type Peer = ironrdp_tokio::TokioFramed<tokio::io::DuplexStream>;
-    type PeerResult<T> = std::result::Result<T, String>;
+    pub(crate) type Peer = ironrdp_tokio::TokioFramed<tokio::io::DuplexStream>;
+    pub(crate) type PeerResult<T> = std::result::Result<T, String>;
 
     /// A server-to-client Share Control PDU, as an X.224 Data frame carrying
     /// an MCS Send Data Indication on the I/O channel.
@@ -812,7 +858,7 @@ mod tests {
     /// `width` x `height` desktop, check the client's Confirm Active and its
     /// four finalization PDUs in order, and answer with the server
     /// finalization PDUs.
-    async fn serve_reactivation(
+    pub(crate) async fn serve_reactivation(
         peer: &mut Peer,
         send_deactivate_all: bool,
         width: u16,
@@ -906,12 +952,15 @@ mod tests {
                 let mut peer = ironrdp_tokio::TokioFramed::new(server);
                 let bridge = std::sync::Arc::new(crate::bridge::BridgeShared::new());
                 let shutdown = bridge.clone();
+                let frame = SharedFrame::new();
+                let lifecycle = LifecycleOwner::new(frame.clone(), (100, 100));
                 let pump = tokio::task::spawn_local(run(
                     framed,
                     connection_result_fixture(),
                     input_rx,
-                    SharedFrame::new(),
+                    frame,
                     bridge,
+                    lifecycle,
                 ));
 
                 let observed = async {
@@ -940,6 +989,136 @@ mod tests {
                     .expect("pump task joins");
                 assert!(joined.is_ok(), "run returned an error: {joined:?}");
                 observed.expect("reactivation and input after it");
+            })
+            .await;
+    }
+
+    /// The pump of a scripted session: the loop runs on the local set
+    /// against a duplex peer, with its own lifecycle.
+    pub(crate) struct Pump {
+        pub(crate) peer: Peer,
+        pub(crate) input_tx: mpsc::Sender<RdpInputEvent>,
+        pub(crate) frame: SharedFrame,
+        pub(crate) lifecycle: LifecycleOwner,
+        pub(crate) bridge: std::sync::Arc<crate::bridge::BridgeShared>,
+        pub(crate) task: tokio::task::JoinHandle<Result<()>>,
+    }
+
+    /// Start `run` with the 100x100 fixture on the current local set.
+    pub(crate) fn spawn_pump() -> Pump {
+        let (input_tx, input_rx) = mpsc::channel(16);
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let framed =
+            ironrdp_tokio::TokioFramed::new(Box::new(client) as crate::connect::UpgradedStream);
+        let bridge = std::sync::Arc::new(crate::bridge::BridgeShared::new());
+        let frame = SharedFrame::new();
+        let lifecycle = LifecycleOwner::new(frame.clone(), (100, 100));
+        let task = tokio::task::spawn_local(run(
+            framed,
+            connection_result_fixture(),
+            input_rx,
+            frame.clone(),
+            bridge.clone(),
+            lifecycle.clone(),
+        ));
+        Pump {
+            peer: ironrdp_tokio::TokioFramed::new(server),
+            input_tx,
+            frame,
+            lifecycle,
+            bridge,
+            task,
+        }
+    }
+
+    fn ended_cause(lifecycle: &LifecycleOwner) -> Option<EndCause> {
+        match lifecycle.subscribe().borrow().lifecycle.clone() {
+            crate::Lifecycle::Live => None,
+            crate::Lifecycle::Ended(cause) => Some(cause),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_server_terminate_ends_the_lifecycle_as_server_ended() {
+        use ironrdp::pdu::rdp::headers::ShareDataPdu;
+        use ironrdp::pdu::rdp::server_error_info::{
+            ErrorInfo, ProtocolIndependentCode, ServerSetErrorInfoPdu,
+        };
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let mut pump = spawn_pump();
+                assert_eq!(ended_cause(&pump.lifecycle), None);
+                peer_send(
+                    &mut pump.peer,
+                    server_share_data(ShareDataPdu::ServerSetErrorInfo(ServerSetErrorInfoPdu(
+                        ErrorInfo::ProtocolIndependentCode(
+                            ProtocolIndependentCode::RpcInitiatedLogoff,
+                        ),
+                    ))),
+                )
+                .await
+                .expect("error info sent");
+                let joined = tokio::time::timeout(PEER_DEADLINE, pump.task)
+                    .await
+                    .expect("run ends on the server's terminate")
+                    .expect("pump task joins");
+                assert!(joined.is_ok(), "run returned an error: {joined:?}");
+                assert!(
+                    matches!(ended_cause(&pump.lifecycle), Some(EndCause::ServerEnded(_))),
+                    "{:?}",
+                    ended_cause(&pump.lifecycle)
+                );
+                assert!(pump.frame.watch().status().ended);
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn a_transport_eof_ends_the_lifecycle_as_an_error() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let pump = spawn_pump();
+                drop(pump.peer);
+                let joined = tokio::time::timeout(PEER_DEADLINE, pump.task)
+                    .await
+                    .expect("run ends when the transport closes")
+                    .expect("pump task joins");
+                assert!(joined.is_err(), "a closed transport is a loop error");
+                match ended_cause(&pump.lifecycle) {
+                    Some(EndCause::Error(text)) => {
+                        assert!(text.contains("read PDU failed"), "{text}");
+                    }
+                    other => panic!("lifecycle {other:?}"),
+                }
+                assert!(pump.frame.watch().status().ended);
+                drop(pump.input_tx);
+                drop(pump.bridge);
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn a_reactivation_publishes_the_new_desktop_size() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let mut pump = spawn_pump();
+                let mut rx = pump.lifecycle.subscribe();
+                assert_eq!(rx.borrow().desktop_size, (100, 100));
+                serve_reactivation(&mut pump.peer, true, 200, 50)
+                    .await
+                    .expect("reactivation served");
+                tokio::time::timeout(PEER_DEADLINE, rx.wait_for(|s| s.desktop_size == (200, 50)))
+                    .await
+                    .expect("the new size is published")
+                    .expect("the lifecycle sender lives");
+                assert_eq!(ended_cause(&pump.lifecycle), None);
+                pump.bridge.shutdown.notify_one();
+                let joined = tokio::time::timeout(PEER_DEADLINE, pump.task)
+                    .await
+                    .expect("pump join deadline")
+                    .expect("pump task joins");
+                assert!(joined.is_ok(), "{joined:?}");
+                assert_eq!(ended_cause(&pump.lifecycle), Some(EndCause::ClientClosed));
             })
             .await;
     }

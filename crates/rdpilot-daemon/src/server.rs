@@ -18,7 +18,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rdpilot::ConnectionConfig;
-use rdpilot_ipc::SessionLifecycle;
 
 use crate::bundle::{BundleError, BundleRequest, DaemonBundleSource, PreparedBundle};
 use crate::diagnostics::Diagnostics;
@@ -322,6 +321,36 @@ struct FakeTestSession {
     cua: bool,
     /// Counting human input sink when [`TEST_INPUT_LOG_ENV`] is set.
     input: Option<Arc<CountingInput>>,
+    /// The session's lifecycle: ended as a client close by `close`, and as a
+    /// server end by the fake server end, before the frames end (the SDK's
+    /// order).
+    lifecycle: Arc<tokio::sync::watch::Sender<rdpilot::SessionState>>,
+}
+
+/// A fake session's lifecycle: `Live` at 1920x1080.
+fn live_fake_lifecycle() -> Arc<tokio::sync::watch::Sender<rdpilot::SessionState>> {
+    Arc::new(
+        tokio::sync::watch::channel(rdpilot::SessionState {
+            lifecycle: rdpilot::Lifecycle::Live,
+            desktop_size: (1920, 1080),
+        })
+        .0,
+    )
+}
+
+/// End `lifecycle` with `cause` unless it has ended (the first cause wins).
+fn end_fake_lifecycle(
+    lifecycle: &tokio::sync::watch::Sender<rdpilot::SessionState>,
+    cause: rdpilot::EndCause,
+) {
+    lifecycle.send_if_modified(|state| {
+        if state.lifecycle == rdpilot::Lifecycle::Live {
+            state.lifecycle = rdpilot::Lifecycle::Ended(cause);
+            true
+        } else {
+            false
+        }
+    });
 }
 
 /// The fake connector's human input sink: counts only.
@@ -378,20 +407,21 @@ impl crate::seams::HumanInput for CountingInput {
 
 impl ManagedSession for FakeTestSession {
     fn close(self: Box<Self>) -> BoxFuture<'static, Result<(), DaemonError>> {
+        end_fake_lifecycle(&self.lifecycle, rdpilot::EndCause::ClientClosed);
         if let Some(frames) = &self.frames {
             frames.end();
         }
         Box::pin(async { Ok(()) })
     }
 
+    fn lifecycle(&self) -> tokio::sync::watch::Receiver<rdpilot::SessionState> {
+        self.lifecycle.subscribe()
+    }
+
     fn frame_source(&self) -> Option<Arc<dyn ViewFrameSource>> {
         self.frames
             .as_ref()
             .map(|f| Arc::clone(f) as Arc<dyn ViewFrameSource>)
-    }
-
-    fn describe(&self) -> SessionLifecycle {
-        SessionLifecycle::Live
     }
 
     fn human_input(&self) -> Option<Arc<dyn crate::seams::HumanInput>> {
@@ -524,6 +554,7 @@ impl SessionConnector for FakeTestConnector {
                 state: std::sync::Mutex::default(),
             })
         });
+        let lifecycle = live_fake_lifecycle();
         let frames = self.frames.then(|| {
             let frames = SyntheticFrames::new();
             if cfg.host() == TEST_FRAMES_STILL_HOST {
@@ -540,8 +571,15 @@ impl SessionConnector for FakeTestConnector {
             frames.spawn_animation();
             if cfg.host() == TEST_FRAMES_SERVER_END_HOST {
                 let weak = Arc::downgrade(&frames);
+                let lifecycle = Arc::downgrade(&lifecycle);
                 tokio::spawn(async move {
                     tokio::time::sleep(Duration::from_secs(4)).await;
+                    if let Some(lifecycle) = lifecycle.upgrade() {
+                        end_fake_lifecycle(
+                            &lifecycle,
+                            rdpilot::EndCause::ServerEnded("fake server end".to_owned()),
+                        );
+                    }
                     if let Some(frames) = weak.upgrade() {
                         frames.end();
                     }
@@ -563,6 +601,7 @@ impl SessionConnector for FakeTestConnector {
                 frames,
                 cua,
                 input,
+                lifecycle,
             }) as Box<dyn ManagedSession>)
         })
     }
@@ -815,6 +854,7 @@ mod tests {
             frames: None,
             cua: false,
             input: None,
+            lifecycle: live_fake_lifecycle(),
         };
         let immediate_bound = Duration::from_millis(50);
 
@@ -853,6 +893,7 @@ mod tests {
             frames: None,
             cua: false,
             input: None,
+            lifecycle: live_fake_lifecycle(),
         };
         let bound = Duration::from_millis(SLOW_MS);
 
@@ -896,6 +937,7 @@ mod tests {
             frames: None,
             cua: true,
             input: None,
+            lifecycle: live_fake_lifecycle(),
         };
         let mut cua = session.attach_cua().await.expect("fake Cua attaches");
         let call = |id: u64, method: &str, params: serde_json::Value| json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
@@ -952,6 +994,7 @@ mod tests {
             frames: None,
             cua: false,
             input: None,
+            lifecycle: live_fake_lifecycle(),
         };
         assert!(without.attach_cua().await.is_err());
     }

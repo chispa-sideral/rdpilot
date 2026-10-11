@@ -29,7 +29,6 @@ use std::thread::JoinHandle;
 
 use rdpilot::ConnectionConfig;
 use rdpilot_daemon::{DaemonError, ManagedSession, ReconciliationSink, Registry, SessionConnector};
-use rdpilot_ipc::SessionLifecycle;
 use sysinfo::{ProcessesToUpdate, System};
 
 type TestFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
@@ -64,10 +63,6 @@ impl ManagedSession for ThreadOwningFakeSession {
             }
             Ok(())
         })
-    }
-
-    fn describe(&self) -> SessionLifecycle {
-        SessionLifecycle::Live
     }
 
     fn screenshot(&self) -> OpFuture<'_, Result<rdpilot::Screenshot, DaemonError>> {

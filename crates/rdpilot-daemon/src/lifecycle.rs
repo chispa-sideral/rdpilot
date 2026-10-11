@@ -256,7 +256,6 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use rdpilot::ConnectionConfig;
-    use rdpilot_ipc::SessionLifecycle;
 
     use super::*;
     use crate::seams::{
@@ -270,6 +269,26 @@ mod tests {
     /// `#[cfg(test)]`, so this module defines its own).
     struct FakeSession {
         closed: Arc<AtomicBool>,
+        /// A lifecycle the test can end; `None` keeps the default (live).
+        lifecycle: Option<Arc<tokio::sync::watch::Sender<rdpilot::SessionState>>>,
+    }
+
+    /// A Cua attachment that does nothing; it only holds a lease.
+    struct IdleCua;
+
+    impl crate::seams::ManagedCua for IdleCua {
+        fn identity(&self) -> (u64, u64, u64) {
+            (1, 1, 1)
+        }
+        fn send(&self, _: serde_json::Value) -> BoxFuture<'_, Result<(), DaemonError>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn recv(&mut self) -> BoxFuture<'_, Result<Option<serde_json::Value>, DaemonError>> {
+            Box::pin(std::future::pending())
+        }
+        fn close(&mut self) -> BoxFuture<'_, Result<(), DaemonError>> {
+            Box::pin(async { Ok(()) })
+        }
     }
 
     impl ManagedSession for FakeSession {
@@ -277,8 +296,24 @@ mod tests {
             self.closed.store(true, Ordering::SeqCst);
             Box::pin(async { Ok(()) })
         }
-        fn describe(&self) -> SessionLifecycle {
-            SessionLifecycle::Live
+
+        fn lifecycle(&self) -> tokio::sync::watch::Receiver<rdpilot::SessionState> {
+            match &self.lifecycle {
+                Some(lifecycle) => lifecycle.subscribe(),
+                None => {
+                    tokio::sync::watch::channel(rdpilot::SessionState {
+                        lifecycle: rdpilot::Lifecycle::Live,
+                        desktop_size: (1920, 1080),
+                    })
+                    .1
+                }
+            }
+        }
+
+        fn attach_cua(
+            &self,
+        ) -> BoxFuture<'_, Result<Box<dyn crate::seams::ManagedCua>, DaemonError>> {
+            Box::pin(async { Ok(Box::new(IdleCua) as Box<dyn crate::seams::ManagedCua>) })
         }
 
         fn screenshot(&self) -> BoxFuture<'_, Result<rdpilot::Screenshot, DaemonError>> {
@@ -346,8 +381,28 @@ mod tests {
             Box::pin(async {
                 Ok(Box::new(FakeSession {
                     closed: Arc::new(AtomicBool::new(false)),
+                    lifecycle: None,
                 }) as Box<dyn ManagedSession>)
             })
+        }
+    }
+
+    /// Connects one session whose lifecycle and close the test observes.
+    struct EndableConnector {
+        lifecycle: Arc<tokio::sync::watch::Sender<rdpilot::SessionState>>,
+        closed: Arc<AtomicBool>,
+    }
+
+    impl SessionConnector for EndableConnector {
+        fn connect(
+            &self,
+            _cfg: ConnectionConfig,
+        ) -> TestFuture<Result<Box<dyn ManagedSession>, DaemonError>> {
+            let session = FakeSession {
+                closed: Arc::clone(&self.closed),
+                lifecycle: Some(Arc::clone(&self.lifecycle)),
+            };
+            Box::pin(async move { Ok(Box::new(session) as Box<dyn ManagedSession>) })
         }
     }
 
@@ -450,6 +505,58 @@ mod tests {
             idle_reaper(Arc::clone(&registry), cfg, shutdown.clone()),
             driver
         );
+    }
+
+    /// A session that has ended is reaped even while a Cua stream holds a
+    /// lease on it (the stream cannot do anything with an ended session).
+    #[tokio::test]
+    async fn idle_reaper_reaps_a_disconnected_entry_with_a_cua_lease() {
+        let lifecycle = Arc::new(
+            tokio::sync::watch::channel(rdpilot::SessionState {
+                lifecycle: rdpilot::Lifecycle::Live,
+                desktop_size: (1920, 1080),
+            })
+            .0,
+        );
+        let closed = Arc::new(AtomicBool::new(false));
+        let registry = Arc::new(Registry::new(
+            Arc::new(EndableConnector {
+                lifecycle: Arc::clone(&lifecycle),
+                closed: Arc::clone(&closed),
+            }),
+            Arc::new(NoopReconciliationSink),
+        ));
+        let id = registry
+            .open(Some("web".to_owned()), "10.0.0.5".to_owned(), test_cfg())
+            .await
+            .expect("open should succeed");
+        let attached = registry.attach_cua(&id).await.expect("attach");
+        assert!(
+            registry.live_idle_durations().is_empty(),
+            "a live session with a Cua lease is not a candidate"
+        );
+        lifecycle.send_modify(|state| {
+            state.lifecycle = rdpilot::Lifecycle::Ended(rdpilot::EndCause::ServerEnded(
+                "fake server end".to_owned(),
+            ));
+        });
+        assert_eq!(registry.live_idle_durations().len(), 1);
+
+        let cfg = tiny_cfg();
+        let shutdown = ShutdownSignal::new();
+        let registry_for_driver = Arc::clone(&registry);
+        let shutdown_for_driver = shutdown.clone();
+        let driver = async move {
+            tokio::time::sleep(cfg.idle_timeout + cfg.reap_interval * 3).await;
+            assert_eq!(registry_for_driver.len(), 0, "the ended entry was reaped");
+            shutdown_for_driver.fire();
+        };
+        tokio::join!(
+            idle_reaper(Arc::clone(&registry), cfg, shutdown.clone()),
+            driver
+        );
+        assert!(closed.load(Ordering::SeqCst), "reaped through close");
+        drop(attached);
     }
 
     #[tokio::test]

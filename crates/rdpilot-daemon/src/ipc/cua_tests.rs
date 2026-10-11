@@ -4,7 +4,6 @@ use super::*;
 use crate::seams::{
     BoxFuture, DaemonError, ManagedSession, NoopReconciliationSink, SessionConnector,
 };
-use rdpilot_ipc::SessionLifecycle;
 use serde_json::{json, Value};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -69,9 +68,6 @@ impl ManagedSession for FakeSession {
             let _ = self.dead.send(true);
             Ok(())
         })
-    }
-    fn describe(&self) -> SessionLifecycle {
-        SessionLifecycle::Live
     }
     fn attach_cua(&self) -> BoxFuture<'_, Result<Box<dyn ManagedCua>, DaemonError>> {
         Box::pin(async move {

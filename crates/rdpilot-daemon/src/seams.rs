@@ -58,8 +58,22 @@ pub trait ManagedSession: Send + Sync + 'static {
     /// Returns [`DaemonError`] if the underlying close/join failed.
     fn close(self: Box<Self>) -> BoxFuture<'static, Result<(), DaemonError>>;
 
-    /// The session's current lifecycle status (D-30), for `list` rendering.
-    fn describe(&self) -> SessionLifecycle;
+    /// The session's current lifecycle status (D-30), derived from
+    /// [`ManagedSession::lifecycle`].
+    fn describe(&self) -> SessionLifecycle {
+        lifecycle_status(&self.lifecycle().borrow())
+    }
+
+    /// A receiver of the session's lifecycle and current desktop size,
+    /// captured once when the registry inserts the session. The default is a
+    /// session that stays live: its sender is already gone, so it never ends.
+    fn lifecycle(&self) -> tokio::sync::watch::Receiver<rdpilot::SessionState> {
+        let (_, rx) = tokio::sync::watch::channel(rdpilot::SessionState {
+            lifecycle: rdpilot::Lifecycle::Live,
+            desktop_size: self.desktop_size(),
+        });
+        rx
+    }
 
     // --- Operational methods (Phase 13, CLI-02/CLI-03) ---------------------
     //
@@ -212,11 +226,8 @@ impl ManagedSession for Session {
         Box::pin(async move { (*self).close().await.map_err(DaemonError::Sdk) })
     }
 
-    fn describe(&self) -> SessionLifecycle {
-        // Baseline until Plan 12-03/12-06 derives a finer-grained status
-        // from the SDK keepalive signal (D-30) — a `Session` handle only
-        // exists here while it is live.
-        SessionLifecycle::Live
+    fn lifecycle(&self) -> tokio::sync::watch::Receiver<rdpilot::SessionState> {
+        Session::lifecycle(self)
     }
 
     fn attach_cua(&self) -> BoxFuture<'_, Result<Box<dyn ManagedCua>, DaemonError>> {
@@ -367,6 +378,15 @@ impl SessionConnector for DeadlineConnector {
     }
 }
 
+/// The list status of a session in `state`: live, or disconnected once it
+/// ended.
+pub(crate) fn lifecycle_status(state: &rdpilot::SessionState) -> SessionLifecycle {
+    match state.lifecycle {
+        rdpilot::Lifecycle::Live => SessionLifecycle::Live,
+        rdpilot::Lifecycle::Ended(_) => SessionLifecycle::Disconnected,
+    }
+}
+
 /// Lets the registry (Plan 12-03) emit session-state transitions without
 /// knowing about disk persistence (Plan 12-05 provides the real JSON-disk
 /// implementation).
@@ -443,13 +463,10 @@ pub enum SessionEntry {
         /// IPC wire; it identifies the exact Connect response owner when a
         /// peer closes before receiving `Connected`.
         generation: u64,
-        /// A cheap, lock-free snapshot of the session's lifecycle status,
-        /// captured at insert time and never updated by this phase (mirrors
-        /// `describe()`'s current baseline-`Live` behavior exactly). Storing
-        /// this separately lets [`SessionEntry::to_status`] avoid taking the
-        /// inner `tokio::sync::Mutex` at all — `list` must never block on a
-        /// busy session.
-        status: SessionLifecycle,
+        /// The session's lifecycle, captured once at insert like `frame`.
+        /// Reading it takes only the watch's own lock, never the per-session
+        /// mutex above, so `list` never blocks on a busy session.
+        lifecycle: tokio::sync::watch::Receiver<rdpilot::SessionState>,
         /// When the connect completed (monotonic; idle-reap arithmetic,
         /// Plan 12-06).
         connected_since: Instant,
@@ -474,9 +491,10 @@ pub enum SessionEntry {
         /// This incarnation's event log (names, outcomes and timings only).
         /// Recording and reading never take the per-session mutex above.
         events: Arc<crate::events::SessionEvents>,
-        /// The task that records the server ending the session (only with a
-        /// frame source). Aborted when the entry is removed or dropped.
-        ended_watch: Option<crate::events::WatchTask>,
+        /// The task that handles an end of the session not caused by a
+        /// daemon close (record, `session_ended`, human lease). Aborted when
+        /// the entry is removed or dropped.
+        end_hook: crate::events::WatchTask,
         /// Who may send input: the agent, or a human viewer's lease.
         control: Arc<crate::control::SessionControl>,
         /// ISO-8601 wall-clock rendering of `last_activity`. No
@@ -503,6 +521,19 @@ pub enum SessionEntry {
 }
 
 impl SessionEntry {
+    /// Why a `Live` entry's session ended, or `None` while it is live (and
+    /// for the other entry kinds).
+    #[must_use]
+    pub fn end_cause(&self) -> Option<rdpilot::EndCause> {
+        match self {
+            SessionEntry::Live { lifecycle, .. } => match &lifecycle.borrow().lifecycle {
+                rdpilot::Lifecycle::Live => None,
+                rdpilot::Lifecycle::Ended(cause) => Some(cause.clone()),
+            },
+            _ => None,
+        }
+    }
+
     /// Render this entry (plus its registry key) into the credential-free
     /// wire DTO `list` returns (D-30/D-31, SESSION-03).
     ///
@@ -525,7 +556,7 @@ impl SessionEntry {
                 controller: None,
             },
             SessionEntry::Live {
-                status,
+                lifecycle,
                 name,
                 host,
                 connected_since_wall,
@@ -545,7 +576,7 @@ impl SessionEntry {
                     id: id.as_str().to_owned(),
                     name: name.clone(),
                     host: host.clone(),
-                    status: *status,
+                    status: lifecycle_status(&lifecycle.borrow()),
                     connected_since: Some(connected_since_wall.clone()),
                     last_activity: Some(last_activity),
                     recording: None,
@@ -589,6 +620,10 @@ pub enum DaemonError {
     /// still in flight. A `Disconnect` cancels the connect instead.
     #[error("session \"{0}\" is still connecting")]
     StillConnecting(String),
+    /// An operation named a session that has ended (it is listed as
+    /// `Disconnected`). The cause is the SDK end cause.
+    #[error("session \"{id}\" ended: {cause}")]
+    SessionEnded { id: String, cause: String },
     /// An underlying `rdpilot` SDK error. `rdpilot::Error`'s own `Display`
     /// is already external-detail-only (never embeds a credential), so
     /// this variant's message reuse is safe by construction.
@@ -732,6 +767,10 @@ mod tests {
             DaemonError::DuplicateSession("brave-otter".to_owned()),
             DaemonError::SessionNotFound("brave-otter".to_owned()),
             DaemonError::StillConnecting("brave-otter".to_owned()),
+            DaemonError::SessionEnded {
+                id: "brave-otter".to_owned(),
+                cause: rdpilot::EndCause::ServerEnded("logoff".to_owned()).to_string(),
+            },
             DaemonError::Sdk(rdpilot::Error::Connect("host unreachable".to_owned())),
             DaemonError::Connect("host unreachable".to_owned()),
             DaemonError::Io("disk full".to_owned()),

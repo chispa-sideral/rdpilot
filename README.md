@@ -226,6 +226,11 @@ Existing handles cannot route to a new connection that reuses the same name.
 Native RDP framebuffer/input remain independent of Cua. UAC/secure-desktop
 computer use is unsupported; signed binaries do not imply elevated automation.
 
+When the server ends a session or its connection fails, `rdpilot list` and the
+viewer show it as `Disconnected` until `rdpilot disconnect`, the idle reaper or a
+`connect` with the same name removes it. Other commands for that session fail
+with `session-not-found` and a message that names the end.
+
 ## Live viewer
 
 `rdpilot view` shows the daemon's live sessions in a browser. A viewer tab
