@@ -32,7 +32,7 @@ struct Session {
 }
 
 impl ManagedSession for Session {
-    fn close(self: Box<Self>) -> BoxFuture<'static, Result<(), DaemonError>> {
+    fn close(&self) -> BoxFuture<'_, Result<(), DaemonError>> {
         if let Some(f) = &self.frames {
             f.end();
         }

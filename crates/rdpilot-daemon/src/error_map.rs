@@ -66,6 +66,7 @@ impl From<DaemonError> for WireError {
             DaemonError::Recording(_) => WireErrorCode::Recording,
             DaemonError::Bundle(_) => WireErrorCode::BundleUnavailable,
             DaemonError::HumanControl { .. } => WireErrorCode::HumanControl,
+            DaemonError::SessionClosed => WireErrorCode::TransferFailed,
             // No trailing wildcard: `DaemonError` is defined in THIS
             // crate, so — unlike `wire_code_for_sdk_error`'s match on the
             // externally-`#[non_exhaustive]` `rdpilot::Error` above — the
@@ -97,6 +98,20 @@ mod tests {
     use super::*;
 
     const PLANTED_SECRET: &str = "RDPILOT-PLANTED-SECRET-SENTINEL";
+
+    #[test]
+    fn a_transfer_cut_by_close_is_transfer_failed_with_session_closed() {
+        let wire = WireError::from(DaemonError::SessionClosed);
+        assert_eq!(wire.code, WireErrorCode::TransferFailed);
+        assert_eq!(wire.message, "session closed");
+        assert!(wire.controller.is_none());
+    }
+
+    #[test]
+    fn a_dvc_error_stays_internal() {
+        let wire = WireError::from(DaemonError::Sdk(rdpilot::Error::Dvc("gone".to_owned())));
+        assert_eq!(wire.code, WireErrorCode::Internal);
+    }
 
     #[test]
     fn path_traversal_maps_to_path_traversal_code() {

@@ -70,7 +70,7 @@ fn address() -> IpAddr {
 }
 
 async fn human(f: &Fixture) -> crate::control::Grant {
-    f.control.take(address(), async {}).await.unwrap()
+    f.control.take(address()).await.unwrap()
 }
 
 fn call(id: u64, name: &str, arguments: Value) -> Value {
@@ -311,7 +311,7 @@ async fn a_human_take_waits_for_forwarded_acting_calls_and_their_eviction_or_clo
     forwarded(f.gate.inbound(call(1, "hold", json!({}))).0);
     let busy = f
         .control
-        .take_within(address(), async {}, Duration::from_secs(10))
+        .take_within(address(), Duration::from_secs(10))
         .await;
     assert_eq!(busy.unwrap_err(), TakeError::Busy);
     let mut answer = json!({"jsonrpc":"2.0","id":1,"result":{"content":[]}});
@@ -333,5 +333,5 @@ async fn a_human_take_waits_for_forwarded_acting_calls_and_their_eviction_or_clo
     let control = Arc::clone(&f.control);
     drop(f.gate);
     assert_eq!(control.inflight(), 0);
-    assert!(control.take(address(), async {}).await.is_ok());
+    assert!(control.take(address()).await.is_ok());
 }

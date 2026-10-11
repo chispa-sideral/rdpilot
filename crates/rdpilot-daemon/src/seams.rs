@@ -44,19 +44,23 @@ use rdpilot_vocab::RawInput;
 /// `Send` explicitly.
 pub(crate) type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
-/// Abstracts the owned, live session handle's close contract.
+/// The daemon's view of one live session.
 ///
-/// Mirrors [`rdpilot::Session::close`]'s awaited thread-join contract
-/// exactly (research Pattern 2): `close` takes `self` by value (via
-/// `Box<Self>`, since this is used behind `dyn`) and returns once the
-/// session's background thread has been joined — never a bare drop.
+/// The registry shares one session among concurrent callers; no lock wraps
+/// it. Its close is a lifecycle command any holder may send.
 pub trait ManagedSession: Send + Sync + 'static {
-    /// Gracefully close the session, awaiting the background thread's join.
+    /// Close the session and join its background thread.
+    ///
+    /// The first poll of the returned future stops the session (its end is
+    /// published and its loop is told to stop) before it waits for anything.
+    /// Awaiting it to the end waits for the one join of the session thread.
+    /// Close is idempotent: every call, also a concurrent one, gets the
+    /// result of that one join.
     ///
     /// # Errors
     ///
     /// Returns [`DaemonError`] if the underlying close/join failed.
-    fn close(self: Box<Self>) -> BoxFuture<'static, Result<(), DaemonError>>;
+    fn close(&self) -> BoxFuture<'_, Result<(), DaemonError>>;
 
     /// The session's current lifecycle status (D-30), derived from
     /// [`ManagedSession::lifecycle`].
@@ -185,7 +189,7 @@ pub trait ManagedSession: Send + Sync + 'static {
     }
 }
 
-/// Sends human input events to one session without the per-session lock.
+/// Sends human input events to one session without waiting for agent work.
 /// Implementations apply them through the same input state and input epoch
 /// as the agent's native input.
 pub trait HumanInput: Send + Sync + 'static {
@@ -349,8 +353,8 @@ impl HumanInput for rdpilot::InputHandle {
 }
 
 impl ManagedSession for Session {
-    fn close(self: Box<Self>) -> BoxFuture<'static, Result<(), DaemonError>> {
-        Box::pin(async move { (*self).close().await.map_err(DaemonError::Sdk) })
+    fn close(&self) -> BoxFuture<'_, Result<(), DaemonError>> {
+        Box::pin(async move { Session::close(self).await.map_err(DaemonError::Sdk) })
     }
 
     fn lifecycle(&self) -> tokio::sync::watch::Receiver<rdpilot::SessionState> {
@@ -605,27 +609,21 @@ pub enum SessionEntry {
     },
     /// A live, connected session.
     Live {
-        /// The owned, type-erased managed session, behind a `tokio::sync::Mutex`
-        /// so [`crate::registry::Registry::call`] can dispatch a `&self`
-        /// operational method WITHOUT holding the registry's synchronous
-        /// outer lock across the call's `.await` (research Pitfall 3): the
-        /// `Arc` is cloned under the outer lock, the outer lock is dropped,
-        /// THEN the inner `tokio::sync::Mutex` is `.await`-locked.
-        ///
-        /// The `Option` lets [`crate::registry::Registry::close`] `.take()`
-        /// the SIZED `Box` out from behind the `Arc` to reclaim ownership
-        /// for its consuming `close()` call — moving the unsized
-        /// `dyn ManagedSession` trait object itself out of an `Arc` does not
-        /// compile (research Pitfall 2); the `Box` (a sized pointer) is what
-        /// actually moves.
-        session: Arc<tokio::sync::Mutex<Option<Box<dyn ManagedSession>>>>,
+        /// The shared, type-erased managed session. No lock wraps it:
+        /// [`crate::registry::Registry::call`] clones the `Arc` under the
+        /// registry's synchronous outer lock, drops that lock, then runs the
+        /// operation; a close is a lifecycle command on the same `Arc`.
+        session: Arc<dyn ManagedSession>,
+        /// The transfer worker of this generation (Put, Get and the Connect
+        /// bootstrap, one at a time). A close cancels it first.
+        transfers: crate::transfer::TransferQueue,
         /// Internal monotonic lease generation. It is never exposed over the
         /// IPC wire; it identifies the exact Connect response owner when a
         /// peer closes before receiving `Connected`.
         generation: u64,
         /// The session's lifecycle, captured once at insert like `frame`.
-        /// Reading it takes only the watch's own lock, never the per-session
-        /// mutex above, so `list` never blocks on a busy session.
+        /// Reading it takes only the watch's own lock, so `list` never
+        /// blocks on a busy session.
         lifecycle: tokio::sync::watch::Receiver<rdpilot::SessionState>,
         /// When the connect completed (monotonic; idle-reap arithmetic,
         /// Plan 12-06).
@@ -646,10 +644,10 @@ pub enum SessionEntry {
         /// Owned Cua stream leases prevent idle reaping while a tool or caller is waiting.
         cua_leases: Arc<std::sync::atomic::AtomicUsize>,
         /// Passive frame source for the live viewer, captured once at insert
-        /// so viewer reads never take the per-session mutex above.
+        /// so viewer reads never reach the session.
         frame: Option<Arc<dyn ViewFrameSource>>,
         /// This incarnation's event log (names, outcomes and timings only).
-        /// Recording and reading never take the per-session mutex above.
+        /// Recording and reading never reach the session.
         events: Arc<crate::events::SessionEvents>,
         /// The task that handles an end of the session not caused by a
         /// daemon close (record, `session_ended`, human lease). Aborted when
@@ -836,6 +834,10 @@ pub enum DaemonError {
         address: String,
         since: String,
     },
+    /// The session was closed while a transfer (Put, Get or the Connect
+    /// bootstrap) was queued, running or waiting for queue capacity.
+    #[error("session closed")]
+    SessionClosed,
 }
 
 /// Supplies the verified bundle directory a Cua-enabled connect serves.
@@ -954,6 +956,7 @@ mod tests {
                 address: "127.0.0.1".to_owned(),
                 since: "2026-01-01T14:02:07Z".to_owned(),
             },
+            DaemonError::SessionClosed,
         ];
         for err in cases {
             let rendered = format!("{err}");

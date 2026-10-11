@@ -31,7 +31,7 @@ type OpFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 struct FakeSession;
 
 impl ManagedSession for FakeSession {
-    fn close(self: Box<Self>) -> TestFuture<Result<(), DaemonError>> {
+    fn close(&self) -> OpFuture<'_, Result<(), DaemonError>> {
         Box::pin(async { Ok(()) })
     }
 

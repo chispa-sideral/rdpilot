@@ -44,18 +44,19 @@ type OpFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// `spawn_blocking` — mirroring `Session::close`'s own join shape exactly.
 struct ThreadOwningFakeSession {
     stop_tx: std_mpsc::Sender<()>,
-    thread: Option<JoinHandle<()>>,
+    /// Taken once by the first close, so the thread is joined exactly once.
+    thread: std::sync::Mutex<Option<JoinHandle<()>>>,
 }
 
 impl ManagedSession for ThreadOwningFakeSession {
-    fn close(self: Box<Self>) -> TestFuture<Result<(), DaemonError>> {
+    fn close(&self) -> OpFuture<'_, Result<(), DaemonError>> {
         Box::pin(async move {
-            let mut this = self;
             // Best-effort: if the thread already exited for some reason,
             // the send simply fails and is ignored (mirrors
             // `Session::close`'s own best-effort shutdown-request send).
-            let _ = this.stop_tx.send(());
-            if let Some(thread) = this.thread.take() {
+            let _ = self.stop_tx.send(());
+            let thread = self.thread.lock().expect("test mutex").take();
+            if let Some(thread) = thread {
                 tokio::task::spawn_blocking(move || thread.join())
                     .await
                     .map_err(|e| DaemonError::Io(format!("join task failed: {e}")))?
@@ -150,7 +151,7 @@ impl SessionConnector for ThreadOwningFakeConnector {
                 })?;
             Ok(Box::new(ThreadOwningFakeSession {
                 stop_tx,
-                thread: Some(thread),
+                thread: std::sync::Mutex::new(Some(thread)),
             }) as Box<dyn ManagedSession>)
         })
     }

@@ -55,7 +55,7 @@ struct FakeSession {
 type Lifecycle = std::sync::Arc<tokio::sync::watch::Sender<rdpilot::SessionState>>;
 
 impl ManagedSession for FakeSession {
-    fn close(self: Box<Self>) -> TestFuture<Result<(), DaemonError>> {
+    fn close(&self) -> OpFuture<'_, Result<(), DaemonError>> {
         Box::pin(async { Ok(()) })
     }
 

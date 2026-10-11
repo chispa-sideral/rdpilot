@@ -94,7 +94,7 @@ impl crate::seams::HumanInput for InputLog {
 }
 
 impl ManagedSession for FramedSession {
-    fn close(self: Box<Self>) -> BoxFuture<'static, Result<(), DaemonError>> {
+    fn close(&self) -> BoxFuture<'_, Result<(), DaemonError>> {
         end_lifecycle(&self.lifecycle, rdpilot::EndCause::ClientClosed);
         self.frames.end();
         Box::pin(async { Ok(()) })

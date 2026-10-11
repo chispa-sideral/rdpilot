@@ -55,6 +55,7 @@ use crate::seams::{
     BoxFuture, BundleSource, CancelCause, DaemonError, ManagedSession, NoBundleSource,
     ReconciliationSink, SessionConnector, SessionEntry, ViewFrameSource,
 };
+use crate::transfer::TransferQueue;
 
 /// Word lists for [`generate_auto_id`] (D-29: short, human-legible
 /// adjective-noun auto-generated ids, e.g. `brave-otter`). Deliberately
@@ -613,6 +614,7 @@ impl Registry {
             }
         };
 
+        let session: Arc<dyn ManagedSession> = Arc::from(session);
         let frame = session.frame_source();
         let generation = attempt;
         let events = Arc::new(SessionEvents::new(&id, generation, frame.clone()));
@@ -657,10 +659,14 @@ impl Registry {
                     id.clone(),
                     generation,
                 );
+                // The worker serves this generation only. Spawning does not
+                // await.
+                let transfers = TransferQueue::start(Arc::clone(&session));
                 guard.insert(
                     id.clone(),
                     SessionEntry::Live {
-                        session: Arc::new(tokio::sync::Mutex::new(Some(session))),
+                        session,
+                        transfers,
                         generation,
                         lifecycle,
                         connected_since: Instant::now(),
@@ -796,9 +802,14 @@ impl Registry {
 
     /// Close a `Live` entry that was removed from the map under the registry
     /// lock: the one close sequence of every removal path. Its own close is
-    /// not a server-side end, so the end hook is dropped before the session
-    /// loop is told to stop. The record is removed whatever the close
-    /// returns, and the close error still reaches the caller.
+    /// not a server-side end, so the end hook is dropped first. Then, in this
+    /// order and without waiting for any operation in flight: the transfer
+    /// worker is cancelled (its callers get [`DaemonError::SessionClosed`]),
+    /// the first poll of the session's close publishes its end and stops its
+    /// loop, the human lease ends without sending anything, the recording
+    /// closes, and the close is awaited to the join of the session thread.
+    /// The record is removed whatever the close returns, and the close error
+    /// still reaches the caller.
     ///
     /// For a session that has already ended, the record is removed before
     /// the close is awaited, so a caller dropped during the close (a
@@ -814,6 +825,7 @@ impl Registry {
         let ended = entry.end_cause().is_some();
         let SessionEntry::Live {
             session,
+            transfers,
             generation,
             end_hook,
             events,
@@ -826,24 +838,20 @@ impl Registry {
         drop(end_hook);
         if ended {
             self.records.closed(id, generation);
-            // The session loop is gone: nothing to confirm.
-            end_lease_of_ended(&control).await;
-        } else {
-            end_lease(&control, EndReason::SessionEnded).await;
         }
+        transfers.cancel();
+        // One explicit first poll: it ends the lifecycle and stops the loop
+        // before anything below. `Ready` is the result of a session that was
+        // already closed.
+        use std::future::Future as _;
+        let mut close = std::pin::pin!(session.close());
+        let first =
+            std::future::poll_fn(|cx| std::task::Poll::Ready(close.as_mut().poll(cx))).await;
+        end_lease_on_close(&control);
         self.recordings.session_closed(&events, reason);
-        // Take the SIZED `Box` out of the `Option` (never the unsized
-        // `dyn ManagedSession` itself, which does not compile out of an
-        // `Arc` -- research Pitfall 2) and close it -- NEVER a bare drop
-        // (DAEMON-01). `try_lock` cannot be used here: `close` is this
-        // session's terminal operation and MUST wait for any concurrent
-        // `Registry::call` in flight to finish before reclaiming ownership,
-        // not race past it. A box already taken by a concurrent close is a
-        // clean success, not a double-close error.
-        let boxed = { session.lock().await.take() };
-        let result = match boxed {
-            Some(boxed) => boxed.close().await, // joins the OS thread
-            None => Ok(()),
+        let result = match first {
+            std::task::Poll::Ready(result) => result,
+            std::task::Poll::Pending => close.await, // joins the OS thread
         };
         self.records.closed(id, generation);
         result
@@ -914,20 +922,14 @@ impl Registry {
 
     /// Dispatch an operation onto the live session `id` WITHOUT holding the
     /// registry's synchronous outer [`Mutex`] across the operation's
-    /// `.await` (research Pitfall 3): the `Arc` wrapping the session is
-    /// cloned under the outer lock, the outer lock is DROPPED, THEN the
-    /// inner `tokio::sync::Mutex` is `.await`-locked to reach the boxed
-    /// session and run `op`.
-    ///
-    /// Calls to the SAME session serialize (the inner `tokio::sync::Mutex`
-    /// is per-session); calls to DIFFERENT sessions never block each other
-    /// (each `Live` entry owns its own `Arc`) — pre-satisfying Phase 14's
-    /// MCP-06 non-blocking-isolation property.
+    /// `.await`: the session's `Arc` is cloned under the
+    /// outer lock, the lock is DROPPED, then `op` runs. No lock wraps the
+    /// session: calls to one session run concurrently, and calls to
+    /// different sessions never block each other.
     ///
     /// # Errors
     ///
-    /// Returns [`DaemonError::SessionNotFound`] if `id` has no entry (or was
-    /// closed mid-flight between the clone and the inner lock),
+    /// Returns [`DaemonError::SessionNotFound`] if `id` has no entry,
     /// [`DaemonError::StillConnecting`] if `id`'s connect is still in
     /// flight, or whatever `op` itself returns.
     pub async fn call<T>(
@@ -935,37 +937,36 @@ impl Registry {
         id: &SessionId,
         op: impl for<'a> FnOnce(&'a dyn ManagedSession) -> BoxFuture<'a, Result<T, DaemonError>>,
     ) -> Result<T, DaemonError> {
-        let entry = {
-            #[allow(clippy::expect_used)] // A poisoned registry mutex is unrecoverable.
-            let guard = self.sessions.lock().expect("registry mutex poisoned");
-            let found = guard.get(id);
-            refuse_ended(id, found)?;
-            match found {
-                Some(SessionEntry::Live { session, .. }) => Arc::clone(session),
-                Some(SessionEntry::Connecting { .. }) => {
-                    return Err(DaemonError::StillConnecting(id.as_str().to_owned()));
-                }
-                Some(SessionEntry::Orphaned { .. }) | None => {
-                    return Err(DaemonError::SessionNotFound(id.as_str().to_owned()));
-                }
-            }
-        }; // outer lock dropped here — never held across the .await below
+        let session = self.live_session(id)?.0;
+        op(&*session).await
+    }
 
-        let guard = entry.lock().await; // tokio::sync::Mutex — safe across .await
-        match guard.as_deref() {
-            Some(session) => op(session).await,
-            None => Err(DaemonError::SessionNotFound(id.as_str().to_owned())), // closed mid-flight
+    /// The session and control lease of live session `id`, cloned under the
+    /// outer lock.
+    fn live_session(
+        &self,
+        id: &SessionId,
+    ) -> Result<(Arc<dyn ManagedSession>, Arc<SessionControl>), DaemonError> {
+        #[allow(clippy::expect_used)] // A poisoned registry mutex is unrecoverable.
+        let guard = self.sessions.lock().expect("registry mutex poisoned");
+        let found = guard.get(id);
+        refuse_ended(id, found)?;
+        match found {
+            Some(SessionEntry::Live {
+                session, control, ..
+            }) => Ok((Arc::clone(session), Arc::clone(control))),
+            other => Err(not_live(id, other)),
         }
     }
 
-    /// Like [`Registry::call`], for agent input (native Mouse and Key): after
-    /// the per-session lock is taken, the call is refused while a human
-    /// viewer holds (or is taking) the control lease, and waits for the
-    /// releases of an ended lease to be sent. Checking under the
-    /// per-session lock is what orders it with a human take, which marks
-    /// the lease first and then waits for this lock. `op` sends with the
-    /// input epoch captured at admission; input refused as stale while a
-    /// human holds or takes the lease is that human's control.
+    /// Like [`Registry::call`], for agent input (native Mouse and Key): the
+    /// call is refused while a human viewer holds (or is taking) the control
+    /// lease, and waits for the releases of an ended lease to be sent. `op`
+    /// sends with the input epoch captured at admission. The epoch, not a
+    /// lock, orders it with a human take: a take advances the epoch, and the
+    /// session loop refuses this input as stale from its next batch. Input
+    /// refused as stale while a human holds or takes the lease is that
+    /// human's control.
     ///
     /// # Errors
     ///
@@ -978,31 +979,42 @@ impl Registry {
             InputEpoch,
         ) -> BoxFuture<'a, Result<T, DaemonError>>,
     ) -> Result<T, DaemonError> {
-        let (entry, control) = {
+        let (session, control) = self.live_session(id)?;
+        let epoch = control.admit_agent().await?;
+        op(&*session, epoch)
+            .await
+            .map_err(|error| control.stale_error(error))
+    }
+
+    /// Run `op` as a job of live session `id`'s transfer worker: after the
+    /// jobs queued before it, one at a time. A `blocking` job runs on a
+    /// blocking-pool thread (its synchronous local copy and hash never hold a
+    /// runtime worker). Under the outer lock only the queue handle is
+    /// cloned.
+    ///
+    /// # Errors
+    ///
+    /// As for [`Registry::call`], plus [`DaemonError::SessionClosed`] when
+    /// the session is closed while the job waits, is queued or runs.
+    pub(crate) async fn transfer<T: Send + 'static>(
+        &self,
+        id: &SessionId,
+        op: impl FnOnce(Arc<dyn ManagedSession>) -> BoxFuture<'static, Result<T, DaemonError>>
+            + Send
+            + 'static,
+        blocking: bool,
+    ) -> Result<T, DaemonError> {
+        let queue = {
             #[allow(clippy::expect_used)] // A poisoned registry mutex is unrecoverable.
             let guard = self.sessions.lock().expect("registry mutex poisoned");
             let found = guard.get(id);
             refuse_ended(id, found)?;
             match found {
-                Some(SessionEntry::Live {
-                    session, control, ..
-                }) => (Arc::clone(session), Arc::clone(control)),
-                Some(SessionEntry::Connecting { .. }) => {
-                    return Err(DaemonError::StillConnecting(id.as_str().to_owned()));
-                }
-                Some(SessionEntry::Orphaned { .. }) | None => {
-                    return Err(DaemonError::SessionNotFound(id.as_str().to_owned()));
-                }
+                Some(SessionEntry::Live { transfers, .. }) => transfers.handle(),
+                other => return Err(not_live(id, other)),
             }
         };
-        let guard = entry.lock().await;
-        let epoch = control.admit_agent().await?;
-        match guard.as_deref() {
-            Some(session) => op(session, epoch)
-                .await
-                .map_err(|error| control.stale_error(error)),
-            None => Err(DaemonError::SessionNotFound(id.as_str().to_owned())),
-        }
+        queue.run(id.as_str(), op, blocking).await
     }
 
     /// The control lease of live session `id`; `None` once it has ended.
@@ -1071,24 +1083,19 @@ impl Registry {
         Ok((previous, changed))
     }
 
-    /// The per-session lock of `id` plus its control, for a human take: the
-    /// take waits on the lock to let an in-flight native operation finish.
+    /// The control of `id`, for a human take.
     ///
     /// # Errors
     ///
     /// [`ControlRefusal::NoSession`] when `id` is not a live session with an
     /// input path (or has ended); [`TakeError::Busy`] at once while its bridge
     /// bootstrap types its launch keys.
-    pub(crate) fn take_parts(
-        &self,
-        id: &SessionId,
-    ) -> Result<(SessionSlot, Arc<SessionControl>), ControlRefusal> {
+    pub(crate) fn take_parts(&self, id: &SessionId) -> Result<Arc<SessionControl>, ControlRefusal> {
         #[allow(clippy::expect_used)] // A poisoned registry mutex is unrecoverable.
         let guard = self.sessions.lock().expect("registry mutex poisoned");
         match guard.get(id) {
             Some(
                 entry @ SessionEntry::Live {
-                    session,
                     control,
                     bootstrapping,
                     ..
@@ -1097,14 +1104,14 @@ impl Registry {
                 if bootstrapping.load(Ordering::Acquire) {
                     return Err(ControlRefusal::Take(TakeError::Busy));
                 }
-                Ok((Arc::clone(session), Arc::clone(control)))
+                Ok(Arc::clone(control))
             }
             _ => Err(ControlRefusal::NoSession),
         }
     }
 
     /// Capture the incarnation and acquire a stream under one short session lease.
-    /// Neither the global registry lock nor the per-session lock escapes this call.
+    /// The global registry lock does not escape this call.
     /// Also returns the session's event log, so the stream records without
     /// touching the registry per message.
     pub(crate) async fn attach_cua(&self, id: &SessionId) -> Result<CuaAttach, DaemonError> {
@@ -1134,11 +1141,7 @@ impl Registry {
                 _ => return Err(DaemonError::SessionNotFound(id.as_str().into())),
             }
         };
-        let guard = entry.lock().await;
-        let session = guard
-            .as_deref()
-            .ok_or_else(|| DaemonError::SessionNotFound(id.as_str().into()))?;
-        let attachment = session.attach_cua().await?;
+        let attachment = entry.attach_cua().await?;
         cua_leases.fetch_add(1, Ordering::Relaxed);
         Ok(CuaAttach {
             generation,
@@ -1344,15 +1347,20 @@ impl Registry {
     }
 }
 
-/// The per-session lock around a live session.
-pub(crate) type SessionSlot = Arc<tokio::sync::Mutex<Option<Box<dyn ManagedSession>>>>;
-
 /// End `control`'s human lease (if any) for `reason` and send its epoch
 /// change (or its releases).
 pub(crate) async fn end_lease(control: &SessionControl, reason: EndReason) {
     if let Some(transition) = control.end_human(reason) {
         control.discharge(transition).await;
     }
+}
+
+/// End `control`'s human lease (if any) because its session is being closed.
+/// Nothing is sent and nothing is waited for: the transition is dropped,
+/// which ends its pending count. The release obligation ends with the RDP
+/// connection.
+fn end_lease_on_close(control: &SessionControl) {
+    drop(control.end_human_ended());
 }
 
 /// End `control`'s human lease (if any) because its session ended. Nothing is
@@ -1373,6 +1381,18 @@ fn refuse_ended(id: &SessionId, entry: Option<&SessionEntry>) -> Result<(), Daem
             cause: cause.to_string(),
         }),
         None => Ok(()),
+    }
+}
+
+/// The refusal for `id` when `entry` is not a live session:
+/// [`DaemonError::StillConnecting`] while its connect is in flight, else
+/// [`DaemonError::SessionNotFound`].
+fn not_live(id: &SessionId, entry: Option<&SessionEntry>) -> DaemonError {
+    match entry {
+        Some(SessionEntry::Connecting { .. }) => {
+            DaemonError::StillConnecting(id.as_str().to_owned())
+        }
+        _ => DaemonError::SessionNotFound(id.as_str().to_owned()),
     }
 }
 
@@ -1440,8 +1460,8 @@ pub(crate) struct ViewerSession {
 ///
 /// Declared here, outside the `viewer` module tree, so the viewer cannot
 /// reach the private `Registry` field and therefore cannot call `call`,
-/// `close`, `open`, `attach_cua` or `touch_generation`. It never takes a
-/// per-session mutex and never changes activity, leases or entries.
+/// `close`, `open`, `attach_cua` or `touch_generation`. It never reaches a
+/// session and never changes activity, leases or entries.
 #[derive(Clone)]
 pub(crate) struct ViewerRegistry {
     inner: Arc<Registry>,
@@ -1549,22 +1569,17 @@ impl ViewerControl {
             .ok_or(ControlRefusal::NoSession)
     }
 
-    /// Take the lease of `id` for a tab at `address`. The take waits for
-    /// the per-session lock, so an in-flight native agent operation ends
-    /// first.
+    /// Take the lease of `id` for a tab at `address`. The take waits only
+    /// for in-flight acting Cua calls and the epoch confirmation, within one
+    /// bound; agent native input in flight is cut at its next batch by the
+    /// epoch change.
     pub(crate) async fn take(
         &self,
         id: &SessionId,
         address: std::net::IpAddr,
     ) -> Result<(Grant, Option<(u32, u32)>), ControlRefusal> {
-        let (slot, control) = self.inner.take_parts(id)?;
-        let agent_idle = async move {
-            drop(slot.lock().await);
-        };
-        let grant = control
-            .take(address, agent_idle)
-            .await
-            .map_err(ControlRefusal::Take)?;
+        let control = self.inner.take_parts(id)?;
+        let grant = control.take(address).await.map_err(ControlRefusal::Take)?;
         Ok((grant, control.geometry()))
     }
 
@@ -1759,7 +1774,7 @@ mod tests {
     impl ManagedSession for FakeSession {
         /// Counts when the returned future is polled, not when `close` is
         /// called: a future that is dropped unpolled closes nothing.
-        fn close(self: Box<Self>) -> TestFuture<Result<(), DaemonError>> {
+        fn close(&self) -> BoxFuture<'_, Result<(), DaemonError>> {
             let closes = Arc::clone(&self.closes);
             end_lifecycle(&self.lifecycle, rdpilot::EndCause::ClientClosed);
             let fails = self.close_fails;
@@ -2933,17 +2948,15 @@ mod tests {
     /// own refusal checks.
     fn described(registry: &Registry, name: &str) -> Option<SessionLifecycle> {
         #[allow(clippy::expect_used)]
-        let slot = match registry
+        match registry
             .sessions
             .lock()
             .expect("registry mutex")
             .get(&sid(name))
         {
-            Some(SessionEntry::Live { session, .. }) => Arc::clone(session),
-            _ => return None,
-        };
-        let guard = slot.try_lock().ok()?;
-        guard.as_deref().map(|session| session.describe())
+            Some(SessionEntry::Live { session, .. }) => Some(session.describe()),
+            _ => None,
+        }
     }
 
     fn ended_events(registry: &Registry, name: &str) -> usize {
@@ -3364,10 +3377,8 @@ mod tests {
             let registry = Arc::clone(&registry);
             tokio::spawn(async move { registry.call(&sid("alpha"), |s| s.ping()).await })
         };
-        until("the operation holds the session", || {
-            described(&registry, "alpha").is_none()
-        })
-        .await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!op.is_finished(), "the operation waits at its gate");
         let started = std::time::Instant::now();
         assert_eq!(listed(&registry, "alpha"), Some(SessionLifecycle::Live));
         assert_eq!(

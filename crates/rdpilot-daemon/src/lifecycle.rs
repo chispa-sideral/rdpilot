@@ -313,7 +313,7 @@ mod tests {
     }
 
     impl ManagedSession for FakeSession {
-        fn close(self: Box<Self>) -> TestFuture<Result<(), DaemonError>> {
+        fn close(&self) -> BoxFuture<'_, Result<(), DaemonError>> {
             self.closed.store(true, Ordering::SeqCst);
             Box::pin(async { Ok(()) })
         }
@@ -502,7 +502,7 @@ mod tests {
             .expect("open should succeed");
         let control = registry.control(&id).expect("live");
         control
-            .take("127.0.0.1".parse().unwrap(), async {})
+            .take("127.0.0.1".parse().unwrap())
             .await
             .expect("take");
         let cfg = LifecycleConfig {
