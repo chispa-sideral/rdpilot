@@ -18,7 +18,9 @@
 // so the module-level allow stays rather than per-item annotation churn.
 #![allow(dead_code)]
 
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
@@ -39,6 +41,40 @@ use crate::seams::{BundleSource, DaemonError};
 pub(crate) struct DispatchOutcome {
     pub(crate) response: WireResponse,
     pub(crate) connect_lease: Option<ConnectLease>,
+    /// The IPC peer left while a Connect was in flight and the daemon has
+    /// already cancelled it: nothing is left to write or reclaim, and
+    /// `response` is a placeholder that must not be sent.
+    pub(crate) peer_closed: bool,
+}
+
+impl DispatchOutcome {
+    /// An answer that holds no connect lease.
+    fn reply(response: WireResponse) -> Self {
+        Self {
+            response,
+            connect_lease: None,
+            peer_closed: false,
+        }
+    }
+
+    fn peer_closed() -> Self {
+        Self {
+            peer_closed: true,
+            ..Self::reply(WireResponse::Ack)
+        }
+    }
+}
+
+/// A future that completes when the IPC peer of a Connect is gone (or has
+/// broken the request/response order by writing early).
+pub(crate) type PeerWatch<'a> = Pin<&'a mut (dyn Future<Output = ()> + Send + 'a)>;
+
+/// Completes when `watch` does; never completes without a watch.
+async fn peer_gone(watch: &mut Option<PeerWatch<'_>>) {
+    match watch {
+        Some(watch) => watch.as_mut().await,
+        None => std::future::pending().await,
+    }
 }
 
 /// Route one decoded `Request` to `registry` and produce the corresponding
@@ -55,7 +91,7 @@ pub(crate) struct DispatchOutcome {
 /// Native recovery and transfer operations use a short registry call.
 /// CuaAttach is handled by the authenticated IPC stream upgrade.
 pub async fn dispatch(registry: &Registry, req: Request) -> WireResponse {
-    dispatch_for_ipc(registry, req, None).await.response
+    dispatch_for_ipc(registry, req, None, None).await.response
 }
 
 /// The fields of `Request::Connect`.
@@ -78,11 +114,20 @@ pub(crate) struct ConnectFields {
 /// bundle before the RDP connection starts; otherwise the connect fails
 /// closed and no RDP session is opened. With `cua_enabled` off, `bundles`
 /// is never asked.
+///
+/// With a `watch`, the peer is watched at the two awaits that can be
+/// abandoned safely: the handshake, where dropping the wait cancels the
+/// connect, and the bridge bootstrap, where the entry is closed by its lease.
+/// The recording start, the close of a failed bootstrap and the response
+/// build are not watched, so no close is cut in half. A peer that leaves in
+/// an unwatched step is seen by the next watched await or by the failed
+/// `Connected` write.
 pub(crate) async fn dispatch_connect(
     registry: &Registry,
     fields: ConnectFields,
     diagnostics: Option<&Diagnostics>,
     bundles: &dyn BundleSource,
+    mut watch: Option<PeerWatch<'_>>,
 ) -> DispatchOutcome {
     let ConnectFields {
         name,
@@ -115,10 +160,7 @@ pub(crate) async fn dispatch_connect(
     let share_root = match resolve_share_root() {
         Ok(path) => path,
         Err(e) => {
-            return DispatchOutcome {
-                response: WireResponse::Error(e.into()),
-                connect_lease: None,
-            }
+            return DispatchOutcome::reply(WireResponse::Error(e.into()));
         }
     };
     cfg = cfg.share_root(share_root);
@@ -144,24 +186,29 @@ pub(crate) async fn dispatch_connect(
                 true
             }
             Err(e) => {
-                return DispatchOutcome {
-                    response: WireResponse::Error(DaemonError::Bundle(e.to_string()).into()),
-                    connect_lease: None,
-                }
+                return DispatchOutcome::reply(WireResponse::Error(
+                    DaemonError::Bundle(e.to_string()).into(),
+                ));
             }
         }
     } else {
         false
     };
-    let (lease, recording) = match registry.open_tracked(name, host, cfg, record).await {
-        Ok(opened) => opened,
-        Err(e) => {
-            return DispatchOutcome {
-                response: WireResponse::Error(e.into()),
-                connect_lease: None,
-            }
-        }
+    // Dropping `open_tracked` here cancels the connect and releases its
+    // placeholder (`ConnectGuard`); it adds no `.await` after the entry is
+    // `Live`, so no entry can outlive the drop. `select!` drops both futures
+    // before a branch runs.
+    let lease = tokio::select! {
+        biased;
+        opened = registry.open_tracked(name, host, cfg) => match opened {
+            Ok(lease) => lease,
+            Err(e) => return DispatchOutcome::reply(WireResponse::Error(e.into())),
+        },
+        () = peer_gone(&mut watch) => return DispatchOutcome::peer_closed(),
     };
+    // No `.await` and no diagnostics call between `open_tracked` and the
+    // recording start, and the start is not watched.
+    let recording = registry.start_connect_recording(&lease.id, record).await;
     let session = lease.id.clone();
     if let Some(diagnostics) = diagnostics {
         diagnostics.record(session.as_str(), Stage::RegistryOpened);
@@ -171,7 +218,23 @@ pub(crate) async fn dispatch_connect(
         if let Some(diagnostics) = diagnostics {
             diagnostics.record(session.as_str(), Stage::BridgeBootstrapStarted);
         }
-        let bootstrap = registry.call(&session, |s| s.deploy_and_launch()).await;
+        // Dropping the call releases the session lock and stops the bootstrap
+        // loop at its next await; the entry is then closed by its lease.
+        let bootstrap = tokio::select! {
+            biased;
+            bootstrap = registry.call(&session, |s| s.deploy_and_launch()) => bootstrap,
+            () = peer_gone(&mut watch) => {
+                if let Some(diagnostics) = diagnostics {
+                    diagnostics.record(session.as_str(), Stage::IpcPeerClosed);
+                }
+                if matches!(registry.close_if_generation(&lease).await, Ok(true)) {
+                    if let Some(diagnostics) = diagnostics {
+                        diagnostics.record(session.as_str(), Stage::RegistryClosed);
+                    }
+                }
+                return DispatchOutcome::peer_closed();
+            }
+        };
         let bootstrap_stages = registry
             .call(&session, |s| {
                 Box::pin(async move { Ok(s.bootstrap_stages()) })
@@ -187,10 +250,7 @@ pub(crate) async fn dispatch_connect(
                     diagnostics.record(session.as_str(), Stage::RegistryClosed);
                 }
             }
-            return DispatchOutcome {
-                response: WireResponse::Error(e.into()),
-                connect_lease: None,
-            };
+            return DispatchOutcome::reply(WireResponse::Error(e.into()));
         }
         if let Some(diagnostics) = diagnostics {
             diagnostics.record(session.as_str(), Stage::BridgeBootstrapFinished);
@@ -212,15 +272,19 @@ pub(crate) async fn dispatch_connect(
             warnings,
         },
         connect_lease: Some(lease),
+        peer_closed: false,
     }
 }
 
 /// Dispatch one request for the IPC server. Connect is special: the returned
-/// private lease is valid only until the matching Connected frame is written.
+/// private lease is valid only until the matching Connected frame is written,
+/// and a `watch` on its peer cancels it in flight (see [`dispatch_connect`]).
+/// Other requests ignore the `watch`.
 pub(crate) async fn dispatch_for_ipc(
     registry: &Registry,
     req: Request,
     diagnostics: Option<&Diagnostics>,
+    watch: Option<PeerWatch<'_>>,
 ) -> DispatchOutcome {
     // Native verbs are recorded by name only (never coordinates, keys or
     // paths). Unknown or connecting sessions have no log and record nothing.
@@ -262,6 +326,7 @@ pub(crate) async fn dispatch_for_ipc(
                 },
                 diagnostics,
                 registry.bundle_source(),
+                watch,
             )
             .await;
         }
@@ -375,10 +440,7 @@ pub(crate) async fn dispatch_for_ipc(
     if let Some(call) = cli_call {
         call.finish(!matches!(response, WireResponse::Error(_)));
     }
-    DispatchOutcome {
-        response,
-        connect_lease: None,
-    }
+    DispatchOutcome::reply(response)
 }
 
 /// Start recording `session` now. Takes only the registry's brief outer
@@ -726,7 +788,8 @@ mod tests {
             calls: calls.clone(),
             result,
         };
-        let outcome = dispatch_connect(&registry, connect_fields(cua_enabled), None, &source).await;
+        let outcome =
+            dispatch_connect(&registry, connect_fields(cua_enabled), None, &source, None).await;
         let recorded = bundles.lock().map(|b| b.clone()).unwrap_or_default();
         ConnectRun {
             response: outcome.response,

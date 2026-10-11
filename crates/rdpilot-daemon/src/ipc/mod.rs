@@ -35,7 +35,7 @@ pub use windows::{accept_and_authorize, bind, socket_path};
 
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 
 mod cua_gate;
 
@@ -64,7 +64,7 @@ pub(crate) async fn serve_connection<S>(
     diagnostics: Option<&Diagnostics>,
     viewer: Option<&ViewerContext>,
 ) where
-    S: AsyncRead + AsyncWrite + Unpin,
+    S: AsyncRead + AsyncWrite + Unpin + Send,
 {
     loop {
         let req = match read_frame(&mut stream).await {
@@ -162,7 +162,23 @@ pub(crate) async fn serve_connection<S>(
             }
             return;
         }
-        let outcome = dispatch_for_ipc(registry, req, diagnostics).await;
+        let outcome = if matches!(req, Request::Connect { .. }) {
+            // A client sends nothing between Connect and its answer, so any
+            // read result (end of stream, an error, or an early byte) means
+            // the peer is gone. `dispatch_for_ipc` cancels the connect, and
+            // the borrow of the stream ends before the answer is written.
+            let watch = async {
+                let mut byte = [0u8; 1];
+                let _ = stream.read(&mut byte).await;
+            };
+            let watch = std::pin::pin!(watch);
+            dispatch_for_ipc(registry, req, diagnostics, Some(watch)).await
+        } else {
+            dispatch_for_ipc(registry, req, diagnostics, None).await
+        };
+        if outcome.peer_closed {
+            return;
+        }
         if write_frame(&mut stream, &outcome.response).await.is_err() {
             if let Some(lease) = outcome.connect_lease {
                 if let Some(diagnostics) = diagnostics {

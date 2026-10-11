@@ -308,9 +308,30 @@ class Run:
                      "domain": cred.get("domain"), "accept_invalid_certs": True}
             for target, cred in self.credentials.items()})
 
+    async def clean_up_timed_out_connect(self, target):
+        """After a connect timeout `cli` has killed the CLI, which closes its IPC
+        connection and cancels the connect in the daemon. Disconnect must answer
+        Ack, or session-not-found when the cancel was first, and `list` must not
+        show the target."""
+        result = await self.cli("disconnect", "--session", target, timeout=15, allow_failure=True)
+        if result.get("ok") is True:
+            outcome = "ack"
+        elif result.get("error", {}).get("code") == "session-not-found":
+            outcome = "session-not-found"
+        else:
+            raise ProofError(self.clean(f"{target}: connect timeout cleanup: disconnect answered {result}"))
+        listed = await self.cli("list", timeout=15)
+        require(isinstance(listed, list), f"{target}: connect timeout cleanup: list answered {listed}")
+        require(all(s.get("id") != target for s in listed), f"{target}: still listed after the connect timeout")
+        self.check(f"{target}.connect_timeout_cleanup", disconnect=outcome)
+
     async def connect(self, target):
         hosts = self.hosts_for_relays()
-        result = await self.cli("connect", target, "-F", str(hosts), "--name", target, target=target, timeout=self.args.connect_timeout)
+        try:
+            result = await self.cli("connect", target, "-F", str(hosts), "--name", target, target=target, timeout=self.args.connect_timeout)
+        except asyncio.TimeoutError:
+            await self.clean_up_timed_out_connect(target)
+            raise
         require(result.get("bridge_live"), "Connect did not report live bridge")
         self.check(f"{target}.rdp_bundle_ready")
 

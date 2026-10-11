@@ -89,6 +89,39 @@ fn request(name: &str) -> Request {
     }
 }
 
+fn request_with_cua(name: &str) -> Request {
+    match request(name) {
+        Request::Connect {
+            name,
+            host,
+            port,
+            username,
+            password,
+            domain,
+            accept_invalid_certs,
+            cua_version,
+            cua_auto_download,
+            connect_ack,
+            record,
+            ..
+        } => Request::Connect {
+            name,
+            host,
+            port,
+            username,
+            password,
+            domain,
+            accept_invalid_certs,
+            cua_enabled: true,
+            cua_version,
+            cua_auto_download,
+            connect_ack,
+            record,
+        },
+        other => other,
+    }
+}
+
 fn stop(child: &mut std::process::Child) {
     let _ = child.kill();
     let _ = child.wait();
@@ -115,33 +148,94 @@ async fn acknowledge(stream: &mut UnixStream, name: &str) -> rdpilot_ipc::Sessio
     session
 }
 
+/// A client that leaves while its connect is still in flight cancels it:
+/// nothing is listed or recorded, now or after the gate opens, and a restart
+/// finds no orphan. The gate stays closed, so the connect cannot finish
+/// before the peer is seen to be gone.
 #[tokio::test]
-async fn early_close_leaves_no_live_or_reconciliation_record_after_restart() {
+async fn peer_close_during_the_handshake_cancels_the_connect_and_leaves_no_record() {
     let root = root("early");
     let mut daemon = spawn(&root);
     let path = socket(&root);
+
     let mut cancelled = connect(&path).await;
     write_frame(&mut cancelled, &request("cancelled")).await;
+    let mut observer = connect(&path).await;
+    wait_until_connecting(&mut observer, "cancelled").await;
+
     cancelled.shutdown().await.expect("close client write side");
     drop(cancelled);
-    release_connect(&root);
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
-    let mut observer = connect(&path).await;
-    write_frame(&mut observer, &Request::List {}).await;
-    assert!(
-        matches!(read_frame(&mut observer).await, WireResponse::SessionList { ref sessions, .. } if sessions.is_empty())
-    );
+    wait_until_absent(&mut observer, "cancelled").await;
     assert!(rdpilot_daemon::scan_orphans(&root.join("sessions.json")).is_empty());
+
+    // The connect would finish now, but its attempt is gone.
+    release_connect(&root);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(list(&mut observer).await.is_empty());
+    assert!(rdpilot_daemon::scan_orphans(&root.join("sessions.json")).is_empty());
+
+    assert_name_free_then_restart_clean(&root, &mut daemon, &mut observer, "cancelled", &[]).await;
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// A client that leaves during the bridge bootstrap closes its entry by the
+/// connect lease, and an independent Live session is untouched.
+#[tokio::test]
+async fn peer_close_during_the_bootstrap_closes_the_entry_and_keeps_an_independent_session() {
+    let root = root("bootstrap");
+    let env = [
+        ("RDPILOT_DAEMON_TEST_CUA", "1"),
+        ("RDPILOT_DAEMON_TEST_BOOTSTRAP_DELAY_MS", "30000"),
+    ];
+    let mut daemon = spawn_with(&root, &env);
+    let path = socket(&root);
+    release_connect(&root);
+
+    let mut control = connect(&path).await;
+    let control_id = acknowledge(&mut control, "keep").await;
+
+    let mut leaving = connect(&path).await;
+    write_frame(&mut leaving, &request_with_cua("boot")).await;
+    let mut observer = connect(&path).await;
+    wait_until_live(&mut observer, "boot").await;
+
+    leaving.shutdown().await.expect("close client write side");
+    drop(leaving);
+    wait_until_absent(&mut observer, "boot").await;
+
+    let sessions = list(&mut observer).await;
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].id, control_id.as_str());
+    assert_eq!(sessions[0].status, SessionLifecycle::Live);
+    write_frame(
+        &mut observer,
+        &Request::Ping {
+            session: control_id.clone(),
+        },
+    )
+    .await;
+    assert!(matches!(read_frame(&mut observer).await, WireResponse::Ack));
+    let records = rdpilot_daemon::scan_orphans(&root.join("sessions.json"));
+    assert_eq!(
+        records.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+        [control_id.as_str()]
+    );
+
+    write_frame(
+        &mut observer,
+        &Request::Disconnect {
+            session: control_id,
+        },
+    )
+    .await;
+    assert!(matches!(read_frame(&mut observer).await, WireResponse::Ack));
     drop(observer);
+    drop(control);
     stop(&mut daemon);
 
-    let mut restarted = spawn(&root);
+    let mut restarted = spawn_with(&root, &env);
     let mut observer = connect(&path).await;
-    write_frame(&mut observer, &Request::List {}).await;
-    assert!(
-        matches!(read_frame(&mut observer).await, WireResponse::SessionList { ref sessions, .. } if sessions.is_empty())
-    );
+    assert!(list(&mut observer).await.is_empty());
     drop(observer);
     stop(&mut restarted);
     let _ = std::fs::remove_dir_all(root);
@@ -224,6 +318,31 @@ async fn wait_until_connecting(observer: &mut UnixStream, name: &str) {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     panic!("{name} never showed as Connecting");
+}
+
+async fn wait_until_live(observer: &mut UnixStream, name: &str) {
+    for _ in 0..250 {
+        if list(observer)
+            .await
+            .iter()
+            .any(|s| s.id == name && s.status == SessionLifecycle::Live)
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("{name} never showed as Live");
+}
+
+/// Bounded to about 2 s, so a regression fails the test instead of hanging it.
+async fn wait_until_absent(observer: &mut UnixStream, name: &str) {
+    for _ in 0..100 {
+        if !list(observer).await.iter().any(|s| s.id == name) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("{name} stayed listed after its client left");
 }
 
 /// After a failed connect: nothing is listed or recorded, the name connects

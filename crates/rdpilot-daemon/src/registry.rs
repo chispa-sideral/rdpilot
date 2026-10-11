@@ -208,9 +208,9 @@ type Delivered = Result<(Box<dyn ManagedSession>, oneshot::Receiver<CancelCause>
 /// When the `open_tracked` future is dropped in that wait (the IPC peer left,
 /// or a timeout elapsed), it removes the placeholder of its attempt, which
 /// cancels the connect, and closes a session that was already delivered, so
-/// no session is dropped bare. Its scope is the `Connecting` entry only: a
-/// future dropped after promotion leaves its `Live` entry to the lease-based
-/// cleanup.
+/// no session is dropped bare. Its scope is the `Connecting` entry only:
+/// `open_tracked` does not await after promotion, so a dropped future never
+/// leaves a `Live` entry without its lease.
 struct ConnectGuard<'a> {
     registry: &'a Registry,
     lease: ConnectLease,
@@ -433,20 +433,19 @@ impl Registry {
         host: String,
         cfg: ConnectionConfig,
     ) -> Result<SessionId, DaemonError> {
-        Ok(self.open_tracked(name, host, cfg, None).await?.0.id)
+        Ok(self.open_tracked(name, host, cfg).await?.id)
     }
 
     /// Like [`Registry::open`], but returns an internal exact-generation
-    /// ownership handle for the IPC response path. With `record`, a
-    /// recording starts right after the session is inserted; its outcome
-    /// (the id, or why it could not start) never fails the connect.
+    /// ownership handle for the IPC response path. It does not await after
+    /// the session is inserted and recorded, so a dropped future leaves either
+    /// no entry or an entry whose lease the caller holds.
     pub(crate) async fn open_tracked(
         &self,
         name: Option<String>,
         host: String,
         cfg: ConnectionConfig,
-        record: Option<RecordingTrigger>,
-    ) -> Result<(ConnectLease, Option<Result<String, String>>), DaemonError> {
+    ) -> Result<ConnectLease, DaemonError> {
         let (id, attempt, mut cancel_rx) = match &name {
             Some(n) => {
                 let id = SessionId::from_str(n).map_err(DaemonError::Connect)?;
@@ -582,18 +581,27 @@ impl Registry {
             });
         }
         self.sink.record_open(&id, &host, &now_wall);
-        let recording = match record {
-            Some(trigger) => Some(match self.recording_target(&id) {
-                Ok(target) => self
-                    .recordings
-                    .start(target, trigger, EventSource::Cli)
-                    .await
-                    .map(|started| started.id),
-                Err(e) => Err(e.to_string()),
-            }),
-            None => None,
-        };
-        Ok((lease, recording))
+        Ok(lease)
+    }
+
+    /// Start the recording a connect asked for on the session `id` that
+    /// [`Registry::open_tracked`] has just inserted. The outcome (the id, or
+    /// why it could not start) never fails the connect. `None` when `record`
+    /// is `None`.
+    pub(crate) async fn start_connect_recording(
+        &self,
+        id: &SessionId,
+        record: Option<RecordingTrigger>,
+    ) -> Option<Result<String, String>> {
+        let trigger = record?;
+        Some(match self.recording_target(id) {
+            Ok(target) => self
+                .recordings
+                .start(target, trigger, EventSource::Cli)
+                .await
+                .map(|started| started.id),
+            Err(e) => Err(e.to_string()),
+        })
     }
 
     /// Close `id`: extract the entry, then await its `close()` — never let
@@ -1961,7 +1969,7 @@ mod tests {
         (registry, handles, closes)
     }
 
-    type Opened = Result<(ConnectLease, Option<Result<String, String>>), DaemonError>;
+    type Opened = Result<ConnectLease, DaemonError>;
 
     /// Poll `open_tracked` for `name` exactly once and hand back the pinned,
     /// unfinished future.
@@ -1969,9 +1977,8 @@ mod tests {
         registry: &'a Registry,
         name: &str,
     ) -> Pin<Box<dyn Future<Output = Opened> + Send + 'a>> {
-        let mut open: Pin<Box<dyn Future<Output = Opened> + Send + 'a>> = Box::pin(
-            registry.open_tracked(Some(name.to_owned()), "h".to_owned(), test_cfg(), None),
-        );
+        let mut open: Pin<Box<dyn Future<Output = Opened> + Send + 'a>> =
+            Box::pin(registry.open_tracked(Some(name.to_owned()), "h".to_owned(), test_cfg()));
         tokio::select! {
             biased;
             _ = &mut open => panic!("the gated connect cannot have finished"),
@@ -2086,7 +2093,7 @@ mod tests {
 
         // Attempt 2 completes and is promoted under its own attempt.
         calls[1].gate.add_permits(1);
-        let (lease, _) = second.await.expect("attempt 2 succeeds");
+        let lease = second.await.expect("attempt 2 succeeds");
         assert_eq!(lease.generation, second_attempt);
         assert_eq!(live_generation(&registry, "s"), Some(second_attempt));
         assert_eq!(closes.load(Ordering::SeqCst), 1, "attempt 2 stays open");
@@ -2107,7 +2114,7 @@ mod tests {
         let second = start_open(&registry, "s").await;
         until("attempt 2 started", || flag(&calls[1].started)).await;
         calls[1].gate.add_permits(1);
-        let (lease, _) = second.await.expect("attempt 2 succeeds");
+        let lease = second.await.expect("attempt 2 succeeds");
 
         // Attempt 1's future is dropped without being polled again: its guard
         // removes nothing of attempt 2, and closes the session it was handed.
@@ -2128,7 +2135,7 @@ mod tests {
         let attempt = connecting_attempt(&registry, "s").expect("a placeholder");
 
         calls[0].gate.add_permits(1);
-        let (lease, _) = open.await.expect("the connect succeeds");
+        let lease = open.await.expect("the connect succeeds");
 
         assert_eq!(lease.generation, attempt);
         assert_eq!(live_generation(&registry, "s"), Some(attempt));
@@ -2192,7 +2199,7 @@ mod tests {
         let second_attempt = connecting_attempt(&registry, "s").expect("a new placeholder");
         assert!(second_attempt > first_attempt);
         calls[1].gate.add_permits(1);
-        let (lease, _) = second.await.expect("the second connect succeeds");
+        let lease = second.await.expect("the second connect succeeds");
         assert_eq!(lease.generation, second_attempt);
         assert_eq!(live_generation(&registry, "s"), Some(second_attempt));
     }
@@ -2203,7 +2210,7 @@ mod tests {
         let keep = start_open(&registry, "keep").await;
         until("the first connect started", || flag(&calls[0].started)).await;
         calls[0].gate.add_permits(1);
-        let (keep_lease, _) = keep.await.expect("the first connect succeeds");
+        let keep_lease = keep.await.expect("the first connect succeeds");
 
         let victim = start_open(&registry, "victim").await;
         until("the second connect started", || flag(&calls[1].started)).await;
@@ -2267,7 +2274,7 @@ mod tests {
         let began = tokio::time::Instant::now();
 
         let error = registry
-            .open_tracked(Some("s".to_owned()), "h".to_owned(), test_cfg(), None)
+            .open_tracked(Some("s".to_owned()), "h".to_owned(), test_cfg())
             .await
             .expect_err("a connect that is never released times out");
 
@@ -2290,8 +2297,8 @@ mod tests {
 
         // The name is free again.
         calls[1].gate.add_permits(1);
-        let (lease, _) = registry
-            .open_tracked(Some("s".to_owned()), "h".to_owned(), test_cfg(), None)
+        let lease = registry
+            .open_tracked(Some("s".to_owned()), "h".to_owned(), test_cfg())
             .await
             .expect("the name connects again");
         assert_eq!(live_generation(&registry, "s"), Some(lease.generation));
