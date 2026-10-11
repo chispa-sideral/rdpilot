@@ -610,7 +610,7 @@ mod tests {
     /// A sink whose `remove_records` fails a set number of times.
     #[derive(Default)]
     struct FaultSink {
-        failures_left: std::sync::atomic::AtomicU32,
+        failures_left: std::sync::Mutex<u32>,
         removed: std::sync::Mutex<Vec<String>>,
         closes: std::sync::Mutex<Vec<String>>,
     }
@@ -618,7 +618,7 @@ mod tests {
     impl FaultSink {
         fn failing(times: u32) -> std::sync::Arc<Self> {
             let sink = FaultSink::default();
-            sink.failures_left.store(times, Ordering::SeqCst);
+            *sink.failures_left.lock().unwrap() = times;
             std::sync::Arc::new(sink)
         }
         fn removed(&self) -> Vec<String> {
@@ -634,11 +634,9 @@ mod tests {
             self.closes.lock().unwrap().push(id.as_str().to_owned());
         }
         fn remove_records(&self, ids: &[SessionId]) -> io::Result<()> {
-            let failed = self
-                .failures_left
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
-                .is_ok();
-            if failed {
+            let mut failures_left = self.failures_left.lock().unwrap();
+            if *failures_left > 0 {
+                *failures_left -= 1;
                 return Err(io::Error::other("injected write failure"));
             }
             self.removed
