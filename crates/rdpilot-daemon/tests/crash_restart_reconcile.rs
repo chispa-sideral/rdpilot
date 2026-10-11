@@ -18,8 +18,9 @@
 //! `seed_into` (the startup reconciliation Plan 12-06's `run()` performs),
 //! surfaces the prior session as `SessionLifecycle::Orphaned` in `list` —
 //! never silently forgotten (DAEMON-04's core failure mode) and never
-//! auto-killed (D-31) — only an explicit `Registry::close` call on the
-//! orphan reconciles it, at which point the disk record is removed too.
+//! auto-killed (D-31). Seeding deletes the disk record, so a second restart
+//! shows nothing; an explicit `Registry::close` call on the orphan removes
+//! the entry.
 //!
 //! **Deliberately NOT proven here (deferred to Plan 12-07's live gate):**
 //! that the remote Windows session is genuinely STILL LIVE server-side
@@ -236,6 +237,23 @@ async fn kill_minus_9_then_restart_surfaces_the_orphan_which_is_then_explicitly_
         "a leftover reconciliation record must surface as Orphaned, not Live/Connecting -- \
          it is never blindly reconnected or auto-killed (D-31)"
     );
+
+    // Shown once: seeding deleted the record, so a second restart on the
+    // same path finds nothing while this daemon still lists the orphan.
+    assert!(
+        rdpilot_daemon::scan_orphans(&state_path).is_empty(),
+        "seeding must delete the records it seeded"
+    );
+    let registry_c = Registry::new(
+        std::sync::Arc::new(FakeConnector),
+        std::sync::Arc::new(JsonReconciliationSink::at(state_path.clone())),
+    );
+    rdpilot_daemon::seed_into(rdpilot_daemon::scan_orphans(&state_path), &registry_c);
+    assert!(
+        registry_c.list().is_empty(),
+        "a second restart must not show the orphan again"
+    );
+    assert_eq!(registry_b.list().len(), 1);
 
     // --- Phase D: explicit reconcile -- Registry-B.close() on the orphan. ---
     registry_b

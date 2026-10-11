@@ -184,6 +184,25 @@ pub(crate) struct ConnectLease {
     generation: u64,
 }
 
+/// Why [`Registry::expire_retained`] removes entries; it names the cause in
+/// the log line of each removal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Removal {
+    /// The retention period passed.
+    Retention,
+    /// The daemon exits.
+    DaemonExit,
+}
+
+impl Removal {
+    fn describe(self) -> &'static str {
+        match self {
+            Removal::Retention => "after the retention period",
+            Removal::DaemonExit => "at daemon exit",
+        }
+    }
+}
+
 /// The error of a connect whose placeholder was removed before its session
 /// was registered. It maps to the wire code `internal`.
 fn connect_cancelled() -> DaemonError {
@@ -366,8 +385,9 @@ impl Registry {
     ///
     /// The ENTIRE lock scope is synchronous (no `.await` inside) — this is
     /// what makes the claim atomic w.r.t. every other concurrent caller
-    /// (research Pattern 1). Returns `Err(DuplicateSession)` if `id` is
-    /// already claimed (`Connecting`), live, or orphaned. On success it
+    /// (research Pattern 1). Returns `Err(DuplicateSession)` if `id` has any
+    /// entry; [`Registry::open_tracked`] first frees a name held by an
+    /// `Orphaned` or ended entry. On success it
     /// returns the attempt identity drawn for this claim and the receiver
     /// side of the placeholder's cancel handle. The number is drawn only for
     /// a claim that succeeds.
@@ -440,10 +460,10 @@ impl Registry {
     /// # Errors
     ///
     /// Returns [`DaemonError::DuplicateSession`] if `name` is already
-    /// claimed/live/orphaned (a session with the name that has ended, listed
-    /// as `Disconnected`, is closed and replaced instead), or the connector's
-    /// error (mapped through
-    /// [`DaemonError`]) if the connect itself fails — in which case the
+    /// claimed or live (an `Orphaned` entry, or a session with the name that
+    /// has ended, listed as `Disconnected`, is replaced instead), or the
+    /// connector's error (mapped through [`DaemonError`]) if the connect
+    /// itself fails — in which case the
     /// claim is released so a retry with the same name can succeed. A connect
     /// whose placeholder was removed before its session was registered fails
     /// with [`DaemonError::Connect`], and its session is closed.
@@ -473,10 +493,11 @@ impl Registry {
         let (id, attempt, mut cancel_rx) = match &name {
             Some(n) => {
                 let id = SessionId::from_str(n).map_err(DaemonError::Connect)?;
-                // A session with this name that has ended (listed as
-                // Disconnected) is replaced. Its close never fails the new
-                // connect: the entry and its record are gone either way.
-                if let Err(error) = self.close_ended(&id).await {
+                // An Orphaned entry or a session with this name that has
+                // ended (listed as Disconnected) is replaced. Its close never
+                // fails the new connect: the entry and its record are gone
+                // either way.
+                if let Err(error) = self.release_name(&id).await {
                     eprintln!(
                         "rdpilot-daemon: closing ended session {} for a new connect failed: {error}",
                         id.as_str()
@@ -603,6 +624,7 @@ impl Registry {
                         end_hook,
                         control,
                         last_activity_wall: now_wall.clone(),
+                        ended_seen: None,
                     },
                 );
                 None
@@ -708,8 +730,9 @@ impl Registry {
                 Err(DaemonError::StillConnecting(id.as_str().to_owned()))
             }
             Some(SessionEntry::Orphaned { .. }) => {
-                // Explicit reclaim/teardown of an orphan (DAEMON-04) —
-                // clears its record; there is no live OS thread to join.
+                // Explicit removal of an orphan (DAEMON-04): its record, if
+                // a failed purge left it, goes too; there is no live OS
+                // thread to join.
                 self.records.closed_orphan(id);
                 Ok(())
             }
@@ -769,10 +792,10 @@ impl Registry {
         result
     }
 
-    /// Remove and close the entry of `id` only when it is a `Live` session
-    /// that has ended (listed as `Disconnected`), for a Connect that reuses
-    /// its name. The close reason of a recording is `disconnect`. Returns
-    /// whether it removed an entry.
+    /// Free the name `id` for a Connect that reuses it: remove an `Orphaned`
+    /// entry, or remove and close a `Live` session that has ended (listed as
+    /// `Disconnected`). The close reason of a recording is `disconnect`.
+    /// Other entries stay. Returns whether it removed an entry.
     ///
     /// The record is removed before the close is awaited, so a Connect
     /// future dropped during the close leaves no record; the session it
@@ -782,16 +805,21 @@ impl Registry {
     /// # Errors
     ///
     /// The close error of the removed session.
-    async fn close_ended(&self, id: &SessionId) -> Result<bool, DaemonError> {
+    async fn release_name(&self, id: &SessionId) -> Result<bool, DaemonError> {
         let entry = {
             #[allow(clippy::expect_used)] // A poisoned registry mutex is unrecoverable.
             let mut guard = self.sessions.lock().expect("registry mutex poisoned");
             match guard.get(id) {
+                Some(SessionEntry::Orphaned { .. }) => guard.remove(id),
                 Some(entry) if entry.end_cause().is_some() => guard.remove(id),
                 _ => None,
             }
         };
         match entry {
+            Some(SessionEntry::Orphaned { .. }) => {
+                self.records.closed_orphan(id);
+                Ok(true)
+            }
             Some(entry) => self
                 .close_removed(id, entry, CloseReason::Disconnect)
                 .await
@@ -1097,13 +1125,14 @@ impl Registry {
     /// Insert an `Orphaned` entry directly (no I/O here — used by the
     /// startup reconciliation scan, Plan 12-05/12-06, to seed a
     /// possibly-still-live remote session surfaced after a crash-restart,
-    /// DAEMON-04).
+    /// DAEMON-04). Its retention period starts now.
     pub fn seed_orphan(&self, id: SessionId, host: String, connected_since: String) {
         #[allow(clippy::expect_used)] // A poisoned registry mutex is unrecoverable.
         let mut guard = self.sessions.lock().expect("registry mutex poisoned");
         guard.insert(
             id,
             SessionEntry::Orphaned {
+                seeded_at: Instant::now(),
                 host,
                 connected_since,
             },
@@ -1120,18 +1149,93 @@ impl Registry {
         guard.len()
     }
 
-    /// `true` when the registry has no entries (DAEMON-03's
-    /// empty-registry self-shutdown watcher, Plan 12-06, will poll this).
+    /// `true` when the registry has no entries.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Delete the reconciliation records of the entries seeded at startup.
+    /// A failed delete is logged and retried at the next write.
+    pub(crate) fn purge_seeded_records(&self, ids: &[SessionId]) {
+        self.records.purge_seeded(ids);
+    }
+
+    /// `true` while an entry keeps the daemon running: a connect in flight
+    /// or a session that has not ended. `Orphaned` and ended entries do not
+    /// (DAEMON-03's self-shutdown watcher polls this).
+    #[must_use]
+    pub(crate) fn holds_active(&self) -> bool {
+        #[allow(clippy::expect_used)] // A poisoned registry mutex is unrecoverable.
+        let guard = self.sessions.lock().expect("registry mutex poisoned");
+        guard.values().any(|entry| match entry {
+            SessionEntry::Connecting { .. } => true,
+            SessionEntry::Live { .. } => entry.end_cause().is_none(),
+            SessionEntry::Orphaned { .. } => false,
+        })
+    }
+
+    /// Remove the `Orphaned` entries and the ended `Live` entries whose
+    /// retention period has passed, and log one line per removal.
+    ///
+    /// A `Live` entry's retention period starts when this sweep first sees
+    /// it ended. The sweep stamps that time before it selects, in the same
+    /// pass, so a `retention` of zero removes every ended entry, seen or
+    /// not. Selection and removal share one registry lock scope, so an entry
+    /// that replaced a removed name is never touched. An ended entry is
+    /// closed through the one close path, with the recording close reason
+    /// `idle_reap`; an `Orphaned` entry's record is removed unless a later
+    /// session of the same name owns it.
+    pub(crate) async fn expire_retained(&self, retention: std::time::Duration, cause: Removal) {
+        let now = Instant::now();
+        let expired: Vec<(SessionId, SessionEntry)> = {
+            #[allow(clippy::expect_used)] // A poisoned registry mutex is unrecoverable.
+            let mut guard = self.sessions.lock().expect("registry mutex poisoned");
+            let due: Vec<SessionId> = guard
+                .iter_mut()
+                .filter_map(|(id, entry)| {
+                    let ended = entry.end_cause().is_some();
+                    let since = match entry {
+                        SessionEntry::Orphaned { seeded_at, .. } => *seeded_at,
+                        SessionEntry::Live { ended_seen, .. } if ended => {
+                            *ended_seen.get_or_insert(now)
+                        }
+                        _ => return None,
+                    };
+                    (now.duration_since(since) >= retention).then(|| id.clone())
+                })
+                .collect();
+            due.into_iter()
+                .filter_map(|id| guard.remove(&id).map(|entry| (id, entry)))
+                .collect()
+        };
+        for (id, entry) in expired {
+            let kind = if matches!(entry, SessionEntry::Orphaned { .. }) {
+                self.records.closed_orphan(&id);
+                "orphaned"
+            } else {
+                if let Err(error) = self.close_removed(&id, entry, CloseReason::IdleReap).await {
+                    eprintln!(
+                        "rdpilot-daemon: closing disconnected session {} failed: {error}",
+                        id.as_str()
+                    );
+                }
+                "disconnected"
+            };
+            eprintln!(
+                "rdpilot-daemon: removed {kind} session {} {}",
+                id.as_str(),
+                cause.describe()
+            );
+        }
     }
 
     /// Every `Live` entry's id paired with the elapsed time since its
     /// `last_activity` (DAEMON-03's idle reaper, Plan 12-06, uses this to
     /// decide which sessions are stale). `Connecting`/`Orphaned` entries
     /// have no `last_activity` to age and are never candidates for idle
-    /// reap -- only a `Live` entry is included.
+    /// reap -- only a `Live` entry that has not ended is included. An ended
+    /// entry leaves through [`Registry::expire_retained`] instead.
     #[must_use]
     pub fn live_idle_durations(&self) -> Vec<(SessionId, std::time::Duration)> {
         #[allow(clippy::expect_used)] // A poisoned registry mutex is unrecoverable.
@@ -1144,8 +1248,9 @@ impl Registry {
                     cua_leases,
                     control,
                     ..
-                } => (entry.end_cause().is_some()
-                    || (cua_leases.load(Ordering::Relaxed) == 0 && !control.human_active()))
+                } => (entry.end_cause().is_none()
+                    && cua_leases.load(Ordering::Relaxed) == 0
+                    && !control.human_active())
                 .then(|| {
                     // Human input and lease ends count as activity.
                     let latest = control
@@ -1438,6 +1543,8 @@ impl Registry {
         let guard = self.sessions.lock().expect("registry mutex poisoned");
         guard
             .iter()
+            // The viewer has nothing to show of an orphan; `list` keeps it.
+            .filter(|(_, entry)| !matches!(entry, SessionEntry::Orphaned { .. }))
             .map(|(id, entry)| {
                 let status = self.status_of(id, entry);
                 let ended = status.status == rdpilot_ipc::SessionLifecycle::Disconnected;
@@ -2281,6 +2388,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_stale_delivered_attempt_never_removes_the_record_of_a_later_attempt() {
+        let (connector, calls, _closes) = gated(2);
+        let sink = Arc::new(CountingSink::default());
+        let registry = Registry::new(connector, Arc::clone(&sink) as Arc<dyn ReconciliationSink>);
+
+        // Attempt 1 delivers its session, then loses its placeholder.
+        let first = start_open(&registry, "s").await;
+        until("attempt 1 started", || flag(&calls[0].started)).await;
+        let first_attempt = connecting_attempt(&registry, "s").expect("attempt 1");
+        calls[0].gate.add_permits(1);
+        until("attempt 1 delivered", || flag(&calls[0].delivered)).await;
+        assert!(registry.cancel_connecting(&lease_of("s", first_attempt)));
+
+        // Attempt 2 claims the name, delivers and is promoted first.
+        let second = start_open(&registry, "s").await;
+        until("attempt 2 started", || flag(&calls[1].started)).await;
+        calls[1].gate.add_permits(1);
+        let lease = second.await.expect("attempt 2 succeeds");
+
+        // Only then does attempt 1 see its delivered session.
+        assert!(first.await.is_err());
+        assert_eq!(
+            sink.count("closed", "s"),
+            0,
+            "a stale attempt removed the record of the live session"
+        );
+        assert_eq!(live_generation(&registry, "s"), Some(lease.generation));
+
+        registry.close(&sid("s")).await.expect("disconnect");
+        assert_eq!(sink.count("closed", "s"), 1);
+    }
+
+    #[tokio::test]
     async fn a_dropped_stale_future_leaves_the_live_entry_of_a_later_attempt() {
         let (registry, calls, closes) = gated_registry(2);
         let first = start_open(&registry, "s").await;
@@ -2990,6 +3130,129 @@ mod tests {
         drop(replacing);
         assert_eq!(sink.count("closed", "alpha"), 1, "the record is gone");
         gate.add_permits(1);
+    }
+
+    fn seed(registry: &Registry, name: &str) {
+        registry.seed_orphan(sid(name), "h".to_owned(), "2026-01-01T00:00:00Z".to_owned());
+    }
+
+    const SHORT: Duration = Duration::from_millis(50);
+
+    #[tokio::test]
+    async fn an_orphan_is_removed_after_the_retention_and_not_before() {
+        let (registry, connector, sink) = scripted();
+        seed(&registry, "o");
+        registry.expire_retained(SHORT, Removal::Retention).await;
+        assert_eq!(listed(&registry, "o"), Some(SessionLifecycle::Orphaned));
+        assert_eq!(sink.count("closed", "o"), 0);
+
+        tokio::time::sleep(SHORT + Duration::from_millis(10)).await;
+        registry.expire_retained(SHORT, Removal::Retention).await;
+        assert_eq!(listed(&registry, "o"), None);
+        assert_eq!(sink.count("closed", "o"), 1, "its record goes too");
+        assert_eq!(connector.closes(), 0, "an orphan has no session to close");
+    }
+
+    #[tokio::test]
+    async fn an_ended_entry_is_removed_after_the_retention_through_its_close() {
+        let (registry, connector, sink) = scripted();
+        open_named(&registry, "alpha").await;
+        server_end(&connector.lifecycle(0));
+        until("the record went", || sink.count("closed", "alpha") == 1).await;
+
+        registry.expire_retained(SHORT, Removal::Retention).await;
+        assert_eq!(
+            listed(&registry, "alpha"),
+            Some(SessionLifecycle::Disconnected)
+        );
+        assert_eq!(connector.closes(), 0);
+
+        tokio::time::sleep(SHORT + Duration::from_millis(10)).await;
+        registry.expire_retained(SHORT, Removal::Retention).await;
+        assert_eq!(listed(&registry, "alpha"), None);
+        assert_eq!(connector.closes(), 1, "removed through its close");
+        assert_eq!(sink.count("closed", "alpha"), 1, "the record went once");
+    }
+
+    #[tokio::test]
+    async fn a_zero_retention_removes_an_ended_entry_the_sweep_never_saw() {
+        let (registry, connector, _sink) = scripted();
+        open_named(&registry, "alpha").await;
+        server_end(&connector.lifecycle(0));
+        registry
+            .expire_retained(Duration::ZERO, Removal::DaemonExit)
+            .await;
+        assert!(registry.is_empty());
+        assert_eq!(connector.closes(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_sweep_never_touches_a_live_entry_or_one_that_replaced_an_orphan() {
+        let (registry, connector, sink) = scripted();
+        seed(&registry, "a");
+        let lease = open_named(&registry, "a").await;
+        registry
+            .expire_retained(Duration::ZERO, Removal::Retention)
+            .await;
+        assert_eq!(live_generation(&registry, "a"), Some(lease.generation));
+        assert_eq!(connector.closes(), 0);
+        assert!(registry.holds_active());
+        // The open wrote the record after the orphan's removal; nothing
+        // removed it since.
+        #[allow(clippy::expect_used)]
+        let writes = sink.writes.lock().expect("test mutex").clone();
+        assert_eq!(writes.last(), Some(&("open", "a".to_owned())), "{writes:?}");
+    }
+
+    #[tokio::test]
+    async fn live_idle_durations_excludes_ended_entries() {
+        let (registry, connector, _sink) = scripted();
+        open_named(&registry, "alpha").await;
+        open_named(&registry, "beta").await;
+        server_end(&connector.lifecycle(0));
+        let idle = registry.live_idle_durations();
+        assert_eq!(idle.len(), 1, "{idle:?}");
+        assert_eq!(idle[0].0.as_str(), "beta");
+    }
+
+    #[tokio::test]
+    async fn holds_active_ignores_orphaned_and_ended_entries() {
+        let (registry, connector, _sink) = scripted();
+        assert!(!registry.holds_active());
+        seed(&registry, "o");
+        assert!(!registry.holds_active());
+        open_named(&registry, "alpha").await;
+        assert!(registry.holds_active());
+        server_end(&connector.lifecycle(0));
+        assert!(!registry.holds_active());
+        assert_eq!(registry.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn the_viewer_list_omits_orphans_and_list_keeps_them() {
+        let (registry, _connector, _sink) = scripted();
+        seed(&registry, "o");
+        open_named(&registry, "alpha").await;
+        assert_eq!(viewer_view(&registry, "o"), None);
+        assert_eq!(
+            viewer_view(&registry, "alpha"),
+            Some((SessionLifecycle::Live, false))
+        );
+        assert_eq!(listed(&registry, "o"), Some(SessionLifecycle::Orphaned));
+    }
+
+    #[tokio::test]
+    async fn a_connect_with_an_orphans_name_replaces_it() {
+        let (registry, connector, sink) = scripted();
+        seed(&registry, "a");
+        let lease = open_named(&registry, "a").await;
+        let statuses = registry.list();
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(statuses[0].status, SessionLifecycle::Live);
+        assert_eq!(live_generation(&registry, "a"), Some(lease.generation));
+        assert_eq!(connector.closes(), 0);
+        assert_eq!(sink.count("open", "a"), 1);
+        assert_eq!(sink.count("closed", "a"), 1, "the orphan's record went");
     }
 
     #[tokio::test]

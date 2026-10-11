@@ -29,9 +29,10 @@ pub enum SessionLifecycle {
     /// The session is no longer active.
     Disconnected,
     /// A possibly-still-live remote Windows session left behind by a
-    /// crashed/restarted daemon (DAEMON-04, research Pitfall 9). Surfaced
-    /// distinctly, never silently forgotten or auto-torn-down — the daemon
-    /// requires an explicit reclaim/teardown of an `Orphaned` entry.
+    /// crashed/restarted daemon (DAEMON-04, research Pitfall 9). Shown after
+    /// the restart that finds it; the remote session is never torn down. The
+    /// daemon removes the entry after a retention period, when it exits, on
+    /// an explicit disconnect, or for a connect with the same name.
     Orphaned,
 }
 

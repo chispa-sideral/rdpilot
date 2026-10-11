@@ -401,6 +401,20 @@ pub trait ReconciliationSink: Send + Sync + 'static {
     /// Record that session `id` closed (explicit disconnect, idle reap, or
     /// orphan reconciliation).
     fn record_closed(&self, id: &SessionId);
+
+    /// Remove the records of `ids`, and return the error of a failed write
+    /// so the caller can retry. The default calls
+    /// [`ReconciliationSink::record_closed`] for each id and returns `Ok`.
+    ///
+    /// # Errors
+    ///
+    /// The write error of the sink.
+    fn remove_records(&self, ids: &[SessionId]) -> std::io::Result<()> {
+        for id in ids {
+            self.record_closed(id);
+        }
+        Ok(())
+    }
 }
 
 /// A no-op [`ReconciliationSink`] — used by tests that do not exercise
@@ -505,11 +519,18 @@ pub enum SessionEntry {
         /// activity tracking, which is accurate: for a freshly connected
         /// session, the last observed activity IS the connect itself.
         last_activity_wall: String,
+        /// When the retention sweep first saw this session ended; `None`
+        /// while it is live or not yet seen. The entry is removed one
+        /// retention period after it.
+        ended_seen: Option<Instant>,
     },
     /// A possibly-still-live remote Windows session surfaced after a
-    /// crash-restart (DAEMON-04) — never silently torn down; requires an
-    /// explicit reclaim/teardown request.
+    /// crash-restart (DAEMON-04). The remote session is never torn down; the
+    /// entry is removed after a retention period, when the daemon exits, on
+    /// an explicit disconnect, or by a connect with the same name.
     Orphaned {
+        /// When this entry was seeded; the retention period starts here.
+        seeded_at: Instant,
         /// The target host (non-secret target addressing, D-31).
         host: String,
         /// ISO-8601 timestamp of when the session originally connected, as
@@ -586,6 +607,7 @@ impl SessionEntry {
             SessionEntry::Orphaned {
                 host,
                 connected_since,
+                ..
             } => SessionStatus {
                 id: id.as_str().to_owned(),
                 name: None,

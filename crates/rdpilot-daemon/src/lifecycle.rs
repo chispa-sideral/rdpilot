@@ -1,12 +1,13 @@
 //! Idle-session reaper (periodic tokio task) and empty-registry
 //! grace-period self-shutdown (Plan 12-06; DAEMON-03, D-31).
 //!
-//! - [`LifecycleConfig`] carries the three config-overridable durations
-//!   D-31 requires: how long a session may sit idle before it is reaped,
-//!   how long the registry must stay empty before the daemon self-exits
-//!   (the anti-thrash grace period), and how often both watchers poll the
-//!   registry. Every field defaults to a sane production value but is
-//!   fully injectable so a test can drive the lifecycle on millisecond
+//! - [`LifecycleConfig`] carries the config-overridable durations D-31
+//!   requires: how long a session may sit idle before it is reaped, how
+//!   long the registry must hold no active session before the daemon
+//!   self-exits (the anti-thrash grace period), how often both watchers
+//!   poll the registry, and how long `Orphaned` and ended entries stay.
+//!   Every field defaults to a sane production value but is fully
+//!   injectable so a test can drive the lifecycle on millisecond
 //!   timescales.
 //! - [`ShutdownSignal`] is a `tokio::sync::watch`-backed broadcast a
 //!   `server::run()` accept loop selects on to know when to stop accepting
@@ -15,14 +16,16 @@
 //!   ran) still observes the fired state -- `Notify::notify_waiters()`
 //!   would silently miss that waiter, which is exactly the race an
 //!   accept-loop `select!` could hit.
-//! - [`idle_reaper`] periodically closes `Live` sessions whose
+//! - [`idle_reaper`] periodically removes `Orphaned` and ended entries
+//!   whose retention period has passed, then closes `Live` sessions whose
 //!   `last_activity` has exceeded `idle_timeout`, ALWAYS via the awaited
 //!   `Registry::close_idle` (never a bare removal).
-//! - [`empty_watcher`] periodically checks whether the registry is empty;
-//!   on finding it empty, it sleeps `empty_grace` and re-checks -- if the
-//!   registry gained a session during the grace window, the watcher loops
-//!   back (anti-thrash, D-31: a rapid disconnect->reconnect must not pay a
-//!   full daemon cold-start); if it is STILL empty after the grace, the
+//! - [`empty_watcher`] periodically checks whether the registry holds an
+//!   active session (a connect in flight or a session that has not ended);
+//!   on finding none, it sleeps `empty_grace` and re-checks -- if a session
+//!   became active during the grace window, the watcher loops back
+//!   (anti-thrash, D-31: a rapid disconnect->reconnect must not pay a full
+//!   daemon cold-start); if there is STILL none after the grace, the
 //!   watcher fires [`ShutdownSignal`] and returns.
 
 use std::sync::Arc;
@@ -31,15 +34,16 @@ use std::time::Duration;
 use rdpilot_ipc::SessionId;
 use tokio::sync::watch;
 
-use crate::registry::Registry;
+use crate::registry::{Registry, Removal};
 
-/// The three config-overridable lifecycle durations (D-31).
+/// The config-overridable lifecycle durations (D-31).
 ///
 /// Every field has a sane production default ([`LifecycleConfig::default`])
 /// but is fully constructible/injectable so tests can drive the reaper and
 /// watcher on millisecond timescales -- `server::run()` (Plan 12-06) reads
 /// these from environment overrides (`RDPILOT_DAEMON_IDLE_TIMEOUT_MS` /
-/// `RDPILOT_DAEMON_EMPTY_GRACE_MS` / `RDPILOT_DAEMON_REAP_INTERVAL_MS`) so
+/// `RDPILOT_DAEMON_EMPTY_GRACE_MS` / `RDPILOT_DAEMON_REAP_INTERVAL_MS` /
+/// `RDPILOT_DAEMON_RETENTION_MS`) so
 /// the offline `autostart_lifecycle` integration test can tune the real
 /// compiled binary's lifecycle without a config-file/CLI-flag round trip
 /// that does not exist yet in this phase.
@@ -55,6 +59,10 @@ pub struct LifecycleConfig {
     /// The poll interval both [`idle_reaper`] and [`empty_watcher`] use to
     /// re-scan the registry.
     pub reap_interval: Duration,
+    /// How long an `Orphaned` entry stays after it was seeded, and an ended
+    /// `Live` entry after its end was seen, before [`idle_reaper`] removes
+    /// it.
+    pub retention: Duration,
 }
 
 impl LifecycleConfig {
@@ -64,6 +72,8 @@ impl LifecycleConfig {
     pub const DEFAULT_EMPTY_GRACE: Duration = Duration::from_secs(30);
     /// Production default poll interval: 15 seconds.
     pub const DEFAULT_REAP_INTERVAL: Duration = Duration::from_secs(15);
+    /// Production default retention of `Orphaned` and ended entries: 1 hour.
+    pub const DEFAULT_RETENTION: Duration = Duration::from_secs(60 * 60);
 
     /// The env var overriding [`LifecycleConfig::idle_timeout`], in
     /// milliseconds.
@@ -74,9 +84,12 @@ impl LifecycleConfig {
     /// The env var overriding [`LifecycleConfig::reap_interval`], in
     /// milliseconds.
     pub const ENV_REAP_INTERVAL_MS: &'static str = "RDPILOT_DAEMON_REAP_INTERVAL_MS";
+    /// The env var overriding [`LifecycleConfig::retention`], in
+    /// milliseconds (for tests).
+    pub const ENV_RETENTION_MS: &'static str = "RDPILOT_DAEMON_RETENTION_MS";
 
     /// Build a [`LifecycleConfig`] from the production defaults, overridden
-    /// by any of the three `RDPILOT_DAEMON_*_MS` env vars that are present
+    /// by any of the `RDPILOT_DAEMON_*_MS` env vars that are present
     /// and parse as a `u64` millisecond count. An absent or unparseable env
     /// var silently falls back to the default for that field -- a
     /// malformed override must never block daemon startup.
@@ -92,6 +105,9 @@ impl LifecycleConfig {
         if let Some(ms) = env_millis(Self::ENV_REAP_INTERVAL_MS) {
             cfg.reap_interval = Duration::from_millis(ms);
         }
+        if let Some(ms) = env_millis(Self::ENV_RETENTION_MS) {
+            cfg.retention = Duration::from_millis(ms);
+        }
         cfg
     }
 }
@@ -102,6 +118,7 @@ impl Default for LifecycleConfig {
             idle_timeout: Self::DEFAULT_IDLE_TIMEOUT,
             empty_grace: Self::DEFAULT_EMPTY_GRACE,
             reap_interval: Self::DEFAULT_REAP_INTERVAL,
+            retention: Self::DEFAULT_RETENTION,
         }
     }
 }
@@ -188,15 +205,17 @@ impl Default for ShutdownSignal {
     }
 }
 
-/// Periodically scan `registry` for `Live` sessions whose `last_activity`
-/// has exceeded `cfg.idle_timeout` and close each one via the awaited
-/// `Registry::close` (DAEMON-01 discipline: never a bare removal). Returns
-/// once `shutdown` fires.
+/// Periodically remove the `Orphaned` and ended entries of `registry`
+/// whose `cfg.retention` has passed, then scan it for `Live` sessions whose
+/// `last_activity` has exceeded `cfg.idle_timeout` and close each one via
+/// the awaited `Registry::close` (DAEMON-01 discipline: never a bare
+/// removal). Returns once `shutdown` fires.
 pub async fn idle_reaper(registry: Arc<Registry>, cfg: LifecycleConfig, shutdown: ShutdownSignal) {
     let mut interval = tokio::time::interval(cfg.reap_interval);
     loop {
         tokio::select! {
             _ = interval.tick() => {
+                registry.expire_retained(cfg.retention, Removal::Retention).await;
                 let stale: Vec<SessionId> = registry
                     .live_idle_durations()
                     .into_iter()
@@ -217,10 +236,12 @@ pub async fn idle_reaper(registry: Arc<Registry>, cfg: LifecycleConfig, shutdown
     }
 }
 
-/// Periodically check whether `registry` is empty; on finding it empty,
-/// sleep `cfg.empty_grace` and re-check -- if a session appeared during the
-/// grace window, loop back (anti-thrash, D-31); if the registry is STILL
-/// empty after the grace, fire `shutdown` and return.
+/// Periodically check whether `registry` holds an active session (a connect
+/// in flight or a session that has not ended; `Orphaned` and ended entries
+/// do not count); on finding none, sleep `cfg.empty_grace` and re-check --
+/// if a session became active during the grace window, loop back
+/// (anti-thrash, D-31); if there is STILL none after the grace, fire
+/// `shutdown` and return.
 pub async fn empty_watcher(
     registry: Arc<Registry>,
     cfg: LifecycleConfig,
@@ -230,13 +251,13 @@ pub async fn empty_watcher(
     loop {
         tokio::select! {
             _ = interval.tick() => {
-                if registry.is_empty() {
+                if !registry.holds_active() {
                     tokio::time::sleep(cfg.empty_grace).await;
                     // A claim on another worker can land between this check
                     // and `fire`. That window is the one the grace period
                     // already leaves open: a connect admitted after the last
                     // check is cancelled and its session closed at exit.
-                    if registry.is_empty() {
+                    if !registry.holds_active() {
                         shutdown.fire();
                         return;
                     }
@@ -422,6 +443,7 @@ mod tests {
             idle_timeout: Duration::from_millis(20),
             empty_grace: Duration::from_millis(60),
             reap_interval: Duration::from_millis(10),
+            retention: LifecycleConfig::DEFAULT_RETENTION,
         }
     }
 
@@ -479,6 +501,7 @@ mod tests {
             idle_timeout: Duration::from_millis(40),
             empty_grace: Duration::from_millis(60),
             reap_interval: Duration::from_millis(10),
+            retention: LifecycleConfig::DEFAULT_RETENTION,
         };
         let shutdown = ShutdownSignal::new();
         let registry_for_driver = Arc::clone(&registry);
@@ -507,10 +530,12 @@ mod tests {
         );
     }
 
-    /// A session that has ended is reaped even while a Cua stream holds a
-    /// lease on it (the stream cannot do anything with an ended session).
-    #[tokio::test]
-    async fn idle_reaper_reaps_a_disconnected_entry_with_a_cua_lease() {
+    /// An endable session in a registry, and its lifecycle and close flag.
+    fn endable_registry() -> (
+        Arc<Registry>,
+        Arc<tokio::sync::watch::Sender<rdpilot::SessionState>>,
+        Arc<AtomicBool>,
+    ) {
         let lifecycle = Arc::new(
             tokio::sync::watch::channel(rdpilot::SessionState {
                 lifecycle: rdpilot::Lifecycle::Live,
@@ -526,6 +551,33 @@ mod tests {
             }),
             Arc::new(NoopReconciliationSink),
         ));
+        (registry, lifecycle, closed)
+    }
+
+    fn end_server_side(lifecycle: &tokio::sync::watch::Sender<rdpilot::SessionState>) {
+        lifecycle.send_modify(|state| {
+            state.lifecycle = rdpilot::Lifecycle::Ended(rdpilot::EndCause::ServerEnded(
+                "fake server end".to_owned(),
+            ));
+        });
+    }
+
+    /// A reaper whose idle timeout never fires, with a short retention.
+    fn retention_cfg() -> LifecycleConfig {
+        LifecycleConfig {
+            idle_timeout: Duration::from_secs(3600),
+            empty_grace: Duration::from_millis(60),
+            reap_interval: Duration::from_millis(10),
+            retention: Duration::from_millis(80),
+        }
+    }
+
+    /// A session that has ended leaves through the retention, not the idle
+    /// timeout, even while a Cua stream holds a lease on it (the stream
+    /// cannot do anything with an ended session).
+    #[tokio::test]
+    async fn the_reaper_tick_removes_a_disconnected_entry_with_a_cua_lease_after_the_retention() {
+        let (registry, lifecycle, closed) = endable_registry();
         let id = registry
             .open(Some("web".to_owned()), "10.0.0.5".to_owned(), test_cfg())
             .await
@@ -535,28 +587,82 @@ mod tests {
             registry.live_idle_durations().is_empty(),
             "a live session with a Cua lease is not a candidate"
         );
-        lifecycle.send_modify(|state| {
-            state.lifecycle = rdpilot::Lifecycle::Ended(rdpilot::EndCause::ServerEnded(
-                "fake server end".to_owned(),
-            ));
-        });
-        assert_eq!(registry.live_idle_durations().len(), 1);
+        end_server_side(&lifecycle);
+        assert!(
+            registry.live_idle_durations().is_empty(),
+            "an ended session is not an idle candidate"
+        );
 
-        let cfg = tiny_cfg();
+        let cfg = retention_cfg();
         let shutdown = ShutdownSignal::new();
         let registry_for_driver = Arc::clone(&registry);
         let shutdown_for_driver = shutdown.clone();
+        let closed_for_driver = Arc::clone(&closed);
         let driver = async move {
-            tokio::time::sleep(cfg.idle_timeout + cfg.reap_interval * 3).await;
-            assert_eq!(registry_for_driver.len(), 0, "the ended entry was reaped");
+            tokio::time::sleep(cfg.retention / 2).await;
+            assert_eq!(registry_for_driver.len(), 1, "kept during the retention");
+            assert!(!closed_for_driver.load(Ordering::SeqCst));
+            tokio::time::sleep(cfg.retention + cfg.reap_interval * 3).await;
+            assert_eq!(registry_for_driver.len(), 0, "removed after the retention");
             shutdown_for_driver.fire();
         };
         tokio::join!(
             idle_reaper(Arc::clone(&registry), cfg, shutdown.clone()),
             driver
         );
-        assert!(closed.load(Ordering::SeqCst), "reaped through close");
+        assert!(closed.load(Ordering::SeqCst), "removed through close");
         drop(attached);
+    }
+
+    #[tokio::test]
+    async fn an_orphan_is_removed_by_the_reaper_tick_after_the_retention() {
+        let registry = fake_registry();
+        registry.seed_orphan(
+            "orphan".parse().expect("non-empty literal"),
+            "10.0.0.9".to_owned(),
+            "2026-01-01T00:00:00Z".to_owned(),
+        );
+        let cfg = retention_cfg();
+        let shutdown = ShutdownSignal::new();
+        let registry_for_driver = Arc::clone(&registry);
+        let shutdown_for_driver = shutdown.clone();
+        let driver = async move {
+            tokio::time::sleep(cfg.retention / 2).await;
+            assert_eq!(registry_for_driver.len(), 1, "kept during the retention");
+            tokio::time::sleep(cfg.retention + cfg.reap_interval * 3).await;
+            assert_eq!(registry_for_driver.len(), 0, "removed after the retention");
+            shutdown_for_driver.fire();
+        };
+        tokio::join!(
+            idle_reaper(Arc::clone(&registry), cfg, shutdown.clone()),
+            driver
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_watcher_fires_with_only_orphaned_and_ended_entries() {
+        let (registry, lifecycle, _closed) = endable_registry();
+        registry
+            .open(Some("web".to_owned()), "10.0.0.5".to_owned(), test_cfg())
+            .await
+            .expect("open should succeed");
+        registry.seed_orphan(
+            "orphan".parse().expect("non-empty literal"),
+            "10.0.0.9".to_owned(),
+            "2026-01-01T00:00:00Z".to_owned(),
+        );
+        end_server_side(&lifecycle);
+        assert_eq!(registry.len(), 2);
+
+        let shutdown = ShutdownSignal::new();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            empty_watcher(Arc::clone(&registry), tiny_cfg(), shutdown.clone()),
+        )
+        .await
+        .expect("the watcher fires");
+        assert!(shutdown.is_fired());
+        assert_eq!(registry.len(), 2, "the watcher removes nothing");
     }
 
     #[tokio::test]
@@ -574,6 +680,7 @@ mod tests {
             idle_timeout: Duration::from_secs(3600),
             empty_grace: Duration::from_millis(60),
             reap_interval: Duration::from_millis(10),
+            retention: LifecycleConfig::DEFAULT_RETENTION,
         };
         let shutdown = ShutdownSignal::new();
 

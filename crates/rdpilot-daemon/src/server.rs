@@ -285,6 +285,11 @@ pub async fn run(config: RunConfig) -> Result<(), DaemonError> {
     // `shutdown` this loop just observed, so they are already unwinding.
     let _ = reaper_handle.await;
     let _ = watcher_handle.await;
+    // Ended sessions are closed, never dropped bare (DAEMON-01); orphans go
+    // with the daemon process.
+    registry
+        .expire_retained(Duration::ZERO, crate::registry::Removal::DaemonExit)
+        .await;
     // Return control to the agent, with held-key releases, before the
     // recordings close so the lease end is in them.
     registry
@@ -770,6 +775,7 @@ mod tests {
                 idle_timeout: Duration::from_secs(3600),
                 empty_grace: Duration::from_millis(30),
                 reap_interval: Duration::from_millis(10),
+                retention: LifecycleConfig::DEFAULT_RETENTION,
             },
         };
 
@@ -787,6 +793,44 @@ mod tests {
         assert!(
             result.is_ok(),
             "run's lifecycle assembly must self-shut-down well within the timeout"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn run_with_only_orphans_self_shuts_down_and_leaves_no_record() {
+        let dir = std::env::temp_dir().join(format!(
+            "rdpilot-daemon-server-orphan-run-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let sink_path = dir.join("sessions.json");
+        JsonReconciliationSink::at(sink_path.clone()).record_open(
+            &"leftover".parse().expect("non-empty literal"),
+            "10.0.0.9",
+            "2026-01-01T00:00:00Z",
+        );
+        assert_eq!(reconcile::scan_orphans(&sink_path).len(), 1);
+
+        let config = RunConfig {
+            sink_path_override: Some(sink_path.clone()),
+            lifecycle: LifecycleConfig {
+                idle_timeout: Duration::from_secs(3600),
+                empty_grace: Duration::from_millis(30),
+                reap_interval: Duration::from_millis(10),
+                retention: LifecycleConfig::DEFAULT_RETENTION,
+            },
+        };
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_inner_without_bind_for_test(config),
+        )
+        .await;
+        assert!(result.is_ok(), "an orphan must not keep the daemon running");
+        assert!(
+            reconcile::scan_orphans(&sink_path).is_empty(),
+            "no record is left"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -838,6 +882,9 @@ mod tests {
         shutdown.wait().await;
         let _ = reaper_handle.await;
         let _ = watcher_handle.await;
+        registry
+            .expire_retained(Duration::ZERO, crate::registry::Removal::DaemonExit)
+            .await;
     }
 
     // --- 14-05 (MCP-06): the env-gated slowness hook -----------------

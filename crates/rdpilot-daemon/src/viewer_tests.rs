@@ -1166,6 +1166,7 @@ async fn an_open_viewer_changes_neither_idle_reaping_nor_self_shutdown() {
             idle_timeout: Duration::from_millis(800),
             empty_grace: Duration::from_millis(300),
             reap_interval: Duration::from_millis(50),
+            retention: LifecycleConfig::DEFAULT_RETENTION,
         };
         let shutdown = ShutdownSignal::new();
         let reaper = tokio::spawn(lifecycle::idle_reaper(
