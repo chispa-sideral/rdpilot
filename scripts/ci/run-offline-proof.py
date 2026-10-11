@@ -36,7 +36,7 @@ CHECKS = {
         "a.connected", "viewer_started", "w1.frame_age_sampled_on_every_tick", "w1.stale_frames_counted",
         "w1.encode_time_and_frame_rate_per_viewer", "w1.clock_offset_bounded", "w1.cross_check_recorded",
         "w1.daemon_cpu_and_memory_sampled", "w1.recorder_counters_and_ratio", "w1.result_has_every_field",
-        "w2_w4.skipped_with_reason", "evidence_contains_no_token_or_credentials",
+        "w2_w4.skipped_with_reason", "w1.comparison_rendered", "evidence_contains_no_token_or_credentials",
     ),
 }
 

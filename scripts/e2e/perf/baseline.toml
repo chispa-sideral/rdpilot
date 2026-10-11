@@ -1,0 +1,83 @@
+# Targets and baseline of the performance workload (scripts/e2e/run-perf-proof.py).
+# The workload compares each run with this file and reports; it never fails on it.
+# Target values change by owner decision only. Baseline values change in the change
+# that intends to move them.
+schema = 1
+
+# What the baseline applies to. A run in another setting gets a note, not a status.
+[setting]
+image_os = "win25-vs2026"
+resolution = "1920x1080"
+vcpu = 4
+browser = "headless"
+
+[[target]]
+id = "viewer_frame_age_p95"
+text = "Viewer frame-to-screen latency, p95, on loopback at 1080p with two viewers and the recorder"
+workload = "w1"
+metric = "pooled.frame_age_ms.p95"
+op = "<="
+value = 150
+unit = "ms"
+
+[[target]]
+id = "resize_first_frame"
+text = "Controller resize to the first frame at the new size"
+workload = "w2"
+op = "<="
+value = 1
+unit = "s"
+
+[[target]]
+id = "clipboard_round_trip"
+text = "Clipboard text round trip, 1 MB"
+workload = "w3"
+op = "<="
+value = 500
+unit = "ms"
+
+[[target]]
+id = "print_to_pdf"
+text = "One-page print to PDF"
+workload = "w4"
+op = "<="
+value = 30
+unit = "s"
+
+[[target]]
+id = "recorder_dropped_ratio"
+text = "Recorder dropped-frame ratio at 10 fps"
+workload = "w1"
+metric = "recorder.dropped_ratio"
+op = "<"
+value = 0.01
+unit = "ratio"
+rate_fps = 10
+
+[[target]]
+id = "daemon_cpu"
+text = "Daemon CPU in the W1 workload"
+workload = "w1"
+metric = "daemon.cpu_cores"
+op = "<="
+value = 1
+unit = "cores"
+
+# Metrics that no run can measure yet.
+[[baseline]]
+workload = "w2"
+not_measurable = "no resize operation exists"
+
+[[baseline]]
+workload = "w3"
+not_measurable = "no clipboard channel exists"
+
+[[baseline]]
+workload = "w4"
+not_measurable = "no printer device is redirected"
+
+[[baseline]]
+workload = "w1"
+metric = "recorder.dropped_ratio"
+rate_fps = 10
+not_measurable = "the recorder rate is limited to 0.5-8.0 fps"

@@ -111,8 +111,12 @@ with Cua disabled.
 The step uploads the `perf-workload-result` artifact (90 days) with
 `perf-result.json` and the raw samples. The offline job runs the same script
 with `--fake` against synthetic frames of a known age
-(`run-offline-proof.py perf`). `docs/performance.md` has the workload
-definitions, the measurement method and the baseline.
+(`run-offline-proof.py perf`). The docstring of `run-perf-proof.py` has the
+workload definitions and the measurement method. `scripts/e2e/perf/baseline.toml`
+has the targets and the baseline. Each run that measures W1 also writes
+`perf-comparison.html` and `perf-comparison.md` to the `perf-workload-result`
+artifact, and a live run adds the table to the job summary. The comparison is
+report only.
 
 Not executed live: the recording proof (three concurrent users and POSIX
 client checks; offline only), tailnet and cross-machine viewing, UAC and the

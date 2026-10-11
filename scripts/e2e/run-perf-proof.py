@@ -30,8 +30,31 @@ input-to-change wall time of a key press as a cross-check (never pooled); the
 recorder counters of the recording manifest, with the recording started and
 stopped at the window edges; and daemon CPU (cores) and working set. The
 result is perf-result.json (schema 1). The summary status "passed" means the
-measurement path completed with non-zero sample counts in every pass; no value
-is compared with a target.
+measurement path completed with non-zero sample counts in every pass; it does
+not compare a value with a target.
+
+Window and recorder: each pass runs the session for a warm-up (30 s by
+default) and then a steady-state window (60 s by default); the pixel-clock
+samples, the frame responses, the daemon CPU and the recorder counters cover
+the window. The recorder dropped ratio is frames dropped divided by frames
+captured: a captured frame that the encoder did not take before the next
+capture replaced it. It does not count every missed opportunity at the
+recorder rate. The recorder maximum is 8 fps, so the 10 fps target has no pass.
+
+Comparison (report only): scripts/e2e/perf/baseline.toml holds the setting the
+baseline applies to (runner image, resolution, vCPU count, browser mode), the
+six targets and the baseline values (median, minimum and maximum of the
+baseline runs per metric and recorder rate). A run that measured W1 also
+writes perf-comparison.html (one self-contained page) and perf-comparison.md
+next to perf-result.json, and a live run appends the markdown to the job
+summary. Every target and baseline metric gets a row with the target, the
+baseline, this run, the delta to the baseline median and whether the run is
+inside the baseline range. The status of a target row is "met", "not met" or
+"not measurable" (a skipped workload, or a recorder rate that has no pass). A
+fake run shows "not applicable", because its frames are synthetic. A setting
+that differs from the baseline is a note on the page, never a status. No
+status changes the exit code. Target values change by owner decision only;
+baseline values change in the change that intends to move them.
 
 Fake mode (offline, Linux; fake connector, the real page, sampler, decoder,
 statistics, CPU sampler, recorder start and stop and manifest reading, against
@@ -65,9 +88,11 @@ import argparse
 import asyncio
 import base64
 import ctypes
+import html
 import http.client
 import json
 import math
+import operator
 import os
 from pathlib import Path
 import platform
@@ -79,6 +104,7 @@ import sys
 import tempfile
 import threading
 import time
+import tomllib
 import zlib
 
 HERE = Path(__file__).resolve().parent
@@ -693,6 +719,9 @@ class Perf:
     def write_json(self, name, data):
         (self.output / name).write_text(self.clean(json.dumps(data, default=str)))
 
+    def write_text(self, name, text):
+        (self.output / name).write_text(self.clean(text), encoding="utf-8")
+
     def write_png(self, name, data_url):
         if data_url:
             (self.output / name).write_bytes(base64.b64decode(data_url.split(",", 1)[1]))
@@ -1199,6 +1228,20 @@ class Perf:
         require(not missing, "result fields missing: " + ", ".join(missing))
         self.check("w1.result_has_every_field", passes=len(passes))
 
+    def render_comparison(self):
+        """Write the comparison with the reference next to the result; a live run adds it to the job summary."""
+        reference = load_reference(self.args.reference)
+        rows = compare(self.result, reference)
+        notes = setting_notes(self.result, reference)
+        markdown = render_markdown(rows, notes, self.result)
+        self.write_text("perf-comparison.html", render_html(rows, notes, self.result))
+        self.write_text("perf-comparison.md", markdown)
+        summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+        if summary_path and not self.fake:
+            with open(summary_path, "a", encoding="utf-8") as handle:
+                handle.write(markdown)
+        self.check("w1.comparison_rendered", rows=len(rows))
+
     # --- orchestration --------------------------------------------------------------------------
 
     def environment(self, passes):
@@ -1239,6 +1282,7 @@ class Perf:
             if workloads in ("all", "w1"):
                 self.summary["status"] = "passed"
                 self.result["status"] = "measured"
+                self.render_comparison()
             else:
                 self.summary["status"] = "skipped"
                 self.result["status"] = "skipped"
@@ -1261,6 +1305,215 @@ class Perf:
         return 0 if self.summary["status"] == "passed" else 2
 
 
+# --- comparison with the reference ---------------------------------------------------------
+
+REFERENCE = HERE / "perf" / "baseline.toml"
+# The W1 metrics that have a baseline: (path in a pass, unit).
+BASELINE_METRICS = (
+    ("pooled.frame_age_ms.p50", "ms"), ("pooled.frame_age_ms.p95", "ms"), ("pooled.frame_age_ms.max", "ms"),
+    ("recorder.frames_captured", "frames"), ("recorder.frames_encoded", "frames"),
+    ("recorder.frames_dropped", "frames"), ("recorder.dropped_ratio", "ratio"),
+    ("daemon.cpu_cores", "cores"),
+    ("daemon.working_set_window_peak_bytes", "bytes"), ("daemon.working_set_peak_lifetime_bytes", "bytes"),
+)
+OPERATORS = {"<=": operator.le, "<": operator.lt}
+FAKE_NOTE = "mode fake: synthetic frames of a known age; no status applies"
+NOT_APPLICABLE = "not applicable"
+
+
+def load_reference(path=None):
+    """The targets, the setting and the baseline values (scripts/e2e/perf/baseline.toml)."""
+    with open(path or REFERENCE, "rb") as handle:
+        reference = tomllib.load(handle)
+    require(reference.get("schema") == 1, "reference: schema 1 expected")
+    for target in reference.get("target", []):
+        require(target.get("op") in OPERATORS, f"reference: unknown operator in target {target.get('id')}")
+    return reference
+
+
+def number(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def fmt(value):
+    """A number with four significant digits, or a whole number with thousands separators."""
+    if not number(value):
+        return "none"
+    if abs(value) >= 10000 or float(value).is_integer():
+        return f"{value:,.0f}"
+    return f"{value:.4g}"
+
+
+def fmt_unit(value, unit):
+    return f"{fmt(value)} {unit}" if number(value) else "none"
+
+
+def dig(data, path):
+    for key in path.split("."):
+        if not isinstance(data, dict) or key not in data:
+            return None
+        data = data[key]
+    return data
+
+
+def find_baseline(reference, workload, metric, rate):
+    for entry in reference.get("baseline", []):
+        if entry.get("workload") == workload and entry.get("metric") == metric and entry.get("rate_fps") == rate:
+            return entry
+    return None
+
+
+def baseline_text(entry, unit):
+    if entry is None:
+        return "no baseline"
+    if entry.get("not_measurable"):
+        return "not measurable: " + entry["not_measurable"]
+    if not all(number(entry.get(k)) for k in ("median", "min", "max")):
+        return "no baseline"
+    return f"{fmt(entry['median'])} ({fmt(entry['min'])} to {fmt(entry['max'])}) {unit}"
+
+
+def delta_text(value, entry):
+    """The delta to the baseline median and the position against the baseline range."""
+    if not number(value) or entry is None or not all(number(entry.get(k)) for k in ("median", "min", "max")):
+        return ""
+    delta = value - entry["median"]
+    text = f"{delta:+.4g}"
+    if entry["median"]:
+        text += f" ({delta / entry['median'] * 100:+.1f} %)"
+    return text + (", inside the range" if entry["min"] <= value <= entry["max"] else ", outside the range")
+
+
+def row(kind, name, pass_fps, target, baseline, value, status, delta="", note=""):
+    return {"kind": kind, "name": name, "pass": pass_fps, "target": target, "baseline": baseline, "value": value,
+            "status": status, "delta": delta, "note": note}
+
+
+def compare(result, reference):
+    """Rows for every target and every baseline metric of every pass; report only."""
+    fake = result.get("mode") == "fake"
+    workloads = result.get("workloads") or {}
+    passes = (workloads.get("w1") or {}).get("passes") or []
+    rows = []
+
+    def verdict(raw):
+        return NOT_APPLICABLE if fake else raw
+
+    for target in reference.get("target", []):
+        workload, unit, rate = target["workload"], target["unit"], target.get("rate_fps")
+        want = f"{target['op']} {fmt_unit(target['value'], unit)}" + (f" at {rate:g} fps" if rate else "")
+        metric = target.get("metric")
+        if workload != "w1":
+            entry = workloads.get(workload) or {}
+            reason = entry.get("reason") or "workload not run"
+            rows.append(row("target", target["id"], "-", want, baseline_text(find_baseline(reference, workload, None, None), unit),
+                            "none", verdict("not measurable"), note=reason))
+            continue
+        chosen = [p for p in passes if rate is None or p.get("recorder_fps") == rate]
+        if not chosen:
+            context = "; ".join(f"{fmt(dig(p, metric))} at {p['recorder_fps']:g} fps" for p in passes if number(dig(p, metric)))
+            rows.append(row("target", target["id"], f"{rate:g} fps" if rate else "-", want,
+                            baseline_text(find_baseline(reference, workload, metric, rate), unit), "none",
+                            verdict("not measurable"),
+                            note="no pass at this recorder rate" + (f"; context: {context}" if context else "")))
+            continue
+        for p in chosen:
+            value = dig(p, metric)
+            entry = find_baseline(reference, workload, metric, p.get("recorder_fps"))
+            if number(value):
+                raw = "met" if OPERATORS[target["op"]](value, target["value"]) else "not met"
+            else:
+                raw = "not measurable"
+            rows.append(row("target", target["id"], f"{p['recorder_fps']:g} fps", want, baseline_text(entry, unit),
+                            fmt_unit(value, unit), verdict(raw), delta_text(value, entry)))
+    for p in passes:
+        for metric, unit in BASELINE_METRICS:
+            value = dig(p, metric)
+            entry = find_baseline(reference, "w1", metric, p.get("recorder_fps"))
+            rows.append(row("baseline", metric, f"{p['recorder_fps']:g} fps", "", baseline_text(entry, unit),
+                            fmt_unit(value, unit), "-", delta_text(value, entry)))
+    return rows
+
+
+def setting_notes(result, reference):
+    """Differences between the run and the setting of the baseline; none for a fake run."""
+    if result.get("mode") == "fake":
+        return []
+    environment = result.get("environment") or {}
+    size, browser = environment.get("resolution"), environment.get("browser")
+    seen = {
+        "image_os": environment.get("image_os"),
+        "resolution": f"{size[0]}x{size[1]}" if isinstance(size, list) and len(size) == 2 else None,
+        "vcpu": environment.get("vcpu"),
+        "browser": ("headless" if browser.get("headless") else "headed") if isinstance(browser, dict) else None,
+    }
+    return [f"The baseline applies to {key} = {want}; this run has {seen.get(key)}."
+            for key, want in (reference.get("setting") or {}).items() if seen.get(key) != want]
+
+
+def comparison_heading(result):
+    mode = result.get("mode")
+    return f"Performance comparison: mode {mode}, status {result.get('status')}, commit {str(result.get('commit'))[:12]}"
+
+
+COLUMNS = ("name", "pass", "target", "baseline", "value", "status", "delta", "note")
+COLUMN_HEADS = ("Pass", "Requirement", "Baseline", "This run", "Status", "Delta to the baseline median", "Note")
+
+
+def render_markdown(rows, notes, result):
+    def cell(text):
+        return str(text).replace("|", "/").replace("\n", " ")
+
+    lines = [f"## {comparison_heading(result)}", "", "Report only: no status changes the result of the run.", ""]
+    if result.get("mode") == "fake":
+        lines += [FAKE_NOTE, ""]
+    lines += [f"- {note}" for note in notes] + ([""] if notes else [])
+    for kind, title, first in (("target", "Targets", "Target"), ("baseline", "Baseline metrics", "Metric")):
+        head = "| " + " | ".join((first, *COLUMN_HEADS)) + " |"
+        lines += [f"### {title}", "", head, "|" + " --- |" * len(COLUMNS)]
+        for r in rows:
+            if r["kind"] == kind:
+                lines.append("| " + " | ".join(cell(r[k]) for k in COLUMNS) + " |")
+        lines.append("")
+    return "\n".join(lines) + "\n"
+
+
+CSS = """
+body { font-family: sans-serif; margin: 1.5em; }
+table { border-collapse: collapse; margin-bottom: 1.5em; }
+th, td { border: 1px solid silver; padding: 0.25em 0.6em; text-align: left; vertical-align: top; }
+th { background: whitesmoke; }
+.met { color: darkgreen; font-weight: bold; }
+.not-met { color: firebrick; font-weight: bold; }
+.not-measurable, .not-applicable { color: dimgray; }
+.note { background: lightyellow; border: 1px solid khaki; padding: 0.4em 0.8em; }
+pre { white-space: pre-wrap; }
+"""
+
+
+def render_html(rows, notes, result):
+    esc = html.escape
+    parts = ["<!DOCTYPE html>", '<html lang="en"><head><meta charset="utf-8">',
+             f"<title>{esc(comparison_heading(result))}</title>", f"<style>{CSS}</style></head><body>",
+             f"<h1>{esc(comparison_heading(result))}</h1>",
+             "<p>Report only: no status changes the result of the run.</p>"]
+    if result.get("mode") == "fake":
+        parts.append(f'<p class="note">{esc(FAKE_NOTE)}</p>')
+    parts += [f'<p class="note">{esc(note)}</p>' for note in notes]
+    for kind, title, first in (("target", "Targets", "Target"), ("baseline", "Baseline metrics", "Metric")):
+        parts += [f"<h2>{title}</h2>", "<table><tr>" + "".join(f"<th>{esc(h)}</th>" for h in (first, *COLUMN_HEADS)) + "</tr>"]
+        for r in rows:
+            if r["kind"] == kind:
+                css = esc(r["status"].replace(" ", "-"))
+                parts.append("<tr>" + "".join(
+                    f'<td class="{css}">{esc(str(r[k]))}</td>' if k == "status" else f"<td>{esc(str(r[k]))}</td>"
+                    for k in COLUMNS) + "</tr>")
+        parts.append("</table>")
+    method = (__doc__ or "").split("Fake mode (", 1)[0].strip()
+    parts += ["<h2>Workloads and method</h2>", f"<pre>{esc(method)}</pre>", "</body></html>"]
+    return "\n".join(parts) + "\n"
+
+
 # --- self test -------------------------------------------------------------------------------
 
 def inflate_png(data):
@@ -1275,6 +1528,60 @@ def inflate_png(data):
             idat += body
         position += 12 + length
     return zlib.decompress(idat)  # raises on a wrong adler checksum
+
+
+def selftest_comparison():
+    def one_pass(fps, p95, cpu, ratio):
+        return {"recorder_fps": fps, "pooled": {"frame_age_ms": {"p50": 100.0, "p95": p95, "max": 400.0}},
+                "recorder": {"dropped_ratio": ratio, "frames_captured": 240}, "daemon": {"cpu_cores": cpu}}
+
+    reference = {
+        "schema": 1, "setting": {"image_os": "win25", "resolution": "1920x1080", "vcpu": 4, "browser": "headless"},
+        "target": [
+            {"id": "age", "workload": "w1", "metric": "pooled.frame_age_ms.p95", "op": "<=", "value": 150, "unit": "ms"},
+            {"id": "resize", "workload": "w2", "op": "<=", "value": 1, "unit": "s"},
+            {"id": "ratio", "workload": "w1", "metric": "recorder.dropped_ratio", "op": "<", "value": 0.01, "unit": "ratio", "rate_fps": 10},
+            {"id": "cpu", "workload": "w1", "metric": "daemon.cpu_cores", "op": "<=", "value": 1, "unit": "cores"},
+        ],
+        "baseline": [
+            {"workload": "w1", "metric": "pooled.frame_age_ms.p95", "rate_fps": 4, "median": 140.0, "min": 130.0, "max": 160.0},
+            {"workload": "w1", "metric": "recorder.dropped_ratio", "rate_fps": 10, "not_measurable": "above the recorder range"},
+            {"workload": "w2", "not_measurable": "no resize operation"},
+        ],
+    }
+    live = {"mode": "live", "status": "measured", "commit": "abc",
+            "environment": {"image_os": "win25", "resolution": [1920, 1080], "vcpu": 2, "browser": {"headless": True}},
+            "workloads": {"w1": {"status": "measured", "passes": [one_pass(4.0, 150.0, 0.5, 0.2), one_pass(8.0, 151.0, 1.5, 0.5)]},
+                          "w2": {"status": "not_measurable_at_baseline", "reason": "no resize operation"}}}
+    rows = compare(live, reference)
+    target = {(r["name"], r["pass"]): r for r in rows if r["kind"] == "target"}
+    require(target[("age", "4 fps")]["status"] == "met" and target[("age", "8 fps")]["status"] == "not met", "met and not met")
+    require(target[("age", "4 fps")]["baseline"] == "140 (130 to 160) ms" and target[("age", "4 fps")]["delta"] == "+10 (+7.1 %), inside the range",
+            f"delta {target[('age', '4 fps')]}")
+    require(target[("age", "8 fps")]["baseline"] == "no baseline" and target[("age", "8 fps")]["delta"] == "", "no baseline")
+    require(target[("resize", "-")]["status"] == "not measurable" and target[("resize", "-")]["note"] == "no resize operation",
+            "skipped workload")
+    require(target[("ratio", "10 fps")]["status"] == "not measurable" and "0.2 at 4 fps" in target[("ratio", "10 fps")]["note"]
+            and "above the recorder range" in target[("ratio", "10 fps")]["baseline"], "missing recorder rate")
+    require(target[("cpu", "4 fps")]["status"] == "met" and target[("cpu", "8 fps")]["status"] == "not met", "cpu rows")
+    require(sum(1 for r in rows if r["kind"] == "baseline") == 2 * len(BASELINE_METRICS), "one row per metric and pass")
+    require(any(r["kind"] == "baseline" and r["value"] == "none" for r in rows), "a metric the pass lacks shows none")
+    notes = setting_notes(live, reference)
+    require(notes == ["The baseline applies to vcpu = 4; this run has 2."], f"setting note {notes}")
+    page = render_html(rows, notes, live)
+    text = render_markdown(rows, notes, live)
+    require("<script" not in page and "http" not in page and "<link" not in page, "page is self-contained")
+    require("vcpu = 4" in page and "vcpu = 4" in text and "not met" in page and "140 (130 to 160) ms" in text, "page content")
+    require(html.escape("<b>&") in render_html([row("target", "<b>&", "-", "", "", "", "met")], [], live), "values are escaped")
+    fake = dict(live, mode="fake")
+    fake_rows = compare(fake, reference)
+    require({r["status"] for r in fake_rows if r["kind"] == "target"} == {NOT_APPLICABLE}, "fake statuses")
+    require(setting_notes(fake, reference) == [] and FAKE_NOTE in render_html(fake_rows, [], fake)
+            and FAKE_NOTE in render_markdown(fake_rows, [], fake), "fake mode note")
+    require(number(1.5) and not number(True) and not number(float("nan")) and fmt(12345.6) == "12,346", "number formats")
+    shipped = load_reference()
+    require(len(shipped.get("target", [])) == 6, "the shipped reference has six targets")
+    compare(live, shipped)
 
 
 def selftest():
@@ -1325,6 +1632,7 @@ def selftest():
         x, y = BLOCK_PROBE
         offset = y * (1 + 3 * SCREEN_W) + 1 + 3 * x
         require(tuple(raw[offset:offset + 3]) == colour, "block colour follows the state")
+    selftest_comparison()
     meter = ProcessMeter(os.getpid())
     try:
         cpu_a, working_set, peak = meter.read()
@@ -1349,6 +1657,7 @@ def main():
     parser.add_argument("--window-s", type=int, help="steady-state window in seconds (default 60; fake 5)")
     parser.add_argument("--warmup-s", type=int, help="warm-up before the window in seconds (default 30; fake 1)")
     parser.add_argument("--recorder-fps", help="comma-separated recorder rates, one pass each (default 4,8; fake 4)")
+    parser.add_argument("--reference", help="targets and baseline for the comparison (default scripts/e2e/perf/baseline.toml)")
     parser.add_argument("--cross-checks", type=int, default=5, help="key presses for the input-to-change cross-check")
     parser.add_argument("--painter-port", type=int, default=47653)
     parser.add_argument("--painter-interval-ms", type=int, default=20)
