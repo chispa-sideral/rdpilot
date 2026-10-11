@@ -97,3 +97,53 @@ Not executed live: the recording proof (three concurrent users and POSIX
 client checks; offline only), tailnet and cross-machine viewing, UAC and the
 secure desktop, Windows Job containment over RDP, download of a published
 bridge release, and domain or production authentication.
+
+## Evidence matrix
+
+Every `ci.yml` run publishes the artifact `evidence-matrix`, which holds
+`evidence-matrix.toml` and `evidence-matrix.html`. The report-only job
+`evidence-matrix` makes it with `scripts/ci/evidence-matrix.py render`. The job
+is not in `success.needs`, and a failure of the job does not fail the run or a
+release that calls `ci.yml`.
+
+Each row is one assertion selector of the tree and has the ID
+`<kind>/<selector>`:
+
+- `offline/<proof>/<label>`: a check of `run-offline-proof.py`.
+- `e2e/<script>/<site>`: a `check()` site of `scripts/e2e/*.py`. A generated
+  part of the label is `{}`. The labels that the run produced are in the row.
+- `cargo/<package>/lib`, `lib/<module>`, `bin/<name>` or `test/<name>`: a Cargo
+  test target. The libraries of `split_packages` have one selector per module.
+- `ignored/<repo path>::<fn>`: an `#[ignore]` test.
+- `file/<repo path>`: a `scripts/ci/test_*.py` or `scripts/e2e/*.sh` file.
+
+`evidence-rules.toml` gives each selector its tier, mode, cadence and the
+`ci.yml` steps that run it. A rule has a `kind`, a glob in `match` and the
+steps in `runs`. The first rule of a kind whose glob fits a selector wins, so a
+rule for one OS goes before a general rule. The same file holds the definitions
+of the tiers, modes and cadences, the placement rules and the duration limits
+that the HTML shows. It holds no run data.
+
+The unit tests (`test_evidence_matrix.py`, in the step "CI and publisher
+failure-injection tests") run `evidence-matrix.py check`. The check fails when
+a selector has no rule, a rule fits no selector, or a rule names a `ci.yml` job
+or step that does not exist. A new test target, `#[ignore]` test or `check()`
+label in a new script therefore needs a rule in the same change. A new label in
+a script that a rule already covers needs none. The check does not run cargo.
+
+A row result is `passed`, `failed`, `skipped` or `not run`:
+
+- A proof row (`offline`, `e2e`) is `passed` when a listed proof reports the
+  label as passed. The summary of a proof lists passed checks only, so a missing
+  label in the summary of a failed proof is `failed` with the note "failed or
+  not reached". A missing label in the summary of a passed proof is `not run`:
+  the proof did not reach the check. A label is matched by name within the
+  summaries of the listed proofs.
+- Other rows take the conclusion of every listed step. A row without a step is
+  `not run` and shows why.
+- The job reads the steps and the durations of the run from the jobs API of the
+  repository, with the job token and then without a token. The API is not read
+  when `release.yml` calls `ci.yml`, and a failed read does not fail the job.
+  The row results then come from the job results, and the artifact states this
+  in `jobs_api`. Durations are reported against the limits in the rules file
+  and are never enforced.
