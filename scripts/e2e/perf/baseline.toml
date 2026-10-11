@@ -81,3 +81,187 @@ workload = "w1"
 metric = "recorder.dropped_ratio"
 rate_fps = 10
 not_measurable = "the recorder rate is limited to 0.5-8.0 fps"
+
+# Baseline of the W1 pass with the recorder at 4 fps.
+
+[[baseline]]
+workload = "w1"
+metric = "pooled.frame_age_ms.p50"
+rate_fps = 4
+median = 184.9
+min = 170.6
+max = 187.0
+unit = "ms"
+
+[[baseline]]
+workload = "w1"
+metric = "pooled.frame_age_ms.p95"
+rate_fps = 4
+median = 300.1
+min = 285.8
+max = 300.5
+unit = "ms"
+
+[[baseline]]
+workload = "w1"
+metric = "pooled.frame_age_ms.max"
+rate_fps = 4
+median = 358.4
+min = 339.0
+max = 394.3
+unit = "ms"
+
+[[baseline]]
+workload = "w1"
+metric = "recorder.frames_captured"
+rate_fps = 4
+median = 243
+min = 242
+max = 244
+unit = "frames"
+
+[[baseline]]
+workload = "w1"
+metric = "recorder.frames_encoded"
+rate_fps = 4
+median = 236
+min = 183
+max = 238
+unit = "frames"
+
+[[baseline]]
+workload = "w1"
+metric = "recorder.frames_dropped"
+rate_fps = 4
+median = 7
+min = 1
+max = 55
+unit = "frames"
+
+[[baseline]]
+workload = "w1"
+metric = "recorder.dropped_ratio"
+rate_fps = 4
+median = 0.02881
+min = 0.004132
+max = 0.2254
+unit = "ratio"
+
+[[baseline]]
+workload = "w1"
+metric = "daemon.cpu_cores"
+rate_fps = 4
+median = 1.519
+min = 1.037
+max = 1.559
+unit = "cores"
+
+[[baseline]]
+workload = "w1"
+metric = "daemon.working_set_window_peak_bytes"
+rate_fps = 4
+median = 209514496
+min = 202162176
+max = 210239488
+unit = "bytes"
+
+[[baseline]]
+workload = "w1"
+metric = "daemon.working_set_peak_lifetime_bytes"
+rate_fps = 4
+median = 225714176
+min = 222240768
+max = 227311616
+unit = "bytes"
+
+# Baseline of the W1 pass with the recorder at 8 fps.
+
+[[baseline]]
+workload = "w1"
+metric = "pooled.frame_age_ms.p50"
+rate_fps = 8
+median = 184.6
+min = 170.4
+max = 187.8
+unit = "ms"
+
+[[baseline]]
+workload = "w1"
+metric = "pooled.frame_age_ms.p95"
+rate_fps = 8
+median = 298.9
+min = 285.0
+max = 302.0
+unit = "ms"
+
+[[baseline]]
+workload = "w1"
+metric = "pooled.frame_age_ms.max"
+rate_fps = 8
+median = 342.8
+min = 334.7
+max = 349.4
+unit = "ms"
+
+[[baseline]]
+workload = "w1"
+metric = "recorder.frames_captured"
+rate_fps = 8
+median = 484
+min = 482
+max = 484
+unit = "frames"
+
+[[baseline]]
+workload = "w1"
+metric = "recorder.frames_encoded"
+rate_fps = 8
+median = 244
+min = 184
+max = 396
+unit = "frames"
+
+[[baseline]]
+workload = "w1"
+metric = "recorder.frames_dropped"
+rate_fps = 8
+median = 238
+min = 88
+max = 288
+unit = "frames"
+
+[[baseline]]
+workload = "w1"
+metric = "recorder.dropped_ratio"
+rate_fps = 8
+median = 0.4938
+min = 0.1818
+max = 0.595
+unit = "ratio"
+
+[[baseline]]
+workload = "w1"
+metric = "daemon.cpu_cores"
+rate_fps = 8
+median = 1.597
+min = 1.549
+max = 1.602
+unit = "cores"
+
+[[baseline]]
+workload = "w1"
+metric = "daemon.working_set_window_peak_bytes"
+rate_fps = 8
+median = 210055168
+min = 208138240
+max = 210128896
+unit = "bytes"
+
+[[baseline]]
+workload = "w1"
+metric = "daemon.working_set_peak_lifetime_bytes"
+rate_fps = 8
+median = 225914880
+min = 223264768
+max = 230756352
+unit = "bytes"
