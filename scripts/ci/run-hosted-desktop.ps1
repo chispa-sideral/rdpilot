@@ -5,7 +5,7 @@
 # machine (see README.md).
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory)][ValidateSet('cua', 'viewer', 'takeover')][string]$Proof,
+    [Parameter(Mandatory)][ValidateSet('cua', 'viewer', 'takeover', 'perf')][string]$Proof,
     [string]$BinDir = 'target/x86_64-pc-windows-msvc/release',
     # Keep this below the CI step timeout, so that cleanup runs when a harness hangs.
     [int]$TimeLimitMinutes = 35
@@ -28,6 +28,12 @@ $oldNla = (Get-ItemProperty $tcp).UserAuthentication
 $service = Get-CimInstance Win32_Service -Filter "Name='TermService'"
 $cache = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'rdpilot\cache'
 $initialCachePresent = Test-Path $cache
+# The perf proof paints a pixel clock inside the test user's session: a logon entry starts it.
+$painterDir = 'C:\rdpilot-perf-painter'
+$runKey = 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Run'
+$runName = "RdpilotPerfPainter-$PID"
+$painterPort = 47653
+$painterIntervalMs = 20
 $result = [ordered]@{ proof = $Proof; stage = 'setup'; harness_exit_code = $null; summary_status = $null; passed = $false }
 # Only processes started from this build, never an unrelated rdpilot.
 $ownProcesses = {
@@ -66,7 +72,7 @@ try {
         )
     } | ConvertTo-Json | Set-Content (Join-Path $evidence 'environment.json')
 
-    $labels = if ($Proof -eq 'takeover') { @('a') } else { @('a', 'b') }
+    $labels = if ($Proof -in 'takeover', 'perf') { @('a') } else { @('a', 'b') }
     foreach ($label in $labels) {
         $name = "rdp$Proof$label"
         $password = 'Rdp1!' + [Convert]::ToBase64String([Security.Cryptography.RandomNumberGenerator]::GetBytes(24)) + 'aA1!'
@@ -76,6 +82,17 @@ try {
         Add-LocalGroupMember -Group 'Remote Desktop Users' -Member $name
         Add-LocalGroupMember -Group 'Users' -Member $name
         $credentials[$label] = [ordered]@{ host = '127.0.0.1'; port = 3389; username = $name; domain = $env:COMPUTERNAME; password = $password }
+    }
+
+    if ($Proof -eq 'perf') {
+        # The painter files, readable and writable for the test user (its log goes there).
+        New-Item -ItemType Directory -Force $painterDir | Out-Null
+        Copy-Item (Join-Path $PSScriptRoot '../e2e/perf/painter.ps1'), (Join-Path $PSScriptRoot '../e2e/perf/PixelClock.cs') $painterDir
+        & icacls $painterDir /grant 'Users:(OI)(CI)M' | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw 'Unable to open the painter directory to the test user' }
+        # Any other user's logon exits at once; only the test user paints.
+        $painterCommand = "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File $painterDir\painter.ps1 -User $($users.Keys | Select-Object -First 1) -Port $painterPort -IntervalMs $painterIntervalMs"
+        New-ItemProperty -Path $runKey -Name $runName -Value $painterCommand -PropertyType String -Force | Out-Null
     }
 
     $result.stage = 'listener'
@@ -99,7 +116,7 @@ try {
     # Passwords reach the harness only through a private file or its own environment.
     $start = [Diagnostics.ProcessStartInfo]::new((Get-Command python).Source)
     $start.UseShellExecute = $false
-    $script = @{ cua = 'run-cua-e2e.py'; viewer = 'run-viewer-proof.py'; takeover = 'run-takeover-proof.py' }[$Proof]
+    $script = @{ cua = 'run-cua-e2e.py'; viewer = 'run-viewer-proof.py'; takeover = 'run-takeover-proof.py'; perf = 'run-perf-proof.py' }[$Proof]
     $arguments = @((Join-Path $PSScriptRoot "../e2e/$script"), '--bin-dir', $bin, '--bundle', $bundle,
         '--output', (Join-Path $evidence 'proof'), '--connect-timeout', '600')
     if ($Proof -eq 'cua') {
@@ -109,8 +126,9 @@ try {
         }
     } else {
         $arguments += '--allow-no-tailnet'
+        if ($Proof -eq 'perf') { $arguments += '--painter-dir', $painterDir, '--painter-port', [string]$painterPort, '--painter-interval-ms', [string]$painterIntervalMs }
         foreach ($label in $labels) {
-            $prefix = if ($Proof -eq 'viewer') { "RDPILOT_VIEW_$($label.ToUpper())_" } else { 'RDPILOT_TAKE_' }
+            $prefix = switch ($Proof) { 'viewer' { "RDPILOT_VIEW_$($label.ToUpper())_" } 'perf' { "RDPILOT_PERF_$($label.ToUpper())_" } default { 'RDPILOT_TAKE_' } }
             foreach ($key in $credentials[$label].Keys) { $start.Environment[$prefix + $key.ToUpper()] = [string]$credentials[$label][$key] }
         }
     }
@@ -132,6 +150,7 @@ try {
     # One failed restore must not skip the others; the readbacks below report it.
     $ErrorActionPreference = 'Continue'
     & $ownProcesses | Stop-Process -Force -ErrorAction SilentlyContinue
+    if ($Proof -eq 'perf') { Remove-ItemProperty -Path $runKey -Name $runName -ErrorAction SilentlyContinue }
     foreach ($name in $users.Keys) {
         # Terminate only the disposable users' sessions.
         $sessions = & quser $name 2>$null
@@ -156,6 +175,11 @@ try {
         }
     }
     foreach ($name in $users.Keys) { Remove-LocalUser $name -ErrorAction SilentlyContinue }
+    if ($Proof -eq 'perf') {
+        # The painter is gone with its session; copy its log as evidence, then remove its files.
+        Get-ChildItem $painterDir -Filter '*.log' -ErrorAction SilentlyContinue | Copy-Item -Destination $evidence -ErrorAction SilentlyContinue
+        Remove-Item $painterDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
     Set-ItemProperty $ts -Name fDenyTSConnections -Value $oldDeny
     Set-ItemProperty $tcp -Name UserAuthentication -Value $oldNla
     Remove-NetFirewallRule -Name $rule -ErrorAction SilentlyContinue
@@ -183,6 +207,9 @@ try {
         service_state_restored = $restoredService.State -eq $service.State
         service_start_mode_restored = $restoredService.StartMode -eq $service.StartMode
         cache_removed = $initialCachePresent -or -not (Test-Path $cache)
+    }
+    if ($Proof -eq 'perf') {
+        $cleanup['painter_removed'] = -not (Test-Path $painterDir) -and -not (Get-ItemProperty -Path $runKey -Name $runName -ErrorAction SilentlyContinue)
     }
     $cleanup | ConvertTo-Json | Set-Content (Join-Path $evidence 'cleanup.json')
     $summary = Join-Path $evidence 'proof/summary.json'

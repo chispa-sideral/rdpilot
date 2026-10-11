@@ -187,6 +187,45 @@ class MappingTests(unittest.TestCase):
             for run in rule["runs"]:
                 self.assertIn(run["step"], jobs[run["job"]]["steps"])
 
+    def test_perf_selectors_follow_their_placement(self):
+        rules = em.load_rules(ROOT)
+        selectors = em.enumerate_selectors(ROOT, set(rules["split_packages"]))
+        expected = {
+            "offline-check": ("perf/", "synthetic", "offline", "every-push",
+                              [{"job": "offline", "step": "Offline perf workload smoke", "proof": "perf"}]),
+            "e2e": ("run-perf-proof.py/", "live", "hosted-live", "on-demand",
+                    [{"job": "desktop", "step": "Performance workload (on demand)", "proof": "perf"}]),
+        }
+        for kind, (prefix, mode, tier, cadence, runs) in expected.items():
+            found = [selector for (k, selector) in selectors if k == kind and selector.startswith(prefix)]
+            self.assertTrue(found, kind)
+            for selector in found:
+                rule = rules["rule"][em.find_rule(rules, kind, selector)]
+                self.assertEqual((rule["mode"], rule["tier"], rule["cadence"], rule["runs"]),
+                                 (mode, tier, cadence, runs), selector)
+
+    def test_perf_results_reach_their_rows(self):
+        rules = em.load_rules(ROOT)
+        base = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: shutil.rmtree(base, ignore_errors=True))
+        offline = base / "offline-proof-summaries/offline-perf"
+        offline.mkdir(parents=True)
+        (offline / "artifact-summary.json").write_text(json.dumps(
+            {"proof": "perf", "status": "passed", "completed_checks": ["w1.comparison_rendered"]}), encoding="utf-8")
+        live = base / "desktop-proof-evidence/perf/proof"
+        live.mkdir(parents=True)
+        (live / "summary.json").write_text(json.dumps(
+            {"status": "passed", "checks": [{"check": "w1.clock_offset_bounded", "passed": True}]}), encoding="utf-8")
+        proofs = em.proof_results(base)
+
+        def state(job, step):
+            return "ok", True
+        for kind, selector in (("offline-check", "perf/w1.comparison_rendered"),
+                               ("e2e", "run-perf-proof.py/w1.clock_offset_bounded")):
+            rule = rules["rule"][em.find_rule(rules, kind, selector)]
+            result = em.proof_row_result({"kind": kind, "selector": selector}, rule, proofs, state)
+            self.assertEqual(result, ("passed", "", [selector.split("/", 1)[1]]))
+
     def test_cli_check_succeeds(self):
         with contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(em.main(["check"]), 0)

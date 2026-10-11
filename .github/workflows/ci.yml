@@ -5,6 +5,11 @@ on:
   pull_request:
   workflow_call:
   workflow_dispatch:
+    inputs:
+      perf_workload:
+        description: Run the performance workload on the hosted desktop runner (skips the other live proofs)
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -117,6 +122,9 @@ jobs:
       - name: Offline takeover proof
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: python scripts/ci/run-offline-proof.py takeover --bin-dir target/debug --output "$RUNNER_TEMP/offline-takeover"
+      - name: Offline perf workload smoke
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: python scripts/ci/run-offline-proof.py perf --bin-dir target/debug --output "$RUNNER_TEMP/offline-perf"
       - name: Sanitized offline proof summaries
         if: ${{ always() }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -126,13 +134,17 @@ jobs:
             ${{ runner.temp }}/offline-viewer/artifact-summary.json
             ${{ runner.temp }}/offline-recording/artifact-summary.json
             ${{ runner.temp }}/offline-takeover/artifact-summary.json
+            ${{ runner.temp }}/offline-perf/artifact-summary.json
           retention-days: 7
           if-no-files-found: warn
 
   desktop:
     name: Live RDP bridge, Cua, viewer and takeover proofs
     runs-on: windows-latest
-    # At least the sum of the step timeouts below, plus setup and upload.
+    # At least the sum of the step timeouts of the longest path, plus setup and
+    # upload. A push runs build, browser, Cua, viewer and takeover (120). The
+    # on-demand perf dispatch skips the three live proofs and runs build,
+    # browser and the perf step (70).
     timeout-minutes: 135
     steps:
       - uses: actions/checkout@v4
@@ -162,20 +174,26 @@ jobs:
       # Each proof creates its own users and restores the runner; it stops its
       # harness a few minutes before the step timeout so that cleanup still runs.
       - name: Live Cua proof
-        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && !(github.event_name == 'workflow_dispatch' && inputs.perf_workload) }}
         timeout-minutes: 40
         shell: pwsh
         run: ./scripts/ci/run-hosted-desktop.ps1 -Proof cua -TimeLimitMinutes 35
       - name: Live viewer proof
-        if: ${{ !cancelled() && steps.browser.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.browser.outcome == 'success' && !(github.event_name == 'workflow_dispatch' && inputs.perf_workload) }}
         timeout-minutes: 20
         shell: pwsh
         run: ./scripts/ci/run-hosted-desktop.ps1 -Proof viewer -TimeLimitMinutes 15
       - name: Live takeover proof
-        if: ${{ !cancelled() && steps.browser.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.browser.outcome == 'success' && !(github.event_name == 'workflow_dispatch' && inputs.perf_workload) }}
         timeout-minutes: 20
         shell: pwsh
         run: ./scripts/ci/run-hosted-desktop.ps1 -Proof takeover -TimeLimitMinutes 15
+      # On demand only: the workflow_dispatch input perf_workload. Never a gate.
+      - name: Performance workload (on demand)
+        if: ${{ !cancelled() && steps.browser.outcome == 'success' && github.event_name == 'workflow_dispatch' && inputs.perf_workload }}
+        timeout-minutes: 30
+        shell: pwsh
+        run: ./scripts/ci/run-hosted-desktop.ps1 -Proof perf -TimeLimitMinutes 25
       - name: Live proof evidence
         if: ${{ always() }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -183,6 +201,14 @@ jobs:
           name: desktop-proof-evidence
           path: ${{ runner.temp }}/hosted-desktop-evidence
           retention-days: 7
+          if-no-files-found: error
+      - name: Performance workload result
+        if: ${{ always() && github.event_name == 'workflow_dispatch' && inputs.perf_workload }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: perf-workload-result
+          path: ${{ runner.temp }}/hosted-desktop-evidence/perf
+          retention-days: 90
           if-no-files-found: error
 
   evidence-matrix:
