@@ -76,6 +76,15 @@ tier = "offline"
 cadence = "every-push"
 runs = [{ job = "offline", step = "Offline takeover proof", proof = "takeover" }]
 
+# The fake run of the perf workload: structure and consistency checks, never targets.
+[[rule]]
+kind = "offline-check"
+match = "perf/*"
+mode = "synthetic"
+tier = "offline"
+cadence = "every-push"
+runs = [{ job = "offline", step = "Offline perf workload smoke", proof = "perf" }]
+
 # --- live proofs: the check() sites of scripts/e2e ---------------------------------------
 
 [[rule]]
@@ -117,6 +126,16 @@ tier = "hosted-live"
 cadence = "on-demand"
 why = "needs a real Windows RDP server for the recorded sessions, and no ci.yml step runs the live recording proof"
 runs = []
+
+# The step runs only in a workflow_dispatch run with the input perf_workload. It is never a gate.
+[[rule]]
+kind = "e2e"
+match = "run-perf-proof.py/*"
+mode = "live"
+tier = "hosted-live"
+cadence = "on-demand"
+why = "needs a real Windows RDP server, the source bridge and the painter in the session, and runs only when a dispatch sets perf_workload"
+runs = [{ job = "desktop", step = "Performance workload (on demand)", proof = "perf" }]
 
 # --- Cargo test targets ------------------------------------------------------------------
 # Order matters: the first match wins, so a target that only one OS compiles comes first.
