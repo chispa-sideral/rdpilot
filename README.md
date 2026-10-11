@@ -227,9 +227,10 @@ Native RDP framebuffer/input remain independent of Cua. UAC/secure-desktop
 computer use is unsupported; signed binaries do not imply elevated automation.
 
 When the server ends a session or its connection fails, `rdpilot list` and the
-viewer show it as `Disconnected` until `rdpilot disconnect`, the idle reaper or a
-`connect` with the same name removes it. Other commands for that session fail
-with `session-not-found` and a message that names the end.
+viewer show it as `Disconnected` until `rdpilot disconnect` or a `connect` with
+the same name removes it, the retention period (1 hour) ends, or the daemon
+exits. Other commands for that session fail with `session-not-found` and a
+message that names the end.
 
 ## Live viewer
 
@@ -318,7 +319,8 @@ not need control.
 
 Lifetime: `rdpilot view` never starts a daemon. When the daemon exits, the
 viewer stops and the command exits. The daemon exits about 30 s after its last
-session closes, so a viewer started with no sessions stops after that time.
+session closes or ends (`Disconnected` and `Orphaned` entries do not keep it
+running), so a viewer started with no sessions stops after that time.
 
 Remote viewing: from another device on the tailnet, open the printed tailnet
 URL. When the tailnet bind is off, forward the same port over SSH and open the

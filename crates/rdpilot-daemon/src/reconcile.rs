@@ -13,8 +13,11 @@
 //! is a candidate orphan (Pitfall 9) — a missing or corrupt file yields an
 //! empty scan rather than blocking daemon startup (T-12-16), and
 //! [`seed_into`] is the bridge that feeds those candidates into the
-//! registry as `Orphaned` entries (T-12-14), never auto-torn-down
-//! (T-12-17, D-31) — only an explicit `Registry::close` reconciles one.
+//! registry as `Orphaned` entries (T-12-14) and then deletes their records,
+//! so one restart shows them. The remote session is never torn down
+//! (T-12-17, D-31); the registry removes the `Orphaned` entry after a
+//! retention period, when the daemon exits, or on an explicit
+//! `Registry::close`.
 //!
 //! `record_open`/`record_closed` are synchronous and infallible in
 //! signature ([`crate::seams::ReconciliationSink`]'s contract): a failed
@@ -135,6 +138,12 @@ impl ReconciliationSink for JsonReconciliationSink {
         records.retain(|r| r.id != id.as_str());
         self.save(&records);
     }
+
+    fn remove_records(&self, ids: &[SessionId]) -> io::Result<()> {
+        let mut records = self.load();
+        records.retain(|r| !ids.iter().any(|id| id.as_str() == r.id));
+        save_records(&self.path, &records)
+    }
 }
 
 /// The registry's writer of reconciliation records. It serializes every sink
@@ -150,49 +159,101 @@ impl ReconciliationSink for JsonReconciliationSink {
 ///
 /// The generation is held in memory only; the sink and its file keep their
 /// shape.
+///
+/// Records that no generation owns (those of `Orphaned` entries) are removed
+/// through a pending set: a removal that fails stays pending and is retried
+/// at the next write.
 pub(crate) struct RecordBook {
     sink: std::sync::Arc<dyn ReconciliationSink>,
-    open: std::sync::Mutex<std::collections::HashMap<SessionId, u64>>,
+    state: std::sync::Mutex<BookState>,
+}
+
+/// The guarded state of a [`RecordBook`].
+#[derive(Default)]
+struct BookState {
+    /// The generation that owns the record of each open session.
+    open: std::collections::HashMap<SessionId, u64>,
+    /// Records to remove that no generation owns.
+    pending: std::collections::HashSet<SessionId>,
 }
 
 impl RecordBook {
     pub(crate) fn new(sink: std::sync::Arc<dyn ReconciliationSink>) -> Self {
         RecordBook {
             sink,
-            open: std::sync::Mutex::new(std::collections::HashMap::new()),
+            state: std::sync::Mutex::new(BookState::default()),
         }
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, std::collections::HashMap<SessionId, u64>> {
-        self.open
+    fn lock(&self) -> std::sync::MutexGuard<'_, BookState> {
+        self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Record that generation `generation` of `id` opened against `host`.
+    /// Remove the pending records. On failure they stay pending.
+    fn flush_pending(&self, state: &mut BookState) {
+        if state.pending.is_empty() {
+            return;
+        }
+        let ids: Vec<SessionId> = state.pending.iter().cloned().collect();
+        match self.sink.remove_records(&ids) {
+            Ok(()) => state.pending.clear(),
+            Err(err) => eprintln!(
+                "rdpilot-daemon: could not remove {} reconciliation records (retrying at the next write): {err}",
+                ids.len()
+            ),
+        }
+    }
+
+    /// Record that generation `generation` of `id` opened against `host`. An
+    /// earlier generation than the one that owns the record writes nothing.
     pub(crate) fn opened(&self, id: &SessionId, generation: u64, host: &str, since: &str) {
-        let mut open = self.lock();
-        open.insert(id.clone(), generation);
+        let mut state = self.lock();
+        if state.open.get(id).is_some_and(|owner| *owner >= generation) {
+            return;
+        }
+        // This generation owns the record now.
+        state.pending.remove(id);
+        state.open.insert(id.clone(), generation);
         self.sink.record_open(id, host, since);
+        self.flush_pending(&mut state);
     }
 
     /// Remove the record of `id` if generation `generation` owns it. Returns
     /// whether it removed the record.
     pub(crate) fn closed(&self, id: &SessionId, generation: u64) -> bool {
-        let mut open = self.lock();
-        if open.get(id) != Some(&generation) {
+        let mut state = self.lock();
+        if state.open.get(id) != Some(&generation) {
             return false;
         }
-        open.remove(id);
+        state.open.remove(id);
         self.sink.record_closed(id);
+        self.flush_pending(&mut state);
         true
     }
 
     /// Remove the record of an `Orphaned` entry, which no generation of this
-    /// process owns.
+    /// process owns. A record that a generation owns stays.
     pub(crate) fn closed_orphan(&self, id: &SessionId) {
-        let _open = self.lock();
-        self.sink.record_closed(id);
+        let mut state = self.lock();
+        if state.open.contains_key(id) {
+            return;
+        }
+        state.pending.insert(id.clone());
+        self.flush_pending(&mut state);
+    }
+
+    /// Remove the records of the entries seeded at startup.
+    pub(crate) fn purge_seeded(&self, ids: &[SessionId]) {
+        let mut state = self.lock();
+        let unowned: Vec<SessionId> = ids
+            .iter()
+            .filter(|id| !state.open.contains_key(*id))
+            .cloned()
+            .collect();
+        state.pending.extend(unowned);
+        self.flush_pending(&mut state);
     }
 }
 
@@ -260,13 +321,23 @@ fn save_records(path: &Path, records: &[ReconciliationRecord]) -> io::Result<()>
 
 /// Seed every leftover reconciliation record into `registry` as an
 /// `Orphaned` entry (DAEMON-04) — the bridge Plan 12-06's `run()` calls
-/// once at startup, after [`scan_orphans`]. Never auto-tears-down a
-/// session (D-31/T-12-17); this only makes each candidate orphan visible
-/// via `Registry::list`.
+/// once at startup, after [`scan_orphans`]. Never tears down a remote
+/// session (D-31/T-12-17); this makes each candidate orphan visible via
+/// `Registry::list`.
+///
+/// The records of the seeded entries are then deleted, so a later restart
+/// does not show them again. A failed delete is logged and retried at the
+/// next write; seeding continues. The registry removes an `Orphaned` entry
+/// after the retention period, when the daemon exits, or on an explicit
+/// disconnect.
 pub fn seed_into(records: Vec<ReconciliationRecord>, registry: &Registry) {
+    let mut seeded = Vec::with_capacity(records.len());
     for record in records {
         match SessionId::from_str(&record.id) {
-            Ok(id) => registry.seed_orphan(id, record.host, record.connected_since),
+            Ok(id) => {
+                registry.seed_orphan(id.clone(), record.host, record.connected_since);
+                seeded.push(id);
+            }
             Err(err) => {
                 eprintln!(
                     "rdpilot-daemon: skipping malformed reconciliation record id {:?}: {err}",
@@ -275,6 +346,7 @@ pub fn seed_into(records: Vec<ReconciliationRecord>, registry: &Registry) {
             }
         }
     }
+    registry.purge_seeded_records(&seeded);
 }
 
 #[cfg(test)]
@@ -520,6 +592,157 @@ mod tests {
         assert!(sink.closes.lock().unwrap().is_empty());
         assert!(book.closed(&id, 2));
         assert_eq!(*sink.closes.lock().unwrap(), vec!["alpha"]);
+    }
+
+    #[test]
+    fn a_stale_open_never_takes_over_the_record() {
+        let sink = std::sync::Arc::new(CountingSink::default());
+        let book = RecordBook::new(sink.clone());
+        let id = test_id("alpha");
+        book.opened(&id, 2, "h", "t");
+        book.opened(&id, 1, "h", "t");
+        assert!(!book.closed(&id, 1), "generation 1 never owned it");
+        assert!(sink.closes.lock().unwrap().is_empty());
+        assert!(book.closed(&id, 2));
+        assert_eq!(*sink.closes.lock().unwrap(), vec!["alpha"]);
+    }
+
+    /// A sink whose `remove_records` fails a set number of times.
+    #[derive(Default)]
+    struct FaultSink {
+        failures_left: std::sync::atomic::AtomicU32,
+        removed: std::sync::Mutex<Vec<String>>,
+        closes: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl FaultSink {
+        fn failing(times: u32) -> std::sync::Arc<Self> {
+            let sink = FaultSink::default();
+            sink.failures_left.store(times, Ordering::SeqCst);
+            std::sync::Arc::new(sink)
+        }
+        fn removed(&self) -> Vec<String> {
+            let mut removed = self.removed.lock().unwrap().clone();
+            removed.sort();
+            removed
+        }
+    }
+
+    impl ReconciliationSink for FaultSink {
+        fn record_open(&self, _id: &SessionId, _host: &str, _since: &str) {}
+        fn record_closed(&self, id: &SessionId) {
+            self.closes.lock().unwrap().push(id.as_str().to_owned());
+        }
+        fn remove_records(&self, ids: &[SessionId]) -> io::Result<()> {
+            let failed = self
+                .failures_left
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok();
+            if failed {
+                return Err(io::Error::other("injected write failure"));
+            }
+            self.removed
+                .lock()
+                .unwrap()
+                .extend(ids.iter().map(|id| id.as_str().to_owned()));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn an_orphan_record_removal_skips_an_id_a_generation_owns() {
+        let sink = std::sync::Arc::new(CountingSink::default());
+        let book = RecordBook::new(sink.clone());
+        let id = test_id("alpha");
+        book.opened(&id, 5, "h", "t");
+        book.closed_orphan(&id);
+        assert!(sink.closes.lock().unwrap().is_empty());
+        assert!(book.closed(&id, 5), "generation 5 still owns it");
+    }
+
+    #[test]
+    fn a_failed_purge_is_retried_at_the_next_write() {
+        let sink = FaultSink::failing(2);
+        let book = RecordBook::new(sink.clone());
+        book.purge_seeded(&[test_id("a"), test_id("b")]);
+        assert!(sink.removed().is_empty(), "the first try failed");
+
+        // The next write retries; it fails once more and still keeps them.
+        book.opened(&test_id("c"), 1, "h", "t");
+        assert!(sink.removed().is_empty());
+
+        assert!(book.closed(&test_id("c"), 1));
+        assert_eq!(sink.removed(), vec!["a", "b"]);
+
+        // Cleared: a later write removes nothing again.
+        book.opened(&test_id("d"), 2, "h", "t");
+        assert_eq!(sink.removed(), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn an_open_of_a_pending_id_takes_it_out_of_the_purge() {
+        let sink = FaultSink::failing(1);
+        let book = RecordBook::new(sink.clone());
+        book.purge_seeded(&[test_id("a"), test_id("b")]);
+        assert!(sink.removed().is_empty());
+
+        // A new session takes the name: its record must survive the retry.
+        book.opened(&test_id("a"), 1, "h", "t");
+        assert_eq!(sink.removed(), vec!["b"]);
+        assert!(book.closed(&test_id("a"), 1));
+        assert_eq!(sink.removed(), vec!["b"]);
+    }
+
+    #[test]
+    fn json_remove_records_returns_the_write_error() {
+        // A path whose parent is a regular file cannot be written.
+        let parent = unique_test_path("not-a-dir");
+        fs::write(&parent, b"plain file").expect("scratch write should succeed");
+        let sink = JsonReconciliationSink::at(parent.join("sessions.json"));
+        assert!(sink.remove_records(&[test_id("a")]).is_err());
+        let _ = fs::remove_file(&parent);
+    }
+
+    #[test]
+    fn json_remove_records_removes_only_the_named_records() {
+        let path = unique_test_path("remove-records");
+        let sink = JsonReconciliationSink::at(path.clone());
+        for id in ["a", "b", "c"] {
+            sink.record_open(&test_id(id), "h", "t");
+        }
+        sink.remove_records(&[test_id("a"), test_id("c")])
+            .expect("the write succeeds");
+        let ids: Vec<String> = scan_orphans(&path).into_iter().map(|r| r.id).collect();
+        assert_eq!(ids, vec!["b"]);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn seeding_deletes_the_seeded_records() {
+        let path = unique_test_path("seed-purge");
+        let sink = std::sync::Arc::new(JsonReconciliationSink::at(path.clone()));
+        sink.record_open(&test_id("payroll"), "10.0.0.9", "2026-01-01T00:00:00Z");
+        let registry = Registry::new(std::sync::Arc::new(NoopSessionConnector), sink);
+        seed_into(scan_orphans(&path), &registry);
+        assert_eq!(registry.list().len(), 1, "still shown in this lifetime");
+        assert!(scan_orphans(&path).is_empty(), "the record is deleted");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn seeding_with_a_failing_purge_still_seeds_and_logs() {
+        let sink = FaultSink::failing(u32::MAX);
+        let registry = Registry::new(std::sync::Arc::new(NoopSessionConnector), sink.clone());
+        let records = vec![ReconciliationRecord {
+            id: "payroll".to_owned(),
+            host: "10.0.0.9".to_owned(),
+            connected_since: "2026-01-01T00:00:00Z".to_owned(),
+        }];
+        seed_into(records, &registry);
+        let statuses = registry.list();
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(statuses[0].status, rdpilot_ipc::SessionLifecycle::Orphaned);
+        assert!(sink.removed().is_empty());
     }
 
     #[test]
