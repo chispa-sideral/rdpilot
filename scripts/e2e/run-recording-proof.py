@@ -8,7 +8,7 @@ fake Cua; needs ffmpeg, ffprobe and Playwright Chromium and Firefox):
     --bin-dir target/debug --output /private/recording-fake-proof
 
 Live mode (a Windows host with three independent Windows users; release
-builds, as users install them):
+builds, as users install them; the daemon runs on Linux or Windows):
   cargo build --release --workspace
   export RDPILOT_REC_{A,B,C}_HOST=... RDPILOT_REC_{A,B,C}_USERNAME=... RDPILOT_REC_{A,B,C}_PASSWORD=...
   # optional: RDPILOT_REC_{A,B,C}_PORT, RDPILOT_REC_{A,B,C}_DOMAIN
@@ -25,6 +25,21 @@ and its recording is started from the viewer page, c is not recorded (live)
 or shows one change and then a still display (fake). Viewer actions go
 through the page UI in a headless browser: Start recording, the annotation
 input and the Keep toggle.
+
+Live flow: a and b connect first. After a disconnects, c connects with
+CuaEnabled=no and must have no recording. At most two RDP sessions are
+Active at once, as on a Windows host without RD Session Host, where a third
+connect disconnects the oldest session.
+
+The per-host entry is in the daemon user's config.toml: a file under the
+run's temporary directory on Linux, %APPDATA%\rdpilot\config.toml on
+Windows. On Windows that file must not exist before the run, and the run
+removes it at the end. Recording files are owner-only: on Linux directories
+are 0700 and files 0600; on Windows each path has exactly one Allow ACE, for
+the daemon user's SID, and each directory DACL is protected (files carry
+that ACE as inherited). Daemon CPU time comes from /proc on Linux and from
+GetProcessTimes on Windows; the recorder threads' CPU time is measured on
+Linux only.
 
 Live setup (before the first logon of the three users): the taskbar clock
 must be hidden for them, or its minute tick is a display change in the
@@ -47,7 +62,11 @@ harness provisions nothing: prepare the Windows host first.
 """
 import argparse
 import asyncio
+import csv
+import ctypes
+import functools
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -101,6 +120,21 @@ viewer_proof = load("run_viewer_proof", "run-viewer-proof.py")
 ProofError, require, http_request = viewer_proof.ProofError, viewer_proof.require, viewer_proof.http_request
 ARGUMENT_MARKER = viewer_proof.ARGUMENT_MARKER
 LIVE_FAILING_TOOL = viewer_proof.LIVE_FAILING_TOOL
+WINDOWS = os.name == "nt"
+PER_HOST_ENTRY = '[[recording.hosts]]\nhost = "a"\nenabled = true\n'
+# SIDs that must never hold an ACE on a recording path: Users, Everyone, Authenticated Users.
+SHARED_SIDS = {"S-1-5-32-545", "S-1-1-0", "S-1-5-11"}
+# The DACL of each path on stdin (a JSON list): protection and every ACE with its SID.
+ACL_SCRIPT = r"""
+$paths = [Console]::In.ReadToEnd() | ConvertFrom-Json
+$out = foreach ($p in $paths) {
+  $acl = Get-Acl -LiteralPath $p
+  [ordered]@{ path = $p; protected = $acl.AreAccessRulesProtected; aces = @($acl.Access | ForEach-Object {
+    [ordered]@{ sid = $_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value
+                inherited = $_.IsInherited; type = [string]$_.AccessControlType } }) }
+}
+ConvertTo-Json -InputObject @($out) -Depth 5 -Compress
+"""
 
 
 def credentials_from_env(target):
@@ -115,6 +149,42 @@ def mode_string(path):
     return oct(path.stat().st_mode & 0o777)
 
 
+def windows_config_file():
+    """The daemon user's config.toml on Windows, as rdpilot resolves it."""
+    return Path(os.environ["APPDATA"]) / "rdpilot" / "config.toml"
+
+
+@functools.cache
+def current_user_sid():
+    out = subprocess.run(["whoami", "/user", "/fo", "csv", "/nh"], capture_output=True, text=True,
+                         timeout=30, check=True).stdout
+    return next(csv.reader(io.StringIO(out.strip())))[1]
+
+
+def windows_acls(paths):
+    """{path: (protected, [(sid, inherited, type)])} from one Get-Acl call."""
+    out = subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", ACL_SCRIPT],
+                         input=json.dumps([str(p) for p in paths]), capture_output=True, text=True,
+                         timeout=120, check=True).stdout
+    return {Path(entry["path"]): (entry["protected"], [(a["sid"], a["inherited"], a["type"]) for a in entry["aces"]])
+            for entry in json.loads(out)}
+
+
+def process_cpu_seconds(pid):
+    """Kernel plus user CPU time of a Windows process (GetProcessTimes)."""
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.restype = ctypes.c_void_p
+    handle = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+    require(handle, f"OpenProcess({pid}) failed: {ctypes.get_last_error()}")
+    try:
+        times = [ctypes.c_ulonglong() for _ in range(4)]
+        require(kernel32.GetProcessTimes(ctypes.c_void_p(handle), *(ctypes.byref(t) for t in times)),
+                f"GetProcessTimes({pid}) failed: {ctypes.get_last_error()}")
+        return (times[2].value + times[3].value) / 1e7
+    finally:
+        kernel32.CloseHandle(ctypes.c_void_p(handle))
+
+
 class Proof(viewer_proof.Proof):
     """Reuses the viewer proof's process, evidence and browser helpers."""
 
@@ -122,11 +192,14 @@ class Proof(viewer_proof.Proof):
         args.bind = args.bind or "loopback"
         args.marker_region = None
         args.allow_no_tailnet = True
+        self.config_file = windows_config_file() if WINDOWS and not args.fake else None
         if args.fake:
             super().__init__(args)
         else:
             # Credentials of three users, read before anything is created.
             creds = {t: credentials_from_env(t) for t in LIVE_TARGETS}
+            require(self.config_file is None or not self.config_file.exists(),
+                    f"{self.config_file} exists; the live proof writes its own per-host entry there")
             args.fake = True  # skip the viewer proof's two-target credential read
             super().__init__(args)
             args.fake = False
@@ -144,10 +217,12 @@ class Proof(viewer_proof.Proof):
         self.targets = FAKE_TARGETS if self.fake else LIVE_TARGETS
         self.recordings_dir = self.temp / "recordings"
         self.env["RDPILOT_RECORDING__DIR"] = str(self.recordings_dir)
-        config = self.temp / "config" / "rdpilot"
-        config.mkdir(mode=0o700, parents=True, exist_ok=True)
-        # Live: a records through the per-host entry keyed on its alias.
-        (config / "config.toml").write_text("" if self.fake else '[[recording.hosts]]\nhost = "a"\nenabled = true\n')
+        if self.config_file is None:
+            config = self.temp / "config" / "rdpilot"
+            config.mkdir(mode=0o700, parents=True, exist_ok=True)
+            # Live: a records through the per-host entry keyed on its alias.
+            (config / "config.toml").write_text("" if self.fake else PER_HOST_ENTRY)
+        self.config_written = self.config_dir_created = False
         self.ids = {}
         self.page_errors = []
         self.recorder_threads = {}
@@ -263,14 +338,28 @@ class Proof(viewer_proof.Proof):
 
     def listing(self, target):
         root = self.rec_dir(target)
+        paths = sorted([root, *root.rglob("*")])
+        acls = windows_acls(paths) if WINDOWS else {}
+        me = current_user_sid() if WINDOWS else None
         rows = []
-        for path in sorted([root, *root.rglob("*")]):
-            rows.append({"path": str(path.relative_to(self.recordings_dir)), "mode": mode_string(path),
-                         "bytes": path.stat().st_size if path.is_file() else None})
-            if path.is_dir():
-                require(path.stat().st_mode & 0o777 == 0o700, f"{path.name}: directory not 0700")
+        for path in paths:
+            row = {"path": str(path.relative_to(self.recordings_dir)),
+                   "bytes": path.stat().st_size if path.is_file() else None}
+            if WINDOWS:
+                protected, aces = acls[path]
+                row["acl"] = {"protected": protected, "aces": [{"sid": s, "inherited": i, "type": t} for s, i, t in aces]}
+                require(len(aces) == 1 and aces[0][2] == "Allow" and aces[0][0] == me,
+                        f"{path.name}: DACL is not one Allow ACE for the daemon user: {aces}")
+                require(not {s for s, _, _ in aces} & SHARED_SIDS, f"{path.name}: DACL grants a shared group: {aces}")
+                if path.is_dir():
+                    require(protected, f"{path.name}: directory DACL is not protected")
             else:
-                require(path.stat().st_mode & 0o777 == 0o600, f"{path.name}: file not 0600")
+                row["mode"] = mode_string(path)
+                if path.is_dir():
+                    require(path.stat().st_mode & 0o777 == 0o700, f"{path.name}: directory not 0700")
+                else:
+                    require(path.stat().st_mode & 0o777 == 0o600, f"{path.name}: file not 0600")
+            rows.append(row)
         return rows
 
     def probe_segments(self, target):
@@ -642,6 +731,10 @@ class Proof(viewer_proof.Proof):
         await self.endpoints["a"].stop()
         await self.cli("recording", "keep", self.ids["a"])
         await self.cli("disconnect", "--session", "a")
+        # c only has to stay unrecorded: it needs no Cua bridge. It connects
+        # after a disconnects, so that at most two sessions are Active.
+        state = await self.connect_with("c", "-o", "CuaEnabled=no")
+        require(state.get("state") != "on" and "c" not in self.ids, f"c records from connect: {state}")
         # b: started from the page, one action, stopped with the CLI.
         await self.open_panel(page, "b")
         rid_b = await self.start_from_page(page, "b")
@@ -770,7 +863,9 @@ class Proof(viewer_proof.Proof):
     async def sample_recorder_threads(self):
         """CPU time of the daemon's recorder threads (the recorder and the
         encoder pool it starts, which inherit its name), sampled every 0.5 s:
-        a thread that exits loses at most its last interval."""
+        a thread that exits loses at most its last interval. Linux only."""
+        if WINDOWS:
+            return
         tick = os.sysconf("SC_CLK_TCK")
         while self.daemon and self.daemon.returncode is None:
             for task in Path(f"/proc/{self.daemon.pid}/task").glob("*"):
@@ -787,6 +882,8 @@ class Proof(viewer_proof.Proof):
     def cpu_seconds(self):
         if not self.daemon:
             return None
+        if WINDOWS:
+            return process_cpu_seconds(self.daemon.pid)
         stat = Path(f"/proc/{self.daemon.pid}/stat").read_text()
         fields = stat[stat.rindex(")") + 2:].split()
         return (int(fields[11]) + int(fields[12])) / os.sysconf("SC_CLK_TCK")
@@ -798,11 +895,21 @@ class Proof(viewer_proof.Proof):
 
         daemon_log = open(self.output / "daemon.log", "w")
         try:
+            if self.config_file is not None:
+                self.config_dir_created = not self.config_file.parent.exists()
+                self.config_file.parent.mkdir(parents=True, exist_ok=True)
+                with open(self.config_file, "x") as handle:
+                    self.config_written = True
+                    handle.write(PER_HOST_ENTRY)
+            if WINDOWS:
+                self.summary["unverified"].append(
+                    "recorder thread CPU time on Windows: encoder pool threads carry no thread name, "
+                    "so only the recorder thread is attributable")
             if not self.fake:
                 for target in LIVE_TARGETS:
                     relay = self.e2e.Relay(self.credentials[target])
                     self.relays[target] = (relay, await relay.start())
-            self.daemon = await asyncio.create_subprocess_exec(str(self.bin / "rdpilot-daemon"), env=self.env,
+            self.daemon = await asyncio.create_subprocess_exec(str(self.bin / viewer_proof.DAEMON), env=self.env,
                                                                stdout=daemon_log, stderr=daemon_log)
             await asyncio.sleep(0.3)
             cpu0, t0 = self.cpu_seconds(), time.monotonic()
@@ -814,8 +921,6 @@ class Proof(viewer_proof.Proof):
             else:
                 await self.connect_with("a")
                 await self.connect_with("b", "--no-record")
-                # c only has to stay unrecorded: it needs no Cua bridge.
-                await self.connect_with("c", "-o", "CuaEnabled=no")
                 require(set(self.ids) == {"a"}, f"only a records from connect: {self.ids}")
             await self.start_viewer()
             async with async_playwright() as playwright:
@@ -827,10 +932,11 @@ class Proof(viewer_proof.Proof):
                 await browser.close()
                 cpu = self.cpu_seconds()
                 sampler.cancel()
-                self.summary["daemon_cpu"] = {"seconds": round(cpu - cpu0, 2) if cpu is not None else None,
-                                              "wall_seconds": round(time.monotonic() - t0, 1),
-                                              "recorder_threads_seconds": round(sum(self.recorder_threads.values()), 2),
-                                              "recorder_threads_seen": len(self.recorder_threads)}
+                self.summary["daemon_cpu"] = {
+                    "seconds": round(cpu - cpu0, 2) if cpu is not None else None,
+                    "wall_seconds": round(time.monotonic() - t0, 1),
+                    "recorder_threads_seconds": None if WINDOWS else round(sum(self.recorder_threads.values()), 2),
+                    "recorder_threads_seen": None if WINDOWS else len(self.recorder_threads)}
                 if self.fake:
                     await self.replay_flow(playwright)
                 else:
@@ -864,6 +970,10 @@ class Proof(viewer_proof.Proof):
                     await self.daemon.wait()
             for relay, _ in self.relays.values():
                 await relay.close()
+            if self.config_written:
+                self.config_file.unlink(missing_ok=True)
+                if self.config_dir_created:
+                    shutil.rmtree(self.config_file.parent, ignore_errors=True)
             daemon_log.close()
             for path in (self.output / "daemon.log", self.output / "view.stderr"):
                 if path.exists():

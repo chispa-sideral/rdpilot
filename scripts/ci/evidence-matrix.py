@@ -30,7 +30,9 @@ REPORT_JOB = "evidence-matrix"
 KINDS = {"offline-check": "offline", "e2e": "e2e", "cargo": "cargo", "ignored": "ignored", "file": "file"}
 PROOF_KINDS = ("offline-check", "e2e")
 RESULTS = ("passed", "failed", "skipped", "not run")
-ARTIFACTS = {"offline-check": "offline-proof-summaries", "e2e": "desktop-proof-evidence"}
+# The e2e artifacts hold disjoint proof names, one directory per proof.
+ARTIFACTS = {"offline-check": "offline-proof-summaries",
+             "e2e": ("desktop-proof-evidence", "desktop-recording-proof-evidence")}
 LABEL = re.compile(r"[A-Za-z0-9_.\-]{1,200}")
 TEST_ATTRIBUTE = re.compile(r"^\s*#\[(?:tokio::)?test\b", re.MULTILINE)
 IGNORE_ATTRIBUTE = re.compile(r"^\s*#\[(?:ignore\b|cfg_attr\(.*\bignore\b)", re.MULTILINE)
@@ -336,8 +338,8 @@ def proof_results(artifacts):
         if isinstance(data, dict) and isinstance(data.get("proof"), str):
             found["offline-check"][data["proof"]] = (
                 data.get("status") == "passed", labels_of(data.get("completed_checks")))
-    base = Path(artifacts) / ARTIFACTS["e2e"]
-    for path in sorted(base.rglob("summary.json")):
+    paths = [path for name in ARTIFACTS["e2e"] for path in sorted((Path(artifacts) / name).rglob("summary.json"))]
+    for path in paths:
         data = read_json(path)
         if path.parent.name == "proof" and isinstance(data, dict):
             checks = data.get("checks")

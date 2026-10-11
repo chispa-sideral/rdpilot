@@ -5,7 +5,7 @@
 # machine (see README.md).
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory)][ValidateSet('cua', 'viewer', 'takeover', 'perf')][string]$Proof,
+    [Parameter(Mandatory)][ValidateSet('cua', 'viewer', 'takeover', 'perf', 'recording')][string]$Proof,
     [string]$BinDir = 'target/x86_64-pc-windows-msvc/release',
     # Keep this below the CI step timeout, so that cleanup runs when a harness hangs.
     [int]$TimeLimitMinutes = 35
@@ -34,11 +34,57 @@ $runKey = 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Run'
 $runName = "RdpilotPerfPainter-$PID"
 $painterPort = 47653
 $painterIntervalMs = 20
+# The recording proof's users must start without the taskbar clock and with a
+# steady caret: both are set in the Default user hive before their first logon.
+$defaultHive = 'RdpilotDefaultHive'
+$hiveSettings = @(
+    @{ Key = 'Software\Microsoft\Windows\CurrentVersion\Policies\Explorer'; Name = 'HideClock'; Kind = 'DWord'; Value = 1 }
+    @{ Key = 'Control Panel\Desktop'; Name = 'CursorBlinkRate'; Kind = 'String'; Value = '-1' }
+)
+$hivePrevious = $null
+# The recording proof writes its per-host entry to this user's config file.
+$recordingConfig = Join-Path $env:APPDATA 'rdpilot\config.toml'
 $result = [ordered]@{ proof = $Proof; stage = 'setup'; harness_exit_code = $null; summary_status = $null; passed = $false }
 # Only processes started from this build, never an unrelated rdpilot.
 $ownProcesses = {
     Get-Process rdpilot, rdpilot-daemon, rdpilot-mcp -ErrorAction SilentlyContinue |
         Where-Object { $_.Path -and $_.Path.StartsWith($bin + '\', [StringComparison]::OrdinalIgnoreCase) }
+}
+# Run $action with the Default user hive loaded; the hive is unloaded again
+# afterwards, which needs every registry handle to it closed.
+function Use-DefaultHive([scriptblock]$action) {
+    & reg load "HKU\$defaultHive" 'C:\Users\Default\NTUSER.DAT' | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw 'Unable to load the Default user hive' }
+    try { & $action } finally {
+        [GC]::Collect()
+        [GC]::WaitForPendingFinalizers()
+        for ($i = 0; $i -lt 10; $i++) {
+            & reg unload "HKU\$defaultHive" 2>$null | Out-Null
+            if ($LASTEXITCODE -eq 0) { break }
+            Start-Sleep -Seconds 1
+        }
+        if ($LASTEXITCODE -ne 0) { throw 'Unable to unload the Default user hive' }
+    }
+}
+# The hive values of $hiveSettings by name; $null for an absent value.
+function Get-HiveValues {
+    $values = @{}
+    foreach ($entry in $hiveSettings) {
+        $key = [Microsoft.Win32.Registry]::Users.OpenSubKey("$defaultHive\$($entry.Key)")
+        $values[$entry.Name] = $null
+        if ($key) { try { $values[$entry.Name] = $key.GetValue($entry.Name) } finally { $key.Dispose() } }
+    }
+    $values
+}
+# Set the hive values of $hiveSettings; $null removes a value.
+function Set-HiveValues($values) {
+    foreach ($entry in $hiveSettings) {
+        $key = [Microsoft.Win32.Registry]::Users.CreateSubKey("$defaultHive\$($entry.Key)")
+        try {
+            if ($null -eq $values[$entry.Name]) { $key.DeleteValue($entry.Name, $false) }
+            else { $key.SetValue($entry.Name, $values[$entry.Name], [Microsoft.Win32.RegistryValueKind]$entry.Kind) }
+        } finally { $key.Dispose() }
+    }
 }
 New-Item -ItemType Directory -Force $evidence | Out-Null
 try {
@@ -63,7 +109,6 @@ try {
         target = '127.0.0.1:3389'
         native_cache_initially_absent = $true
         not_executed_live = @(
-            'recording proof: needs three concurrent users and POSIX client checks; offline fake proof only'
             'tailnet and cross-machine viewing'
             'UAC and the secure desktop'
             'Windows Job containment over RDP'
@@ -72,7 +117,7 @@ try {
         )
     } | ConvertTo-Json | Set-Content (Join-Path $evidence 'environment.json')
 
-    $labels = if ($Proof -in 'takeover', 'perf') { @('a') } else { @('a', 'b') }
+    $labels = if ($Proof -in 'takeover', 'perf') { @('a') } elseif ($Proof -eq 'recording') { @('a', 'b', 'c') } else { @('a', 'b') }
     foreach ($label in $labels) {
         $name = "rdp$Proof$label"
         $password = 'Rdp1!' + [Convert]::ToBase64String([Security.Cryptography.RandomNumberGenerator]::GetBytes(24)) + 'aA1!'
@@ -93,6 +138,17 @@ try {
         # Any other user's logon exits at once; only the test user paints.
         $painterCommand = "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File $painterDir\painter.ps1 -User $($users.Keys | Select-Object -First 1) -Port $painterPort -IntervalMs $painterIntervalMs"
         New-ItemProperty -Path $runKey -Name $runName -Value $painterCommand -PropertyType String -Force | Out-Null
+    }
+
+    if ($Proof -eq 'recording') {
+        if (Test-Path $recordingConfig) { throw "The recording proof requires no rdpilot config file at $recordingConfig" }
+        # The users exist but have not logged on yet: their profiles copy the Default hive at first logon.
+        Use-DefaultHive {
+            $script:hivePrevious = Get-HiveValues
+            $wanted = @{}
+            foreach ($entry in $hiveSettings) { $wanted[$entry.Name] = $entry.Value }
+            Set-HiveValues $wanted
+        }
     }
 
     $result.stage = 'listener'
@@ -116,7 +172,7 @@ try {
     # Passwords reach the harness only through a private file or its own environment.
     $start = [Diagnostics.ProcessStartInfo]::new((Get-Command python).Source)
     $start.UseShellExecute = $false
-    $script = @{ cua = 'run-cua-e2e.py'; viewer = 'run-viewer-proof.py'; takeover = 'run-takeover-proof.py'; perf = 'run-perf-proof.py' }[$Proof]
+    $script = @{ cua = 'run-cua-e2e.py'; viewer = 'run-viewer-proof.py'; takeover = 'run-takeover-proof.py'; perf = 'run-perf-proof.py'; recording = 'run-recording-proof.py' }[$Proof]
     $arguments = @((Join-Path $PSScriptRoot "../e2e/$script"), '--bin-dir', $bin, '--bundle', $bundle,
         '--output', (Join-Path $evidence 'proof'), '--connect-timeout', '600')
     if ($Proof -eq 'cua') {
@@ -125,10 +181,15 @@ try {
             $arguments += "--credentials-$label", (Join-Path $private "$label.json")
         }
     } else {
-        $arguments += '--allow-no-tailnet'
+        if ($Proof -ne 'recording') { $arguments += '--allow-no-tailnet' }
         if ($Proof -eq 'perf') { $arguments += '--painter-dir', $painterDir, '--painter-port', [string]$painterPort, '--painter-interval-ms', [string]$painterIntervalMs }
         foreach ($label in $labels) {
-            $prefix = switch ($Proof) { 'viewer' { "RDPILOT_VIEW_$($label.ToUpper())_" } 'perf' { "RDPILOT_PERF_$($label.ToUpper())_" } default { 'RDPILOT_TAKE_' } }
+            $prefix = switch ($Proof) {
+                'viewer' { "RDPILOT_VIEW_$($label.ToUpper())_" }
+                'perf' { "RDPILOT_PERF_$($label.ToUpper())_" }
+                'recording' { "RDPILOT_REC_$($label.ToUpper())_" }
+                default { 'RDPILOT_TAKE_' }
+            }
             foreach ($key in $credentials[$label].Keys) { $start.Environment[$prefix + $key.ToUpper()] = [string]$credentials[$label][$key] }
         }
     }
@@ -175,6 +236,20 @@ try {
         }
     }
     foreach ($name in $users.Keys) { Remove-LocalUser $name -ErrorAction SilentlyContinue }
+    $hiveRestored = $true
+    if ($null -ne $hivePrevious) {
+        try {
+            Use-DefaultHive { Set-HiveValues $hivePrevious }
+            # Read back from a fresh load.
+            Use-DefaultHive {
+                $now = Get-HiveValues
+                foreach ($entry in $hiveSettings) {
+                    if ([string]$now[$entry.Name] -ne [string]$hivePrevious[$entry.Name] -or
+                        ($null -eq $now[$entry.Name]) -ne ($null -eq $hivePrevious[$entry.Name])) { $script:hiveRestored = $false }
+                }
+            }
+        } catch { $hiveRestored = $false; Write-Host $_.Exception.Message }
+    }
     if ($Proof -eq 'perf') {
         # The painter is gone with its session; copy its log as evidence, then remove its files.
         Get-ChildItem $painterDir -Filter '*.log' -ErrorAction SilentlyContinue | Copy-Item -Destination $evidence -ErrorAction SilentlyContinue
@@ -207,6 +282,10 @@ try {
         service_state_restored = $restoredService.State -eq $service.State
         service_start_mode_restored = $restoredService.StartMode -eq $service.StartMode
         cache_removed = $initialCachePresent -or -not (Test-Path $cache)
+    }
+    if ($Proof -eq 'recording') {
+        $cleanup['default_hive_restored'] = $hiveRestored -and $null -ne $hivePrevious
+        $cleanup['recording_config_absent'] = -not (Test-Path $recordingConfig)
     }
     if ($Proof -eq 'perf') {
         $cleanup['painter_removed'] = -not (Test-Path $painterDir) -and -not (Get-ItemProperty -Path $runKey -Name $runName -ErrorAction SilentlyContinue)

@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       perf_workload:
-        description: Run the performance workload on the hosted desktop runner (skips the other live proofs)
+        description: Run the performance workload on the hosted desktop runner (skips the other live proofs of the desktop job)
         type: boolean
         default: false
 
@@ -211,10 +211,67 @@ jobs:
           retention-days: 90
           if-no-files-found: error
 
+  desktop-recording:
+    name: Live RDP recording proof
+    runs-on: windows-latest
+    # At least the sum of the step timeouts: build, recording dependencies and
+    # the live recording proof (65), plus setup and upload. It runs on every
+    # event, a perf dispatch included.
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Enable MSVC developer environment
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
+        with:
+          arch: x64
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - name: Build the source bridge and clients
+        id: build
+        timeout-minutes: 20
+        run: cargo build --release --locked -p rdpilot-cli -p rdpilot-daemon -p rdpilot-mcp -p rdpilot-bridge --target x86_64-pc-windows-msvc
+      - name: Recording proof dependencies
+        id: deps
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        timeout-minutes: 10
+        shell: pwsh
+        run: |
+          python -m pip install playwright==1.63.0 Pillow==12.3.0 numpy==2.5.4
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          python -m playwright install chromium firefox
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          choco install ffmpeg --version 9.0.2 -y --no-progress
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          # The media checks decode AV1 segments.
+          $decoders = & ffmpeg -hide_banner -decoders
+          if ($LASTEXITCODE -or -not ($decoders | Select-String -Pattern '\b(libdav1d|libaom-av1)\b')) { throw 'ffmpeg has no AV1 decoder' }
+          & ffprobe -hide_banner -version | Select-Object -First 1
+          if ($LASTEXITCODE) { throw 'ffprobe does not run' }
+          (Get-Command ffmpeg).Source
+      - name: Live recording proof
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        timeout-minutes: 35
+        shell: pwsh
+        run: ./scripts/ci/run-hosted-desktop.ps1 -Proof recording -TimeLimitMinutes 30
+      - name: Live recording proof evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: desktop-recording-proof-evidence
+          path: ${{ runner.temp }}/hosted-desktop-evidence
+          retention-days: 7
+          if-no-files-found: error
+
   evidence-matrix:
     name: Evidence matrix (report only)
     if: ${{ always() }}
-    needs: [linux, windows, windows-dacl, offline, desktop]
+    needs: [linux, windows, windows-dacl, offline, desktop, desktop-recording]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     # Report only: a failure here must not fail the called workflow of a release.
@@ -251,7 +308,7 @@ jobs:
   success:
     name: Required checks success
     if: ${{ always() }}
-    needs: [linux, windows, windows-dacl, offline, desktop]
+    needs: [linux, windows, windows-dacl, offline, desktop, desktop-recording]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -262,4 +319,4 @@ jobs:
       - name: Require every predecessor
         env:
           NEEDS_JSON: ${{ toJSON(needs) }}
-        run: python3 scripts/ci/check-ci-results.py linux windows windows-dacl offline desktop
+        run: python3 scripts/ci/check-ci-results.py linux windows windows-dacl offline desktop desktop-recording

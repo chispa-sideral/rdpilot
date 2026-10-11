@@ -226,6 +226,20 @@ class MappingTests(unittest.TestCase):
             result = em.proof_row_result({"kind": kind, "selector": selector}, rule, proofs, state)
             self.assertEqual(result, ("passed", "", [selector.split("/", 1)[1]]))
 
+    def test_recording_results_reach_their_rows(self):
+        base = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: shutil.rmtree(base, ignore_errors=True))
+        live = base / "desktop-recording-proof-evidence/recording/proof"
+        live.mkdir(parents=True)
+        (live / "summary.json").write_text(json.dumps(
+            {"status": "passed", "checks": [{"check": "idle_interval_adds_no_video", "passed": True}]}), encoding="utf-8")
+        proofs = em.proof_results(base)
+        self.assertIn("recording", proofs["e2e"])
+        selector = "run-recording-proof.py/idle_interval_adds_no_video"
+        rule = {"runs": [{"job": "desktop-recording", "step": "Live recording proof", "proof": "recording"}]}
+        result = em.proof_row_result({"kind": "e2e", "selector": selector}, rule, proofs, lambda job, step: ("ok", True))
+        self.assertEqual(result, ("passed", "", ["idle_interval_adds_no_video"]))
+
     def test_cli_check_succeeds(self):
         with contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(em.main(["check"]), 0)
