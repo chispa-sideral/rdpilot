@@ -229,11 +229,17 @@ pub(crate) async fn dispatch_connect(
         let epoch = registry
             .control(&session)
             .map_or(InputEpoch::INITIAL, |control| control.input_epoch());
-        // Dropping the call releases the session lock and stops the bootstrap
-        // loop at its next await; the entry is then closed by its lease.
+        // The bootstrap is a job of the session's transfer worker. Dropping
+        // the wait abandons the job, which stops at its next await; the
+        // entry is then closed by its lease. A close of the session cancels
+        // it: the Connect then fails with `SessionClosed`.
         let bootstrap = tokio::select! {
             biased;
-            bootstrap = registry.call(&session, move |s| s.deploy_and_launch(epoch)) => bootstrap,
+            bootstrap = registry.transfer(
+                &session,
+                move |s| Box::pin(async move { s.deploy_and_launch(epoch).await }),
+                false,
+            ) => bootstrap,
             () = peer_gone(&mut watch) => {
                 if let Some(diagnostics) = diagnostics {
                     diagnostics.record(session.as_str(), Stage::IpcPeerClosed);
@@ -377,9 +383,15 @@ pub(crate) async fn dispatch_for_ipc(
             remote_name,
         } => {
             match registry
-                .call(&session, move |s| {
-                    s.upload_file(PathBuf::from(local_path), remote_name)
-                })
+                .transfer(
+                    &session,
+                    move |s| {
+                        Box::pin(async move {
+                            s.upload_file(PathBuf::from(local_path), remote_name).await
+                        })
+                    },
+                    true,
+                )
                 .await
             {
                 Ok(outcome) => WireResponse::Transfer(wire_transfer_outcome(outcome)),
@@ -392,9 +404,16 @@ pub(crate) async fn dispatch_for_ipc(
             local_path,
         } => {
             match registry
-                .call(&session, move |s| {
-                    s.download_file(remote_name, PathBuf::from(local_path))
-                })
+                .transfer(
+                    &session,
+                    move |s| {
+                        Box::pin(async move {
+                            s.download_file(remote_name, PathBuf::from(local_path))
+                                .await
+                        })
+                    },
+                    true,
+                )
                 .await
             {
                 Ok(outcome) => WireResponse::Transfer(wire_transfer_outcome(outcome)),
@@ -647,7 +666,7 @@ mod tests {
     }
 
     impl ManagedSession for FakeSession {
-        fn close(self: Box<Self>) -> TestFuture<Result<(), DaemonError>> {
+        fn close(&self) -> BoxFuture<'_, Result<(), DaemonError>> {
             self.closed.store(true, Ordering::SeqCst);
             Box::pin(async { Ok(()) })
         }
@@ -1100,7 +1119,7 @@ mod tests {
         registry
             .control(session)
             .expect("live session")
-            .take("100.101.102.103".parse().unwrap(), async {})
+            .take("100.101.102.103".parse().unwrap())
             .await
             .expect("take");
     }
@@ -1317,7 +1336,7 @@ mod tests {
     }
 
     impl ManagedSession for BootstrapSession {
-        fn close(self: Box<Self>) -> TestFuture<Result<(), DaemonError>> {
+        fn close(&self) -> BoxFuture<'_, Result<(), DaemonError>> {
             Box::pin(async { Ok(()) })
         }
         fn screenshot(&self) -> BoxFuture<'_, Result<rdpilot::Screenshot, DaemonError>> {
@@ -1524,6 +1543,32 @@ mod tests {
             Err(ControlRefusal::NoSession)
         ));
         assert!(b.registry.list().is_empty());
+    }
+
+    /// A Disconnect from another client during a held bootstrap cancels it
+    /// at once: the Connect fails with transfer-failed "session closed".
+    #[tokio::test]
+    async fn a_disconnect_during_a_held_bootstrap_fails_the_connect_at_once() {
+        let b = start_bootstrap(true, false).await;
+        let closed = tokio::time::timeout(
+            crate::op_class_tests::BOUND,
+            dispatch(
+                &b.registry,
+                Request::Disconnect {
+                    session: b.id.clone(),
+                },
+            ),
+        )
+        .await
+        .expect("the close does not wait for the bootstrap");
+        assert!(matches!(closed, WireResponse::Ack), "{closed:?}");
+        let outcome = tokio::time::timeout(crate::op_class_tests::BOUND, b.connect)
+            .await
+            .expect("the Connect is answered at once")
+            .unwrap();
+        crate::op_class_tests::assert_session_closed(&outcome.response);
+        assert!(b.registry.list().is_empty());
+        drop(b.peer);
     }
 
     #[tokio::test(start_paused = true)]

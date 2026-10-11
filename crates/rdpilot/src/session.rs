@@ -17,7 +17,7 @@ use std::{
     io::Read,
     net::SocketAddr,
     path::{Path, PathBuf},
-    sync::{atomic::AtomicU64, Arc},
+    sync::{atomic::AtomicU64, Arc, Mutex, OnceLock, PoisonError},
     thread::JoinHandle,
     time::Duration,
 };
@@ -29,10 +29,12 @@ const RUN_DIALOG_SETTLE: Duration = Duration::from_secs(2);
 const SESSION_SETTLE: Duration = Duration::from_secs(10);
 const TYPE_CHUNK_LEN: usize = 1;
 const TYPE_CHUNK_GAP: Duration = Duration::from_millis(150);
+/// How long [`Session::close`] waits for the session thread to end.
+const CLOSE_JOIN_DEADLINE: Duration = Duration::from_secs(15);
 const NATIVE_ONLY_PING: &str =
     "native-only session (CuaEnabled no): there is no rdpilot-bridge to ping";
 pub struct Session {
-    thread: Option<JoinHandle<()>>,
+    close: CloseState,
     input_tx: mpsc::Sender<LoopCommand>,
     frame: SharedFrame,
     lifecycle: LifecycleOwner,
@@ -152,7 +154,7 @@ async fn connect_with_resolver(
     })??;
 
     Ok(Session {
-        thread: Some(thread),
+        close: CloseState::new(Some(thread)),
         input_tx,
         frame,
         lifecycle,
@@ -440,29 +442,82 @@ impl Session {
     /// ended. A session that already ended with an error closes with `Ok`: the
     /// error is reported once, as the end cause of its lifecycle.
     ///
+    /// The first poll of the returned future ends the lifecycle and tells the
+    /// session loop to stop before it waits for anything. Close is
+    /// idempotent: the first call starts one join of the session thread on
+    /// the runtime, and every call, also a concurrent one, waits for that one
+    /// join and gets its result. A caller that drops its future does not
+    /// abandon the join.
+    ///
     /// # Errors
     ///
     /// [`Error::Session`] when the thread does not end within the deadline,
-    /// the join task fails or the thread panicked.
-    pub async fn close(mut self) -> Result<()> {
+    /// the join task fails, the thread panicked or the runtime dropped the
+    /// join before it ended.
+    pub async fn close(&self) -> Result<()> {
+        self.close_within(CLOSE_JOIN_DEADLINE).await
+    }
+
+    async fn close_within(&self, deadline: Duration) -> Result<()> {
         self.lifecycle.end(EndCause::ClientClosed);
         self.bridge.stop("session closed");
-
-        let (dummy_tx, _dummy_rx) = mpsc::channel(1);
-        let _ = std::mem::replace(&mut self.input_tx, dummy_tx);
-
-        if let Some(thread) = self.thread.take() {
-            tokio::time::timeout(
-                Duration::from_secs(15),
-                tokio::task::spawn_blocking(move || thread.join()),
-            )
-            .await
-            .map_err(|_| Error::Session("session shutdown deadline exceeded".into()))?
-            .map_err(|e| Error::Session(format!("join task failed: {e}")))?
-            .map_err(|_| Error::Session("session thread panicked".to_owned()))
-        } else {
-            Ok(())
+        let mut result = self.close.start(deadline).clone();
+        let shared = result.wait_for(Option::is_some).await;
+        match shared.as_deref() {
+            Ok(Some(result)) => result.clone().map_err(Error::Session),
+            _ => Err(Error::Session("session close abandoned".to_owned())),
         }
+    }
+}
+
+/// The shared close of a [`Session`]: one join of the session thread and
+/// its result for every caller of [`Session::close`].
+struct CloseState {
+    /// The session thread until the first close takes it. The mutex is held
+    /// only to take the handle once; it never wraps an operation.
+    thread: Mutex<Option<JoinHandle<()>>>,
+    /// The join result, `None` until the join ends.
+    result: OnceLock<watch::Receiver<Option<std::result::Result<(), String>>>>,
+}
+
+impl CloseState {
+    fn new(thread: Option<JoinHandle<()>>) -> Self {
+        Self {
+            thread: Mutex::new(thread),
+            result: OnceLock::new(),
+        }
+    }
+
+    /// The receiver of the join result. The first call starts the join on
+    /// the current runtime.
+    fn start(
+        &self,
+        deadline: Duration,
+    ) -> &watch::Receiver<Option<std::result::Result<(), String>>> {
+        self.result.get_or_init(|| {
+            let thread = self
+                .thread
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take();
+            let Some(thread) = thread else {
+                return watch::channel(Some(Ok(()))).1;
+            };
+            let (tx, rx) = watch::channel(None);
+            tokio::spawn(async move {
+                let joined =
+                    tokio::time::timeout(deadline, tokio::task::spawn_blocking(|| thread.join()))
+                        .await;
+                let result = match joined {
+                    Err(_) => Err("session shutdown deadline exceeded".to_owned()),
+                    Ok(Err(e)) => Err(format!("join task failed: {e}")),
+                    Ok(Ok(Err(_))) => Err("session thread panicked".to_owned()),
+                    Ok(Ok(Ok(()))) => Ok(()),
+                };
+                let _ = tx.send(Some(result));
+            });
+            rx
+        })
     }
 }
 
@@ -782,7 +837,7 @@ mod tests {
         let frame = SharedFrame::new();
         (
             Session {
-                thread: None,
+                close: CloseState::new(None),
                 input_tx: tx,
                 lifecycle: LifecycleOwner::new(frame.clone(), (100, 100)),
                 frame,
@@ -994,6 +1049,104 @@ mod tests {
         );
     }
 
+    /// A session whose thread ends when the returned sender is used or
+    /// dropped; the flag is set when the thread has ended.
+    fn session_with_held_thread() -> (
+        Session,
+        std::sync::mpsc::Sender<()>,
+        Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        let (mut s, _rx) = session();
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let thread_ended = ended.clone();
+        let thread = std::thread::spawn(move || {
+            let _ = held.recv();
+            thread_ended.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        s.close = CloseState::new(Some(thread));
+        (s, release, ended)
+    }
+
+    #[tokio::test]
+    async fn two_concurrent_closes_share_one_join() {
+        let (s, release, ended) = session_with_held_thread();
+        let (first, second) = (s.close(), s.close());
+        let release = async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            release.send(()).unwrap();
+        };
+        let (first, second, ()) = tokio::join!(first, second, release);
+        first.unwrap();
+        second.unwrap();
+        assert!(ended.load(std::sync::atomic::Ordering::SeqCst));
+        s.close().await.expect("a later close gets the same result");
+    }
+
+    #[tokio::test]
+    async fn a_dropped_first_close_does_not_abandon_the_join() {
+        let (s, release, ended) = session_with_held_thread();
+        let mut first = Box::pin(s.close());
+        let polled =
+            std::future::poll_fn(|cx| std::task::Poll::Ready(first.as_mut().poll(cx).is_pending()))
+                .await;
+        assert!(polled, "the first close waits for the held thread");
+        assert!(
+            s.frame_watch().status().ended,
+            "the first poll ends the lifecycle"
+        );
+        drop(first);
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), s.close())
+            .await
+            .expect("the join ends")
+            .expect("the join result is shared");
+        assert!(ended.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn a_join_timeout_is_shared_by_every_close() {
+        let (s, release, _ended) = session_with_held_thread();
+        let deadline = Duration::from_millis(50);
+        let (first, second) = tokio::join!(s.close_within(deadline), s.close_within(deadline));
+        for result in [first, second] {
+            assert!(
+                matches!(&result, Err(Error::Session(m)) if m == "session shutdown deadline exceeded"),
+                "{result:?}"
+            );
+        }
+        assert!(matches!(s.close().await, Err(Error::Session(_))));
+        release.send(()).unwrap();
+    }
+
+    #[test]
+    fn a_close_whose_join_was_dropped_is_abandoned_not_hung() {
+        let (s, release, _ended) = session_with_held_thread();
+        let first = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let polled = first.block_on(async {
+            let mut close = std::pin::pin!(s.close());
+            std::future::poll_fn(|cx| std::task::Poll::Ready(close.as_mut().poll(cx).is_pending()))
+                .await
+        });
+        assert!(polled, "the close waits for the held thread");
+        // The runtime that runs the join goes away before the join ends.
+        first.shutdown_background();
+        let second = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let result = second
+            .block_on(async { tokio::time::timeout(Duration::from_secs(5), s.close()).await });
+        assert!(
+            matches!(&result, Ok(Err(Error::Session(m))) if m == "session close abandoned"),
+            "{result:?}"
+        );
+        release.send(()).unwrap();
+    }
+
     #[tokio::test]
     async fn close_ends_the_lifecycle_as_client_closed() {
         let (s, _rx) = session();
@@ -1016,7 +1169,7 @@ mod tests {
         let pump = session_loop::tests::spawn_pump();
         (
             Session {
-                thread: None,
+                close: CloseState::new(None),
                 input_tx: pump.input_tx,
                 frame: pump.frame,
                 lifecycle: pump.lifecycle,
@@ -1110,7 +1263,7 @@ mod tests {
             })
         };
         let s = Session {
-            thread: Some(thread),
+            close: CloseState::new(Some(thread)),
             input_tx,
             frame,
             lifecycle,
@@ -1241,7 +1394,7 @@ mod tests {
                 let mut peer = pump.peer;
                 let task = pump.task;
                 let s = Session {
-                    thread: None,
+                    close: CloseState::new(None),
                     input_tx: pump.input_tx,
                     frame: pump.frame,
                     lifecycle: pump.lifecycle,

@@ -15,8 +15,8 @@
 //!   frame lookup, recording actions and recording reads) and
 //!   [`ViewerControl`] (human lease operations and input). It has no path
 //!   to Cua, transfer, connect, disconnect, native agent input or agent
-//!   takeover. Only a take waits on a per-session lock, to let an agent
-//!   operation in flight finish.
+//!   takeover. Only a take waits, within one bound, for acting Cua calls
+//!   in flight and the epoch confirmation.
 //! - Read-only mode serves no POST route at all.
 //! - All tasks run on the multi-thread runtime (`tokio::spawn`), and frame
 //!   capture and PNG encoding run in `spawn_blocking`: nothing runs on an

@@ -63,7 +63,7 @@ impl ManagedCua for FakeAttachment {
     }
 }
 impl ManagedSession for FakeSession {
-    fn close(self: Box<Self>) -> BoxFuture<'static, Result<(), DaemonError>> {
+    fn close(&self) -> BoxFuture<'_, Result<(), DaemonError>> {
         Box::pin(async move {
             let _ = self.dead.send(true);
             Ok(())
@@ -696,7 +696,7 @@ async fn the_stream_gates_acting_calls_under_a_human_lease() {
             let id = open(&registry, "notepad").await;
             let control = registry.control(&id).unwrap();
             control
-                .take("100.64.0.5".parse().unwrap(), async {})
+                .take("100.64.0.5".parse().unwrap())
                 .await
                 .unwrap();
             let mut client = server(registry.clone(), 4096);

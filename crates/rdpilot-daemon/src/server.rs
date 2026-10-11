@@ -430,7 +430,7 @@ impl crate::seams::HumanInput for CountingInput {
 }
 
 impl ManagedSession for FakeTestSession {
-    fn close(self: Box<Self>) -> BoxFuture<'static, Result<(), DaemonError>> {
+    fn close(&self) -> BoxFuture<'_, Result<(), DaemonError>> {
         end_fake_lifecycle(&self.lifecycle, rdpilot::EndCause::ClientClosed);
         if let Some(frames) = &self.frames {
             frames.end();

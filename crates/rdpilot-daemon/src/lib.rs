@@ -66,6 +66,8 @@ mod error_map;
 mod events;
 mod ipc;
 mod lifecycle;
+#[cfg(test)]
+mod op_class_tests;
 mod reconcile;
 mod recording;
 #[cfg(test)]
@@ -74,6 +76,7 @@ mod registry;
 mod seams;
 mod server;
 mod synthetic_frames;
+mod transfer;
 mod viewer;
 #[cfg(test)]
 mod viewer_tests;

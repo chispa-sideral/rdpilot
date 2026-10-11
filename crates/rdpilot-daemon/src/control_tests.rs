@@ -105,7 +105,7 @@ fn tab(last: u8) -> IpAddr {
 }
 
 async fn take(f: &Fixture, last: u8) -> Grant {
-    f.control.take(tab(last), async {}).await.expect("take")
+    f.control.take(tab(last)).await.expect("take")
 }
 
 fn kinds(events: &SessionEvents) -> Vec<EventKind> {
@@ -343,7 +343,7 @@ async fn cua_admission_and_take_interleave_deterministically() {
     assert_eq!(f.control.inflight(), 1);
     let taking = {
         let f = Arc::clone(&f);
-        tokio::spawn(async move { f.control.take(tab(7), async {}).await })
+        tokio::spawn(async move { f.control.take(tab(7)).await })
     };
     tokio::task::yield_now().await;
     assert!(f.control.human_active(), "the take is marked at once");
@@ -381,7 +381,7 @@ async fn cua_takeover_during_a_pending_take_displaces_it() {
     assert!(f.control.admit_cua(1, false).unwrap().is_none());
     let taking = {
         let f = Arc::clone(&f);
-        tokio::spawn(async move { f.control.take(tab(8), async {}).await })
+        tokio::spawn(async move { f.control.take(tab(8)).await })
     };
     tokio::task::yield_now().await;
     let transition = f.control.admit_cua(1, true).unwrap();
@@ -399,10 +399,7 @@ async fn cua_takeover_during_a_pending_take_displaces_it() {
 async fn a_take_gives_up_after_its_bound_and_leaves_the_agent_in_control() {
     let f = fixture();
     assert!(f.control.admit_cua(1, false).unwrap().is_none());
-    let result = f
-        .control
-        .take_within(tab(9), async {}, Duration::from_secs(10))
-        .await;
+    let result = f.control.take_within(tab(9), Duration::from_secs(10)).await;
     assert_eq!(result.unwrap_err(), TakeError::Busy);
     assert!(f.control.check_agent().is_ok());
     assert!(!f.control.human_active());
@@ -412,26 +409,24 @@ async fn a_take_gives_up_after_its_bound_and_leaves_the_agent_in_control() {
     );
 }
 
+/// From another tab, a take waits for releases still pending only within
+/// its one bound: then it is busy and the agent controls.
 #[tokio::test(start_paused = true)]
-async fn a_take_waits_for_the_per_session_lock() {
-    let f = Arc::new(fixture());
-    let lock = Arc::new(tokio::sync::Mutex::new(()));
-    let held = Arc::clone(&lock).lock_owned().await;
-    let taking = {
-        let f = Arc::clone(&f);
-        let lock = Arc::clone(&lock);
-        tokio::spawn(async move {
-            f.control
-                .take(tab(9), async move {
-                    let _ = lock.lock().await;
-                })
-                .await
-        })
-    };
-    tokio::time::sleep(Duration::from_secs(1)).await;
-    assert!(!taking.is_finished());
-    drop(held);
-    assert!(taking.await.unwrap().is_ok());
+async fn a_tab_to_tab_take_waits_for_pending_releases_only_within_its_bound() {
+    let f = fixture();
+    let first = take(&f, 1).await;
+    let pending = f.control.blur(&first.lease).unwrap();
+    let started = tokio::time::Instant::now();
+    let result = tokio::time::timeout(
+        Duration::from_secs(60),
+        f.control.take_within(tab(2), Duration::from_secs(1)),
+    )
+    .await
+    .expect("the take ends within its bound");
+    assert_eq!(result.unwrap_err(), TakeError::Busy);
+    assert_eq!(started.elapsed(), Duration::from_secs(1));
+    assert!(f.control.check_agent().is_ok(), "the agent controls");
+    drop(pending);
 }
 
 #[tokio::test(start_paused = true)]
@@ -440,7 +435,7 @@ async fn an_abandoned_take_is_undone() {
     assert!(f.control.admit_cua(1, false).unwrap().is_none());
     let taking = {
         let f = Arc::clone(&f);
-        tokio::spawn(async move { f.control.take(tab(9), async {}).await })
+        tokio::spawn(async move { f.control.take(tab(9)).await })
     };
     tokio::time::sleep(Duration::from_secs(1)).await;
     assert!(f.control.check_agent().is_err());
@@ -655,7 +650,7 @@ impl AgentLog for Sink {
 struct InputSession<S>(Arc<S>);
 
 impl<S: AgentLog> crate::seams::ManagedSession for InputSession<S> {
-    fn close(self: Box<Self>) -> crate::seams::BoxFuture<'static, Result<(), DaemonError>> {
+    fn close(&self) -> crate::seams::BoxFuture<'_, Result<(), DaemonError>> {
         Box::pin(async { Ok(()) })
     }
     fn screenshot(&self) -> crate::seams::BoxFuture<'_, Result<rdpilot::Screenshot, DaemonError>> {
@@ -721,11 +716,12 @@ impl<S: AgentLog> crate::seams::SessionConnector for InputConnector<S> {
     }
 }
 
-/// Closing a session ends its human lease with releases before the
-/// session closes, and records `session_ended`.
+/// Closing a live session ends its human lease without sending anything:
+/// no release batch and no epoch change, so the close does not wait for the
+/// confirm wait. The end is recorded.
 #[tokio::test]
-async fn closing_a_session_ends_its_lease_with_releases() {
-    let sink = Arc::new(Sink::default());
+async fn closing_a_session_ends_its_lease_without_sending() {
+    let sink = Arc::new(GatedSink::new());
     let registry = crate::registry::Registry::new(
         Arc::new(InputConnector(Arc::clone(&sink))),
         Arc::new(crate::seams::NoopReconciliationSink),
@@ -740,7 +736,7 @@ async fn closing_a_session_ends_its_lease_with_releases() {
         .unwrap();
     let control = registry.control(&id).unwrap();
     assert!(control.has_input());
-    let grant = control.take(tab(1), async {}).await.unwrap();
+    let grant = control.take(tab(1)).await.unwrap();
     // No frame source: pointer events drop, keys apply.
     control
         .input(
@@ -751,10 +747,15 @@ async fn closing_a_session_ends_its_lease_with_releases() {
         )
         .await
         .unwrap();
-    sink.take();
+    let before = sink.log().len();
     let events = registry.events(&id).unwrap();
-    registry.close(&id).await.unwrap();
-    assert_eq!(sink.take(), vec![key(SHIFT, false)]);
+    // Every send and epoch change would now wait at the shut gate.
+    sink.shut();
+    tokio::time::timeout(Duration::from_secs(1), registry.close(&id))
+        .await
+        .expect("the close does not wait for the session's input")
+        .unwrap();
+    assert_eq!(sink.log().len(), before, "nothing was sent on close");
     assert_eq!(
         kinds(&events).last(),
         Some(&EventKind::ControlEnded {
@@ -1182,11 +1183,13 @@ async fn ending_a_pending_take_keeps_the_agents_epoch() {
     for takeover in [false, true] {
         let f = Arc::new(fixture());
         let epoch = f.control.admit_agent().await.unwrap();
-        // The agent presses a button (a drag in flight holds the lock).
+        // The agent presses a button (a drag in flight); an acting Cua call
+        // held open keeps the take pending.
         f.sink.send(vec![left(true)], epoch).await.unwrap();
+        assert!(f.control.admit_cua(1, false).unwrap().is_none());
         let taking = {
             let f = Arc::clone(&f);
-            tokio::spawn(async move { f.control.take(tab(9), std::future::pending::<()>()).await })
+            tokio::spawn(async move { f.control.take(tab(9)).await })
         };
         tokio::task::yield_now().await;
         assert!(f.control.human_active());
@@ -1272,7 +1275,7 @@ async fn the_old_tabs_input_after_a_take_is_rejected_stale() {
         Some(Arc::clone(&sink) as Arc<dyn HumanInput>),
         EPOCH_CONFIRM_WAIT,
     ));
-    let a = control.take(tab(1), async {}).await.unwrap();
+    let a = control.take(tab(1)).await.unwrap();
     sink.arm();
     let a_input = {
         let control = Arc::clone(&control);
@@ -1285,7 +1288,7 @@ async fn the_old_tabs_input_after_a_take_is_rejected_stale() {
     };
     tokio::task::yield_now().await;
     let started = tokio::time::Instant::now();
-    let b = control.take(tab(2), async {}).await.unwrap();
+    let b = control.take(tab(2)).await.unwrap();
     assert_eq!(started.elapsed(), Duration::ZERO, "no wait for tab A");
     sink.open();
     let report = a_input.await.unwrap().unwrap();
@@ -1406,21 +1409,15 @@ async fn an_unconfirmed_epoch_change_refuses_the_take_and_still_ends_the_lease()
     // From the agent.
     sink.stall.store(true, std::sync::atomic::Ordering::SeqCst);
     let started = tokio::time::Instant::now();
-    assert_eq!(
-        control.take(tab(1), async {}).await.unwrap_err(),
-        TakeError::Busy
-    );
+    assert_eq!(control.take(tab(1)).await.unwrap_err(), TakeError::Busy);
     assert_eq!(started.elapsed(), wait);
     assert!(!control.human_active());
     assert_eq!(control.admit_agent().await.unwrap(), n.next());
     // From another tab.
     sink.stall.store(false, std::sync::atomic::Ordering::SeqCst);
-    let first = control.take(tab(1), async {}).await.unwrap();
+    let first = control.take(tab(1)).await.unwrap();
     sink.stall.store(true, std::sync::atomic::Ordering::SeqCst);
-    assert_eq!(
-        control.take(tab(2), async {}).await.unwrap_err(),
-        TakeError::Busy
-    );
+    assert_eq!(control.take(tab(2)).await.unwrap_err(), TakeError::Busy);
     assert!(!control.human_active());
     assert_eq!(
         control.heartbeat(&first.lease),
@@ -1429,7 +1426,7 @@ async fn an_unconfirmed_epoch_change_refuses_the_take_and_still_ends_the_lease()
     assert_eq!(control.admit_agent().await.unwrap(), n.next().next().next());
     // A release.
     sink.stall.store(false, std::sync::atomic::Ordering::SeqCst);
-    let held = control.take(tab(3), async {}).await.unwrap();
+    let held = control.take(tab(3)).await.unwrap();
     sink.stall.store(true, std::sync::atomic::Ordering::SeqCst);
     let transition = control.release(&held.lease).unwrap();
     let started = tokio::time::Instant::now();

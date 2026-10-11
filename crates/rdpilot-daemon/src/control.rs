@@ -24,15 +24,18 @@
 //!   a human take wait until no transition is pending. So no controller
 //!   acts before the previous holder's keys and buttons are released.
 //! - A human take is granted only after the session loop confirmed the
-//!   epoch change, within [`TAKE_WAIT`] and at most the confirm wait; an
+//!   epoch change, within [`TAKE_BOUND`] and at most the confirm wait; an
 //!   unconfirmed change refuses the take as busy. The epoch is never rolled
 //!   back: the agent then acts at the new epoch.
 //! - A human take from the agent marks the lease held at once, so new agent
-//!   actions are refused, and then waits (bounded by [`TAKE_WAIT`]) for the
-//!   agent operations already in flight: a native operation holding the
-//!   per-session lock, and forwarded acting Cua calls without an answer. It
-//!   never interrupts them. If the bound expires, the take is undone.
-//!   The heartbeat and idle clocks start only when the take completes.
+//!   actions are refused, and then waits, within the one [`TAKE_BOUND`],
+//!   only for forwarded acting Cua calls without an answer and for the
+//!   epoch confirmation. It never interrupts a Cua call; if the bound
+//!   expires while one is in flight, the take is undone. Agent native input
+//!   in flight is not waited for: the epoch change cuts it at its next
+//!   batch, and the session loop releases what it pressed. Transfers and
+//!   reads never delay a take. The heartbeat and idle clocks start only
+//!   when the take completes.
 //! - Cua admission ([`SessionControl::admit_cua`]) checks the controller
 //!   and counts the call as in flight in one critical section of the state
 //!   mutex, so a take cannot slip between the check and the count.
@@ -43,7 +46,6 @@
 //! - The std mutex is never held across an `.await`.
 
 use std::collections::{BTreeSet, VecDeque};
-use std::future::Future;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -59,8 +61,10 @@ use crate::events::{EventKind, EventSource, SessionEvents};
 use crate::registry::iso8601_from_system_time;
 use crate::seams::{DaemonError, HumanInput, ViewFrameSource};
 
-/// Longest wait of a human take for agent operations in flight.
-pub(crate) const TAKE_WAIT: Duration = Duration::from_secs(10);
+/// The one bound of a human take: in-flight acting Cua calls, the pending
+/// release ordering and the epoch confirmation. `EPOCH_CONFIRM_WAIT` is spent
+/// inside it.
+pub(crate) const TAKE_BOUND: Duration = Duration::from_secs(10);
 
 /// A human lease ends after this long without a heartbeat from its tab.
 pub(crate) const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -212,7 +216,8 @@ pub(crate) enum NotHeld {
 /// Why a human take failed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum TakeError {
-    /// Agent work was still in flight when [`TAKE_WAIT`] expired.
+    /// An acting Cua call was still in flight, or the epoch change was not
+    /// confirmed, when [`TAKE_BOUND`] expired.
     Busy,
     /// The pending take was displaced before it completed.
     Lost(Loss),
@@ -759,33 +764,27 @@ impl SessionControl {
     }
 
     /// Take the lease for a viewer tab at `address`. From the agent, the
-    /// take is marked at once and then waits (bounded) for `agent_idle`
-    /// (the per-session lock) and for in-flight acting Cua calls. From
-    /// another tab, the old lease ends at once. Either way the take is
-    /// granted only after the session loop confirmed the epoch change.
+    /// take is marked at once and then waits for in-flight acting Cua calls
+    /// and pending releases. From another tab, the old lease ends at once.
+    /// Either way the take is granted only after the session loop confirmed
+    /// the epoch change. Every wait shares one bound, [`TAKE_BOUND`].
     ///
     /// # Errors
     ///
-    /// [`TakeError::Busy`] when agent work did not finish, or the epoch
-    /// change was not confirmed, within [`TAKE_WAIT`]; [`TakeError::Lost`]
-    /// when displaced while waiting.
-    pub(crate) async fn take<F>(&self, address: IpAddr, agent_idle: F) -> Result<Grant, TakeError>
-    where
-        F: Future<Output = ()>,
-    {
-        self.take_within(address, agent_idle, TAKE_WAIT).await
+    /// [`TakeError::Busy`] when an acting Cua call did not finish, or the
+    /// epoch change was not confirmed, within [`TAKE_BOUND`];
+    /// [`TakeError::Lost`] when displaced while waiting.
+    pub(crate) async fn take(&self, address: IpAddr) -> Result<Grant, TakeError> {
+        self.take_within(address, TAKE_BOUND).await
     }
 
-    pub(crate) async fn take_within<F>(
+    pub(crate) async fn take_within(
         &self,
         address: IpAddr,
-        agent_idle: F,
         bound: Duration,
-    ) -> Result<Grant, TakeError>
-    where
-        F: Future<Output = ()>,
-    {
+    ) -> Result<Grant, TakeError> {
         let started = Instant::now();
+        let deadline = tokio::time::Instant::now() + bound;
         let lease = Lease {
             id: new_lease_id(),
             address,
@@ -835,12 +834,14 @@ impl SessionControl {
                 .discharge_within(transition, self.confirm_wait.min(bound))
                 .await;
             // Releases of the old holder still pending (a blur, a fence)
-            // are sent before the new holder acts.
-            self.wait_released().await;
+            // are sent before the new holder acts. Not sent within the bound:
+            // busy, like an unconfirmed change.
             confirmed
+                && tokio::time::timeout_at(deadline, self.wait_released())
+                    .await
+                    .is_ok()
         } else {
-            let settled = tokio::time::timeout(bound, async {
-                agent_idle.await;
+            let settled = tokio::time::timeout_at(deadline, async {
                 self.wait_settled().await;
                 self.wait_released().await;
             })
@@ -858,7 +859,7 @@ impl SessionControl {
                 }
                 self.advance(&mut state)
             };
-            let remaining = bound.saturating_sub(started.elapsed());
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             self.discharge_within(transition, self.confirm_wait.min(remaining))
                 .await
         };

@@ -53,8 +53,10 @@ use crate::lifecycle::{EndCause, LifecycleOwner};
 ///
 /// Lifecycle commands are not variants: a close or drop of the session
 /// signals the `bridge.shutdown` notify, which the loop checks first and a
-/// full queue cannot refuse. Transfers and channel commands (clipboard,
-/// devices, display control) are later command classes of this queue.
+/// full queue cannot refuse. Transfers are not a command class of this
+/// queue: the daemon runs them in its own per-session transfer queue.
+/// Channel commands (clipboard, devices, display control) are later command
+/// classes of this queue.
 pub(crate) enum LoopCommand {
     /// One batch of ordered input of `epoch`. The loop applies `ops` to its
     /// input state and answers `reply` at dequeue, before it writes the
