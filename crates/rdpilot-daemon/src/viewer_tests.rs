@@ -62,16 +62,33 @@ fn end_lifecycle(
     });
 }
 
-/// Records human input events in order.
+/// Records human input events in order, as the session loop would send
+/// them (with the releases of an epoch change).
 #[derive(Default)]
-struct InputLog(Mutex<Vec<rdpilot_vocab::RawInput>>);
+struct InputLog(
+    Mutex<Vec<rdpilot_vocab::RawInput>>,
+    Mutex<crate::seams::LoopInputModel>,
+);
 
 impl crate::seams::HumanInput for InputLog {
     fn send(
         &self,
         events: Vec<rdpilot_vocab::RawInput>,
+        epoch: rdpilot::InputEpoch,
     ) -> crate::seams::BoxFuture<'_, Result<(), DaemonError>> {
-        self.0.lock().unwrap().extend(events);
+        let sent = self.1.lock().unwrap().send(epoch, events);
+        Box::pin(async move {
+            self.0.lock().unwrap().extend(sent?);
+            Ok(())
+        })
+    }
+
+    fn set_epoch(
+        &self,
+        epoch: rdpilot::InputEpoch,
+    ) -> crate::seams::BoxFuture<'_, Result<(), DaemonError>> {
+        let releases = self.1.lock().unwrap().set_epoch(epoch);
+        self.0.lock().unwrap().extend(releases);
         Box::pin(async { Ok(()) })
     }
 }
@@ -88,10 +105,18 @@ impl ManagedSession for FramedSession {
     fn screenshot(&self) -> BoxFuture<'_, Result<rdpilot::Screenshot, DaemonError>> {
         Box::pin(async { Err(DaemonError::Connect("unused".into())) })
     }
-    fn send_mouse(&self, _: rdpilot::MouseAction) -> BoxFuture<'_, Result<(), DaemonError>> {
+    fn send_mouse(
+        &self,
+        _: rdpilot::MouseAction,
+        _epoch: rdpilot::InputEpoch,
+    ) -> BoxFuture<'_, Result<(), DaemonError>> {
         Box::pin(async { Ok(()) })
     }
-    fn send_key(&self, _: rdpilot::KeyAction) -> BoxFuture<'_, Result<(), DaemonError>> {
+    fn send_key(
+        &self,
+        _: rdpilot::KeyAction,
+        _epoch: rdpilot::InputEpoch,
+    ) -> BoxFuture<'_, Result<(), DaemonError>> {
         Box::pin(async { Ok(()) })
     }
     fn upload_file(
@@ -114,7 +139,10 @@ impl ManagedSession for FramedSession {
     fn desktop_size(&self) -> (u32, u32) {
         (64, 48)
     }
-    fn deploy_and_launch(&self) -> BoxFuture<'_, Result<Duration, DaemonError>> {
+    fn deploy_and_launch(
+        &self,
+        _epoch: rdpilot::InputEpoch,
+    ) -> BoxFuture<'_, Result<Duration, DaemonError>> {
         Box::pin(async { Ok(Duration::ZERO) })
     }
     fn frame_source(&self) -> Option<Arc<dyn ViewFrameSource>> {

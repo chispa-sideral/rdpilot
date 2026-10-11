@@ -28,6 +28,8 @@ struct Env {
     idle_ms: u64,
     grace_ms: u64,
     calls: usize,
+    /// More environment for every command (and so for the daemon).
+    extra: Vec<(&'static str, &'static str)>,
 }
 
 struct Run {
@@ -58,6 +60,7 @@ impl Env {
             idle_ms,
             grace_ms,
             calls: 0,
+            extra: Vec::new(),
         }
     }
 
@@ -94,7 +97,8 @@ impl Env {
             .env("HOME", &self.root)
             .env("APPDATA", self.root.join("appdata"))
             .env_remove("RDPILOT_VIEWER__BIND")
-            .env_remove("RDPILOT_VIEWER__TAILNET_ADDRESS");
+            .env_remove("RDPILOT_VIEWER__TAILNET_ADDRESS")
+            .envs(self.extra.iter().copied());
         command
     }
 
@@ -506,6 +510,10 @@ fn an_open_viewer_changes_neither_idle_reaping_nor_self_shutdown() {
 }
 
 fn http_post(addr: SocketAddr, path: &str, token: &str, body: &str) -> u16 {
+    http_post_reply(addr, path, token, body).status
+}
+
+fn http_post_reply(addr: SocketAddr, path: &str, token: &str, body: &str) -> Reply {
     let mut stream = TcpStream::connect(addr).unwrap();
     stream
         .set_read_timeout(Some(Duration::from_secs(25)))
@@ -520,8 +528,14 @@ Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
     .unwrap();
     let mut raw = Vec::new();
     stream.read_to_end(&mut raw).unwrap();
-    let head = String::from_utf8_lossy(&raw);
-    head.split(' ').nth(1).unwrap().parse().unwrap()
+    let split = raw.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+    let head = String::from_utf8_lossy(&raw[..split]).into_owned();
+    let status = head.split(' ').nth(1).unwrap().parse().unwrap();
+    Reply {
+        status,
+        head,
+        body: raw[split + 4..].to_vec(),
+    }
 }
 
 /// `--read-only` serves no write route; the default viewer offers control.
@@ -584,6 +598,79 @@ fn read_only_viewer_has_no_write_route() {
     }
     let run = env.run(&["disconnect", "--session", "alpha"]);
     assert!(run.status.success());
+    wait_for("daemon self-shutdown", Duration::from_secs(5), || {
+        socket_gone(&env.socket())
+    });
+}
+
+/// A take while the bridge bootstrap of a connect runs answers 409 with the
+/// busy message at once, not after the take bound; once the connect has
+/// returned, a take succeeds.
+#[test]
+fn a_take_during_the_bootstrap_is_busy_at_once() {
+    let mut env = Env::new("bootstrap", 60_000, 1_000);
+    env.extra = vec![
+        ("RDPILOT_DAEMON_TEST_CUA", "1"),
+        ("RDPILOT_DAEMON_TEST_BOOTSTRAP_DELAY_MS", "8000"),
+    ];
+    let mut connect = env
+        .command(&["connect", "--name", "boot", "rdp://u:p@10.0.0.5"])
+        .stdout(Stdio::from(
+            std::fs::File::create(env.capture.join("boot-stdout.log")).unwrap(),
+        ))
+        .stderr(Stdio::from(
+            std::fs::File::create(env.capture.join("boot-stderr.log")).unwrap(),
+        ))
+        .spawn()
+        .unwrap();
+    wait_for("the daemon socket", Duration::from_secs(10), || {
+        env.socket().exists()
+    });
+    wait_for("the session to be live", Duration::from_secs(5), || {
+        env.list()
+            .iter()
+            .any(|s| s["id"] == "boot" && s["status"] == "Live")
+    });
+    let mut viewer = Viewer::start(&env, &["--bind", "loopback"]);
+    let (addr, token) = (viewer.addr(), viewer.token());
+    let started = Instant::now();
+    let take = http_post_reply(
+        addr,
+        "/api/sessions/boot/control",
+        &token,
+        r#"{"action":"take"}"#,
+    );
+    let took = started.elapsed();
+    assert!(
+        connect.try_wait().unwrap().is_none(),
+        "the take landed after the bootstrap"
+    );
+    assert_eq!(take.status, 409, "{}", take.head);
+    let body: serde_json::Value = serde_json::from_slice(&take.body).unwrap();
+    assert_eq!(body["held"], false);
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .starts_with("an agent operation is still running"),
+        "{body}"
+    );
+    assert!(took < Duration::from_secs(1), "busy after {took:?}");
+
+    let status = connect.wait().unwrap();
+    assert!(status.success());
+    let take = http_post(
+        addr,
+        "/api/sessions/boot/control",
+        &token,
+        r#"{"action":"take"}"#,
+    );
+    assert_eq!(take, 200);
+
+    sigint(&viewer.child);
+    assert!(viewer.wait_exit(Duration::from_secs(5)).success());
+    let run = env.run(&["disconnect", "--session", "boot"]);
+    assert!(run.status.success(), "{}", run.stderr);
     wait_for("daemon self-shutdown", Duration::from_secs(5), || {
         socket_gone(&env.socket())
     });

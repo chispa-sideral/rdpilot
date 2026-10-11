@@ -23,7 +23,7 @@ pub use bridge::CuaAttachment;
 pub use config::ConnectionConfig;
 pub use error::{Error, Result};
 pub use framebuffer::{FrameStatus, FrameWatch};
-pub use input::{Button, Key, KeyAction, MouseAction, PointerButton, RawInput};
+pub use input::{Button, InputEpoch, Key, KeyAction, MouseAction, PointerButton, RawInput};
 pub use lifecycle::{EndCause, Lifecycle, SessionState};
 pub use screenshot::{Rect, Screenshot};
 pub use session::{InputHandle, Session, TransferOutcome};

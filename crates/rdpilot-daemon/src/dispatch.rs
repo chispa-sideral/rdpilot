@@ -24,7 +24,7 @@ use std::pin::Pin;
 
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
-use rdpilot::ConnectionConfig;
+use rdpilot::{ConnectionConfig, InputEpoch};
 use rdpilot_ipc::{
     Request, TransferOutcome as WireTransferOutcome, WireRecordingState, WireResponse,
     IPC_COMPATIBILITY_VERSION,
@@ -198,9 +198,11 @@ pub(crate) async fn dispatch_connect(
     // placeholder (`ConnectGuard`); it adds no `.await` after the entry is
     // `Live`, so no entry can outlive the drop. `select!` drops both futures
     // before a branch runs.
-    let lease = tokio::select! {
+    // A configured bundle inserts the session with its bootstrap mark set,
+    // so a human take is refused as busy until the bootstrap ends.
+    let mut lease = tokio::select! {
         biased;
-        opened = registry.open_tracked(name, host, cfg) => match opened {
+        opened = registry.open_tracked(name, host, cfg, bridge_configured) => match opened {
             Ok(lease) => lease,
             Err(e) => return DispatchOutcome::reply(WireResponse::Error(e.into())),
         },
@@ -218,11 +220,20 @@ pub(crate) async fn dispatch_connect(
         if let Some(diagnostics) = diagnostics {
             diagnostics.record(session.as_str(), Stage::BridgeBootstrapStarted);
         }
+        // The mark is cleared when it drops: after the bootstrap, or after
+        // the close of a failed or abandoned one, so no take is granted to a
+        // session that is about to close.
+        let mut mark = lease.take_bootstrap_mark();
+        // No take is granted and no lease exists while the mark is set, so
+        // the epoch stays the same for the whole bootstrap.
+        let epoch = registry
+            .control(&session)
+            .map_or(InputEpoch::INITIAL, |control| control.input_epoch());
         // Dropping the call releases the session lock and stops the bootstrap
         // loop at its next await; the entry is then closed by its lease.
         let bootstrap = tokio::select! {
             biased;
-            bootstrap = registry.call(&session, |s| s.deploy_and_launch()) => bootstrap,
+            bootstrap = registry.call(&session, move |s| s.deploy_and_launch(epoch)) => bootstrap,
             () = peer_gone(&mut watch) => {
                 if let Some(diagnostics) = diagnostics {
                     diagnostics.record(session.as_str(), Stage::IpcPeerClosed);
@@ -232,9 +243,13 @@ pub(crate) async fn dispatch_connect(
                         diagnostics.record(session.as_str(), Stage::RegistryClosed);
                     }
                 }
+                drop(mark);
                 return DispatchOutcome::peer_closed();
             }
         };
+        if bootstrap.is_ok() {
+            mark = None;
+        }
         let bootstrap_stages = registry
             .call(&session, |s| {
                 Box::pin(async move { Ok(s.bootstrap_stages()) })
@@ -250,6 +265,7 @@ pub(crate) async fn dispatch_connect(
                     diagnostics.record(session.as_str(), Stage::RegistryClosed);
                 }
             }
+            drop(mark);
             return DispatchOutcome::reply(WireResponse::Error(e.into()));
         }
         if let Some(diagnostics) = diagnostics {
@@ -387,7 +403,7 @@ pub(crate) async fn dispatch_for_ipc(
         }
         Request::Mouse { session, action } => {
             match registry
-                .call_acting(&session, move |s| s.send_mouse(action))
+                .call_acting(&session, move |s, epoch| s.send_mouse(action, epoch))
                 .await
             {
                 Ok(()) => WireResponse::Ack,
@@ -396,7 +412,7 @@ pub(crate) async fn dispatch_for_ipc(
         }
         Request::Key { session, action } => {
             match registry
-                .call_acting(&session, move |s| s.send_key(action))
+                .call_acting(&session, move |s, epoch| s.send_key(action, epoch))
                 .await
             {
                 Ok(()) => WireResponse::Ack,
@@ -664,10 +680,15 @@ mod tests {
         fn send_mouse(
             &self,
             _action: rdpilot::MouseAction,
+            _epoch: rdpilot::InputEpoch,
         ) -> BoxFuture<'_, Result<(), DaemonError>> {
             Box::pin(async { Ok(()) })
         }
-        fn send_key(&self, _action: rdpilot::KeyAction) -> BoxFuture<'_, Result<(), DaemonError>> {
+        fn send_key(
+            &self,
+            _action: rdpilot::KeyAction,
+            _epoch: rdpilot::InputEpoch,
+        ) -> BoxFuture<'_, Result<(), DaemonError>> {
             Box::pin(async { Ok(()) })
         }
 
@@ -701,7 +722,10 @@ mod tests {
         fn desktop_size(&self) -> (u32, u32) {
             (1920, 1080)
         }
-        fn deploy_and_launch(&self) -> BoxFuture<'_, Result<std::time::Duration, DaemonError>> {
+        fn deploy_and_launch(
+            &self,
+            _epoch: rdpilot::InputEpoch,
+        ) -> BoxFuture<'_, Result<std::time::Duration, DaemonError>> {
             self.deploys.fetch_add(1, Ordering::SeqCst);
             Box::pin(async move { Ok(std::time::Duration::from_millis(0)) })
         }
@@ -1258,5 +1282,263 @@ mod tests {
             }) => {}
             other => panic!("expected Error(SessionNotFound), got {other:?}"),
         }
+    }
+
+    /// The input of a [`BootstrapSession`]: the session loop's epoch model,
+    /// and the epochs and outcomes of the bootstrap keys.
+    #[derive(Default)]
+    struct BootstrapInput {
+        model: Mutex<crate::seams::LoopInputModel>,
+        keys: Mutex<Vec<(rdpilot::InputEpoch, bool)>>,
+    }
+
+    impl crate::seams::HumanInput for BootstrapInput {
+        fn send(
+            &self,
+            events: Vec<rdpilot_vocab::RawInput>,
+            epoch: rdpilot::InputEpoch,
+        ) -> BoxFuture<'_, Result<(), DaemonError>> {
+            let accepted = self.model.lock().unwrap().accept(epoch, &events).map(drop);
+            Box::pin(async move { accepted })
+        }
+
+        fn set_epoch(&self, epoch: rdpilot::InputEpoch) -> BoxFuture<'_, Result<(), DaemonError>> {
+            self.model.lock().unwrap().set_epoch(epoch);
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    /// A session whose bootstrap waits at `gate`, then types three keys
+    /// through its input at the epoch it was given and answers `fail` or Ok.
+    struct BootstrapSession {
+        input: Arc<BootstrapInput>,
+        gate: Arc<tokio::sync::Semaphore>,
+        fail: bool,
+    }
+
+    impl ManagedSession for BootstrapSession {
+        fn close(self: Box<Self>) -> TestFuture<Result<(), DaemonError>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn screenshot(&self) -> BoxFuture<'_, Result<rdpilot::Screenshot, DaemonError>> {
+            Box::pin(async { Err(DaemonError::Io("unused".into())) })
+        }
+        fn send_mouse(
+            &self,
+            _action: rdpilot::MouseAction,
+            _epoch: rdpilot::InputEpoch,
+        ) -> BoxFuture<'_, Result<(), DaemonError>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn send_key(
+            &self,
+            _action: rdpilot::KeyAction,
+            _epoch: rdpilot::InputEpoch,
+        ) -> BoxFuture<'_, Result<(), DaemonError>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn upload_file(
+            &self,
+            _local: std::path::PathBuf,
+            _remote_name: String,
+        ) -> BoxFuture<'_, Result<rdpilot::TransferOutcome, DaemonError>> {
+            Box::pin(async { Err(DaemonError::Io("unused".into())) })
+        }
+        fn download_file(
+            &self,
+            _remote_name: String,
+            _local: std::path::PathBuf,
+        ) -> BoxFuture<'_, Result<rdpilot::TransferOutcome, DaemonError>> {
+            Box::pin(async { Err(DaemonError::Io("unused".into())) })
+        }
+        fn ping(&self) -> BoxFuture<'_, Result<std::time::Duration, DaemonError>> {
+            Box::pin(async { Ok(std::time::Duration::ZERO) })
+        }
+        fn desktop_size(&self) -> (u32, u32) {
+            (1, 1)
+        }
+        fn deploy_and_launch(
+            &self,
+            epoch: rdpilot::InputEpoch,
+        ) -> BoxFuture<'_, Result<std::time::Duration, DaemonError>> {
+            Box::pin(async move {
+                drop(self.gate.acquire().await.unwrap());
+                for (code, down) in [(0x5B, true), (0x13, true), (0x13, false)] {
+                    let key = rdpilot_vocab::RawInput::Key {
+                        code,
+                        extended: false,
+                        down,
+                    };
+                    let sent = crate::seams::HumanInput::send(&*self.input, vec![key], epoch).await;
+                    self.input.keys.lock().unwrap().push((epoch, sent.is_ok()));
+                    sent?;
+                }
+                if self.fail {
+                    return Err(DaemonError::Sdk(rdpilot::Error::Bootstrap(
+                        "fake bootstrap failure".into(),
+                    )));
+                }
+                Ok(std::time::Duration::ZERO)
+            })
+        }
+        fn human_input(&self) -> Option<Arc<dyn crate::seams::HumanInput>> {
+            Some(Arc::clone(&self.input) as Arc<dyn crate::seams::HumanInput>)
+        }
+    }
+
+    /// Connects [`BootstrapSession`]s that share one input and one gate.
+    struct BootstrapConnector {
+        input: Arc<BootstrapInput>,
+        gate: Arc<tokio::sync::Semaphore>,
+        fail: bool,
+    }
+
+    impl SessionConnector for BootstrapConnector {
+        fn connect(
+            &self,
+            _cfg: ConnectionConfig,
+        ) -> TestFuture<Result<Box<dyn ManagedSession>, DaemonError>> {
+            let session = BootstrapSession {
+                input: Arc::clone(&self.input),
+                gate: Arc::clone(&self.gate),
+                fail: self.fail,
+            };
+            Box::pin(async move { Ok(Box::new(session) as Box<dyn ManagedSession>) })
+        }
+    }
+
+    struct Bootstrapping {
+        registry: Arc<Registry>,
+        viewer: crate::registry::ViewerControl,
+        input: Arc<BootstrapInput>,
+        gate: Arc<tokio::sync::Semaphore>,
+        connect: tokio::task::JoinHandle<DispatchOutcome>,
+        /// Ends the Connect's peer.
+        peer: Option<tokio::sync::oneshot::Sender<()>>,
+        id: SessionId,
+    }
+
+    /// Start a Connect of "web" (Cua enabled when `cua`) whose bootstrap
+    /// waits at a shut gate, and wait until its session is listed.
+    async fn start_bootstrap(cua: bool, fail: bool) -> Bootstrapping {
+        let input = Arc::new(BootstrapInput::default());
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let registry = Arc::new(Registry::new(
+            Arc::new(BootstrapConnector {
+                input: Arc::clone(&input),
+                gate: Arc::clone(&gate),
+                fail,
+            }),
+            Arc::new(NoopReconciliationSink),
+        ));
+        let (peer, gone) = tokio::sync::oneshot::channel::<()>();
+        let connect = {
+            let registry = Arc::clone(&registry);
+            tokio::spawn(async move {
+                let source = StubBundles {
+                    calls: Arc::new(AtomicUsize::new(0)),
+                    result: Ok(prepared()),
+                };
+                let gone = async move {
+                    let _ = gone.await;
+                };
+                let watch: PeerWatch<'_> = std::pin::pin!(gone);
+                dispatch_connect(&registry, connect_fields(cua), None, &source, Some(watch)).await
+            })
+        };
+        let id: SessionId = "web".parse().unwrap();
+        while registry.control(&id).is_none() {
+            tokio::task::yield_now().await;
+        }
+        Bootstrapping {
+            viewer: crate::registry::ViewerControl::new(Arc::clone(&registry)),
+            registry,
+            input,
+            gate,
+            connect,
+            peer: Some(peer),
+            id,
+        }
+    }
+
+    fn address() -> std::net::IpAddr {
+        "100.101.102.103".parse().unwrap()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_take_during_a_held_bootstrap_gets_busy_at_once() {
+        use crate::control::TakeError;
+        use crate::registry::ControlRefusal;
+        let b = start_bootstrap(true, false).await;
+        let started = tokio::time::Instant::now();
+        let refused = b.viewer.take(&b.id, address()).await;
+        assert!(
+            matches!(refused, Err(ControlRefusal::Take(TakeError::Busy))),
+            "{refused:?}"
+        );
+        assert_eq!(
+            started.elapsed(),
+            std::time::Duration::ZERO,
+            "at once, not after the take bound"
+        );
+        assert!(!b.registry.control(&b.id).unwrap().human_active());
+        b.gate.add_permits(1);
+        let outcome = b.connect.await.unwrap();
+        assert!(
+            matches!(
+                outcome.response,
+                WireResponse::Connected {
+                    bridge_live: true,
+                    ..
+                }
+            ),
+            "{:?}",
+            outcome.response
+        );
+        let keys = b.input.keys.lock().unwrap().clone();
+        assert_eq!(keys, vec![(rdpilot::InputEpoch::INITIAL, true); 3]);
+        assert!(b.viewer.take(&b.id, address()).await.is_ok());
+        drop(b.peer);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_bootstrap_mark_clears_on_error_and_peer_close() {
+        use crate::registry::ControlRefusal;
+        // A failed bootstrap: the Connect fails and the session is closed.
+        let b = start_bootstrap(true, true).await;
+        b.gate.add_permits(1);
+        let outcome = b.connect.await.unwrap();
+        assert!(matches!(outcome.response, WireResponse::Error(_)));
+        assert!(matches!(
+            b.viewer.take(&b.id, address()).await,
+            Err(ControlRefusal::NoSession)
+        ));
+        assert!(b.registry.list().is_empty());
+        // The Connect's peer closes during the bootstrap.
+        let mut b = start_bootstrap(true, false).await;
+        drop(b.peer.take());
+        let outcome = b.connect.await.unwrap();
+        assert!(outcome.peer_closed);
+        assert!(matches!(
+            b.viewer.take(&b.id, address()).await,
+            Err(ControlRefusal::NoSession)
+        ));
+        assert!(b.registry.list().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn no_mark_without_a_bundle() {
+        let b = start_bootstrap(false, false).await;
+        let outcome = b.connect.await.unwrap();
+        assert!(matches!(
+            outcome.response,
+            WireResponse::Connected {
+                bridge_live: false,
+                ..
+            }
+        ));
+        assert!(b.viewer.take(&b.id, address()).await.is_ok());
+        assert!(b.input.keys.lock().unwrap().is_empty(), "no bootstrap ran");
+        drop(b.peer);
     }
 }

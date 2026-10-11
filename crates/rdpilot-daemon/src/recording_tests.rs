@@ -50,10 +50,18 @@ impl ManagedSession for Session {
             })
         })
     }
-    fn send_mouse(&self, _: rdpilot::MouseAction) -> BoxFuture<'_, Result<(), DaemonError>> {
+    fn send_mouse(
+        &self,
+        _: rdpilot::MouseAction,
+        _epoch: rdpilot::InputEpoch,
+    ) -> BoxFuture<'_, Result<(), DaemonError>> {
         Box::pin(async { Ok(()) })
     }
-    fn send_key(&self, _: rdpilot::KeyAction) -> BoxFuture<'_, Result<(), DaemonError>> {
+    fn send_key(
+        &self,
+        _: rdpilot::KeyAction,
+        _epoch: rdpilot::InputEpoch,
+    ) -> BoxFuture<'_, Result<(), DaemonError>> {
         Box::pin(async { Ok(()) })
     }
     fn upload_file(
@@ -76,7 +84,10 @@ impl ManagedSession for Session {
     fn desktop_size(&self) -> (u32, u32) {
         (16, 12)
     }
-    fn deploy_and_launch(&self) -> BoxFuture<'_, Result<Duration, DaemonError>> {
+    fn deploy_and_launch(
+        &self,
+        _epoch: rdpilot::InputEpoch,
+    ) -> BoxFuture<'_, Result<Duration, DaemonError>> {
         Box::pin(async { Ok(Duration::ZERO) })
     }
     fn frame_source(&self) -> Option<Arc<dyn ViewFrameSource>> {

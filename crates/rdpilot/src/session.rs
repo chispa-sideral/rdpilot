@@ -4,14 +4,12 @@ use crate::{
     connect,
     framebuffer::{FrameWatch, SharedFrame},
     lifecycle::{EndCause, LifecycleOwner, SessionState},
-    session_loop::{self, RdpInputEvent},
+    session_loop::{self, LoopCommand},
 };
 use crate::{
-    BootstrapStage, ConnectionConfig, CuaAttachment, Error, Key, KeyAction, MouseAction, Result,
-    Screenshot,
+    BootstrapStage, ConnectionConfig, CuaAttachment, Error, InputEpoch, Key, KeyAction,
+    MouseAction, Result, Screenshot,
 };
-use ironrdp::pdu::input::fast_path::FastPathInputEvent;
-use ironrdp_input::Database;
 use rdpilot_bridge_protocol::{FileTransferOp, FileTransferRequest, Message};
 use std::{
     fs,
@@ -19,7 +17,7 @@ use std::{
     io::Read,
     net::SocketAddr,
     path::{Path, PathBuf},
-    sync::{atomic::AtomicU64, Arc, Mutex},
+    sync::{atomic::AtomicU64, Arc},
     thread::JoinHandle,
     time::Duration,
 };
@@ -35,9 +33,8 @@ const NATIVE_ONLY_PING: &str =
     "native-only session (CuaEnabled no): there is no rdpilot-bridge to ping";
 pub struct Session {
     thread: Option<JoinHandle<()>>,
-    input_tx: mpsc::Sender<RdpInputEvent>,
+    input_tx: mpsc::Sender<LoopCommand>,
     frame: SharedFrame,
-    input_db: Arc<Mutex<Database>>,
     lifecycle: LifecycleOwner,
     bridge: Arc<BridgeShared>,
     next_req_id: AtomicU64,
@@ -86,6 +83,45 @@ fn sha256_file(path: &Path) -> Result<String> {
     let digest = hasher.finalize();
     Ok(digest.iter().map(|b| format!("{b:02x}")).collect())
 }
+/// The error of an input path whose session loop is gone: the bridge's
+/// failure reason if it has one.
+fn input_closed(bridge: &BridgeShared) -> Error {
+    Error::Session(
+        bridge
+            .failure()
+            .unwrap_or_else(|| "input channel closed".to_owned()),
+    )
+}
+
+/// Send one batch of ordered input of `epoch` to the session loop and wait
+/// until the loop has accepted or refused it.
+async fn send_input(
+    tx: &mpsc::Sender<LoopCommand>,
+    bridge: &BridgeShared,
+    epoch: InputEpoch,
+    ops: Vec<ironrdp_input::Operation>,
+) -> Result<()> {
+    let (reply, answer) = oneshot::channel();
+    tx.send(LoopCommand::Input { epoch, ops, reply })
+        .await
+        .map_err(|_| input_closed(bridge))?;
+    answer.await.map_err(|_| input_closed(bridge))?
+}
+
+/// Change the input epoch of the session loop to `epoch` and wait until the
+/// loop has written the releases of the old epoch.
+async fn set_epoch(
+    tx: &mpsc::Sender<LoopCommand>,
+    bridge: &BridgeShared,
+    epoch: InputEpoch,
+) -> Result<()> {
+    let (reply, answer) = oneshot::channel();
+    tx.send(LoopCommand::SetEpoch { epoch, reply })
+        .await
+        .map_err(|_| input_closed(bridge))?;
+    answer.await.map_err(|_| input_closed(bridge))
+}
+
 /// What the session thread tells the caller once the handshake is over.
 type Ready = Result<(Arc<BridgeShared>, LifecycleOwner)>;
 
@@ -119,7 +155,6 @@ async fn connect_with_resolver(
         thread: Some(thread),
         input_tx,
         frame,
-        input_db: Arc::new(Mutex::new(Database::new())),
         lifecycle,
         bridge,
         next_req_id: AtomicU64::new(1),
@@ -136,7 +171,7 @@ fn run_session_thread(
     cfg: ConnectionConfig,
     addr: SocketAddr,
     frame: SharedFrame,
-    input_rx: mpsc::Receiver<RdpInputEvent>,
+    input_rx: mpsc::Receiver<LoopCommand>,
     mut ready_tx: oneshot::Sender<Ready>,
 ) {
     let runtime = match tokio::runtime::Builder::new_current_thread()
@@ -199,7 +234,7 @@ type SessionThreadBody = fn(
     ConnectionConfig,
     SocketAddr,
     SharedFrame,
-    mpsc::Receiver<RdpInputEvent>,
+    mpsc::Receiver<LoopCommand>,
     oneshot::Sender<Ready>,
 );
 
@@ -266,16 +301,15 @@ impl Session {
         self.frame.watch()
     }
 
-    /// A `Send` input path for a daemon-side human viewer. It applies raw
-    /// events through the same input state as [`Session::send_mouse`] and
-    /// [`Session::send_key`], so pressed keys and buttons stay consistent
-    /// between the two. It holds no session lock and does not keep the
-    /// session alive: after close, sending fails.
+    /// A `Send` input path for a daemon-side human viewer. Its events go
+    /// through the same session loop input state and input epoch as
+    /// [`Session::send_mouse`] and [`Session::send_key`], so pressed keys and
+    /// buttons stay consistent between the two. It holds no session lock and
+    /// does not keep the session alive: after close, sending fails.
     #[must_use]
     pub fn input_handle(&self) -> InputHandle {
         InputHandle {
             tx: self.input_tx.clone(),
-            db: Arc::clone(&self.input_db),
             frame: self.frame.clone(),
             bridge: Arc::clone(&self.bridge),
         }
@@ -292,7 +326,19 @@ impl Session {
         Ok(())
     }
 
-    pub async fn send_mouse(&self, action: MouseAction) -> Result<()> {
+    /// Send a mouse action as input of `epoch`.
+    ///
+    /// Each timed batch of the action waits until the session loop has
+    /// accepted it; the first refused batch ends the action, so no later
+    /// batch is sent.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::CoordinateOutOfBounds`] for a coordinate outside the desktop
+    /// (nothing is sent); [`Error::StaleInput`] when `epoch` is older than
+    /// the session's input epoch; [`Error::Session`] when the session loop
+    /// is gone.
+    pub async fn send_mouse(&self, action: MouseAction, epoch: InputEpoch) -> Result<()> {
         self.check_bounds(&action)?;
 
         let gap = match action {
@@ -307,24 +353,7 @@ impl Session {
         let last_index = batches.len().saturating_sub(1);
 
         for (i, batch) in batches.into_iter().enumerate() {
-            let events: Vec<FastPathInputEvent> = {
-                let mut db = self
-                    .input_db
-                    .lock()
-                    .map_err(|_| Error::Session("input state lock poisoned".to_owned()))?;
-                db.apply(batch).into_iter().collect()
-            }; // guard dropped here — never held across the .await below
-
-            self.input_tx
-                .send(RdpInputEvent::FastPath(events))
-                .await
-                .map_err(|_| {
-                    Error::Session(
-                        self.bridge
-                            .failure()
-                            .unwrap_or_else(|| "input channel closed".to_owned()),
-                    )
-                })?;
+            send_input(&self.input_tx, &self.bridge, epoch, batch).await?;
 
             if let Some(gap) = gap {
                 if i != last_index {
@@ -336,29 +365,32 @@ impl Session {
         Ok(())
     }
 
-    pub async fn send_key(&self, action: KeyAction) -> Result<()> {
-        let ops = crate::input::key_operations(&action);
+    /// Send a key action as input of `epoch`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::StaleInput`] when `epoch` is older than the session's input
+    /// epoch; [`Error::Session`] when the session loop is gone.
+    pub async fn send_key(&self, action: KeyAction, epoch: InputEpoch) -> Result<()> {
+        send_input(
+            &self.input_tx,
+            &self.bridge,
+            epoch,
+            crate::input::key_operations(&action),
+        )
+        .await
+    }
 
-        let events: Vec<FastPathInputEvent> = {
-            let mut db = self
-                .input_db
-                .lock()
-                .map_err(|_| Error::Session("input state lock poisoned".to_owned()))?;
-            db.apply(ops).into_iter().collect()
-        }; // guard dropped here — never held across the .await below
-
-        self.input_tx
-            .send(RdpInputEvent::FastPath(events))
-            .await
-            .map_err(|_| {
-                Error::Session(
-                    self.bridge
-                        .failure()
-                        .unwrap_or_else(|| "input channel closed".to_owned()),
-                )
-            })?;
-
-        Ok(())
+    /// Change the session's input epoch to `epoch`. When `epoch` is newer,
+    /// the session loop first releases every key and button still pressed;
+    /// this returns after those releases are written. An epoch that is not
+    /// newer changes nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Session`] when the session loop is gone.
+    pub async fn set_input_epoch(&self, epoch: InputEpoch) -> Result<()> {
+        set_epoch(&self.input_tx, &self.bridge, epoch).await
     }
 
     fn unique_share_name(&self) -> String {
@@ -415,7 +447,6 @@ impl Session {
     pub async fn close(mut self) -> Result<()> {
         self.lifecycle.end(EndCause::ClientClosed);
         self.bridge.stop("session closed");
-        let _ = self.input_tx.try_send(RdpInputEvent::Close);
 
         let (dummy_tx, _dummy_rx) = mpsc::channel(1);
         let _ = std::mem::replace(&mut self.input_tx, dummy_tx);
@@ -438,8 +469,7 @@ impl Session {
 /// See [`Session::input_handle`].
 #[derive(Clone)]
 pub struct InputHandle {
-    tx: mpsc::Sender<RdpInputEvent>,
-    db: Arc<Mutex<Database>>,
+    tx: mpsc::Sender<LoopCommand>,
     frame: SharedFrame,
     bridge: Arc<BridgeShared>,
 }
@@ -451,15 +481,17 @@ impl std::fmt::Debug for InputHandle {
 }
 
 impl InputHandle {
-    /// Apply `events` in order and hand the result to the session loop.
-    /// Pointer moves outside the current frame are refused.
+    /// Send `events` in order as input of `epoch` and wait until the session
+    /// loop has accepted them. Pointer moves outside the current frame are
+    /// refused before anything is sent.
     ///
     /// # Errors
     ///
     /// [`Error::CoordinateOutOfBounds`] for a move outside the frame (or
-    /// before the first frame); [`Error::Session`] when the session's input
-    /// channel is closed.
-    pub async fn send(&self, events: Vec<crate::RawInput>) -> Result<()> {
+    /// before the first frame); [`Error::StaleInput`] when `epoch` is older
+    /// than the session's input epoch; [`Error::Session`] when the session's
+    /// input channel is closed.
+    pub async fn send(&self, events: Vec<crate::RawInput>, epoch: InputEpoch) -> Result<()> {
         let (w, h) = self.frame.size();
         for event in &events {
             if let crate::RawInput::PointerMove { x, y } = *event {
@@ -470,26 +502,20 @@ impl InputHandle {
             }
         }
         let ops = crate::input::raw_operations(&events);
-        let fast_path: Vec<FastPathInputEvent> = {
-            let mut db = self
-                .db
-                .lock()
-                .map_err(|_| Error::Session("input state lock poisoned".to_owned()))?;
-            db.apply(ops).into_iter().collect()
-        };
-        if fast_path.is_empty() {
+        if ops.is_empty() {
             return Ok(());
         }
-        self.tx
-            .send(RdpInputEvent::FastPath(fast_path))
-            .await
-            .map_err(|_| {
-                Error::Session(
-                    self.bridge
-                        .failure()
-                        .unwrap_or_else(|| "input channel closed".to_owned()),
-                )
-            })
+        send_input(&self.tx, &self.bridge, epoch, ops).await
+    }
+
+    /// Change the session's input epoch, as [`Session::set_input_epoch`]
+    /// does.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Session`] when the session's input channel is closed.
+    pub async fn set_epoch(&self, epoch: InputEpoch) -> Result<()> {
+        set_epoch(&self.tx, &self.bridge, epoch).await
     }
 }
 
@@ -497,7 +523,6 @@ impl Drop for Session {
     fn drop(&mut self) {
         self.lifecycle.end(EndCause::ClientClosed);
         self.bridge.stop("session dropped");
-        let _ = self.input_tx.try_send(RdpInputEvent::Close);
     }
 }
 
@@ -523,7 +548,9 @@ impl Session {
     /// Launch a local copy of the served bridge (`install`, which verifies
     /// and installs the bundle, then starts the installed copy) through the
     /// Run dialog; see [`bridge_launch_command`]. One launch per generation.
-    pub async fn deploy_and_launch(&self) -> Result<Duration> {
+    /// The launch keys are input of `epoch`; a refused key ends the launch
+    /// with that error.
+    pub async fn deploy_and_launch(&self, epoch: InputEpoch) -> Result<Duration> {
         if self.bridge.ready() {
             return self.ping().await;
         }
@@ -538,7 +565,7 @@ impl Session {
         }
         tokio::time::sleep(SESSION_SETTLE).await;
         for _ in 0..3 {
-            self.inject_bootstrap().await?;
+            self.inject_bootstrap(epoch).await?;
             for _ in 0..60 {
                 if let Some(reason) = self.bridge.failure() {
                     return Err(Error::bootstrap(reason));
@@ -556,23 +583,24 @@ impl Session {
             self.bootstrap_summary()
         )))
     }
-    async fn inject_bootstrap(&self) -> Result<()> {
+    async fn inject_bootstrap(&self, epoch: InputEpoch) -> Result<()> {
         // Retrying before Ready does not replay MCP. The guest generation mutex
         // makes repeated launches no-ops while their owner is alive.
         self.bridge
             .bootstrap
             .record(BootstrapStage::LaunchInputAttempted);
-        self.send_key(KeyAction::Combo(vec![Key::Win, Key::R]))
+        self.send_key(KeyAction::Combo(vec![Key::Win, Key::R]), epoch)
             .await?;
         tokio::time::sleep(RUN_DIALOG_SETTLE).await;
-        self.send_key(KeyAction::Combo(vec![Key::Ctrl, Key::A]))
+        self.send_key(KeyAction::Combo(vec![Key::Ctrl, Key::A]), epoch)
             .await?;
         let command = bridge_launch_command(self.bridge.generation);
         for chunk in chunk_str(&command, TYPE_CHUNK_LEN) {
-            self.send_key(KeyAction::Type(chunk)).await?;
+            self.send_key(KeyAction::Type(chunk), epoch).await?;
             tokio::time::sleep(TYPE_CHUNK_GAP).await;
         }
-        self.send_key(KeyAction::Combo(vec![Key::Enter])).await?;
+        self.send_key(KeyAction::Combo(vec![Key::Enter]), epoch)
+            .await?;
         self.bridge
             .bootstrap
             .record(BootstrapStage::LaunchInputSent);
@@ -746,7 +774,10 @@ fn bridge_launch_command(generation: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn session() -> (Session, mpsc::Receiver<RdpInputEvent>) {
+    use ironrdp::pdu::input::fast_path::{FastPathInput, FastPathInputEvent, KeyboardFlags};
+    use session_loop::tests::{Peer, PEER_DEADLINE};
+
+    fn session() -> (Session, mpsc::Receiver<LoopCommand>) {
         let (tx, rx) = mpsc::channel(16);
         let frame = SharedFrame::new();
         (
@@ -755,7 +786,6 @@ mod tests {
                 input_tx: tx,
                 lifecycle: LifecycleOwner::new(frame.clone(), (100, 100)),
                 frame,
-                input_db: Arc::new(Mutex::new(Database::new())),
                 bridge: Arc::new(BridgeShared::new()),
                 next_req_id: AtomicU64::new(1),
                 share_root: None,
@@ -893,21 +923,29 @@ mod tests {
         s.bridge.invalidate("Cua crashed");
         s.frame.write(2, 2, vec![255; 16]);
         assert_eq!(s.screenshot().await.unwrap().width, 2);
-        s.send_key(KeyAction::Combo(vec![Key::Win, Key::R]))
-            .await
-            .unwrap();
-        assert!(matches!(rx.recv().await, Some(RdpInputEvent::FastPath(_))));
-        s.send_mouse(MouseAction::Move { x: 10, y: 10 })
-            .await
-            .unwrap();
-        assert!(matches!(rx.recv().await, Some(RdpInputEvent::FastPath(_))));
+        let (sent, ops) = tokio::join!(
+            s.send_key(
+                KeyAction::Combo(vec![Key::Win, Key::R]),
+                InputEpoch::INITIAL
+            ),
+            accept_next(&mut rx)
+        );
+        sent.unwrap();
+        assert!(!ops.is_empty());
+        let (sent, ops) = tokio::join!(
+            s.send_mouse(MouseAction::Move { x: 10, y: 10 }, InputEpoch::INITIAL),
+            accept_next(&mut rx)
+        );
+        sent.unwrap();
+        assert!(!ops.is_empty());
         assert!(s.attach_cua().await.is_err());
     }
     #[tokio::test]
     async fn invalid_native_coordinates_send_nothing() {
         let (s, mut rx) = session();
         assert!(matches!(
-            s.send_mouse(MouseAction::Move { x: 100, y: 10 }).await,
+            s.send_mouse(MouseAction::Move { x: 100, y: 10 }, InputEpoch::INITIAL)
+                .await,
             Err(Error::CoordinateOutOfBounds { .. })
         ));
         assert!(rx.try_recv().is_err());
@@ -981,7 +1019,6 @@ mod tests {
                 thread: None,
                 input_tx: pump.input_tx,
                 frame: pump.frame,
-                input_db: Arc::new(Mutex::new(Database::new())),
                 lifecycle: pump.lifecycle,
                 bridge: pump.bridge,
                 next_req_id: AtomicU64::new(1),
@@ -1014,7 +1051,7 @@ mod tests {
                 .expect("the lifecycle sender lives");
                 assert_eq!(s.desktop_size(), (200, 50));
                 // Inside the new size, outside the old one: accepted and sent.
-                s.send_mouse(MouseAction::Move { x: 150, y: 20 })
+                s.send_mouse(MouseAction::Move { x: 150, y: 20 }, InputEpoch::INITIAL)
                     .await
                     .expect("inside the new size");
                 let (_, frame) = tokio::time::timeout(PEER_DEADLINE, peer.read_pdu())
@@ -1025,7 +1062,8 @@ mod tests {
                 assert!(!pdu.input_events().is_empty());
                 // Inside the old size, outside the new one: refused.
                 assert!(matches!(
-                    s.send_mouse(MouseAction::Move { x: 50, y: 80 }).await,
+                    s.send_mouse(MouseAction::Move { x: 50, y: 80 }, InputEpoch::INITIAL)
+                        .await,
                     Err(Error::CoordinateOutOfBounds { .. })
                 ));
                 s.close().await.unwrap();
@@ -1075,7 +1113,6 @@ mod tests {
             thread: Some(thread),
             input_tx,
             frame,
-            input_db: Arc::new(Mutex::new(Database::new())),
             lifecycle,
             bridge,
             next_req_id: AtomicU64::new(1),
@@ -1099,65 +1136,356 @@ mod tests {
         ));
     }
 
+    /// Answer the next loop command, which must be an input batch, as
+    /// accepted, and return its operations.
+    async fn accept_next(rx: &mut mpsc::Receiver<LoopCommand>) -> Vec<ironrdp_input::Operation> {
+        match rx.recv().await {
+            Some(LoopCommand::Input { ops, reply, .. }) => {
+                let _ = reply.send(Ok(()));
+                ops
+            }
+            _ => panic!("expected an input batch"),
+        }
+    }
+
+    /// The input events of the next client PDU the peer reads.
+    async fn next_input(peer: &mut Peer) -> Vec<FastPathInputEvent> {
+        let (_, frame) = tokio::time::timeout(PEER_DEADLINE, peer.read_pdu())
+            .await
+            .expect("input frame deadline")
+            .expect("input frame read");
+        input_events(&frame)
+    }
+
+    /// The input events of the PDU the peer reads within 200 ms, or `None`
+    /// when the loop has written none.
+    async fn written(peer: &mut Peer) -> Option<Vec<FastPathInputEvent>> {
+        let (_, frame) = tokio::time::timeout(Duration::from_millis(200), peer.read_pdu())
+            .await
+            .ok()?
+            .expect("input frame read");
+        Some(input_events(&frame))
+    }
+
+    /// The input events of one fast-path input PDU.
+    fn input_events(frame: &[u8]) -> Vec<FastPathInputEvent> {
+        let pdu: FastPathInput = ironrdp::core::decode(frame).expect("fast-path input");
+        pdu.input_events().to_vec()
+    }
+
+    const SHIFT: u8 = 0x2A;
+    const A_KEY: u8 = 0x1E;
+
+    fn key(code: u8, down: bool) -> crate::RawInput {
+        crate::RawInput::Key {
+            code,
+            extended: false,
+            down,
+        }
+    }
+
+    fn key_event(code: u8, down: bool) -> FastPathInputEvent {
+        let flags = if down {
+            KeyboardFlags::empty()
+        } else {
+            KeyboardFlags::RELEASE
+        };
+        FastPathInputEvent::KeyboardEvent(flags, code)
+    }
+
+    fn left_button(down: bool) -> crate::RawInput {
+        crate::RawInput::Button {
+            button: crate::PointerButton::Left,
+            down,
+        }
+    }
+
+    fn is_left_release(event: &FastPathInputEvent) -> bool {
+        use ironrdp::pdu::input::mouse::PointerFlags;
+        matches!(event, FastPathInputEvent::MouseEvent(pdu)
+            if pdu.flags.contains(PointerFlags::LEFT_BUTTON)
+                && !pdu.flags.contains(PointerFlags::DOWN))
+    }
+
+    fn is_stale(result: &Result<()>, sent: InputEpoch, current: InputEpoch) -> bool {
+        matches!(result, Err(Error::StaleInput { sent: s, current: c }) if *s == sent && *c == current)
+    }
+
+    /// Run `test` with a pumped session on a local set, then close it.
+    async fn with_pumped<F, Fut>(test: F)
+    where
+        F: FnOnce(Session, Peer) -> Fut,
+        Fut: Future<Output = (Session, Peer)>,
+    {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (s, peer, task) = pumped_session();
+                let (s, _peer) = test(s, peer).await;
+                s.close().await.unwrap();
+                let joined = tokio::time::timeout(PEER_DEADLINE, task)
+                    .await
+                    .expect("pump join deadline")
+                    .expect("pump task joins");
+                assert!(joined.is_ok(), "{joined:?}");
+            })
+            .await;
+    }
+
+    /// The close and drop of a session reach the loop when its command queue
+    /// is full: the loop sits in a write the peer does not read, every slot
+    /// of the queue is taken, and the loop still ends.
+    async fn ends_with_a_full_queue(close: bool) {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let pump = session_loop::tests::spawn_pump_with_buffer(1024);
+                let mut peer = pump.peer;
+                let task = pump.task;
+                let s = Session {
+                    thread: None,
+                    input_tx: pump.input_tx,
+                    frame: pump.frame,
+                    lifecycle: pump.lifecycle,
+                    bridge: pump.bridge,
+                    next_req_id: AtomicU64::new(1),
+                    share_root: None,
+                    cua: true,
+                };
+                let lifecycle = s.lifecycle();
+                // A long Type stream the 1 KiB duplex cannot hold.
+                let stuck = s.send_key(KeyAction::Type("x".repeat(2_000)), InputEpoch::INITIAL);
+                stuck.await.expect("accepted at dequeue, before the write");
+                let mut queued = 0;
+                loop {
+                    let (reply, _answer) = oneshot::channel();
+                    let command = LoopCommand::Input {
+                        epoch: InputEpoch::INITIAL,
+                        ops: crate::input::key_operations(&KeyAction::Type("y".to_owned())),
+                        reply,
+                    };
+                    match s.input_tx.try_send(command) {
+                        Ok(()) => queued += 1,
+                        Err(mpsc::error::TrySendError::Full(_)) => break,
+                        Err(other) => panic!("queue closed: {other}"),
+                    }
+                }
+                assert_eq!(queued, INPUT_CHANNEL_CAPACITY);
+                if close {
+                    s.close().await.unwrap();
+                } else {
+                    drop(s);
+                }
+                // The peer reads again, so the loop leaves its write.
+                let drain =
+                    tokio::task::spawn_local(async move { while peer.read_pdu().await.is_ok() {} });
+                let joined = tokio::time::timeout(Duration::from_secs(15), task)
+                    .await
+                    .expect("the loop ends within the close bound")
+                    .expect("pump task joins");
+                assert!(joined.is_ok(), "{joined:?}");
+                assert_eq!(
+                    lifecycle.borrow().lifecycle,
+                    crate::Lifecycle::Ended(EndCause::ClientClosed)
+                );
+                drain.abort();
+            })
+            .await;
+    }
+
     #[tokio::test]
-    async fn input_handle_applies_through_the_shared_input_state_and_checks_bounds() {
-        use crate::{PointerButton, RawInput};
-        let (s, mut rx) = session();
+    async fn close_is_not_lost_with_a_full_queue() {
+        ends_with_a_full_queue(true).await;
+    }
+
+    #[tokio::test]
+    async fn drop_is_not_lost_with_a_full_queue() {
+        ends_with_a_full_queue(false).await;
+    }
+
+    #[tokio::test]
+    async fn stale_input_is_rejected_at_dequeue_and_leaves_no_press() {
+        with_pumped(|s, mut peer| async move {
+            let n = InputEpoch::INITIAL;
+            let (n1, n2) = (n.next(), n.next().next());
+            let handle = s.input_handle();
+            s.set_input_epoch(n1).await.unwrap();
+            let refused = s.send_key(KeyAction::Combo(vec![Key::Shift]), n).await;
+            assert!(is_stale(&refused, n, n1), "{refused:?}");
+            let refused = handle.send(vec![left_button(true)], n).await;
+            assert!(is_stale(&refused, n, n1), "{refused:?}");
+            // Nothing of the refused input is held: a change writes nothing.
+            s.set_input_epoch(n2).await.unwrap();
+            handle.send(vec![key(A_KEY, true)], n2).await.unwrap();
+            assert_eq!(next_input(&mut peer).await, vec![key_event(A_KEY, true)]);
+            (s, peer)
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn an_epoch_change_releases_held_keys_and_buttons_before_confirming() {
+        with_pumped(|s, mut peer| async move {
+            let n = InputEpoch::INITIAL;
+            let handle = s.input_handle();
+            handle
+                .send(vec![key(SHIFT, true), left_button(true)], n)
+                .await
+                .unwrap();
+            assert_eq!(next_input(&mut peer).await.len(), 2);
+            s.set_input_epoch(n.next()).await.unwrap();
+            // Confirmed: the releases are already written, buttons first.
+            let releases = written(&mut peer).await.expect("releases written");
+            assert_eq!(releases.len(), 2, "{releases:?}");
+            assert!(is_left_release(&releases[0]), "{releases:?}");
+            assert_eq!(releases[1], key_event(SHIFT, false));
+            handle.send(vec![key(A_KEY, true)], n.next()).await.unwrap();
+            assert_eq!(next_input(&mut peer).await, vec![key_event(A_KEY, true)]);
+            (s, peer)
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_drag_cut_by_an_epoch_change_stops_at_the_first_stale_batch() {
+        with_pumped(|s, mut peer| async move {
+            let n = InputEpoch::INITIAL;
+            let s = std::rc::Rc::new(s);
+            let drag = tokio::task::spawn_local({
+                let s = std::rc::Rc::clone(&s);
+                async move {
+                    s.send_mouse(
+                        MouseAction::Drag {
+                            from_x: 10,
+                            from_y: 10,
+                            to_x: 90,
+                            to_y: 90,
+                            button: crate::Button::Left,
+                        },
+                        n,
+                    )
+                    .await
+                }
+            });
+            // The first batch: the move to the start and the press.
+            assert_eq!(next_input(&mut peer).await.len(), 2);
+            s.set_input_epoch(n.next()).await.unwrap();
+            let result = drag.await.unwrap();
+            assert!(is_stale(&result, n, n.next()), "{result:?}");
+            // Moves the drag sent before the change, then the release of
+            // the change; no drag batch after it.
+            let mut released = false;
+            while let Some(events) = written(&mut peer).await {
+                assert!(!released, "a drag batch after the release: {events:?}");
+                released = events.iter().any(is_left_release);
+            }
+            assert!(released);
+            let s = std::rc::Rc::try_unwrap(s)
+                .ok()
+                .expect("the drag task is done");
+            (s, peer)
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_newer_epoch_acts_as_an_epoch_change() {
+        with_pumped(|s, mut peer| async move {
+            let n = InputEpoch::INITIAL;
+            let handle = s.input_handle();
+            handle.send(vec![key(SHIFT, true)], n).await.unwrap();
+            assert_eq!(next_input(&mut peer).await, vec![key_event(SHIFT, true)]);
+            // Input of a newer epoch without a change: the release comes
+            // first, in the same write.
+            handle.send(vec![key(A_KEY, true)], n.next()).await.unwrap();
+            assert_eq!(
+                next_input(&mut peer).await,
+                vec![key_event(SHIFT, false), key_event(A_KEY, true)]
+            );
+            let refused = handle.send(vec![key(A_KEY, false)], n).await;
+            assert!(is_stale(&refused, n, n.next()), "{refused:?}");
+            (s, peer)
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn an_epoch_change_that_is_not_newer_is_an_idempotent_ok() {
+        with_pumped(|s, mut peer| async move {
+            let n1 = InputEpoch::INITIAL.next();
+            let handle = s.input_handle();
+            s.set_input_epoch(n1).await.unwrap();
+            handle.send(vec![key(SHIFT, true)], n1).await.unwrap();
+            assert_eq!(next_input(&mut peer).await, vec![key_event(SHIFT, true)]);
+            s.set_input_epoch(n1).await.unwrap();
+            s.set_input_epoch(InputEpoch::INITIAL).await.unwrap();
+            assert_eq!(written(&mut peer).await, None, "no release");
+            handle.send(vec![key(SHIFT, false)], n1).await.unwrap();
+            assert_eq!(next_input(&mut peer).await, vec![key_event(SHIFT, false)]);
+            (s, peer)
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn input_handle_and_session_share_the_loop_input_state_and_check_bounds() {
+        with_pumped(|s, mut peer| async move {
+            let n = InputEpoch::INITIAL;
+            let handle = s.input_handle();
+            // No frame yet: pointer moves are out of bounds and send nothing.
+            assert!(matches!(
+                handle
+                    .send(vec![crate::RawInput::PointerMove { x: 0, y: 0 }], n)
+                    .await,
+                Err(Error::CoordinateOutOfBounds { .. })
+            ));
+            s.frame.write(10, 10, vec![0; 400]);
+            assert!(matches!(
+                handle
+                    .send(vec![crate::RawInput::PointerMove { x: 10, y: 0 }], n)
+                    .await,
+                Err(Error::CoordinateOutOfBounds { .. })
+            ));
+            assert_eq!(written(&mut peer).await, None);
+            handle.send(vec![key(SHIFT, true)], n).await.unwrap();
+            assert_eq!(next_input(&mut peer).await, vec![key_event(SHIFT, true)]);
+            // The session's Shift press sees the handle's: a repeat press
+            // (release, press), then its release.
+            s.send_key(KeyAction::Combo(vec![Key::Shift]), n)
+                .await
+                .unwrap();
+            assert_eq!(
+                next_input(&mut peer).await,
+                vec![
+                    key_event(SHIFT, false),
+                    key_event(SHIFT, true),
+                    key_event(SHIFT, false)
+                ]
+            );
+            // Nothing is left to release.
+            handle.send(vec![key(SHIFT, false)], n).await.unwrap();
+            handle.send(vec![key(A_KEY, true)], n).await.unwrap();
+            assert_eq!(next_input(&mut peer).await, vec![key_event(A_KEY, true)]);
+            (s, peer)
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn input_after_close_fails() {
+        let (s, rx) = session();
         let handle = s.input_handle();
-        // No frame yet: pointer moves are out of bounds and send nothing.
-        assert!(handle
-            .send(vec![RawInput::PointerMove { x: 0, y: 0 }])
-            .await
-            .is_err());
-        s.frame.write(10, 10, vec![0; 400]);
-        assert!(handle
-            .send(vec![RawInput::PointerMove { x: 10, y: 0 }])
-            .await
-            .is_err());
-        assert!(rx.try_recv().is_err());
-        handle
-            .send(vec![
-                RawInput::PointerMove { x: 9, y: 9 },
-                RawInput::Button {
-                    button: PointerButton::Left,
-                    down: true,
-                },
-                RawInput::Key {
-                    code: 0x2A,
-                    extended: false,
-                    down: true,
-                },
-            ])
-            .await
-            .unwrap();
-        assert!(matches!(rx.try_recv(), Ok(RdpInputEvent::FastPath(events)) if events.len() == 3));
-        // The agent's input state sees the human's pressed Shift: a release
-        // through the handle emits, a second one is a no-op.
-        assert!(s
-            .input_db
-            .lock()
-            .unwrap()
-            .is_key_pressed(ironrdp_input::Scancode::from_u8(false, 0x2A)));
-        let release = RawInput::Key {
-            code: 0x2A,
-            extended: false,
-            down: false,
-        };
-        handle.send(vec![release]).await.unwrap();
-        assert!(matches!(rx.try_recv(), Ok(RdpInputEvent::FastPath(events)) if events.len() == 1));
-        handle.send(vec![release]).await.unwrap();
-        assert!(rx.try_recv().is_err(), "nothing to release twice");
         drop(rx);
-        assert!(
-            handle.send(vec![release]).await.is_ok(),
-            "no-op sends nothing"
-        );
-        let press = RawInput::Key {
-            code: 0x1E,
-            extended: false,
-            down: true,
-        };
-        assert!(handle.send(vec![press]).await.is_err(), "closed channel");
+        assert!(matches!(
+            handle
+                .send(vec![key(A_KEY, true)], InputEpoch::INITIAL)
+                .await,
+            Err(Error::Session(_))
+        ));
+        assert!(matches!(
+            handle.set_epoch(InputEpoch::INITIAL.next()).await,
+            Err(Error::Session(_))
+        ));
+        // A send with nothing to apply is not sent at all.
+        assert!(handle.send(vec![], InputEpoch::INITIAL).await.is_ok());
     }
 }
 
@@ -1167,6 +1495,7 @@ mod tests {
 #[cfg(all(test, target_os = "linux"))]
 mod connect_thread_tests {
     use super::*;
+    use std::sync::Mutex;
     use std::time::Instant;
 
     static SESSION_THREAD_TESTS: Mutex<()> = Mutex::new(());

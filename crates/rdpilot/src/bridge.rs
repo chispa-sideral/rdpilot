@@ -1,6 +1,6 @@
 //! Target-incarnation-bound Cua carrier. Never interprets MCP tools or IDs.
 use crate::{
-    bootstrap::BootstrapProgress, session_loop::RdpInputEvent, BootstrapStage, Error, Result,
+    bootstrap::BootstrapProgress, session_loop::LoopCommand, BootstrapStage, Error, Result,
 };
 use ironrdp::core::{ensure_size, impl_as_any, Encode, EncodeResult, WriteCursor};
 use ironrdp::pdu::PduResult;
@@ -168,7 +168,7 @@ impl BridgeShared {
     }
     pub async fn request(
         self: &Arc<Self>,
-        input: &mpsc::Sender<RdpInputEvent>,
+        input: &mpsc::Sender<LoopCommand>,
         message: Message,
         duration: Duration,
     ) -> Result<Message> {
@@ -191,7 +191,7 @@ impl BridgeShared {
         let envelope = Envelope::new(self.generation, id, message);
         let result = tokio::time::timeout(duration, async {
             input
-                .send(RdpInputEvent::Request(envelope))
+                .send(LoopCommand::Request(envelope))
                 .await
                 .map_err(|_| Error::dvc("RDP session closed"))?;
             rx.await
@@ -207,7 +207,7 @@ impl BridgeShared {
     }
     pub async fn attach(
         self: &Arc<Self>,
-        input: mpsc::Sender<RdpInputEvent>,
+        input: mpsc::Sender<LoopCommand>,
     ) -> Result<CuaAttachment> {
         if !self.ready() {
             return Err(Error::dvc(
@@ -267,7 +267,7 @@ impl BridgeShared {
 /// A fresh attachment starts a fresh MCP session; requests are never replayed.
 pub struct CuaAttachment {
     bridge: Arc<BridgeShared>,
-    input: mpsc::Sender<RdpInputEvent>,
+    input: mpsc::Sender<LoopCommand>,
     attachment_id: u64,
     runtime_generation: u64,
     output: mpsc::Receiver<serde_json::Value>,
@@ -571,13 +571,13 @@ mod tests {
     async fn attached(
         shared: Arc<BridgeShared>,
         peer: &mut BridgeProcessor,
-    ) -> (CuaAttachment, mpsc::Receiver<RdpInputEvent>) {
+    ) -> (CuaAttachment, mpsc::Receiver<LoopCommand>) {
         let (tx, mut rx) = mpsc::channel(16);
         let task = tokio::spawn({
             let shared = shared.clone();
             async move { shared.attach(tx).await }
         });
-        let RdpInputEvent::Request(e) = rx.recv().await.unwrap() else {
+        let LoopCommand::Request(e) = rx.recv().await.unwrap() else {
             panic!("open")
         };
         let Message::Open { attachment_id } = e.message else {

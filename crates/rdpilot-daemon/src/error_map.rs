@@ -43,7 +43,10 @@ pub fn wire_code_for_sdk_error(e: &rdpilot::Error) -> WireErrorCode {
         | rdpilot::Error::CoordinateOutOfBounds { .. }
         | rdpilot::Error::Dvc(_)
         | rdpilot::Error::Bootstrap(_)
-        | rdpilot::Error::BridgeRejected(_) => WireErrorCode::Internal,
+        | rdpilot::Error::BridgeRejected(_)
+        // Stale input reaches the wire only without a human lease (with one,
+        // it is that human's control): an internal ordering failure.
+        | rdpilot::Error::StaleInput { .. } => WireErrorCode::Internal,
         _ => WireErrorCode::Internal,
     }
 }
@@ -139,6 +142,10 @@ mod tests {
             rdpilot::Error::Dvc("x".to_owned()),
             rdpilot::Error::Bootstrap("x".to_owned()),
             rdpilot::Error::BridgeRejected("x".to_owned()),
+            rdpilot::Error::StaleInput {
+                sent: rdpilot::InputEpoch::INITIAL,
+                current: rdpilot::InputEpoch::INITIAL.next(),
+            },
         ];
         for err in cases {
             assert_eq!(

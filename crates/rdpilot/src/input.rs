@@ -7,14 +7,48 @@
 //!
 //! The pure translation from those types into `ironrdp_input::Operation`
 //! batches is the only code in the crate that constructs `Operation`s;
-//! `Session` calls it and forwards the result to
-//! `ironrdp_input::Database::apply`.
+//! `Session` calls it and sends the result to the session loop, which owns
+//! the `ironrdp_input::Database` and applies it there.
 
 #[cfg(test)]
 use crate::error::Error;
 use ironrdp_input::{MouseButton, MousePosition, Operation, Scancode, WheelRotations};
 
 pub use rdpilot_vocab::{Button, Key, KeyAction, MouseAction, PointerButton, RawInput};
+
+/// The input epoch of a session: a number that the session loop compares
+/// with the epoch every ordered input carries.
+///
+/// The loop refuses an input whose epoch is older than its current epoch
+/// with [`Error::StaleInput`](crate::Error::StaleInput). A change to a newer
+/// epoch first releases every key and button that is still pressed, so input
+/// of an older epoch never leaves a press behind. A session starts at
+/// [`InputEpoch::INITIAL`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct InputEpoch(u64);
+
+impl InputEpoch {
+    /// The epoch of a session after connect.
+    pub const INITIAL: Self = Self(0);
+
+    /// The epoch after this one. It saturates at `u64::MAX`.
+    #[must_use]
+    pub fn next(self) -> Self {
+        Self(self.0.saturating_add(1))
+    }
+
+    /// The epoch as a number.
+    #[must_use]
+    pub fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl std::fmt::Display for InputEpoch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
 
 /// Whether `key` is a held modifier (Ctrl/Alt/Shift) rather than a terminal
 /// key. Drives [`KeyAction::Combo`]'s press/release ordering:
@@ -94,8 +128,8 @@ const DRAG_INTERPOLATION_STEPS: u16 = 5;
 /// Translate a [`MouseAction`] into one or more ordered `Operation` batches.
 ///
 /// The outer `Vec` is the sequence of **timed** batches: `Session::send_mouse`
-/// (a later plan) applies each inner batch to `ironrdp_input::Database` in
-/// one `apply()` call and sends the resulting PDUs together, sleeping
+/// sends each inner batch as one loop command, which the session loop applies
+/// to its `ironrdp_input::Database` in one `apply()` call, sleeping
 /// between batches only where D-3.7/D-3.8 require an inter-batch delay
 /// (`DoubleClick`, `Drag`). `Move`/`Click`/`Scroll` are always exactly one
 /// batch.

@@ -90,10 +90,18 @@ impl ManagedSession for FakeSession {
     fn screenshot(&self) -> BoxFuture<'_, Result<rdpilot::Screenshot, DaemonError>> {
         Box::pin(async { Ok(rdpilot::Screenshot::from_rgba(1, 1, vec![0, 0, 0, 255])?) })
     }
-    fn send_mouse(&self, _: rdpilot::MouseAction) -> BoxFuture<'_, Result<(), DaemonError>> {
+    fn send_mouse(
+        &self,
+        _: rdpilot::MouseAction,
+        _epoch: rdpilot::InputEpoch,
+    ) -> BoxFuture<'_, Result<(), DaemonError>> {
         Box::pin(async { Ok(()) })
     }
-    fn send_key(&self, _: rdpilot::KeyAction) -> BoxFuture<'_, Result<(), DaemonError>> {
+    fn send_key(
+        &self,
+        _: rdpilot::KeyAction,
+        _epoch: rdpilot::InputEpoch,
+    ) -> BoxFuture<'_, Result<(), DaemonError>> {
         Box::pin(async { Ok(()) })
     }
     fn upload_file(
@@ -132,7 +140,10 @@ impl ManagedSession for FakeSession {
     fn desktop_size(&self) -> (u32, u32) {
         (1, 1)
     }
-    fn deploy_and_launch(&self) -> BoxFuture<'_, Result<Duration, DaemonError>> {
+    fn deploy_and_launch(
+        &self,
+        _epoch: rdpilot::InputEpoch,
+    ) -> BoxFuture<'_, Result<Duration, DaemonError>> {
         Box::pin(async { Ok(Duration::ZERO) })
     }
     fn human_input(&self) -> Option<Arc<dyn crate::seams::HumanInput>> {
@@ -151,22 +162,42 @@ enum Seen {
 
 /// Human input that waits at a gate; it and the Cua attachment record into
 /// one sequence.
+/// The gate is FIFO, like the session loop's queue, and epoch changes pass
+/// it too.
 struct GatedSink {
     log: std::sync::Mutex<Vec<Seen>>,
     gate: tokio::sync::Semaphore,
+    model: std::sync::Mutex<crate::seams::LoopInputModel>,
 }
 
 impl crate::seams::HumanInput for GatedSink {
     fn send(
         &self,
         events: Vec<rdpilot_vocab::RawInput>,
+        epoch: rdpilot::InputEpoch,
     ) -> crate::seams::BoxFuture<'_, Result<(), DaemonError>> {
         Box::pin(async move {
             drop(self.gate.acquire().await.unwrap());
+            let sent = self.model.lock().unwrap().send(epoch, events)?;
             self.log
                 .lock()
                 .unwrap()
-                .extend(events.into_iter().map(Seen::Human));
+                .extend(sent.into_iter().map(Seen::Human));
+            Ok(())
+        })
+    }
+
+    fn set_epoch(
+        &self,
+        epoch: rdpilot::InputEpoch,
+    ) -> crate::seams::BoxFuture<'_, Result<(), DaemonError>> {
+        Box::pin(async move {
+            drop(self.gate.acquire().await.unwrap());
+            let releases = self.model.lock().unwrap().set_epoch(epoch);
+            self.log
+                .lock()
+                .unwrap()
+                .extend(releases.into_iter().map(Seen::Human));
             Ok(())
         })
     }
@@ -733,9 +764,11 @@ async fn the_stream_gates_acting_calls_under_a_human_lease() {
 #[tokio::test]
 async fn an_acting_cua_call_after_a_release_waits_for_the_releases() {
     async {
+            // Open for the take; shut once the lease is granted.
             let gated = Arc::new(GatedSink {
                 log: std::sync::Mutex::new(Vec::new()),
-                gate: tokio::sync::Semaphore::new(0),
+                gate: tokio::sync::Semaphore::new(1),
+                model: std::sync::Mutex::new(crate::seams::LoopInputModel::default()),
             });
             let registry = Arc::new(Registry::new(
                 Arc::new(GatedConnector(Arc::clone(&gated))),
@@ -747,6 +780,7 @@ async fn an_acting_cua_call_after_a_release_waits_for_the_releases() {
                 .take(&id, "100.64.0.5".parse().unwrap())
                 .await
                 .unwrap();
+            gated.gate.try_acquire().unwrap().forget();
             let mut client = server(registry.clone(), 4096);
             attach(&mut client, id.clone()).await;
             let _ = read_frame::<_, CuaStreamFrame>(&mut client).await.unwrap();
