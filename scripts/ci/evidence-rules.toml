@@ -249,12 +249,3 @@ runs = [
     { job = "linux", step = "CI and publisher failure-injection tests" },
     { job = "windows-dacl", step = "CI and publisher failure-injection tests" },
 ]
-
-[[rule]]
-kind = "file"
-match = "scripts/e2e/*.sh"
-mode = "synthetic"
-tier = "offline"
-cadence = "on-demand"
-why = "no ci.yml step calls the script"
-runs = []
