@@ -3,6 +3,7 @@ use crate::{
     bridge::BridgeShared,
     connect,
     framebuffer::{FrameWatch, SharedFrame},
+    lifecycle::{EndCause, LifecycleOwner, SessionState},
     session_loop::{self, RdpInputEvent},
 };
 use crate::{
@@ -22,7 +23,7 @@ use std::{
     thread::JoinHandle,
     time::Duration,
 };
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 const DOUBLE_CLICK_GAP: Duration = Duration::from_millis(100);
 const DRAG_STEP_GAP: Duration = Duration::from_millis(15);
 const INPUT_CHANNEL_CAPACITY: usize = 16;
@@ -33,11 +34,11 @@ const TYPE_CHUNK_GAP: Duration = Duration::from_millis(150);
 const NATIVE_ONLY_PING: &str =
     "native-only session (CuaEnabled no): there is no rdpilot-bridge to ping";
 pub struct Session {
-    thread: Option<JoinHandle<Result<()>>>,
+    thread: Option<JoinHandle<()>>,
     input_tx: mpsc::Sender<RdpInputEvent>,
     frame: SharedFrame,
     input_db: Arc<Mutex<Database>>,
-    desktop_size: (u32, u32),
+    lifecycle: LifecycleOwner,
     bridge: Arc<BridgeShared>,
     next_req_id: AtomicU64,
     share_root: Option<PathBuf>,
@@ -86,7 +87,7 @@ fn sha256_file(path: &Path) -> Result<String> {
     Ok(digest.iter().map(|b| format!("{b:02x}")).collect())
 }
 /// What the session thread tells the caller once the handshake is over.
-type Ready = Result<(Arc<BridgeShared>, (u32, u32))>;
+type Ready = Result<(Arc<BridgeShared>, LifecycleOwner)>;
 
 /// [`Session::connect`] with the name resolution injected, so a test can stall
 /// or fail it.
@@ -110,7 +111,7 @@ async fn connect_with_resolver(
 
     // Dropping this future drops `ready_rx`; the session thread sees the
     // closed channel and ends the handshake.
-    let (bridge, desktop_size) = ready_rx.await.map_err(|_| {
+    let (bridge, lifecycle) = ready_rx.await.map_err(|_| {
         Error::Session("session thread ended before the handshake finished".to_owned())
     })??;
 
@@ -119,7 +120,7 @@ async fn connect_with_resolver(
         input_tx,
         frame,
         input_db: Arc::new(Mutex::new(Database::new())),
-        desktop_size,
+        lifecycle,
         bridge,
         next_req_id: AtomicU64::new(1),
         share_root,
@@ -129,14 +130,15 @@ async fn connect_with_resolver(
 
 /// Body of the `rdpilot-session` thread: run the handshake, report it through
 /// `ready_tx`, then run the session loop. The handshake ends early when the
-/// caller drops `ready_tx`'s receiver.
+/// caller drops `ready_tx`'s receiver. A loop error is reported once, as the
+/// [`EndCause::Error`] of the session's lifecycle.
 fn run_session_thread(
     cfg: ConnectionConfig,
     addr: SocketAddr,
     frame: SharedFrame,
     input_rx: mpsc::Receiver<RdpInputEvent>,
     mut ready_tx: oneshot::Sender<Ready>,
-) -> Result<()> {
+) {
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -146,7 +148,7 @@ fn run_session_thread(
             let _ = ready_tx.send(Err(Error::Session(format!(
                 "could not start session runtime: {e}"
             ))));
-            return Ok(());
+            return;
         }
     };
     runtime.block_on(async move {
@@ -155,10 +157,10 @@ fn run_session_thread(
             () = ready_tx.closed() => None,
         };
         let (connection_result, framed, bridge) = match connected {
-            None => return Ok(()),
+            None => return,
             Some(Err(error)) => {
                 let _ = ready_tx.send(Err(error));
-                return Ok(());
+                return;
             }
             Some(Ok(connected)) => connected,
         };
@@ -166,27 +168,30 @@ fn run_session_thread(
             u32::from(connection_result.desktop_size.width),
             u32::from(connection_result.desktop_size.height),
         );
+        let lifecycle = LifecycleOwner::new(frame.clone(), desktop_size);
         // A caller that is gone drops `framed`, which closes the connection.
-        if ready_tx.send(Ok((bridge.clone(), desktop_size))).is_err() {
-            return Ok(());
+        if ready_tx
+            .send(Ok((bridge.clone(), lifecycle.clone())))
+            .is_err()
+        {
+            return;
         }
+        // `run` ends the lifecycle (and so the frame), which passive
+        // observers (the live viewer) see while the registry entry exists.
         let result = session_loop::run(
             framed,
             connection_result,
             input_rx,
-            frame.clone(),
+            frame,
             bridge.clone(),
+            lifecycle,
         )
         .await;
-        // Passive observers (the live viewer) see the end of the RDP
-        // session even while the registry entry still exists.
-        frame.mark_ended();
         if let Err(error) = &result {
             tracing::error!(%error,"RDP session loop ended");
             bridge.invalidate(&error.to_string());
         }
-        result
-    })
+    });
 }
 
 /// The entry point of the session thread. It takes the whole owned config.
@@ -196,7 +201,7 @@ type SessionThreadBody = fn(
     SharedFrame,
     mpsc::Receiver<RdpInputEvent>,
     oneshot::Sender<Ready>,
-) -> Result<()>;
+);
 
 // Fixes at compile time that the whole owned config reaches the session
 // thread, not a part of it.
@@ -235,8 +240,21 @@ impl Session {
         connect_with_resolver(cfg, resolve)
     }
 
+    /// The desktop size of the current activation. It follows a server
+    /// reactivation to a new size.
     pub fn desktop_size(&self) -> (u32, u32) {
-        self.desktop_size
+        self.lifecycle.desktop_size()
+    }
+
+    /// A receiver of this session's lifecycle and current desktop size. It
+    /// starts at [`Lifecycle::Live`](crate::Lifecycle::Live) and changes to
+    /// [`Lifecycle::Ended`](crate::Lifecycle::Ended) once, with the first end
+    /// cause: the server ended the session, the session loop failed, or the
+    /// session was closed or dropped. The frame watch reports `ended` from the
+    /// same transition, after it.
+    #[must_use]
+    pub fn lifecycle(&self) -> watch::Receiver<SessionState> {
+        self.lifecycle.subscribe()
     }
 
     /// A passive, read-only observer of this session's framebuffer. It holds
@@ -264,7 +282,7 @@ impl Session {
     }
 
     fn check_bounds(&self, action: &MouseAction) -> Result<()> {
-        let (w, h) = self.desktop_size;
+        let (w, h) = self.desktop_size();
         for (x, y) in action.coordinates() {
             let (x, y) = (u32::from(x), u32::from(y));
             if x >= w || y >= h {
@@ -384,8 +402,18 @@ impl Session {
         Screenshot::from_rgba(snap.width, snap.height, snap.rgba)
     }
 
+    /// Close the session and wait (at most 15 s) for its thread to end.
+    ///
+    /// The lifecycle ends as [`EndCause::ClientClosed`] unless it has already
+    /// ended. A session that already ended with an error closes with `Ok`: the
+    /// error is reported once, as the end cause of its lifecycle.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Session`] when the thread does not end within the deadline,
+    /// the join task fails or the thread panicked.
     pub async fn close(mut self) -> Result<()> {
-        self.frame.mark_ended();
+        self.lifecycle.end(EndCause::ClientClosed);
         self.bridge.stop("session closed");
         let _ = self.input_tx.try_send(RdpInputEvent::Close);
 
@@ -400,7 +428,7 @@ impl Session {
             .await
             .map_err(|_| Error::Session("session shutdown deadline exceeded".into()))?
             .map_err(|e| Error::Session(format!("join task failed: {e}")))?
-            .map_err(|_| Error::Session("session thread panicked".to_owned()))?
+            .map_err(|_| Error::Session("session thread panicked".to_owned()))
         } else {
             Ok(())
         }
@@ -467,7 +495,7 @@ impl InputHandle {
 
 impl Drop for Session {
     fn drop(&mut self) {
-        self.frame.mark_ended();
+        self.lifecycle.end(EndCause::ClientClosed);
         self.bridge.stop("session dropped");
         let _ = self.input_tx.try_send(RdpInputEvent::Close);
     }
@@ -720,13 +748,14 @@ mod tests {
     use super::*;
     fn session() -> (Session, mpsc::Receiver<RdpInputEvent>) {
         let (tx, rx) = mpsc::channel(16);
+        let frame = SharedFrame::new();
         (
             Session {
                 thread: None,
                 input_tx: tx,
-                frame: SharedFrame::new(),
+                lifecycle: LifecycleOwner::new(frame.clone(), (100, 100)),
+                frame,
                 input_db: Arc::new(Mutex::new(Database::new())),
-                desktop_size: (100, 100),
                 bridge: Arc::new(BridgeShared::new()),
                 next_req_id: AtomicU64::new(1),
                 share_root: None,
@@ -916,9 +945,158 @@ mod tests {
     async fn dropping_the_session_ends_its_frame_watch() {
         let (s, _rx) = session();
         let watch = s.frame_watch();
+        let lifecycle = s.lifecycle();
         assert!(!watch.status().ended);
+        assert_eq!(lifecycle.borrow().lifecycle, crate::Lifecycle::Live);
         drop(s);
         assert!(watch.status().ended);
+        assert_eq!(
+            lifecycle.borrow().lifecycle,
+            crate::Lifecycle::Ended(EndCause::ClientClosed)
+        );
+    }
+
+    #[tokio::test]
+    async fn close_ends_the_lifecycle_as_client_closed() {
+        let (s, _rx) = session();
+        let watch = s.frame_watch();
+        let lifecycle = s.lifecycle();
+        s.close().await.unwrap();
+        assert!(watch.status().ended);
+        assert_eq!(
+            lifecycle.borrow().lifecycle,
+            crate::Lifecycle::Ended(EndCause::ClientClosed)
+        );
+    }
+
+    /// A session whose loop runs on the local set against a scripted peer.
+    fn pumped_session() -> (
+        Session,
+        session_loop::tests::Peer,
+        tokio::task::JoinHandle<Result<()>>,
+    ) {
+        let pump = session_loop::tests::spawn_pump();
+        (
+            Session {
+                thread: None,
+                input_tx: pump.input_tx,
+                frame: pump.frame,
+                input_db: Arc::new(Mutex::new(Database::new())),
+                lifecycle: pump.lifecycle,
+                bridge: pump.bridge,
+                next_req_id: AtomicU64::new(1),
+                share_root: None,
+                cua: true,
+            },
+            pump.peer,
+            pump.task,
+        )
+    }
+
+    #[tokio::test]
+    async fn desktop_size_and_bounds_follow_a_reactivation() {
+        use ironrdp::pdu::input::fast_path::FastPathInput;
+        use session_loop::tests::{serve_reactivation, PEER_DEADLINE};
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (s, mut peer, task) = pumped_session();
+                assert_eq!(s.desktop_size(), (100, 100));
+                serve_reactivation(&mut peer, true, 200, 50)
+                    .await
+                    .expect("reactivation served");
+                let mut rx = s.lifecycle();
+                tokio::time::timeout(
+                    PEER_DEADLINE,
+                    rx.wait_for(|st| st.desktop_size == (200, 50)),
+                )
+                .await
+                .expect("the new size is published")
+                .expect("the lifecycle sender lives");
+                assert_eq!(s.desktop_size(), (200, 50));
+                // Inside the new size, outside the old one: accepted and sent.
+                s.send_mouse(MouseAction::Move { x: 150, y: 20 })
+                    .await
+                    .expect("inside the new size");
+                let (_, frame) = tokio::time::timeout(PEER_DEADLINE, peer.read_pdu())
+                    .await
+                    .expect("input frame deadline")
+                    .expect("input frame read");
+                let pdu: FastPathInput = ironrdp::core::decode(&frame).expect("fast-path input");
+                assert!(!pdu.input_events().is_empty());
+                // Inside the old size, outside the new one: refused.
+                assert!(matches!(
+                    s.send_mouse(MouseAction::Move { x: 50, y: 80 }).await,
+                    Err(Error::CoordinateOutOfBounds { .. })
+                ));
+                s.close().await.unwrap();
+                let joined = tokio::time::timeout(PEER_DEADLINE, task)
+                    .await
+                    .expect("pump join deadline")
+                    .expect("pump task joins");
+                drop(joined);
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn close_after_a_loop_error_is_ok() {
+        let (input_tx, input_rx) = mpsc::channel(16);
+        let (client, server) = tokio::io::duplex(1024);
+        drop(server);
+        let framed =
+            ironrdp_tokio::TokioFramed::new(Box::new(client) as crate::connect::UpgradedStream);
+        let frame = SharedFrame::new();
+        let lifecycle = LifecycleOwner::new(frame.clone(), (100, 100));
+        let bridge = Arc::new(BridgeShared::new());
+        let thread = {
+            let (frame, lifecycle, bridge) = (frame.clone(), lifecycle.clone(), bridge.clone());
+            std::thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                runtime.block_on(async move {
+                    let result = session_loop::run(
+                        framed,
+                        session_loop::tests::connection_result_fixture(),
+                        input_rx,
+                        frame,
+                        bridge.clone(),
+                        lifecycle,
+                    )
+                    .await;
+                    if let Err(error) = &result {
+                        bridge.invalidate(&error.to_string());
+                    }
+                });
+            })
+        };
+        let s = Session {
+            thread: Some(thread),
+            input_tx,
+            frame,
+            input_db: Arc::new(Mutex::new(Database::new())),
+            lifecycle,
+            bridge,
+            next_req_id: AtomicU64::new(1),
+            share_root: None,
+            cua: true,
+        };
+        let mut rx = s.lifecycle();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            rx.wait_for(|st| st.lifecycle != crate::Lifecycle::Live),
+        )
+        .await
+        .expect("the loop ends")
+        .expect("the lifecycle sender lives");
+        s.close()
+            .await
+            .expect("close of an error-ended session is Ok");
+        assert!(matches!(
+            rx.borrow().lifecycle,
+            crate::Lifecycle::Ended(EndCause::Error(_))
+        ));
     }
 
     #[tokio::test]

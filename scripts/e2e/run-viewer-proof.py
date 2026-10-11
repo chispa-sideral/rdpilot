@@ -406,6 +406,27 @@ class Proof:
         require(all(s.get("id") != target for s in listed), f"{target}: still listed after the connect timeout")
         self.check(f"{target}.connect_timeout_cleanup", disconnect=outcome)
 
+    async def disconnected_without_record(self, target):
+        """A server-ended session stays listed as Disconnected, and the daemon
+        removed its reconciliation record at once (a restart shows no Orphaned
+        entry). Returns the evidence fields."""
+        listed = await self.cli("list", timeout=15)
+        require(isinstance(listed, list), f"{target}: list answered {listed}")
+        status = next((s.get("status") for s in listed if s.get("id") == target), None)
+        require(status == "Disconnected", f"{target}: listed as {status!r} after the server end, not Disconnected")
+        sink = self.temp / "sessions.json"
+        deadline = time.monotonic() + 5
+        while True:
+            try:
+                records = json.loads(sink.read_text())
+            except FileNotFoundError:
+                records = []
+            if all(r.get("id") != target for r in records):
+                break
+            require(time.monotonic() < deadline, f"{target}: reconciliation record still present after the server end")
+            await asyncio.sleep(0.2)
+        return {"listed_status": status, "reconciliation_record": "absent"}
+
     async def connect_cli(self, target, *flags):
         hosts = self.hosts_for_targets()
         try:
@@ -815,7 +836,8 @@ class Proof:
                                      "session-ended marker", 2)
         await self.screenshot(page, "04-server-ended-banner.png")
         self.check(f"{end}.disconnect_shown", banner="Disconnected (server ended the session)",
-                   strip=[r["text"] for r in rows if r["kind"] == "marker"])
+                   strip=[r["text"] for r in rows if r["kind"] == "marker"],
+                   **await self.disconnected_without_record(end))
         await self.cli("disconnect", "--session", "a")
         await self.wait_state(page, lambda s: s["sessions"]["a"]["state"] == "closed", "closed banner", 5)
         await self.wait_state(page, lambda s: "a" not in {x["id"] for x in s["list"]}, "list without a", 5)
@@ -953,7 +975,7 @@ $f.Controls.Add($t);[Windows.Forms.Application]::Run($f)
         ended = await self.session_ended_marker(page, "b")
         await self.screenshot(page, "07-b-server-ended-banner.png")
         self.check("b.disconnect_shown", method="RDP connection dropped", banner="Disconnected (server ended the session)",
-                   session_ended_marker=ended)
+                   session_ended_marker=ended, **await self.disconnected_without_record("b"))
         await self.endpoints["a"].stop()
         await self.cli("disconnect", "--session", "a")
         await self.wait_state(page, lambda s: s["sessions"]["a"]["state"] == "closed", "closed banner", 10)

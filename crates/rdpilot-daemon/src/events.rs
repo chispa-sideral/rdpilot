@@ -547,29 +547,43 @@ impl Drop for WatchTask {
     }
 }
 
-/// Record `session_ended` once when `frame` reports that the session loop
-/// ended. Runs on the multi-thread runtime (`tokio::spawn`); the returned
-/// handle aborts it.
+/// Handle the end of a registered session that a daemon close did not cause.
+/// When `lifecycle` ends with a server end or an error, in this order: remove
+/// the reconciliation record of `generation` (so a restart shows no
+/// `Orphaned` entry), record `session_ended` once, log the cause, and end the
+/// human lease. A client close records nothing (every daemon close drops this
+/// task first anyway), and a lifecycle whose sender goes while live never
+/// ends. The task never closes the session and never touches the registry
+/// map: the entry stays, listed as `Disconnected`, until it is removed.
+///
+/// Runs on the multi-thread runtime (`tokio::spawn`); the returned handle
+/// aborts it.
 pub(crate) fn watch_session_end(
-    frame: Arc<dyn ViewFrameSource>,
+    mut lifecycle: watch::Receiver<rdpilot::SessionState>,
     events: Arc<SessionEvents>,
     control: Arc<crate::control::SessionControl>,
+    records: Arc<crate::reconcile::RecordBook>,
+    id: SessionId,
+    generation: u64,
 ) -> WatchTask {
     let task = tokio::spawn(async move {
-        let mut after = 0;
-        loop {
-            let status = frame.changed(after).await;
-            if status.ended {
-                events.record(EventSource::Cli, EventKind::SessionEnded);
-                crate::registry::end_lease(&control, crate::control::EndReason::SessionEnded).await;
-                return;
-            }
-            if status.seq <= after {
-                // A source that answers without progress: do not spin.
-                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-            }
-            after = status.seq.max(after);
+        let cause = match lifecycle
+            .wait_for(|state| matches!(state.lifecycle, rdpilot::Lifecycle::Ended(_)))
+            .await
+        {
+            Ok(state) => match &state.lifecycle {
+                rdpilot::Lifecycle::Ended(cause) => cause.clone(),
+                rdpilot::Lifecycle::Live => return,
+            },
+            Err(_) => return,
+        };
+        if cause == rdpilot::EndCause::ClientClosed {
+            return;
         }
+        records.closed(&id, generation);
+        events.record(EventSource::Cli, EventKind::SessionEnded);
+        eprintln!("rdpilot-daemon: session {} ended: {cause}", id.as_str());
+        crate::registry::end_lease(&control, crate::control::EndReason::SessionEnded).await;
     });
     WatchTask(task.abort_handle())
 }
@@ -1411,15 +1425,37 @@ mod tests {
             .count()
     }
 
-    #[tokio::test]
-    async fn watcher_records_session_ended_once() {
-        let (tx, _) = watch::channel(rdpilot::FrameStatus::default());
-        let frames = Arc::new(EndingFrames(tx));
-        let log = Arc::new(SessionEvents::new(
-            &"alpha".parse().unwrap(),
-            1,
-            Some(Arc::clone(&frames) as Arc<dyn ViewFrameSource>),
-        ));
+    /// A lifecycle sender, a record book over a counting sink holding the
+    /// record of `alpha` generation 1, and the hook's other inputs.
+    struct Hook {
+        lifecycle: watch::Sender<rdpilot::SessionState>,
+        records: Arc<crate::reconcile::RecordBook>,
+        sink: Arc<CountingSink>,
+        log: Arc<SessionEvents>,
+        control: Arc<crate::control::SessionControl>,
+    }
+
+    #[derive(Default)]
+    struct CountingSink {
+        closes: std::sync::atomic::AtomicUsize,
+    }
+
+    impl crate::seams::ReconciliationSink for CountingSink {
+        fn record_open(&self, _id: &SessionId, _host: &str, _since: &str) {}
+        fn record_closed(&self, _id: &SessionId) {
+            self.closes.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn hook(frames: Option<Arc<dyn ViewFrameSource>>) -> Hook {
+        let (lifecycle, _) = watch::channel(rdpilot::SessionState {
+            lifecycle: rdpilot::Lifecycle::Live,
+            desktop_size: (10, 10),
+        });
+        let sink = Arc::new(CountingSink::default());
+        let records = Arc::new(crate::reconcile::RecordBook::new(sink.clone()));
+        records.opened(&"alpha".parse().unwrap(), 1, "h", "t");
+        let log = Arc::new(SessionEvents::new(&"alpha".parse().unwrap(), 1, frames));
         let control = Arc::new(crate::control::SessionControl::new(
             "alpha",
             1,
@@ -1427,43 +1463,95 @@ mod tests {
             None,
             None,
         ));
-        let _watch = watch_session_end(frames.clone(), Arc::clone(&log), control);
+        Hook {
+            lifecycle,
+            records,
+            sink,
+            log,
+            control,
+        }
+    }
+
+    impl Hook {
+        fn spawn(&self) -> WatchTask {
+            watch_session_end(
+                self.lifecycle.subscribe(),
+                Arc::clone(&self.log),
+                Arc::clone(&self.control),
+                Arc::clone(&self.records),
+                "alpha".parse().unwrap(),
+                1,
+            )
+        }
+        fn end(&self, cause: rdpilot::EndCause) {
+            self.lifecycle
+                .send_modify(|s| s.lifecycle = rdpilot::Lifecycle::Ended(cause));
+        }
+        fn record_closes(&self) -> usize {
+            self.sink.closes.load(Ordering::SeqCst)
+        }
+    }
+
+    #[tokio::test]
+    async fn watcher_records_session_ended_once() {
+        let (tx, _) = watch::channel(rdpilot::FrameStatus::default());
+        let frames = Arc::new(EndingFrames(tx));
+        let hook = hook(Some(Arc::clone(&frames) as Arc<dyn ViewFrameSource>));
+        let _watch = hook.spawn();
         frames.0.send_modify(|s| s.seq = 1);
         frames.0.send_modify(|s| s.seq = 2);
+        hook.lifecycle.send_modify(|s| s.desktop_size = (20, 20));
         tokio::time::sleep(Duration::from_millis(30)).await;
-        assert_eq!(ended_count(&log), 0);
+        assert_eq!(ended_count(&hook.log), 0);
+        assert_eq!(hook.record_closes(), 0);
+        hook.end(rdpilot::EndCause::ServerEnded("logoff".to_owned()));
         frames.0.send_modify(|s| s.ended = true);
         tokio::time::sleep(Duration::from_millis(30)).await;
         frames.0.send_modify(|s| s.seq = 3);
+        hook.lifecycle.send_modify(|s| s.desktop_size = (30, 30));
         tokio::time::sleep(Duration::from_millis(30)).await;
-        assert_eq!(ended_count(&log), 1);
-        let ended = log.after(0).events.pop().unwrap();
+        assert_eq!(ended_count(&hook.log), 1);
+        assert_eq!(hook.record_closes(), 1, "the record went at once");
+        let ended = hook.log.after(0).events.pop().unwrap();
         assert_eq!(ended.source, EventSource::Cli);
         assert_eq!(ended.frame_seq, 2);
     }
 
     #[tokio::test]
+    async fn an_error_end_is_handled_like_a_server_end() {
+        let hook = hook(None);
+        let _watch = hook.spawn();
+        hook.end(rdpilot::EndCause::Error("read PDU failed".to_owned()));
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(ended_count(&hook.log), 1);
+        assert_eq!(hook.record_closes(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_client_close_end_records_nothing() {
+        let hook = hook(None);
+        let _watch = hook.spawn();
+        hook.end(rdpilot::EndCause::ClientClosed);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(ended_count(&hook.log), 0);
+        assert_eq!(hook.record_closes(), 0, "the record stays for the close");
+    }
+
+    #[tokio::test]
     async fn dropped_watcher_records_nothing() {
-        let (tx, _) = watch::channel(rdpilot::FrameStatus::default());
-        let frames = Arc::new(EndingFrames(tx));
-        let log = Arc::new(log());
-        let control = Arc::new(crate::control::SessionControl::new(
-            "alpha",
-            1,
-            Arc::clone(&log),
-            None,
-            None,
-        ));
-        let watch = watch_session_end(frames.clone(), Arc::clone(&log), control);
+        let hook = hook(None);
+        let watch = hook.spawn();
         tokio::task::yield_now().await;
         drop(watch);
         tokio::time::sleep(Duration::from_millis(30)).await;
-        frames.0.send_modify(|s| s.ended = true);
+        hook.end(rdpilot::EndCause::ServerEnded("logoff".to_owned()));
         tokio::time::sleep(Duration::from_millis(30)).await;
-        assert_eq!(ended_count(&log), 0);
+        assert_eq!(ended_count(&hook.log), 0);
+        assert_eq!(hook.record_closes(), 0);
         // The task released its references.
-        assert_eq!(Arc::strong_count(&log), 1);
-        assert_eq!(Arc::strong_count(&frames), 1);
+        assert_eq!(Arc::strong_count(&hook.log), 2, "the hook and its control");
+        assert_eq!(Arc::strong_count(&hook.records), 1);
+        assert_eq!(hook.lifecycle.receiver_count(), 0);
     }
 
     /// Pins the control kinds of schema 1 (additive): controller

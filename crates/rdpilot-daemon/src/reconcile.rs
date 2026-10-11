@@ -137,6 +137,65 @@ impl ReconciliationSink for JsonReconciliationSink {
     }
 }
 
+/// The registry's writer of reconciliation records. It serializes every sink
+/// write under one mutex and knows which generation of each session id owns
+/// the record, so:
+///
+/// - a write of one session never loses the write of another (the sink
+///   rewrites the whole file);
+/// - a record is removed once, whichever of a close and a server-end hook
+///   comes first;
+/// - a late close or hook of an earlier generation never removes the record
+///   of a later session with the same name.
+///
+/// The generation is held in memory only; the sink and its file keep their
+/// shape.
+pub(crate) struct RecordBook {
+    sink: std::sync::Arc<dyn ReconciliationSink>,
+    open: std::sync::Mutex<std::collections::HashMap<SessionId, u64>>,
+}
+
+impl RecordBook {
+    pub(crate) fn new(sink: std::sync::Arc<dyn ReconciliationSink>) -> Self {
+        RecordBook {
+            sink,
+            open: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, std::collections::HashMap<SessionId, u64>> {
+        self.open
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Record that generation `generation` of `id` opened against `host`.
+    pub(crate) fn opened(&self, id: &SessionId, generation: u64, host: &str, since: &str) {
+        let mut open = self.lock();
+        open.insert(id.clone(), generation);
+        self.sink.record_open(id, host, since);
+    }
+
+    /// Remove the record of `id` if generation `generation` owns it. Returns
+    /// whether it removed the record.
+    pub(crate) fn closed(&self, id: &SessionId, generation: u64) -> bool {
+        let mut open = self.lock();
+        if open.get(id) != Some(&generation) {
+            return false;
+        }
+        open.remove(id);
+        self.sink.record_closed(id);
+        true
+    }
+
+    /// Remove the record of an `Orphaned` entry, which no generation of this
+    /// process owns.
+    pub(crate) fn closed_orphan(&self, id: &SessionId) {
+        let _open = self.lock();
+        self.sink.record_closed(id);
+    }
+}
+
 /// Read the reconciliation-state file at `path` and return every record
 /// still present — the candidate orphans left by a crashed predecessor
 /// daemon that never got to remove them via a clean `record_closed`.
@@ -420,5 +479,75 @@ mod tests {
         > {
             Box::pin(async { Err(crate::seams::DaemonError::Connect("unused".to_owned())) })
         }
+    }
+
+    /// Counts sink writes per id.
+    #[derive(Default)]
+    struct CountingSink {
+        opens: std::sync::Mutex<Vec<String>>,
+        closes: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl ReconciliationSink for CountingSink {
+        fn record_open(&self, id: &SessionId, _host: &str, _since: &str) {
+            self.opens.lock().unwrap().push(id.as_str().to_owned());
+        }
+        fn record_closed(&self, id: &SessionId) {
+            self.closes.lock().unwrap().push(id.as_str().to_owned());
+        }
+    }
+
+    #[test]
+    fn the_record_book_removes_a_record_once() {
+        let sink = std::sync::Arc::new(CountingSink::default());
+        let book = RecordBook::new(sink.clone());
+        let id = test_id("alpha");
+        book.opened(&id, 1, "h", "t");
+        assert!(book.closed(&id, 1));
+        assert!(!book.closed(&id, 1));
+        assert_eq!(*sink.opens.lock().unwrap(), vec!["alpha"]);
+        assert_eq!(*sink.closes.lock().unwrap(), vec!["alpha"]);
+    }
+
+    #[test]
+    fn the_record_book_never_removes_the_record_of_a_later_generation() {
+        let sink = std::sync::Arc::new(CountingSink::default());
+        let book = RecordBook::new(sink.clone());
+        let id = test_id("alpha");
+        book.opened(&id, 1, "h", "t");
+        book.opened(&id, 2, "h", "t");
+        assert!(!book.closed(&id, 1), "generation 1 no longer owns it");
+        assert!(sink.closes.lock().unwrap().is_empty());
+        assert!(book.closed(&id, 2));
+        assert_eq!(*sink.closes.lock().unwrap(), vec!["alpha"]);
+    }
+
+    #[test]
+    fn the_record_book_serializes_concurrent_writes_of_a_file_sink() {
+        let path = unique_test_path("book-concurrent");
+        let book = std::sync::Arc::new(RecordBook::new(std::sync::Arc::new(
+            JsonReconciliationSink::at(path.clone()),
+        )));
+        let threads: Vec<_> = (0..8u64)
+            .map(|n| {
+                let book = std::sync::Arc::clone(&book);
+                std::thread::spawn(move || {
+                    let id = test_id(&format!("s{n}"));
+                    for generation in 0..10 {
+                        book.opened(&id, generation, "h", "t");
+                        if generation < 9 {
+                            assert!(book.closed(&id, generation));
+                        }
+                    }
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        let mut ids: Vec<String> = scan_orphans(&path).into_iter().map(|r| r.id).collect();
+        ids.sort();
+        assert_eq!(ids, (0..8).map(|n| format!("s{n}")).collect::<Vec<_>>());
+        let _ = fs::remove_file(&path);
     }
 }

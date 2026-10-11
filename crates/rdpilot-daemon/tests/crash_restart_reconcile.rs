@@ -46,14 +46,29 @@ type OpFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// A fake, immediately-resolving `ManagedSession` — this test is about the
 /// disk record + surfacing, not about a real OS thread (the thread-owning
 /// fake used by the DAEMON-01 soak proof lives in `tests/thread_leak_soak.rs`).
-struct FakeSession;
+struct FakeSession {
+    /// A lifecycle the test can end; `None` keeps the default (live).
+    lifecycle: Option<Lifecycle>,
+}
+
+type Lifecycle = std::sync::Arc<tokio::sync::watch::Sender<rdpilot::SessionState>>;
 
 impl ManagedSession for FakeSession {
     fn close(self: Box<Self>) -> TestFuture<Result<(), DaemonError>> {
         Box::pin(async { Ok(()) })
     }
-    fn describe(&self) -> SessionLifecycle {
-        SessionLifecycle::Live
+
+    fn lifecycle(&self) -> tokio::sync::watch::Receiver<rdpilot::SessionState> {
+        match &self.lifecycle {
+            Some(lifecycle) => lifecycle.subscribe(),
+            None => {
+                tokio::sync::watch::channel(rdpilot::SessionState {
+                    lifecycle: rdpilot::Lifecycle::Live,
+                    desktop_size: (1920, 1080),
+                })
+                .1
+            }
+        }
     }
 
     fn screenshot(&self) -> OpFuture<'_, Result<rdpilot::Screenshot, DaemonError>> {
@@ -118,7 +133,24 @@ impl SessionConnector for FakeConnector {
         &self,
         _cfg: ConnectionConfig,
     ) -> TestFuture<Result<Box<dyn ManagedSession>, DaemonError>> {
-        Box::pin(async { Ok(Box::new(FakeSession) as Box<dyn ManagedSession>) })
+        Box::pin(async { Ok(Box::new(FakeSession { lifecycle: None }) as Box<dyn ManagedSession>) })
+    }
+}
+
+/// Connects sessions that share one lifecycle the test can end.
+struct EndableConnector(Lifecycle);
+
+impl SessionConnector for EndableConnector {
+    fn connect(
+        &self,
+        _cfg: ConnectionConfig,
+    ) -> TestFuture<Result<Box<dyn ManagedSession>, DaemonError>> {
+        let lifecycle = std::sync::Arc::clone(&self.0);
+        Box::pin(async move {
+            Ok(Box::new(FakeSession {
+                lifecycle: Some(lifecycle),
+            }) as Box<dyn ManagedSession>)
+        })
     }
 }
 
@@ -220,6 +252,65 @@ async fn kill_minus_9_then_restart_surfaces_the_orphan_which_is_then_explicitly_
     assert!(
         after_reconcile_list.is_empty(),
         "the orphan must no longer be listed once explicitly reconciled"
+    );
+
+    let _ = std::fs::remove_file(&state_path);
+}
+
+/// A session the server ended leaves no record: the daemon removes it at
+/// once, while the entry is still listed as `Disconnected`, so a restart
+/// shows no `Orphaned` entry.
+#[tokio::test]
+async fn a_server_ended_session_leaves_no_orphan_after_restart() {
+    let state_path = unique_state_path();
+    let lifecycle: Lifecycle = std::sync::Arc::new(
+        tokio::sync::watch::channel(rdpilot::SessionState {
+            lifecycle: rdpilot::Lifecycle::Live,
+            desktop_size: (1920, 1080),
+        })
+        .0,
+    );
+    let sink_a = std::sync::Arc::new(JsonReconciliationSink::at(state_path.clone()));
+    let registry_a = Registry::new(
+        std::sync::Arc::new(EndableConnector(std::sync::Arc::clone(&lifecycle))),
+        sink_a,
+    );
+    registry_a
+        .open(
+            Some("payroll".to_owned()),
+            "10.0.0.9".to_owned(),
+            test_cfg(),
+        )
+        .await
+        .expect("open should succeed against the fake connector");
+    assert_eq!(rdpilot_daemon::scan_orphans(&state_path).len(), 1);
+
+    lifecycle.send_modify(|state| {
+        state.lifecycle =
+            rdpilot::Lifecycle::Ended(rdpilot::EndCause::ServerEnded("fake server end".to_owned()));
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while !rdpilot_daemon::scan_orphans(&state_path).is_empty() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the record of a server-ended session must go at once"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    let listed = registry_a.list();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].status, SessionLifecycle::Disconnected);
+
+    // Crash, then restart on the same path: nothing to surface.
+    drop(registry_a);
+    let registry_b = Registry::new(
+        std::sync::Arc::new(FakeConnector),
+        std::sync::Arc::new(JsonReconciliationSink::at(state_path.clone())),
+    );
+    rdpilot_daemon::seed_into(rdpilot_daemon::scan_orphans(&state_path), &registry_b);
+    assert!(
+        registry_b.list().is_empty(),
+        "no Orphaned entry after restart"
     );
 
     let _ = std::fs::remove_file(&state_path);

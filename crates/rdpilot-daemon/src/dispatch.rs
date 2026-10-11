@@ -451,7 +451,7 @@ pub(crate) async fn record_start(
     trigger: RecordingTrigger,
     source: EventSource,
 ) -> WireResponse {
-    let target = match registry.recording_target(session) {
+    let target = match registry.recording_start_target(session) {
         Ok(target) => target,
         Err(e) => return WireResponse::Error(e.into()),
     };
@@ -625,6 +625,9 @@ mod tests {
     struct FakeSession {
         closed: Arc<AtomicBool>,
         deploys: Arc<AtomicUsize>,
+        /// The session has already ended (the server ended it) when it is
+        /// delivered.
+        ended: bool,
     }
 
     impl ManagedSession for FakeSession {
@@ -632,8 +635,20 @@ mod tests {
             self.closed.store(true, Ordering::SeqCst);
             Box::pin(async { Ok(()) })
         }
-        fn describe(&self) -> SessionLifecycle {
-            SessionLifecycle::Live
+
+        fn lifecycle(&self) -> tokio::sync::watch::Receiver<rdpilot::SessionState> {
+            let lifecycle = if self.ended {
+                rdpilot::Lifecycle::Ended(rdpilot::EndCause::ServerEnded(
+                    "fake server end".to_owned(),
+                ))
+            } else {
+                rdpilot::Lifecycle::Live
+            };
+            tokio::sync::watch::channel(rdpilot::SessionState {
+                lifecycle,
+                desktop_size: (1920, 1080),
+            })
+            .1
         }
 
         fn screenshot(&self) -> BoxFuture<'_, Result<rdpilot::Screenshot, DaemonError>> {
@@ -697,6 +712,8 @@ mod tests {
     struct FakeConnector {
         deploys: Arc<AtomicUsize>,
         bundles: Arc<Mutex<Vec<Option<PathBuf>>>>,
+        /// Deliver sessions that have already ended.
+        ended: bool,
     }
 
     impl SessionConnector for FakeConnector {
@@ -708,10 +725,12 @@ mod tests {
                 bundles.push(cfg.get_bundle_path().map(std::path::Path::to_path_buf));
             }
             let deploys = self.deploys.clone();
+            let ended = self.ended;
             Box::pin(async move {
                 Ok(Box::new(FakeSession {
                     closed: Arc::new(AtomicBool::new(false)),
                     deploys,
+                    ended,
                 }) as Box<dyn ManagedSession>)
             })
         }
@@ -829,6 +848,31 @@ mod tests {
             } => assert_eq!(warnings, vec!["using cached Cua".to_owned()]),
             other => panic!("expected Connected, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn a_session_that_ends_before_bootstrap_fails_connect_with_session_not_found() {
+        let connector = FakeConnector {
+            ended: true,
+            ..FakeConnector::default()
+        };
+        let deploys = connector.deploys.clone();
+        let registry = Registry::new(Arc::new(connector), Arc::new(NoopReconciliationSink));
+        let source = StubBundles {
+            calls: Arc::new(AtomicUsize::new(0)),
+            result: Ok(prepared()),
+        };
+        let outcome = dispatch_connect(&registry, connect_fields(true), None, &source, None).await;
+        match outcome.response {
+            WireResponse::Error(WireError { code, message, .. }) => {
+                assert_eq!(code, WireErrorCode::SessionNotFound);
+                assert!(message.contains("ended"), "{message}");
+                assert!(message.contains("fake server end"), "{message}");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+        assert_eq!(deploys.load(Ordering::SeqCst), 0, "no bridge deploy");
+        assert!(registry.list().is_empty());
     }
 
     #[tokio::test]

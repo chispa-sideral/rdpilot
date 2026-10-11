@@ -20,7 +20,6 @@ use std::time::Duration;
 
 use rdpilot::ConnectionConfig;
 use rdpilot_daemon::{DaemonError, ManagedSession, ReconciliationSink, Registry, SessionConnector};
-use rdpilot_ipc::SessionLifecycle;
 
 type TestFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 /// Like `TestFuture`, but lifetime-parameterized -- required for the
@@ -34,9 +33,6 @@ struct FakeSession;
 impl ManagedSession for FakeSession {
     fn close(self: Box<Self>) -> TestFuture<Result<(), DaemonError>> {
         Box::pin(async { Ok(()) })
-    }
-    fn describe(&self) -> SessionLifecycle {
-        SessionLifecycle::Live
     }
 
     fn screenshot(&self) -> OpFuture<'_, Result<rdpilot::Screenshot, DaemonError>> {

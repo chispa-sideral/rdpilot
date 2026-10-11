@@ -627,9 +627,6 @@ impl<S: AgentLog> crate::seams::ManagedSession for InputSession<S> {
     fn close(self: Box<Self>) -> crate::seams::BoxFuture<'static, Result<(), DaemonError>> {
         Box::pin(async { Ok(()) })
     }
-    fn describe(&self) -> rdpilot_ipc::SessionLifecycle {
-        rdpilot_ipc::SessionLifecycle::Live
-    }
     fn screenshot(&self) -> crate::seams::BoxFuture<'_, Result<rdpilot::Screenshot, DaemonError>> {
         Box::pin(async { Ok(rdpilot::Screenshot::from_rgba(1, 1, vec![0; 4])?) })
     }

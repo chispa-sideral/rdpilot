@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use rdpilot::ConnectionConfig;
-use rdpilot_ipc::{SessionId, SessionLifecycle, WireViewerBind};
+use rdpilot_ipc::{SessionId, WireViewerBind};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -32,10 +32,34 @@ const TOKEN: &str = "5ec2e7a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c
 
 // --- Fixtures ------------------------------------------------------------
 
-/// A fake session whose frame source is a [`SyntheticFrames`] the test feeds.
+/// A fake session whose frame source is a [`SyntheticFrames`] the test feeds,
+/// with a lifecycle the test can end.
 struct FramedSession {
     frames: Arc<SyntheticFrames>,
     input: Arc<InputLog>,
+    lifecycle: Arc<tokio::sync::watch::Sender<rdpilot::SessionState>>,
+}
+
+fn live_state() -> rdpilot::SessionState {
+    rdpilot::SessionState {
+        lifecycle: rdpilot::Lifecycle::Live,
+        desktop_size: (64, 48),
+    }
+}
+
+/// End `lifecycle` with `cause` unless it has ended, as the SDK does.
+fn end_lifecycle(
+    lifecycle: &tokio::sync::watch::Sender<rdpilot::SessionState>,
+    cause: rdpilot::EndCause,
+) {
+    lifecycle.send_if_modified(|state| {
+        if state.lifecycle == rdpilot::Lifecycle::Live {
+            state.lifecycle = rdpilot::Lifecycle::Ended(cause);
+            true
+        } else {
+            false
+        }
+    });
 }
 
 /// Records human input events in order.
@@ -54,11 +78,12 @@ impl crate::seams::HumanInput for InputLog {
 
 impl ManagedSession for FramedSession {
     fn close(self: Box<Self>) -> BoxFuture<'static, Result<(), DaemonError>> {
+        end_lifecycle(&self.lifecycle, rdpilot::EndCause::ClientClosed);
         self.frames.end();
         Box::pin(async { Ok(()) })
     }
-    fn describe(&self) -> SessionLifecycle {
-        SessionLifecycle::Live
+    fn lifecycle(&self) -> tokio::sync::watch::Receiver<rdpilot::SessionState> {
+        self.lifecycle.subscribe()
     }
     fn screenshot(&self) -> BoxFuture<'_, Result<rdpilot::Screenshot, DaemonError>> {
         Box::pin(async { Err(DaemonError::Connect("unused".into())) })
@@ -105,6 +130,7 @@ impl ManagedSession for FramedSession {
 struct FramedConnector {
     frames: Mutex<HashMap<String, Arc<SyntheticFrames>>>,
     inputs: Mutex<HashMap<String, Arc<InputLog>>>,
+    lifecycles: Mutex<HashMap<String, Arc<tokio::sync::watch::Sender<rdpilot::SessionState>>>>,
     /// When set, the next connect waits for this before it completes.
     hold: Mutex<Option<Arc<tokio::sync::Notify>>>,
 }
@@ -124,12 +150,21 @@ impl SessionConnector for FramedConnector {
             .lock()
             .unwrap()
             .insert(cfg.host().to_owned(), Arc::clone(&input));
+        let lifecycle = Arc::new(tokio::sync::watch::channel(live_state()).0);
+        self.lifecycles
+            .lock()
+            .unwrap()
+            .insert(cfg.host().to_owned(), Arc::clone(&lifecycle));
         let hold = self.hold.lock().unwrap().take();
         Box::pin(async move {
             if let Some(hold) = hold {
                 hold.notified().await;
             }
-            Ok(Box::new(FramedSession { frames, input }) as Box<dyn ManagedSession>)
+            Ok(Box::new(FramedSession {
+                frames,
+                input,
+                lifecycle,
+            }) as Box<dyn ManagedSession>)
         })
     }
 }
@@ -165,6 +200,22 @@ impl Fixture {
             .unwrap();
         let frames = Arc::clone(&self.connector.frames.lock().unwrap()[name]);
         (id, frames)
+    }
+
+    /// The server ends session `name`: its lifecycle ends, then its frames,
+    /// in the SDK's order.
+    fn server_end(&self, name: &str) {
+        let lifecycle = Arc::clone(&self.connector.lifecycles.lock().unwrap()[name]);
+        end_lifecycle(
+            &lifecycle,
+            rdpilot::EndCause::ServerEnded("fake server end".into()),
+        );
+        self.connector.frames.lock().unwrap()[name].end();
+    }
+
+    /// How many receivers of session `name`'s lifecycle exist.
+    fn lifecycle_receivers(&self, name: &str) -> usize {
+        self.connector.lifecycles.lock().unwrap()[name].receiver_count()
     }
 
     fn viewer_registry(&self) -> ViewerRegistry {
@@ -855,7 +906,7 @@ async fn frames_reach_the_client_with_resize_ended_and_closed() {
     assert_eq!(reply.header("x-frame-height"), Some("64"));
 
     // Server-side end: 410 ended while the entry still exists.
-    frames.end();
+    fx.server_end("alpha");
     let reply = api(addr, &frame_path(id.as_str(), 2)).await;
     assert_eq!(reply.status, 410);
     assert_eq!(reply.body, br#"{"state":"ended"}"#);
@@ -1219,7 +1270,7 @@ async fn a_server_side_end_records_one_session_ended_marker() {
     frames.publish_solid(64, 48, 1);
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert_eq!(ended_markers(&log), 0);
-    frames.end();
+    fx.server_end("alpha");
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(ended_markers(&log), 1);
     let ended = log.after(0).events.pop().unwrap();
@@ -1233,15 +1284,15 @@ async fn a_server_side_end_records_one_session_ended_marker() {
 #[tokio::test]
 async fn closing_a_session_stops_its_watcher_without_a_marker() {
     let fx = Fixture::new();
-    let (id, frames) = fx.open("alpha").await;
+    let (id, _frames) = fx.open("alpha").await;
     let log = fx.registry.events(&id).unwrap();
     tokio::time::sleep(Duration::from_millis(20)).await;
-    // The watcher holds the frame source while it runs.
-    let running = Arc::strong_count(&frames);
+    // The entry and its end hook each hold a lifecycle receiver.
+    assert_eq!(fx.lifecycle_receivers("alpha"), 2);
     fx.registry.close(&id).await.unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(ended_markers(&log), 0, "our own close is not a server end");
-    assert!(Arc::strong_count(&frames) < running, "watcher released");
+    assert_eq!(fx.lifecycle_receivers("alpha"), 0, "hook released");
     assert_eq!(
         Arc::strong_count(&log),
         1,
@@ -2559,4 +2610,34 @@ async fn no_token_lease_key_or_coordinate_reaches_events_or_responses() {
             assert!(!text.contains(marker), "{marker} leaked: {text}");
         }
     }
+}
+
+/// A session the server ended: the viewer lists it as ended and refuses a
+/// take, input and a held lease's actions with 404 (no session).
+#[tokio::test]
+async fn a_server_ended_session_refuses_take_and_input_through_the_viewer() {
+    let fx = Fixture::new();
+    let (id, frames) = fx.open("alpha").await;
+    frames.publish_solid(64, 48, 1);
+    let server = fx.control_server().await;
+    let addr = server.addr();
+    let held = take(addr, id.as_str()).await;
+    fx.server_end("alpha");
+
+    let list: serde_json::Value =
+        serde_json::from_slice(&api(addr, "/api/sessions").await.body).unwrap();
+    assert_eq!(list["sessions"][0]["status"], "Disconnected");
+    assert_eq!(list["sessions"][0]["ended"], true);
+    let reply = send_input(addr, id.as_str(), &held, serde_json::json!([shift(true)])).await;
+    assert_eq!(
+        reply.status,
+        404,
+        "{}",
+        String::from_utf8_lossy(&reply.body)
+    );
+    let reply = action(addr, id.as_str(), "heartbeat", &held.lease).await;
+    assert_eq!(reply.status, 404);
+    let reply = action(addr, id.as_str(), "take", "").await;
+    assert_eq!(reply.status, 404);
+    assert!(fx.input_log("alpha").is_empty());
 }

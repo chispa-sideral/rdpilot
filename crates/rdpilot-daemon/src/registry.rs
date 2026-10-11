@@ -41,7 +41,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use rdpilot::ConnectionConfig;
-use rdpilot_ipc::{SessionId, SessionLifecycle, SessionStatus};
+use rdpilot_ipc::{SessionId, SessionStatus};
 use rdpilot_vocab::RawInput;
 use tokio::sync::oneshot;
 
@@ -49,6 +49,7 @@ use crate::control::{
     EndReason, Grant, InputError, InputReport, NotHeld, SessionControl, TakeError,
 };
 use crate::events::{CloseReason, EventSource, RecordingTrigger, SessionEvents};
+use crate::reconcile::RecordBook;
 use crate::recording::{RecordingService, Target};
 use crate::seams::{
     BoxFuture, BundleSource, CancelCause, DaemonError, ManagedSession, NoBundleSource,
@@ -169,7 +170,7 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 pub struct Registry {
     sessions: Mutex<HashMap<SessionId, SessionEntry>>,
     connector: Arc<dyn SessionConnector>,
-    sink: Arc<dyn ReconciliationSink>,
+    records: Arc<RecordBook>,
     bundles: Arc<dyn BundleSource>,
     next_generation: AtomicU64,
     recordings: Arc<RecordingService>,
@@ -285,7 +286,7 @@ impl Registry {
         Registry {
             sessions: Mutex::new(HashMap::new()),
             connector,
-            sink,
+            records: Arc::new(RecordBook::new(sink)),
             bundles: Arc::new(NoBundleSource),
             next_generation: AtomicU64::new(1),
             recordings,
@@ -304,9 +305,30 @@ impl Registry {
     ///
     /// [`DaemonError::SessionNotFound`] or [`DaemonError::StillConnecting`].
     pub(crate) fn recording_target(&self, id: &SessionId) -> Result<Target, DaemonError> {
+        self.recording_target_of(id, false)
+    }
+
+    /// Like [`Registry::recording_target`], for a recording start: a session
+    /// that has ended cannot start a recording. Stop and annotate keep using
+    /// [`Registry::recording_target`], so a recording in progress can be
+    /// finished.
+    ///
+    /// # Errors
+    ///
+    /// As for [`Registry::recording_target`], plus
+    /// [`DaemonError::SessionEnded`].
+    pub(crate) fn recording_start_target(&self, id: &SessionId) -> Result<Target, DaemonError> {
+        self.recording_target_of(id, true)
+    }
+
+    fn recording_target_of(&self, id: &SessionId, start: bool) -> Result<Target, DaemonError> {
         #[allow(clippy::expect_used)] // A poisoned registry mutex is unrecoverable.
         let guard = self.sessions.lock().expect("registry mutex poisoned");
-        match guard.get(id) {
+        let found = guard.get(id);
+        if start {
+            refuse_ended(id, found)?;
+        }
+        match found {
             Some(SessionEntry::Live {
                 events,
                 frame,
@@ -418,7 +440,9 @@ impl Registry {
     /// # Errors
     ///
     /// Returns [`DaemonError::DuplicateSession`] if `name` is already
-    /// claimed/live/orphaned, or the connector's error (mapped through
+    /// claimed/live/orphaned (a session with the name that has ended, listed
+    /// as `Disconnected`, is closed and replaced instead), or the connector's
+    /// error (mapped through
     /// [`DaemonError`]) if the connect itself fails — in which case the
     /// claim is released so a retry with the same name can succeed. A connect
     /// whose placeholder was removed before its session was registered fails
@@ -449,6 +473,15 @@ impl Registry {
         let (id, attempt, mut cancel_rx) = match &name {
             Some(n) => {
                 let id = SessionId::from_str(n).map_err(DaemonError::Connect)?;
+                // A session with this name that has ended (listed as
+                // Disconnected) is replaced. Its close never fails the new
+                // connect: the entry and its record are gone either way.
+                if let Err(error) = self.close_ended(&id).await {
+                    eprintln!(
+                        "rdpilot-daemon: closing ended session {} for a new connect failed: {error}",
+                        id.as_str()
+                    );
+                }
                 let (attempt, cancel_rx) = self.claim(&id)?;
                 (id, attempt, cancel_rx)
             }
@@ -521,15 +554,18 @@ impl Registry {
             frame.clone(),
             session.human_input(),
         ));
-        let ended_watch = frame.clone().map(|frame| {
-            crate::events::watch_session_end(frame, Arc::clone(&events), Arc::clone(&control))
-        });
+        let lifecycle = session.lifecycle();
         // A single wall-clock capture shared by the entry's
         // `connected_since_wall`/`last_activity_wall` and the
-        // reconciliation sink's `record_open` call below — avoids
-        // two independent `SystemTime::now()` reads racing apart
-        // by a few milliseconds for what is conceptually one event.
+        // reconciliation record — avoids two independent
+        // `SystemTime::now()` reads racing apart by a few milliseconds for
+        // what is conceptually one event.
         let now_wall = iso8601_now();
+        // The record is written before the promotion, so the end hook (and
+        // every close) can only remove a record that exists. A crash between
+        // this write and the promotion leaves the record of a connected
+        // session, which a restart correctly shows as Orphaned.
+        self.records.opened(&id, generation, &host, &now_wall);
         let not_promoted = {
             #[allow(clippy::expect_used)] // A poisoned registry mutex is unrecoverable.
             let mut guard = self.sessions.lock().expect("registry mutex poisoned");
@@ -539,12 +575,23 @@ impl Registry {
                 guard.get(&id),
                 Some(SessionEntry::Connecting { attempt: current, .. }) if *current == attempt
             ) {
+                // Only a registered session gets an end hook, so a session
+                // that is not promoted never reports an end. Spawning does
+                // not await.
+                let end_hook = crate::events::watch_session_end(
+                    lifecycle.clone(),
+                    Arc::clone(&events),
+                    Arc::clone(&control),
+                    Arc::clone(&self.records),
+                    id.clone(),
+                    generation,
+                );
                 guard.insert(
                     id.clone(),
                     SessionEntry::Live {
                         session: Arc::new(tokio::sync::Mutex::new(Some(session))),
                         generation,
-                        status: SessionLifecycle::Live,
+                        lifecycle,
                         connected_since: Instant::now(),
                         connected_since_wall: now_wall.clone(),
                         name,
@@ -553,25 +600,25 @@ impl Registry {
                         cua_leases: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                         frame,
                         events,
-                        ended_watch,
+                        end_hook,
                         control,
                         last_activity_wall: now_wall.clone(),
                     },
                 );
                 None
             } else {
-                Some((session, ended_watch, events, control))
+                Some((session, events, control))
             }
         }; // guard dropped here — never held across the .await below
-        if let Some((session, ended_watch, events, control)) = not_promoted {
+        if let Some((session, events, control)) = not_promoted {
             // The placeholder was removed while the session was in flight.
-            // The session was never registered, so its watcher must not
-            // report an end; then close it, awaited. If this future is
-            // dropped during that close, the session drops mid-close; its
+            // The session was never registered and has no end hook; remove
+            // its record, then close it, awaited. If this future is dropped
+            // during that close, the session drops mid-close; its
             // synchronous part has already run (as in `ConnectGuard::drop`)
-            // and no entry is left to clean up.
-            drop(ended_watch);
+            // and no entry or record is left to clean up.
             drop((events, control));
+            self.records.closed(&id, generation);
             let _ = session.close().await;
             // A Disconnect sends its cause before the lock that removed the
             // placeholder is released, so it is already here.
@@ -580,7 +627,6 @@ impl Registry {
                 Err(_) => connect_cancelled(),
             });
         }
-        self.sink.record_open(&id, &host, &now_wall);
         Ok(lease)
     }
 
@@ -594,7 +640,7 @@ impl Registry {
         record: Option<RecordingTrigger>,
     ) -> Option<Result<String, String>> {
         let trigger = record?;
-        Some(match self.recording_target(id) {
+        Some(match self.recording_start_target(id) {
             Ok(target) => self
                 .recordings
                 .start(target, trigger, EventSource::Cli)
@@ -656,41 +702,7 @@ impl Registry {
         };
 
         match entry {
-            Some(SessionEntry::Live {
-                session,
-                ended_watch,
-                events,
-                control,
-                ..
-            }) => {
-                // Our own close is not a server-side end: stop the watcher
-                // before the session loop is told to stop.
-                drop(ended_watch);
-                end_lease(&control, EndReason::SessionEnded).await;
-                self.recordings.session_closed(&events, reason);
-                // Take the SIZED `Box` out of the `Option` (never the
-                // unsized `dyn ManagedSession` itself, which does not
-                // compile out of an `Arc` -- research Pitfall 2) and close
-                // it -- NEVER a bare drop (DAEMON-01). `try_lock` cannot be
-                // used here: `close` is this session's terminal operation
-                // and MUST wait for any concurrent `Registry::call` in
-                // flight to finish before reclaiming ownership, not race
-                // past it.
-                let boxed = { session.lock().await.take() };
-                match boxed {
-                    Some(boxed) => {
-                        boxed.close().await?; // joins the OS thread — NEVER a bare drop
-                        self.sink.record_closed(id);
-                        Ok(())
-                    }
-                    None => {
-                        // Already taken/closed concurrently -- treat as a
-                        // clean success, not a double-close error.
-                        self.sink.record_closed(id);
-                        Ok(())
-                    }
-                }
-            }
+            Some(entry @ SessionEntry::Live { .. }) => self.close_removed(id, entry, reason).await,
             Some(SessionEntry::Connecting { .. }) => {
                 // Unreachable: a placeholder is handled under the lock above.
                 Err(DaemonError::StillConnecting(id.as_str().to_owned()))
@@ -698,10 +710,93 @@ impl Registry {
             Some(SessionEntry::Orphaned { .. }) => {
                 // Explicit reclaim/teardown of an orphan (DAEMON-04) —
                 // clears its record; there is no live OS thread to join.
-                self.sink.record_closed(id);
+                self.records.closed_orphan(id);
                 Ok(())
             }
             None => Err(DaemonError::SessionNotFound(id.as_str().to_owned())),
+        }
+    }
+
+    /// Close a `Live` entry that was removed from the map under the registry
+    /// lock: the one close sequence of every removal path. Its own close is
+    /// not a server-side end, so the end hook is dropped before the session
+    /// loop is told to stop. The record is removed whatever the close
+    /// returns, and the close error still reaches the caller.
+    ///
+    /// For a session that has already ended, the record is removed before
+    /// the close is awaited, so a caller dropped during the close (a
+    /// replacing Connect whose peer left) leaves no record. A session that is
+    /// still live keeps its record until the close returns: a crash during
+    /// that close must still show the session as Orphaned.
+    async fn close_removed(
+        &self,
+        id: &SessionId,
+        entry: SessionEntry,
+        reason: CloseReason,
+    ) -> Result<(), DaemonError> {
+        let ended = entry.end_cause().is_some();
+        let SessionEntry::Live {
+            session,
+            generation,
+            end_hook,
+            events,
+            control,
+            ..
+        } = entry
+        else {
+            return Ok(());
+        };
+        drop(end_hook);
+        if ended {
+            self.records.closed(id, generation);
+        }
+        end_lease(&control, EndReason::SessionEnded).await;
+        self.recordings.session_closed(&events, reason);
+        // Take the SIZED `Box` out of the `Option` (never the unsized
+        // `dyn ManagedSession` itself, which does not compile out of an
+        // `Arc` -- research Pitfall 2) and close it -- NEVER a bare drop
+        // (DAEMON-01). `try_lock` cannot be used here: `close` is this
+        // session's terminal operation and MUST wait for any concurrent
+        // `Registry::call` in flight to finish before reclaiming ownership,
+        // not race past it. A box already taken by a concurrent close is a
+        // clean success, not a double-close error.
+        let boxed = { session.lock().await.take() };
+        let result = match boxed {
+            Some(boxed) => boxed.close().await, // joins the OS thread
+            None => Ok(()),
+        };
+        self.records.closed(id, generation);
+        result
+    }
+
+    /// Remove and close the entry of `id` only when it is a `Live` session
+    /// that has ended (listed as `Disconnected`), for a Connect that reuses
+    /// its name. The close reason of a recording is `disconnect`. Returns
+    /// whether it removed an entry.
+    ///
+    /// The record is removed before the close is awaited, so a Connect
+    /// future dropped during the close leaves no record; the session it
+    /// drops mid-close has already ended its thread's work and had its
+    /// recording closed.
+    ///
+    /// # Errors
+    ///
+    /// The close error of the removed session.
+    async fn close_ended(&self, id: &SessionId) -> Result<bool, DaemonError> {
+        let entry = {
+            #[allow(clippy::expect_used)] // A poisoned registry mutex is unrecoverable.
+            let mut guard = self.sessions.lock().expect("registry mutex poisoned");
+            match guard.get(id) {
+                Some(entry) if entry.end_cause().is_some() => guard.remove(id),
+                _ => None,
+            }
+        };
+        match entry {
+            Some(entry) => self
+                .close_removed(id, entry, CloseReason::Disconnect)
+                .await
+                .map(|()| true),
+            None => Ok(false),
         }
     }
 
@@ -723,25 +818,13 @@ impl Registry {
             }
         };
 
-        let Some(SessionEntry::Live {
-            session,
-            ended_watch,
-            events,
-            control,
-            ..
-        }) = entry
-        else {
-            return Ok(false);
-        };
-        drop(ended_watch);
-        end_lease(&control, EndReason::SessionEnded).await;
-        self.recordings
-            .session_closed(&events, CloseReason::ConnectAborted);
-        if let Some(session) = session.lock().await.take() {
-            session.close().await?;
+        match entry {
+            Some(entry) => self
+                .close_removed(&lease.id, entry, CloseReason::ConnectAborted)
+                .await
+                .map(|()| true),
+            None => Ok(false),
         }
-        self.sink.record_closed(&lease.id);
-        Ok(true)
     }
 
     /// Dispatch an operation onto the live session `id` WITHOUT holding the
@@ -770,7 +853,9 @@ impl Registry {
         let entry = {
             #[allow(clippy::expect_used)] // A poisoned registry mutex is unrecoverable.
             let guard = self.sessions.lock().expect("registry mutex poisoned");
-            match guard.get(id) {
+            let found = guard.get(id);
+            refuse_ended(id, found)?;
+            match found {
                 Some(SessionEntry::Live { session, .. }) => Arc::clone(session),
                 Some(SessionEntry::Connecting { .. }) => {
                     return Err(DaemonError::StillConnecting(id.as_str().to_owned()));
@@ -806,7 +891,9 @@ impl Registry {
         let (entry, control) = {
             #[allow(clippy::expect_used)] // A poisoned registry mutex is unrecoverable.
             let guard = self.sessions.lock().expect("registry mutex poisoned");
-            match guard.get(id) {
+            let found = guard.get(id);
+            refuse_ended(id, found)?;
+            match found {
                 Some(SessionEntry::Live {
                     session, control, ..
                 }) => (Arc::clone(session), Arc::clone(control)),
@@ -826,12 +913,14 @@ impl Registry {
         }
     }
 
-    /// The control lease of live session `id`.
+    /// The control lease of live session `id`; `None` once it has ended.
     pub(crate) fn control(&self, id: &SessionId) -> Option<Arc<SessionControl>> {
         #[allow(clippy::expect_used)] // A poisoned registry mutex is unrecoverable.
         let guard = self.sessions.lock().expect("registry mutex poisoned");
         match guard.get(id) {
-            Some(SessionEntry::Live { control, .. }) => Some(Arc::clone(control)),
+            Some(entry @ SessionEntry::Live { control, .. }) if entry.end_cause().is_none() => {
+                Some(Arc::clone(control))
+            }
             _ => None,
         }
     }
@@ -872,7 +961,9 @@ impl Registry {
         let control = {
             #[allow(clippy::expect_used)] // A poisoned registry mutex is unrecoverable.
             let guard = self.sessions.lock().expect("registry mutex poisoned");
-            match guard.get(id) {
+            let found = guard.get(id);
+            refuse_ended(id, found)?;
+            match found {
                 Some(SessionEntry::Live { control, .. }) => Arc::clone(control),
                 Some(SessionEntry::Connecting { .. }) => {
                     return Err(DaemonError::StillConnecting(id.as_str().to_owned()));
@@ -890,13 +981,16 @@ impl Registry {
 
     /// The per-session lock of `id` plus its control, for a human take: the
     /// take waits on the lock to let an in-flight native operation finish.
+    /// `None` once the session has ended.
     pub(crate) fn take_parts(&self, id: &SessionId) -> Option<(SessionSlot, Arc<SessionControl>)> {
         #[allow(clippy::expect_used)] // A poisoned registry mutex is unrecoverable.
         let guard = self.sessions.lock().expect("registry mutex poisoned");
         match guard.get(id) {
-            Some(SessionEntry::Live {
-                session, control, ..
-            }) => Some((Arc::clone(session), Arc::clone(control))),
+            Some(
+                entry @ SessionEntry::Live {
+                    session, control, ..
+                },
+            ) if entry.end_cause().is_none() => Some((Arc::clone(session), Arc::clone(control))),
             _ => None,
         }
     }
@@ -909,7 +1003,9 @@ impl Registry {
         let (generation, entry, cua_leases, events, control) = {
             #[allow(clippy::expect_used)]
             let guard = self.sessions.lock().expect("registry mutex poisoned");
-            match guard.get(id) {
+            let found = guard.get(id);
+            refuse_ended(id, found)?;
+            match found {
                 Some(SessionEntry::Live {
                     generation,
                     session,
@@ -1048,15 +1144,15 @@ impl Registry {
                     cua_leases,
                     control,
                     ..
-                } => (cua_leases.load(Ordering::Relaxed) == 0 && !control.human_active()).then(
-                    || {
-                        // Human input and lease ends count as activity.
-                        let latest = control
-                            .human_activity()
-                            .map_or(*last_activity, |(at, _)| at.max(*last_activity));
-                        (id.clone(), latest.elapsed())
-                    },
-                ),
+                } => (entry.end_cause().is_some()
+                    || (cua_leases.load(Ordering::Relaxed) == 0 && !control.human_active()))
+                .then(|| {
+                    // Human input and lease ends count as activity.
+                    let latest = control
+                        .human_activity()
+                        .map_or(*last_activity, |(at, _)| at.max(*last_activity));
+                    (id.clone(), latest.elapsed())
+                }),
                 SessionEntry::Connecting { .. } | SessionEntry::Orphaned { .. } => None,
             })
             .collect()
@@ -1070,6 +1166,19 @@ pub(crate) type SessionSlot = Arc<tokio::sync::Mutex<Option<Box<dyn ManagedSessi
 pub(crate) async fn end_lease(control: &SessionControl, reason: EndReason) {
     if let Some(transition) = control.end_human(reason) {
         control.discharge(transition).await;
+    }
+}
+
+/// [`DaemonError::SessionEnded`] when `entry` is a session that has ended
+/// (listed as `Disconnected`): operational calls name the end instead of
+/// reaching a session whose loop is gone.
+fn refuse_ended(id: &SessionId, entry: Option<&SessionEntry>) -> Result<(), DaemonError> {
+    match entry.and_then(SessionEntry::end_cause) {
+        Some(cause) => Err(DaemonError::SessionEnded {
+            id: id.as_str().to_owned(),
+            cause: cause.to_string(),
+        }),
+        None => Ok(()),
     }
 }
 
@@ -1162,7 +1271,10 @@ impl ViewerRegistry {
     /// Start recording live session `id` from the viewer. Returns the
     /// recording id and whether it changed anything.
     pub(crate) async fn record_start(&self, id: &SessionId) -> Result<(String, bool), Refusal> {
-        let target = self.inner.recording_target(id).map_err(Refusal::from)?;
+        let target = self
+            .inner
+            .recording_start_target(id)
+            .map_err(Refusal::from)?;
         self.inner
             .recordings
             .start(target, RecordingTrigger::Viewer, EventSource::Viewer)
@@ -1327,16 +1439,13 @@ impl Registry {
         guard
             .iter()
             .map(|(id, entry)| {
-                let (ended, frames) = match entry {
-                    SessionEntry::Live {
-                        frame: Some(frame), ..
-                    } => (frame.status().ended, true),
-                    _ => (false, false),
-                };
+                let status = self.status_of(id, entry);
+                let ended = status.status == rdpilot_ipc::SessionLifecycle::Disconnected;
+                let frames = matches!(entry, SessionEntry::Live { frame: Some(_), .. });
                 let input =
                     matches!(entry, SessionEntry::Live { control, .. } if control.has_input());
                 ViewerSession {
-                    status: self.status_of(id, entry),
+                    status,
                     ended,
                     frames,
                     input,
@@ -1402,6 +1511,57 @@ mod tests {
     /// `tests/thread_leak_soak.rs`, Task 3).
     struct FakeSession {
         closes: Arc<AtomicU32>,
+        /// The session's lifecycle; a test ends it to simulate a server end.
+        lifecycle: LifecycleTx,
+        /// `close` returns an injected error (after it counted).
+        close_fails: bool,
+        /// `close` waits for a permit here before it counts.
+        close_gate: Option<Arc<tokio::sync::Semaphore>>,
+        /// `ping` waits for a permit here (an operation in flight).
+        ping_gate: Option<Arc<tokio::sync::Semaphore>>,
+    }
+
+    type LifecycleTx = Arc<tokio::sync::watch::Sender<rdpilot::SessionState>>;
+
+    fn live_lifecycle() -> LifecycleTx {
+        Arc::new(
+            tokio::sync::watch::channel(rdpilot::SessionState {
+                lifecycle: rdpilot::Lifecycle::Live,
+                desktop_size: (1920, 1080),
+            })
+            .0,
+        )
+    }
+
+    /// End `lifecycle` with `cause` unless it has ended, as the SDK does.
+    fn end_lifecycle(lifecycle: &LifecycleTx, cause: rdpilot::EndCause) {
+        lifecycle.send_if_modified(|state| {
+            if state.lifecycle == rdpilot::Lifecycle::Live {
+                state.lifecycle = rdpilot::Lifecycle::Ended(cause);
+                true
+            } else {
+                false
+            }
+        });
+    }
+
+    fn server_end(lifecycle: &LifecycleTx) {
+        end_lifecycle(
+            lifecycle,
+            rdpilot::EndCause::ServerEnded("fake server end".to_owned()),
+        );
+    }
+
+    impl FakeSession {
+        fn new(closes: Arc<AtomicU32>) -> Self {
+            FakeSession {
+                closes,
+                lifecycle: live_lifecycle(),
+                close_fails: false,
+                close_gate: None,
+                ping_gate: None,
+            }
+        }
     }
 
     impl ManagedSession for FakeSession {
@@ -1409,13 +1569,24 @@ mod tests {
         /// called: a future that is dropped unpolled closes nothing.
         fn close(self: Box<Self>) -> TestFuture<Result<(), DaemonError>> {
             let closes = Arc::clone(&self.closes);
+            end_lifecycle(&self.lifecycle, rdpilot::EndCause::ClientClosed);
+            let fails = self.close_fails;
+            let gate = self.close_gate.clone();
             Box::pin(async move {
+                if let Some(gate) = gate {
+                    #[allow(clippy::expect_used)]
+                    gate.acquire().await.expect("gate is never closed").forget();
+                }
                 closes.fetch_add(1, Ordering::SeqCst);
-                Ok(())
+                if fails {
+                    Err(DaemonError::Connect("injected close failure".to_owned()))
+                } else {
+                    Ok(())
+                }
             })
         }
-        fn describe(&self) -> SessionLifecycle {
-            SessionLifecycle::Live
+        fn lifecycle(&self) -> tokio::sync::watch::Receiver<rdpilot::SessionState> {
+            self.lifecycle.subscribe()
         }
 
         fn screenshot(&self) -> BoxFuture<'_, Result<rdpilot::Screenshot, DaemonError>> {
@@ -1463,7 +1634,14 @@ mod tests {
             })
         }
         fn ping(&self) -> BoxFuture<'_, Result<std::time::Duration, DaemonError>> {
-            Box::pin(async { Ok(std::time::Duration::from_millis(0)) })
+            let gate = self.ping_gate.clone();
+            Box::pin(async move {
+                if let Some(gate) = gate {
+                    #[allow(clippy::expect_used)]
+                    gate.acquire().await.expect("gate is never closed").forget();
+                }
+                Ok(std::time::Duration::from_millis(0))
+            })
         }
         fn desktop_size(&self) -> (u32, u32) {
             (1920, 1080)
@@ -1511,9 +1689,8 @@ mod tests {
                 if fail {
                     Err(DaemonError::Connect("fake connect failure".to_owned()))
                 } else {
-                    Ok(Box::new(FakeSession {
-                        closes: Arc::new(AtomicU32::new(0)),
-                    }) as Box<dyn ManagedSession>)
+                    Ok(Box::new(FakeSession::new(Arc::new(AtomicU32::new(0))))
+                        as Box<dyn ManagedSession>)
                 }
             })
         }
@@ -1789,10 +1966,12 @@ mod tests {
         let weak = Arc::downgrade(&events);
         drop(events);
         registry.close(&id).await.expect("close");
-        assert!(
-            weak.upgrade().is_none(),
-            "the log is dropped with the entry"
-        );
+        // The entry drops it at once; the aborted end hook as soon as the
+        // runtime drops the task.
+        until("the log is dropped with the entry", || {
+            weak.upgrade().is_none()
+        })
+        .await;
         assert!(registry.events(&id).is_none());
         assert!(matches!(viewer.events(&id), EventsLookup::Closed));
     }
@@ -1958,7 +2137,7 @@ mod tests {
                     .expect("gate is never closed")
                     .forget();
                 call.delivered.store(true, Ordering::SeqCst);
-                Ok(Box::new(FakeSession { closes }) as Box<dyn ManagedSession>)
+                Ok(Box::new(FakeSession::new(closes)) as Box<dyn ManagedSession>)
             })
         }
     }
@@ -2315,9 +2494,7 @@ mod tests {
         let (tx, rx) = oneshot::channel();
         assert!(tx
             .send(Ok((
-                Box::new(FakeSession {
-                    closes: Arc::clone(closes),
-                }) as Box<dyn ManagedSession>,
+                Box::new(FakeSession::new(Arc::clone(closes))) as Box<dyn ManagedSession>,
                 cancel_rx,
             )))
             .is_ok());
@@ -2386,5 +2563,466 @@ mod tests {
         drop(runtime);
 
         wait_for_closes(&closes, 1);
+    }
+
+    // --- Session lifecycle: status, server end, records (S2) --------------
+
+    /// A connector whose sessions the test can end, fail to close, and gate.
+    /// It keeps every delivered session's lifecycle sender in order.
+    #[derive(Default)]
+    struct ScriptedConnector {
+        lifecycles: Mutex<Vec<LifecycleTx>>,
+        closes: Arc<AtomicU32>,
+        close_fails: AtomicBool,
+        /// The next delivered session's close waits on this.
+        close_gate: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
+        /// The next delivered session's ping waits on this.
+        ping_gate: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
+        /// The next connect waits on this before it delivers.
+        connect_gate: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
+    }
+
+    impl ScriptedConnector {
+        /// The lifecycle sender of the `n`-th delivered session.
+        fn lifecycle(&self, n: usize) -> LifecycleTx {
+            #[allow(clippy::expect_used)]
+            Arc::clone(&self.lifecycles.lock().expect("test mutex")[n])
+        }
+        fn closes(&self) -> u32 {
+            self.closes.load(Ordering::SeqCst)
+        }
+    }
+
+    impl SessionConnector for ScriptedConnector {
+        fn connect(
+            &self,
+            _cfg: ConnectionConfig,
+        ) -> TestFuture<Result<Box<dyn ManagedSession>, DaemonError>> {
+            let mut session = FakeSession::new(Arc::clone(&self.closes));
+            session.close_fails = self.close_fails.load(Ordering::SeqCst);
+            #[allow(clippy::expect_used)]
+            {
+                session.close_gate = self.close_gate.lock().expect("test mutex").take();
+                session.ping_gate = self.ping_gate.lock().expect("test mutex").take();
+                self.lifecycles
+                    .lock()
+                    .expect("test mutex")
+                    .push(Arc::clone(&session.lifecycle));
+            }
+            #[allow(clippy::expect_used)]
+            let gate = self.connect_gate.lock().expect("test mutex").take();
+            Box::pin(async move {
+                if let Some(gate) = gate {
+                    #[allow(clippy::expect_used)]
+                    gate.acquire().await.expect("gate is never closed").forget();
+                }
+                Ok(Box::new(session) as Box<dyn ManagedSession>)
+            })
+        }
+    }
+
+    /// Counts reconciliation writes per id, in order.
+    #[derive(Default)]
+    struct CountingSink {
+        writes: Mutex<Vec<(&'static str, String)>>,
+    }
+
+    impl ReconciliationSink for CountingSink {
+        fn record_open(&self, id: &SessionId, _host: &str, _since: &str) {
+            #[allow(clippy::expect_used)]
+            self.writes
+                .lock()
+                .expect("test mutex")
+                .push(("open", id.as_str().to_owned()));
+        }
+        fn record_closed(&self, id: &SessionId) {
+            #[allow(clippy::expect_used)]
+            self.writes
+                .lock()
+                .expect("test mutex")
+                .push(("closed", id.as_str().to_owned()));
+        }
+    }
+
+    impl CountingSink {
+        fn count(&self, kind: &str, id: &str) -> usize {
+            #[allow(clippy::expect_used)]
+            self.writes
+                .lock()
+                .expect("test mutex")
+                .iter()
+                .filter(|(k, i)| *k == kind && i == id)
+                .count()
+        }
+    }
+
+    fn scripted() -> (Arc<Registry>, Arc<ScriptedConnector>, Arc<CountingSink>) {
+        let connector = Arc::new(ScriptedConnector::default());
+        let sink = Arc::new(CountingSink::default());
+        let registry = Arc::new(Registry::new(
+            Arc::clone(&connector) as Arc<dyn SessionConnector>,
+            Arc::clone(&sink) as Arc<dyn ReconciliationSink>,
+        ));
+        (registry, connector, sink)
+    }
+
+    fn sid(name: &str) -> SessionId {
+        SessionId::from_str(name).expect("non-empty literal")
+    }
+
+    async fn open_named(registry: &Registry, name: &str) -> ConnectLease {
+        registry
+            .open_tracked(Some(name.to_owned()), "h".to_owned(), test_cfg())
+            .await
+            .expect("open")
+    }
+
+    fn listed(registry: &Registry, name: &str) -> Option<SessionLifecycle> {
+        registry
+            .list()
+            .into_iter()
+            .find(|s| s.id == name)
+            .map(|s| s.status)
+    }
+
+    fn viewer_view(registry: &Arc<Registry>, name: &str) -> Option<(SessionLifecycle, bool)> {
+        ViewerRegistry::new(Arc::clone(registry))
+            .sessions()
+            .into_iter()
+            .find(|s| s.status.id == name)
+            .map(|s| (s.status.status, s.ended))
+    }
+
+    /// `describe()` of the registered session, read without the registry's
+    /// own refusal checks.
+    fn described(registry: &Registry, name: &str) -> Option<SessionLifecycle> {
+        #[allow(clippy::expect_used)]
+        let slot = match registry
+            .sessions
+            .lock()
+            .expect("registry mutex")
+            .get(&sid(name))
+        {
+            Some(SessionEntry::Live { session, .. }) => Arc::clone(session),
+            _ => return None,
+        };
+        let guard = slot.try_lock().ok()?;
+        guard.as_deref().map(|session| session.describe())
+    }
+
+    fn ended_events(registry: &Registry, name: &str) -> usize {
+        registry
+            .events(&sid(name))
+            .map_or(0, |log| ended_count(&log))
+    }
+
+    fn ended_count(log: &SessionEvents) -> usize {
+        log.after(0)
+            .events
+            .iter()
+            .filter(|e| e.kind == crate::events::EventKind::SessionEnded)
+            .count()
+    }
+
+    #[tokio::test]
+    async fn status_views_agree_across_connecting_live_and_server_end() {
+        let (registry, connector, _sink) = scripted();
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        *connector.connect_gate.lock().expect("test mutex") = Some(Arc::clone(&gate));
+        let open = {
+            let registry = Arc::clone(&registry);
+            tokio::spawn(async move { open_named(&registry, "alpha").await })
+        };
+        until("the placeholder exists", || {
+            listed(&registry, "alpha").is_some()
+        })
+        .await;
+        assert_eq!(
+            listed(&registry, "alpha"),
+            Some(SessionLifecycle::Connecting)
+        );
+        assert_eq!(
+            viewer_view(&registry, "alpha"),
+            Some((SessionLifecycle::Connecting, false))
+        );
+
+        gate.add_permits(1);
+        open.await.expect("join");
+        assert_eq!(listed(&registry, "alpha"), Some(SessionLifecycle::Live));
+        assert_eq!(described(&registry, "alpha"), Some(SessionLifecycle::Live));
+        assert_eq!(
+            viewer_view(&registry, "alpha"),
+            Some((SessionLifecycle::Live, false))
+        );
+        assert_eq!(ended_events(&registry, "alpha"), 0);
+
+        server_end(&connector.lifecycle(0));
+        assert_eq!(
+            listed(&registry, "alpha"),
+            Some(SessionLifecycle::Disconnected)
+        );
+        assert_eq!(
+            described(&registry, "alpha"),
+            Some(SessionLifecycle::Disconnected)
+        );
+        assert_eq!(
+            viewer_view(&registry, "alpha"),
+            Some((SessionLifecycle::Disconnected, true))
+        );
+        until("the end hook recorded the end", || {
+            ended_events(&registry, "alpha") == 1
+        })
+        .await;
+        let log = registry.events(&sid("alpha")).expect("log");
+        registry.close(&sid("alpha")).await.expect("disconnect");
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(ended_count(&log), 1, "a later Disconnect adds nothing");
+    }
+
+    #[tokio::test]
+    async fn status_views_agree_across_live_and_client_close() {
+        let (registry, connector, _sink) = scripted();
+        open_named(&registry, "alpha").await;
+        let log = registry.events(&sid("alpha")).expect("log");
+        registry.close(&sid("alpha")).await.expect("disconnect");
+        assert_eq!(listed(&registry, "alpha"), None);
+        assert_eq!(viewer_view(&registry, "alpha"), None);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(ended_count(&log), 0, "a client close is not a server end");
+        assert_eq!(connector.closes(), 1);
+    }
+
+    fn assert_ended_refusal(error: DaemonError) {
+        assert!(
+            matches!(&error, DaemonError::SessionEnded { id, .. } if id == "alpha"),
+            "{error:?}"
+        );
+        let wire = rdpilot_ipc::WireError::from(error);
+        assert_eq!(wire.code, rdpilot_ipc::WireErrorCode::SessionNotFound);
+        assert!(wire.message.contains("ended"), "{}", wire.message);
+        assert!(wire.message.contains("fake server end"), "{}", wire.message);
+    }
+
+    #[tokio::test]
+    async fn a_disconnected_entry_refuses_operations_and_keeps_reads() {
+        let (registry, connector, _sink) = scripted();
+        open_named(&registry, "alpha").await;
+        server_end(&connector.lifecycle(0));
+        let id = sid("alpha");
+
+        assert_ended_refusal(
+            registry
+                .call(&id, |session| session.ping())
+                .await
+                .expect_err("ping"),
+        );
+        assert_ended_refusal(
+            registry
+                .call_acting(&id, |session| {
+                    session.send_key(rdpilot::KeyAction::Combo(vec![rdpilot::Key::Enter]))
+                })
+                .await
+                .expect_err("key"),
+        );
+        assert_ended_refusal(registry.attach_cua(&id).await.err().expect("attach"));
+        assert_ended_refusal(
+            registry
+                .takeover(&id, EventSource::Cli)
+                .await
+                .expect_err("takeover"),
+        );
+        assert_ended_refusal(
+            registry
+                .recording_start_target(&id)
+                .err()
+                .expect("recording start"),
+        );
+        assert!(registry.control(&id).is_none());
+        assert!(registry.take_parts(&id).is_none());
+        let control = ViewerControl::new(Arc::clone(&registry));
+        assert!(matches!(
+            control.heartbeat(&id, "lease"),
+            Err(ControlRefusal::NoSession)
+        ));
+        assert!(matches!(
+            control
+                .take(&id, std::net::IpAddr::from([127, 0, 0, 1]))
+                .await,
+            Err(ControlRefusal::NoSession)
+        ));
+
+        // Reads still answer.
+        assert_eq!(
+            listed(&registry, "alpha"),
+            Some(SessionLifecycle::Disconnected)
+        );
+        assert!(viewer_view(&registry, "alpha").is_some());
+        assert!(registry.events(&id).is_some());
+        assert!(registry.recording_target(&id).is_ok(), "stop and annotate");
+        assert!(!matches!(
+            ViewerRegistry::new(Arc::clone(&registry)).frame_source(&id),
+            FrameLookup::Closed
+        ));
+
+        registry.close(&id).await.expect("disconnect removes it");
+        assert!(registry.list().is_empty());
+        assert_eq!(connector.closes(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_connect_with_the_same_name_replaces_a_disconnected_entry() {
+        let (registry, connector, sink) = scripted();
+        let first = open_named(&registry, "alpha").await;
+        server_end(&connector.lifecycle(0));
+
+        let second = open_named(&registry, "alpha").await;
+        assert!(second.generation > first.generation);
+        assert_eq!(connector.closes(), 1, "the ended session was closed once");
+        let statuses = registry.list();
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(statuses[0].status, SessionLifecycle::Live);
+        assert_eq!(live_generation(&registry, "alpha"), Some(second.generation));
+        until("the old record went", || sink.count("closed", "alpha") == 1).await;
+        assert_eq!(sink.count("open", "alpha"), 2);
+
+        // A live entry with the name still refuses a second connect.
+        let duplicate = registry
+            .open(Some("alpha".to_owned()), "h".to_owned(), test_cfg())
+            .await;
+        assert!(matches!(duplicate, Err(DaemonError::DuplicateSession(_))));
+    }
+
+    #[tokio::test]
+    async fn server_end_removes_the_record_at_once() {
+        let (registry, connector, sink) = scripted();
+        open_named(&registry, "alpha").await;
+        assert_eq!(sink.count("open", "alpha"), 1);
+        server_end(&connector.lifecycle(0));
+        until("the record went", || sink.count("closed", "alpha") == 1).await;
+        assert_eq!(
+            listed(&registry, "alpha"),
+            Some(SessionLifecycle::Disconnected)
+        );
+        registry.close(&sid("alpha")).await.expect("disconnect");
+        assert_eq!(sink.count("closed", "alpha"), 1, "nothing more");
+    }
+
+    #[tokio::test]
+    async fn the_end_hook_never_touches_a_later_entry_with_the_same_name() {
+        let (registry, connector, sink) = scripted();
+        let first = open_named(&registry, "alpha").await;
+        server_end(&connector.lifecycle(0));
+        until("the first record went", || {
+            sink.count("closed", "alpha") == 1
+        })
+        .await;
+        let second = open_named(&registry, "alpha").await;
+        // A late hook or close of the first generation writes nothing.
+        assert!(!registry.records.closed(&sid("alpha"), first.generation));
+        assert_eq!(sink.count("closed", "alpha"), 1);
+        assert_eq!(sink.count("open", "alpha"), 2);
+        assert_eq!(live_generation(&registry, "alpha"), Some(second.generation));
+        // The first session's lifecycle ending again changes nothing.
+        server_end(&connector.lifecycle(0));
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(sink.count("closed", "alpha"), 1);
+        assert_eq!(listed(&registry, "alpha"), Some(SessionLifecycle::Live));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_racing_close_and_end_remove_the_record_once() {
+        let (registry, connector, sink) = scripted();
+        for round in 0..50usize {
+            open_named(&registry, "alpha").await;
+            let lifecycle = connector.lifecycle(round);
+            let end = tokio::spawn(async move { server_end(&lifecycle) });
+            let close = {
+                let registry = Arc::clone(&registry);
+                tokio::spawn(async move { registry.close(&sid("alpha")).await })
+            };
+            end.await.expect("join");
+            close.await.expect("join").expect("disconnect");
+            until("the record went", || sink.count("closed", "alpha") > round).await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            assert_eq!(sink.count("closed", "alpha"), round + 1, "round {round}");
+            assert_eq!(connector.closes() as usize, round + 1, "round {round}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_close_still_removes_the_record() {
+        let (registry, connector, sink) = scripted();
+        connector.close_fails.store(true, Ordering::SeqCst);
+        open_named(&registry, "alpha").await;
+        let error = registry
+            .close(&sid("alpha"))
+            .await
+            .expect_err("the injected close failure is returned");
+        assert!(
+            matches!(&error, DaemonError::Connect(m) if m == "injected close failure"),
+            "{error:?}"
+        );
+        assert_eq!(sink.count("closed", "alpha"), 1);
+        assert!(registry.list().is_empty());
+
+        let lease = open_named(&registry, "beta").await;
+        let error = registry
+            .close_if_generation(&lease)
+            .await
+            .expect_err("the injected close failure is returned");
+        assert!(matches!(&error, DaemonError::Connect(_)), "{error:?}");
+        assert_eq!(sink.count("closed", "beta"), 1);
+        assert!(registry.list().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_dropped_replacing_connect_leaves_no_record_of_the_ended_entry() {
+        let (registry, connector, sink) = scripted();
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        *connector.close_gate.lock().expect("test mutex") = Some(Arc::clone(&gate));
+        open_named(&registry, "alpha").await;
+        // End the session and start the replacing connect before the end
+        // hook can run: this test runs on one thread and does not yield.
+        server_end(&connector.lifecycle(0));
+        let replacing = start_open(&registry, "alpha").await;
+        assert_eq!(registry.len(), 0, "the ended entry was removed");
+        assert_eq!(connector.closes(), 0, "its close waits on the gate");
+        drop(replacing);
+        assert_eq!(sink.count("closed", "alpha"), 1, "the record is gone");
+        gate.add_permits(1);
+    }
+
+    #[tokio::test]
+    async fn list_does_not_wait_for_an_operation_in_flight() {
+        let (registry, connector, _sink) = scripted();
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        *connector.ping_gate.lock().expect("test mutex") = Some(Arc::clone(&gate));
+        open_named(&registry, "alpha").await;
+        let op = {
+            let registry = Arc::clone(&registry);
+            tokio::spawn(async move { registry.call(&sid("alpha"), |s| s.ping()).await })
+        };
+        until("the operation holds the session", || {
+            described(&registry, "alpha").is_none()
+        })
+        .await;
+        let started = std::time::Instant::now();
+        assert_eq!(listed(&registry, "alpha"), Some(SessionLifecycle::Live));
+        assert_eq!(
+            viewer_view(&registry, "alpha"),
+            Some((SessionLifecycle::Live, false))
+        );
+        server_end(&connector.lifecycle(0));
+        assert_eq!(
+            listed(&registry, "alpha"),
+            Some(SessionLifecycle::Disconnected)
+        );
+        assert_eq!(
+            viewer_view(&registry, "alpha"),
+            Some((SessionLifecycle::Disconnected, true))
+        );
+        assert!(started.elapsed() < Duration::from_millis(100));
+        gate.add_permits(1);
+        op.await.expect("join").expect("the operation finishes");
     }
 }
