@@ -220,7 +220,12 @@ pub async fn run(config: RunConfig) -> Result<(), DaemonError> {
             sink.clone() as Arc<dyn ReconciliationSink>,
             Arc::clone(&recordings),
         )
-        .with_bundle_source(bundles),
+        .with_bundle_source(bundles)
+        .with_epoch_confirm_wait(crate::control::epoch_confirm_wait(
+            std::env::var(crate::control::EPOCH_CONFIRM_ENV)
+                .ok()
+                .as_deref(),
+        )),
     );
     let diagnostics = Diagnostics::from_env().map(Arc::new);
     // Finish recordings an earlier daemon left open and prune, off the IPC
@@ -358,46 +363,34 @@ fn end_fake_lifecycle(
     });
 }
 
-/// The fake connector's human input sink: counts only.
+/// The fake connector's human input sink: counts only. It keeps the input
+/// epoch and the held keys and buttons as the session loop does, so an epoch
+/// change releases what is held and stale input is refused.
 struct CountingInput {
     log: PathBuf,
     state: std::sync::Mutex<InputCounts>,
 }
 
-/// Events taken so far, and the keys or buttons held now.
-type InputCounts = (u64, std::collections::BTreeSet<crate::control::Held>);
+/// Events taken so far (releases of an epoch change included), and the input
+/// state of the loop.
+type InputCounts = (u64, crate::seams::LoopInputModel);
 
-impl crate::seams::HumanInput for CountingInput {
-    fn send(
+impl CountingInput {
+    fn state(&self) -> std::sync::MutexGuard<'_, InputCounts> {
+        match self.state.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    /// Count `taken` more events and append the counts to the log.
+    fn record(
         &self,
-        events: Vec<rdpilot_vocab::RawInput>,
+        state: &mut InputCounts,
+        taken: usize,
     ) -> crate::seams::BoxFuture<'_, Result<(), DaemonError>> {
-        use crate::control::Held;
-        use rdpilot_vocab::RawInput;
-        let line = {
-            let mut state = match self.state.lock() {
-                Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            for event in &events {
-                state.0 += 1;
-                let (held, down) = match *event {
-                    RawInput::Key {
-                        code,
-                        extended,
-                        down,
-                    } => (Held::Key { code, extended }, down),
-                    RawInput::Button { button, down } => (Held::Button(button), down),
-                    RawInput::PointerMove { .. } | RawInput::Wheel { .. } => continue,
-                };
-                if down {
-                    state.1.insert(held);
-                } else {
-                    state.1.remove(&held);
-                }
-            }
-            serde_json::json!({ "events": state.0, "held": state.1.len() }).to_string()
-        };
+        state.0 += u64::try_from(taken).unwrap_or(u64::MAX);
+        let line = serde_json::json!({ "events": state.0, "held": state.1.held() }).to_string();
         Box::pin(async move {
             use std::io::Write;
             let mut file = std::fs::OpenOptions::new()
@@ -407,6 +400,32 @@ impl crate::seams::HumanInput for CountingInput {
                 .map_err(|e| DaemonError::Io(e.to_string()))?;
             writeln!(file, "{line}").map_err(|e| DaemonError::Io(e.to_string()))
         })
+    }
+}
+
+impl crate::seams::HumanInput for CountingInput {
+    fn send(
+        &self,
+        events: Vec<rdpilot_vocab::RawInput>,
+        epoch: rdpilot::InputEpoch,
+    ) -> crate::seams::BoxFuture<'_, Result<(), DaemonError>> {
+        let mut state = self.state();
+        match state.1.accept(epoch, &events) {
+            Ok(releases) => {
+                let taken = releases.len() + events.len();
+                self.record(&mut state, taken)
+            }
+            Err(stale) => Box::pin(async move { Err(stale) }),
+        }
+    }
+
+    fn set_epoch(
+        &self,
+        epoch: rdpilot::InputEpoch,
+    ) -> crate::seams::BoxFuture<'_, Result<(), DaemonError>> {
+        let mut state = self.state();
+        let releases = state.1.set_epoch(epoch);
+        self.record(&mut state, releases.len())
     }
 }
 
@@ -464,11 +483,19 @@ impl ManagedSession for FakeTestSession {
         })
     }
 
-    fn send_mouse(&self, _action: rdpilot::MouseAction) -> BoxFuture<'_, Result<(), DaemonError>> {
+    fn send_mouse(
+        &self,
+        _action: rdpilot::MouseAction,
+        _epoch: rdpilot::InputEpoch,
+    ) -> BoxFuture<'_, Result<(), DaemonError>> {
         Box::pin(async { Ok(()) })
     }
 
-    fn send_key(&self, _action: rdpilot::KeyAction) -> BoxFuture<'_, Result<(), DaemonError>> {
+    fn send_key(
+        &self,
+        _action: rdpilot::KeyAction,
+        _epoch: rdpilot::InputEpoch,
+    ) -> BoxFuture<'_, Result<(), DaemonError>> {
         Box::pin(async { Ok(()) })
     }
 
@@ -514,7 +541,10 @@ impl ManagedSession for FakeTestSession {
     fn desktop_size(&self) -> (u32, u32) {
         (1920, 1080)
     }
-    fn deploy_and_launch(&self) -> BoxFuture<'_, Result<std::time::Duration, DaemonError>> {
+    fn deploy_and_launch(
+        &self,
+        _epoch: rdpilot::InputEpoch,
+    ) -> BoxFuture<'_, Result<std::time::Duration, DaemonError>> {
         let bootstrap_delay_ms = self.bootstrap_delay_ms;
         Box::pin(async move {
             if bootstrap_delay_ms > 0 {
@@ -1061,15 +1091,24 @@ mod tests {
             extended: false,
             down,
         };
+        let first = rdpilot::InputEpoch::INITIAL;
         input
-            .send(vec![RawInput::PointerMove { x: 777, y: 555 }, key(true)])
+            .send(
+                vec![RawInput::PointerMove { x: 777, y: 555 }, key(true)],
+                first,
+            )
             .await
             .unwrap();
-        input.send(vec![key(false)]).await.unwrap();
+        input.send(vec![key(false)], first).await.unwrap();
+        // An epoch change releases what is held and refuses older input.
+        input.send(vec![key(true)], first).await.unwrap();
+        input.set_epoch(first.next()).await.unwrap();
+        assert!(input.send(vec![key(true)], first).await.is_err());
         let text = std::fs::read_to_string(&log).unwrap();
         assert_eq!(
             text,
-            "{\"events\":2,\"held\":1}\n{\"events\":3,\"held\":0}\n"
+            "{\"events\":2,\"held\":1}\n{\"events\":3,\"held\":0}\n\
+             {\"events\":4,\"held\":1}\n{\"events\":5,\"held\":0}\n"
         );
         assert!(!text.contains("777") && !text.contains("42"));
     }

@@ -4,7 +4,7 @@
 //! into an independent reader/writer, own the only mutating [`DecodedImage`], and
 //! `tokio::select!` over three sources:
 //!   1. inbound PDUs (`reader.read_pdu()`) → `ActiveStage::process`,
-//!   2. control/input events from the [`Session`] (`input_rx.recv()`),
+//!   2. [`LoopCommand`]s from the [`Session`] (`input_rx.recv()`),
 //!   3. the keepalive timer (`keepalive_interval.tick()`).
 //!
 //! Outputs are dispatched: `ResponseFrame` is written back, `GraphicsUpdate`
@@ -23,45 +23,111 @@ use ironrdp::connector::connection_activation::{
 use ironrdp::connector::ConnectionResult;
 use ironrdp::core::WriteBuf;
 use ironrdp::graphics::image_processing::PixelFormat;
+use ironrdp::pdu::input::fast_path::FastPathInputEvent;
 use ironrdp::session::fast_path;
 use ironrdp::session::image::DecodedImage;
 use ironrdp::session::{ActiveStage, ActiveStageBuilder, ActiveStageOutput};
+use ironrdp_input::Database;
 use ironrdp_tokio::{Framed, FramedWrite};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::{interval, MissedTickBehavior};
 use tracing::{debug, trace};
 
 use crate::connect::{ConnectedFramed, UpgradedStream};
 use crate::error::{Error, Result};
 use crate::framebuffer::SharedFrame;
+use crate::input::InputEpoch;
 use crate::keepalive::{null_input_event, KEEPALIVE_INTERVAL};
 use crate::lifecycle::{EndCause, LifecycleOwner};
 
-/// Control/input events the [`Session`](crate::Session) sends into the loop.
+/// The commands the [`Session`](crate::Session), its
+/// [`InputHandle`](crate::InputHandle) and the bridge send into the loop,
+/// through one bounded queue in FIFO order.
 ///
-/// `Close` requests a graceful client-side shutdown; the keepalive is emitted
-/// from its own `select!` arm (no self-send through the channel). `FastPath`
-/// (Phase 3, input injection) carries a pre-built batch of
-/// [`FastPathInputEvent`]s — constructed by `Session::send_mouse`/`send_key`
-/// via `ironrdp_input::Database::apply` — that this loop only forwards to
-/// `process_fastpath_input`; the loop never constructs input events itself and
-/// never sleeps for inter-event timing (Pitfall 3).
-pub(crate) enum RdpInputEvent {
-    /// Begin a graceful client-side shutdown (sent by `Session::close`).
-    Close,
-    /// A pre-built batch of fast-path input events to forward to the active
-    /// stage, unchanged, in the same order.
-    FastPath(Vec<ironrdp::pdu::input::fast_path::FastPathInputEvent>),
+/// The loop owns the input state (the `ironrdp_input::Database`) and the
+/// current [`InputEpoch`]. An [`Input`](Self::Input) of an older epoch is
+/// refused at dequeue with [`Error::StaleInput`]; a change to a newer epoch
+/// first releases every key and button still pressed. The keepalive is
+/// emitted from its own `select!` arm (no self-send through the queue), and
+/// the loop never sleeps for inter-event timing.
+///
+/// Lifecycle commands are not variants: a close or drop of the session
+/// signals the `bridge.shutdown` notify, which the loop checks first and a
+/// full queue cannot refuse. Transfers and channel commands (clipboard,
+/// devices, display control) are later command classes of this queue.
+pub(crate) enum LoopCommand {
+    /// One batch of ordered input of `epoch`. The loop applies `ops` to its
+    /// input state and answers `reply` at dequeue, before it writes the
+    /// resulting events: `Ok` when it accepted the batch, or
+    /// [`Error::StaleInput`] when `epoch` is older than the current epoch.
+    /// A newer `epoch` first changes the current epoch as [`SetEpoch`] does.
+    ///
+    /// [`SetEpoch`]: Self::SetEpoch
+    Input {
+        epoch: InputEpoch,
+        ops: Vec<ironrdp_input::Operation>,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    /// Change the current epoch to `epoch` when it is newer: release every
+    /// key and button still pressed, then answer `reply` after those releases
+    /// are written. An epoch that is not newer is answered at once and
+    /// releases nothing.
+    SetEpoch {
+        epoch: InputEpoch,
+        reply: oneshot::Sender<()>,
+    },
     /// A proactive typed request on the `RDPILOT_BRIDGE` DVC channel
     /// (BRIDGE-03, SC#2; generalized Phase 6, RESEARCH Pattern 2), carrying
     /// the message type, the correlation `req_id` the caller allocated, and
-    /// an optional JSON payload. Unlike `FastPath`, this loop *builds* the
-    /// outbound bytes itself (via `ActiveStage::get_dvc` +
-    /// `BridgeProcessor::encode_request` +
-    /// `ironrdp_dvc::encode_dvc_messages`) rather than merely forwarding a
-    /// pre-built payload — `DvcProcessor::start()`/`process()` are reactive
-    /// only and cannot originate a send on their own (RESEARCH Q1).
+    /// an optional JSON payload. This loop builds the outbound bytes itself
+    /// (via `ActiveStage::get_dvc` + `BridgeProcessor::encode_request` +
+    /// `ironrdp_dvc::encode_dvc_messages`) — `DvcProcessor::start()`/
+    /// `process()` are reactive only and cannot originate a send on their own
+    /// (RESEARCH Q1).
     Request(rdpilot_bridge_protocol::Envelope),
+}
+
+/// The input state of the loop: the pressed keys and buttons and the current
+/// input epoch.
+struct LoopInput {
+    database: Database,
+    epoch: InputEpoch,
+}
+
+impl LoopInput {
+    fn new() -> Self {
+        Self {
+            database: Database::new(),
+            epoch: InputEpoch::INITIAL,
+        }
+    }
+
+    /// Change to `epoch` if it is newer and return the releases of every key
+    /// and button still pressed; return nothing if it is not newer.
+    fn change_epoch(&mut self, epoch: InputEpoch) -> Option<Vec<FastPathInputEvent>> {
+        (epoch > self.epoch).then(|| {
+            self.epoch = epoch;
+            self.database.release_all().into_iter().collect()
+        })
+    }
+
+    /// Apply one batch of `epoch`: the releases of an implicit epoch change,
+    /// then the events of `ops`; or [`Error::StaleInput`] for an older epoch.
+    fn apply(
+        &mut self,
+        epoch: InputEpoch,
+        ops: Vec<ironrdp_input::Operation>,
+    ) -> Result<Vec<FastPathInputEvent>> {
+        if epoch < self.epoch {
+            return Err(Error::StaleInput {
+                sent: epoch,
+                current: self.epoch,
+            });
+        }
+        let mut events = self.change_epoch(epoch).unwrap_or_default();
+        events.extend(self.database.apply(ops));
+        Ok(events)
+    }
 }
 
 /// Run the active-session pump until the connection terminates or the input
@@ -80,7 +146,7 @@ pub(crate) enum RdpInputEvent {
 pub(crate) async fn run(
     framed: ConnectedFramed,
     connection_result: ConnectionResult,
-    input_rx: mpsc::Receiver<RdpInputEvent>,
+    input_rx: mpsc::Receiver<LoopCommand>,
     frame: SharedFrame,
     bridge: std::sync::Arc<crate::bridge::BridgeShared>,
     lifecycle: LifecycleOwner,
@@ -104,7 +170,7 @@ pub(crate) async fn run(
 async fn run_loop(
     framed: ConnectedFramed,
     connection_result: ConnectionResult,
-    mut input_rx: mpsc::Receiver<RdpInputEvent>,
+    mut input_rx: mpsc::Receiver<LoopCommand>,
     frame: SharedFrame,
     bridge: std::sync::Arc<crate::bridge::BridgeShared>,
     lifecycle: &LifecycleOwner,
@@ -133,7 +199,10 @@ async fn run_loop(
     let mut bridge_ping = interval(std::time::Duration::from_secs(10));
     bridge_ping.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
+    let mut input = LoopInput::new();
     loop {
+        // The reply of an epoch change, sent once its releases are written.
+        let mut confirm: Option<oneshot::Sender<()>> = None;
         let outputs = tokio::select! {
             biased;
             _=bridge.shutdown.notified()=>break,
@@ -155,21 +224,36 @@ async fn run_loop(
                     .process(&mut image, action, &payload)
                     .map_err(|e| Error::Session(format!("process PDU failed: {e}")))?
             }
-            event = input_rx.recv() => {
-                match event {
-                    Some(RdpInputEvent::Close) => {
-                        debug!("graceful shutdown requested");
-                        active_stage
-                            .graceful_shutdown()
-                            .map_err(|e| Error::Session(format!("graceful shutdown failed: {e}")))?
+            command = input_rx.recv() => {
+                match command {
+                    Some(LoopCommand::Input { epoch, ops, reply }) => {
+                        // Answered at dequeue, before the write: the sender
+                        // learns at once whether its batch was accepted.
+                        match input.apply(epoch, ops) {
+                            Ok(events) => {
+                                let _ = reply.send(Ok(()));
+                                process_fastpath_input(&mut active_stage, &mut image, &events)?
+                            }
+                            Err(stale) => {
+                                let _ = reply.send(Err(stale));
+                                vec![]
+                            }
+                        }
                     }
-                    Some(RdpInputEvent::FastPath(events)) => {
-                        // Pre-built by Session::send_mouse/send_key; this loop
-                        // only forwards, it never constructs input events or
-                        // sleeps between them (Pitfall 3).
-                        process_fastpath_input(&mut active_stage, &mut image, &events)?
+                    Some(LoopCommand::SetEpoch { epoch, reply }) => {
+                        match input.change_epoch(epoch) {
+                            Some(releases) => {
+                                // Confirmed after the releases are written.
+                                confirm = Some(reply);
+                                process_fastpath_input(&mut active_stage, &mut image, &releases)?
+                            }
+                            None => {
+                                let _ = reply.send(());
+                                vec![]
+                            }
+                        }
                     }
-                    Some(RdpInputEvent::Request(envelope)) => {
+                    Some(LoopCommand::Request(envelope)) => {
                         // Proactive send: DvcProcessor::start()/process() are
                         // reactive only (RESEARCH Q1), so the outbound request
                         // bytes are built here, from outside the processor,
@@ -199,8 +283,8 @@ async fn run_loop(
                         }
                     }
                     None => {
-                        // All senders dropped without an explicit Close (e.g. the
-                        // Session handle was dropped). Exit the loop best-effort.
+                        // All senders dropped (e.g. the Session handle was
+                        // dropped). Exit the loop best-effort.
                         debug!("input channel closed; ending session loop");
                         break;
                     }
@@ -265,6 +349,9 @@ async fn run_loop(
             }
         }
 
+        if let Some(reply) = confirm {
+            let _ = reply.send(());
+        }
         if terminate {
             break;
         }
@@ -529,6 +616,22 @@ pub(crate) mod tests {
             .collect()
     }
 
+    /// An accepted-or-refused input batch of the initial epoch whose answer
+    /// nobody waits for.
+    fn input_command(ops: Vec<ironrdp_input::Operation>) -> LoopCommand {
+        let (reply, _answer) = oneshot::channel();
+        LoopCommand::Input {
+            epoch: InputEpoch::INITIAL,
+            ops,
+            reply,
+        }
+    }
+
+    /// The press of the A key (scancode 0x1e).
+    fn a_key_pressed() -> ironrdp_input::Operation {
+        ironrdp_input::Operation::KeyPressed(ironrdp_input::Scancode::from_u8(false, 0x1e))
+    }
+
     fn dispatch_and_decode(
         stage: &mut ActiveStage,
         image: &mut DecodedImage,
@@ -648,7 +751,9 @@ pub(crate) mod tests {
                 let competitor = FastPathInputEvent::KeyboardEvent(KeyboardFlags::empty(), 0x1e);
                 let (input_tx, input_rx) = mpsc::channel(2);
                 input_tx
-                    .send(RdpInputEvent::FastPath(type_events.clone()))
+                    .send(input_command(crate::input::key_operations(
+                        &crate::input::KeyAction::Type(text.clone()),
+                    )))
                     .await
                     .expect("Type action enqueued");
 
@@ -691,7 +796,7 @@ pub(crate) mod tests {
 
                     tokio::time::timeout(
                         std::time::Duration::from_secs(5),
-                        input_tx.send(RdpInputEvent::FastPath(vec![competitor])),
+                        input_tx.send(input_command(vec![a_key_pressed()])),
                     )
                     .await
                     .map_err(|_| "competitor enqueue deadline".to_owned())?
@@ -966,7 +1071,7 @@ pub(crate) mod tests {
                 let observed = async {
                     serve_reactivation(&mut peer, true, 200, 150).await?;
                     input_tx
-                        .send(RdpInputEvent::FastPath(vec![key]))
+                        .send(input_command(vec![a_key_pressed()]))
                         .await
                         .map_err(|_| "input enqueue failed".to_owned())?;
                     let (_, frame) = tokio::time::timeout(PEER_DEADLINE, peer.read_pdu())
@@ -997,7 +1102,7 @@ pub(crate) mod tests {
     /// against a duplex peer, with its own lifecycle.
     pub(crate) struct Pump {
         pub(crate) peer: Peer,
-        pub(crate) input_tx: mpsc::Sender<RdpInputEvent>,
+        pub(crate) input_tx: mpsc::Sender<LoopCommand>,
         pub(crate) frame: SharedFrame,
         pub(crate) lifecycle: LifecycleOwner,
         pub(crate) bridge: std::sync::Arc<crate::bridge::BridgeShared>,
@@ -1006,8 +1111,14 @@ pub(crate) mod tests {
 
     /// Start `run` with the 100x100 fixture on the current local set.
     pub(crate) fn spawn_pump() -> Pump {
+        spawn_pump_with_buffer(64 * 1024)
+    }
+
+    /// [`spawn_pump`] with a duplex of `buffer` bytes: a small buffer makes
+    /// the loop wait in a write until the peer reads.
+    pub(crate) fn spawn_pump_with_buffer(buffer: usize) -> Pump {
         let (input_tx, input_rx) = mpsc::channel(16);
-        let (client, server) = tokio::io::duplex(64 * 1024);
+        let (client, server) = tokio::io::duplex(buffer);
         let framed =
             ironrdp_tokio::TokioFramed::new(Box::new(client) as crate::connect::UpgradedStream);
         let bridge = std::sync::Arc::new(crate::bridge::BridgeShared::new());

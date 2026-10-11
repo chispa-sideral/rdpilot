@@ -583,7 +583,7 @@ pub(crate) fn watch_session_end(
         records.closed(&id, generation);
         events.record(EventSource::Cli, EventKind::SessionEnded);
         eprintln!("rdpilot-daemon: session {} ended: {cause}", id.as_str());
-        crate::registry::end_lease(&control, crate::control::EndReason::SessionEnded).await;
+        crate::registry::end_lease_of_ended(&control).await;
     });
     WatchTask(task.abort_handle())
 }
@@ -1462,6 +1462,7 @@ mod tests {
             Arc::clone(&log),
             None,
             None,
+            crate::control::EPOCH_CONFIRM_WAIT,
         ));
         Hook {
             lifecycle,

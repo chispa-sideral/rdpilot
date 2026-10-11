@@ -3,17 +3,30 @@
 //! - Each live session has one [`SessionControl`]. The agent (native verbs
 //!   and Cua tool calls) controls by default; one live viewer tab may hold
 //!   a human lease instead. At most one controller exists at any time.
-//! - Every change of controller that displaces a human holder returns a
-//!   [`Transition`] that carries the keys and buttons the holder pressed and
-//!   did not release. [`SessionControl::discharge`] sends those releases
-//!   (awaited, through the session's own input channel) before the next
-//!   controller's first action.
+//! - Every controller change (a granted human lease that ends or moves)
+//!   advances the session's input epoch in the critical section that changes
+//!   the lease, and returns a [`Transition`] that carries the new epoch.
+//!   [`SessionControl::discharge`] sends it to the session loop, which
+//!   releases every key and button still pressed before it confirms. Input
+//!   of the old controller that reaches the loop after the change is
+//!   refused there as stale, so it can neither act nor leave a press behind.
+//!   A pending take that is never granted is not a controller change.
+//! - Every operation captures the epoch once when it is admitted: an agent
+//!   action in [`SessionControl::admit_agent`], a viewer request at its
+//!   first lease check, the bootstrap from [`SessionControl::input_epoch`].
+//! - A blur or a geometry fence releases the holder's keys or buttons
+//!   without a controller change: such a [`Transition`] carries the
+//!   releases, sent with the epoch current when it was created.
 //! - Every lease end and change follows one order: the transition is
 //!   registered as pending in the same critical section that changes the
 //!   lease, and agent admission ([`SessionControl::admit_agent`],
 //!   [`SessionControl::wait_released`] before a Cua call is forwarded) and
 //!   a human take wait until no transition is pending. So no controller
-//!   acts while a key or button of the previous holder is still down.
+//!   acts before the previous holder's keys and buttons are released.
+//! - A human take is granted only after the session loop confirmed the
+//!   epoch change, within [`TAKE_WAIT`] and at most the confirm wait; an
+//!   unconfirmed change refuses the take as busy. The epoch is never rolled
+//!   back: the agent then acts at the new epoch.
 //! - A human take from the agent marks the lease held at once, so new agent
 //!   actions are refused, and then waits (bounded by [`TAKE_WAIT`]) for the
 //!   agent operations already in flight: a native operation holding the
@@ -36,6 +49,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use rdpilot::InputEpoch;
 use rdpilot_ipc::{WireController, WireControllerKind};
 use rdpilot_vocab::{PointerButton, RawInput};
 use serde::{Deserialize, Serialize};
@@ -57,6 +71,24 @@ pub(crate) const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 /// Longest wait for the session's input channel to take one event.
 pub(crate) const INPUT_SEND_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Longest wait for the session loop to confirm an input epoch change: above
+/// its 5 s write deadline plus the drain of its 16 queued commands.
+pub(crate) const EPOCH_CONFIRM_WAIT: Duration = Duration::from_secs(6);
+
+/// Override of [`EPOCH_CONFIRM_WAIT`] in milliseconds, for tests. It is
+/// undocumented and has no CLI flag or config key.
+pub(crate) const EPOCH_CONFIRM_ENV: &str = "RDPILOT_DAEMON_EPOCH_CONFIRM_MS";
+
+/// The confirm wait for the override value `value` (the content of
+/// [`EPOCH_CONFIRM_ENV`], if set): a millisecond count above zero, or
+/// [`EPOCH_CONFIRM_WAIT`] when absent, unparsable or zero.
+pub(crate) fn epoch_confirm_wait(value: Option<&str>) -> Duration {
+    value
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|ms| *ms > 0)
+        .map_or(EPOCH_CONFIRM_WAIT, Duration::from_millis)
+}
+
 /// Lease ends remembered per session for loss notices.
 const RECENT_ENDS: usize = 16;
 
@@ -74,7 +106,7 @@ pub(crate) enum Held {
 }
 
 impl Held {
-    fn release(self) -> RawInput {
+    pub(crate) fn release(self) -> RawInput {
         match self {
             Held::Button(button) => RawInput::Button {
                 button,
@@ -254,15 +286,29 @@ impl Lease {
     }
 }
 
-#[derive(Default)]
 struct State {
     lease: Option<Lease>,
+    /// The input epoch of the session. It advances at every controller
+    /// change and never goes back.
+    epoch: InputEpoch,
     /// Forwarded acting Cua calls without an answer.
     inflight: usize,
     /// Recently ended leases: id -> loss.
     ended: VecDeque<(String, Loss)>,
     /// The latest human activity (accepted input or a lease end).
     human_activity: Option<(Instant, SystemTime)>,
+}
+
+impl Default for State {
+    fn default() -> Self {
+        State {
+            lease: None,
+            epoch: InputEpoch::INITIAL,
+            inflight: 0,
+            ended: VecDeque::new(),
+            human_activity: None,
+        }
+    }
 }
 
 impl State {
@@ -315,7 +361,8 @@ impl Drop for PendingGuard {
     }
 }
 
-/// The release obligation (and the recorded change) of one control change.
+/// The release obligation of one control change: a new input epoch for a
+/// controller change, or the releases of a blur or a lease end without one.
 /// Pass it to [`SessionControl::discharge`] before the next controller acts.
 /// Until it is discharged (or dropped), agent admission and human takes of
 /// the session wait.
@@ -323,6 +370,10 @@ impl Drop for PendingGuard {
 #[derive(Debug)]
 pub(crate) struct Transition {
     release: Vec<Held>,
+    /// The epoch `release` is sent with: the epoch when it was created.
+    at: InputEpoch,
+    /// The new input epoch of a controller change.
+    epoch: Option<InputEpoch>,
     _pending: PendingGuard,
 }
 
@@ -330,6 +381,11 @@ impl Transition {
     #[cfg(test)]
     pub(crate) fn releases(&self) -> usize {
         self.release.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn epoch(&self) -> Option<InputEpoch> {
+        self.epoch
     }
 }
 
@@ -347,6 +403,8 @@ pub struct SessionControl {
     pending: Arc<Pending>,
     /// Serializes human input and releases.
     input_lock: tokio::sync::Mutex<()>,
+    /// Longest wait for the session loop to confirm an epoch change.
+    confirm_wait: Duration,
 }
 
 impl SessionControl {
@@ -356,6 +414,7 @@ impl SessionControl {
         events: Arc<SessionEvents>,
         frame: Option<Arc<dyn ViewFrameSource>>,
         input: Option<Arc<dyn HumanInput>>,
+        confirm_wait: Duration,
     ) -> Self {
         SessionControl {
             session: session.to_owned(),
@@ -367,6 +426,7 @@ impl SessionControl {
             settled: Notify::new(),
             pending: Arc::new(Pending::default()),
             input_lock: tokio::sync::Mutex::new(()),
+            confirm_wait,
         }
     }
 
@@ -377,16 +437,35 @@ impl SessionControl {
         }
     }
 
-    /// A pending transition that releases `held`. Call it in the same
-    /// critical section of the state mutex that changes the lease, so an
-    /// admission check under that mutex sees the lease change and the
-    /// pending release together.
-    fn transition(&self, held: impl IntoIterator<Item = Held>) -> Transition {
+    /// A pending transition that releases `held` at the current epoch. Call
+    /// it in the same critical section of the state mutex that changes the
+    /// lease, so an admission check under that mutex sees the lease change
+    /// and the pending release together.
+    fn transition(&self, state: &State, held: impl IntoIterator<Item = Held>) -> Transition {
         self.pending.count.fetch_add(1, Ordering::AcqRel);
         Transition {
             release: held.into_iter().collect(),
+            at: state.epoch,
+            epoch: None,
             _pending: PendingGuard(Arc::clone(&self.pending)),
         }
+    }
+
+    /// A controller change: advance the input epoch and return the pending
+    /// transition that sends the new epoch. The session loop releases every
+    /// key and button of the old epoch. Call it in the critical section that
+    /// changes the lease, like [`SessionControl::transition`].
+    fn advance(&self, state: &mut State) -> Transition {
+        state.epoch = state.epoch.next();
+        let mut transition = self.transition(state, []);
+        transition.epoch = Some(state.epoch);
+        transition
+    }
+
+    /// The current input epoch, for an operation admitted without
+    /// [`SessionControl::admit_agent`] (the bootstrap).
+    pub(crate) fn input_epoch(&self) -> InputEpoch {
+        self.state().epoch
     }
 
     /// The current frame size (`None` without frames).
@@ -457,20 +536,34 @@ impl SessionControl {
 
     /// Admit one native agent action: refused while a human holds or is
     /// taking the lease; otherwise it waits until the releases of every
-    /// earlier lease end or change are sent.
+    /// earlier lease end or change are sent, and returns the input epoch the
+    /// action sends with.
     ///
     /// # Errors
     ///
     /// [`DaemonError::HumanControl`] naming the holder and the CLI command.
-    pub(crate) async fn admit_agent(&self) -> Result<(), DaemonError> {
+    pub(crate) async fn admit_agent(&self) -> Result<InputEpoch, DaemonError> {
         self.until_released(|| {
             let state = self.state();
             match &state.lease {
                 Some(lease) => Some(Err(self.human_control_error(lease))),
-                None => self.released().then_some(Ok(())),
+                None => self.released().then_some(Ok(state.epoch)),
             }
         })
         .await
+    }
+
+    /// The error of an admitted agent action: input refused as stale while
+    /// a human holds or takes the lease is that human's control; any other
+    /// error is unchanged.
+    pub(crate) fn stale_error(&self, error: DaemonError) -> DaemonError {
+        if !matches!(error, DaemonError::Sdk(rdpilot::Error::StaleInput { .. })) {
+            return error;
+        }
+        match &self.state().lease {
+            Some(lease) => self.human_control_error(lease),
+            None => error,
+        }
     }
 
     /// Wait until the releases of every earlier lease end or change are
@@ -574,12 +667,24 @@ impl SessionControl {
                 by: ControllerRef::Agent,
             },
         );
-        Some(self.transition(lease.held))
+        Some(self.end_lease(state, &lease))
     }
 
-    /// End a human lease for `reason` (daemon source). `None` when none.
-    pub(crate) fn end_human(&self, reason: EndReason) -> Option<Transition> {
-        let mut state = self.state();
+    /// The transition of the end of `lease`: a controller change when it
+    /// was granted. A pending take holds nothing and the agent still
+    /// controls, so its end changes nothing.
+    fn end_lease(&self, state: &mut State, lease: &Lease) -> Transition {
+        if lease.granted {
+            self.advance(state)
+        } else {
+            self.transition(state, [])
+        }
+    }
+
+    /// Take the human lease out of `state` for `reason` (daemon source),
+    /// remember its loss and record its end when it was granted. `None` when
+    /// no lease exists.
+    fn take_human(&self, state: &mut State, reason: EndReason) -> Option<Lease> {
         let lease = state.lease.take()?;
         state.remember(lease.id.clone(), Loss::reason(reason));
         state.touch_human();
@@ -592,37 +697,78 @@ impl SessionControl {
                 },
             );
         }
-        Some(self.transition(lease.held))
+        Some(lease)
     }
 
-    /// Send the releases of `transition`, awaited, through the session's
-    /// input channel. Serialized with human input. Its pending count ends
-    /// when they are sent.
-    pub(crate) async fn discharge(&self, transition: Transition) {
+    /// End a human lease for `reason` (daemon source). `None` when none.
+    pub(crate) fn end_human(&self, reason: EndReason) -> Option<Transition> {
+        let mut state = self.state();
+        let lease = self.take_human(&mut state, reason)?;
+        Some(self.end_lease(&mut state, &lease))
+    }
+
+    /// End a human lease because the session ended. The session loop is gone,
+    /// so nothing is sent and no epoch change is waited for: the transition
+    /// carries neither releases nor an epoch. `None` when no lease exists.
+    pub(crate) fn end_human_ended(&self) -> Option<Transition> {
+        let mut state = self.state();
+        self.take_human(&mut state, EndReason::SessionEnded)?;
+        Some(self.transition(&state, []))
+    }
+
+    /// Discharge `transition` within the confirm wait. Returns whether the
+    /// session loop confirmed its epoch change; see
+    /// [`SessionControl::discharge_within`].
+    pub(crate) async fn discharge(&self, transition: Transition) -> bool {
+        self.discharge_within(transition, self.confirm_wait).await
+    }
+
+    /// Send `transition` to the session. An epoch change is sent without the
+    /// input lock (the session loop orders it after every earlier input) and
+    /// waited for at most `wait`; it is confirmed when the loop has written
+    /// its releases, and at once when the session has no input path. A closed
+    /// session answers not confirmed at once. Releases without an epoch
+    /// change are sent best effort, serialized with human input, and count as
+    /// confirmed. The pending count of the transition ends when this returns.
+    pub(crate) async fn discharge_within(&self, transition: Transition, wait: Duration) -> bool {
+        if let Some(epoch) = transition.epoch {
+            let Some(input) = &self.input else {
+                return true;
+            };
+            return matches!(
+                tokio::time::timeout(wait, input.set_epoch(epoch)).await,
+                Ok(Ok(()))
+            );
+        }
         let _guard = self.input_lock.lock().await;
-        self.send_releases(transition.release).await;
+        self.send_releases(transition.release, transition.at).await;
+        true
     }
 
-    async fn send_releases(&self, release: Vec<Held>) {
+    async fn send_releases(&self, release: Vec<Held>, epoch: InputEpoch) {
         if release.is_empty() {
             return;
         }
         if let Some(input) = &self.input {
             let events = release.into_iter().map(Held::release).collect();
-            // Best effort: a closed or stalled session has no stuck key.
-            let _ = tokio::time::timeout(INPUT_SEND_TIMEOUT, input.send(events)).await;
+            // Best effort: a closed or stalled session has no stuck key, and
+            // releases of an older epoch are refused as stale (the epoch
+            // change already released them).
+            let _ = tokio::time::timeout(INPUT_SEND_TIMEOUT, input.send(events, epoch)).await;
         }
     }
 
     /// Take the lease for a viewer tab at `address`. From the agent, the
     /// take is marked at once and then waits (bounded) for `agent_idle`
     /// (the per-session lock) and for in-flight acting Cua calls. From
-    /// another tab, the lease moves at once after that tab's releases.
+    /// another tab, the old lease ends at once. Either way the take is
+    /// granted only after the session loop confirmed the epoch change.
     ///
     /// # Errors
     ///
-    /// [`TakeError::Busy`] when agent work did not finish within
-    /// [`TAKE_WAIT`]; [`TakeError::Lost`] when displaced while waiting.
+    /// [`TakeError::Busy`] when agent work did not finish, or the epoch
+    /// change was not confirmed, within [`TAKE_WAIT`]; [`TakeError::Lost`]
+    /// when displaced while waiting.
     pub(crate) async fn take<F>(&self, address: IpAddr, agent_idle: F) -> Result<Grant, TakeError>
     where
         F: Future<Output = ()>,
@@ -639,47 +785,43 @@ impl SessionControl {
     where
         F: Future<Output = ()>,
     {
-        let now = Instant::now();
-        let mut lease = Lease {
+        let started = Instant::now();
+        let lease = Lease {
             id: new_lease_id(),
             address,
             since_wall: SystemTime::now(),
             granted: false,
-            last_heartbeat: now,
-            last_input: now,
+            last_heartbeat: started,
+            last_input: started,
             held: BTreeSet::new(),
         };
         let id = lease.id.clone();
+        let by = lease.controller();
+        // The new lease is pending (never expired, displaceable) until the
+        // epoch change is confirmed.
         let moved = {
             let mut state = self.state();
-            match state.lease.take() {
+            match state.lease.replace(lease) {
                 Some(old) if old.granted => {
                     // From another tab: no agent work can be in flight.
-                    let from = old.controller();
-                    let by = lease.controller();
                     state.remember(old.id.clone(), Loss::by(by.clone()));
-                    lease.granted = true;
-                    state.lease = Some(lease.clone());
                     self.record(
                         EventSource::Viewer,
-                        EventKind::ControlTakenOver { from, by },
+                        EventKind::ControlTakenOver {
+                            from: old.controller(),
+                            by,
+                        },
                     );
-                    Some(self.transition(old.held))
+                    Some(self.advance(&mut state))
                 }
                 pending => {
                     if let Some(pending) = pending {
-                        state.remember(pending.id, Loss::by(lease.controller()));
+                        state.remember(pending.id, Loss::by(by));
                     }
-                    state.lease = Some(lease.clone());
                     None
                 }
             }
         };
-        if let Some(transition) = moved {
-            self.discharge(transition).await;
-            self.wait_released().await;
-            return Ok(self.grant(&lease));
-        }
 
         // A take abandoned while it waits (the tab went away) is undone.
         let mut pending = PendingTake {
@@ -687,23 +829,47 @@ impl SessionControl {
             id: &id,
             armed: true,
         };
-        let settled = tokio::time::timeout(bound, async {
-            agent_idle.await;
-            self.wait_settled().await;
+        let from_agent = moved.is_none();
+        let confirmed = if let Some(transition) = moved {
+            let confirmed = self
+                .discharge_within(transition, self.confirm_wait.min(bound))
+                .await;
+            // Releases of the old holder still pending (a blur, a fence)
+            // are sent before the new holder acts.
             self.wait_released().await;
-        })
-        .await;
+            confirmed
+        } else {
+            let settled = tokio::time::timeout(bound, async {
+                agent_idle.await;
+                self.wait_settled().await;
+                self.wait_released().await;
+            })
+            .await;
+            let transition = {
+                let mut state = self.state();
+                if !matches!(&state.lease, Some(current) if current.id == id) {
+                    pending.armed = false;
+                    return Err(lost_take(&state, &id));
+                }
+                if settled.is_err() {
+                    pending.armed = false;
+                    state.lease = None;
+                    return Err(TakeError::Busy);
+                }
+                self.advance(&mut state)
+            };
+            let remaining = bound.saturating_sub(started.elapsed());
+            self.discharge_within(transition, self.confirm_wait.min(remaining))
+                .await
+        };
         pending.armed = false;
 
         let mut state = self.state();
-        let ours = matches!(&state.lease, Some(current) if current.id == id);
-        if !ours {
-            return Err(match state.loss_of(&id) {
-                NotHeld::Lost(loss) => TakeError::Lost(loss),
-                NotHeld::Unknown => TakeError::Lost(Loss::by(ControllerRef::Agent)),
-            });
+        if !matches!(&state.lease, Some(current) if current.id == id) {
+            return Err(lost_take(&state, &id));
         }
-        if settled.is_err() {
+        if !confirmed {
+            // The epoch stays advanced: the agent acts at the new epoch.
             state.lease = None;
             return Err(TakeError::Busy);
         }
@@ -717,12 +883,14 @@ impl SessionControl {
         current.since_wall = SystemTime::now();
         let granted = current.clone();
         drop(state);
-        self.record(
-            EventSource::Viewer,
-            EventKind::ControlTaken {
-                by: granted.controller(),
-            },
-        );
+        if from_agent {
+            self.record(
+                EventSource::Viewer,
+                EventKind::ControlTaken {
+                    by: granted.controller(),
+                },
+            );
+        }
         Ok(self.grant(&granted))
     }
 
@@ -771,7 +939,7 @@ impl SessionControl {
         let lease = state.held(lease)?;
         lease.last_heartbeat = Instant::now();
         let held = std::mem::take(&mut lease.held);
-        Ok(self.transition(held))
+        Ok(self.transition(&state, held))
     }
 
     /// The holder releases control to the agent.
@@ -793,7 +961,7 @@ impl SessionControl {
                 from: lease.controller(),
             },
         );
-        Ok(self.transition(lease.held))
+        Ok(self.advance(&mut state))
     }
 
     /// End a granted lease whose heartbeat or input stopped. A take that
@@ -816,9 +984,11 @@ impl SessionControl {
     /// Apply the holder's input. Each event is checked against the current
     /// lease, and pointer events against the current frame geometry, right
     /// before it is sent; events of an older generation are dropped. The
-    /// release of a held button is never fenced by geometry, and a fenced
-    /// pointer event releases every held button. Runs of pointer moves are
-    /// coalesced to the last one.
+    /// request sends with the input epoch of its first lease check; events
+    /// the session loop refuses as stale (the lease ended after the check)
+    /// are dropped as stale. The release of a held button is never fenced by
+    /// geometry, and a fenced pointer event releases every held button. Runs
+    /// of pointer moves are coalesced to the last one.
     ///
     /// # Errors
     ///
@@ -848,11 +1018,13 @@ impl SessionControl {
         let _guard = self.input_lock.lock().await;
         let events = coalesce(events);
         let mut remaining = u64::try_from(events.len()).unwrap_or(u64::MAX);
+        let mut epoch = None;
         for event in events {
             remaining -= 1;
             let current = self.frame.as_ref().and_then(|frame| frame.geometry());
-            let fenced = {
+            let (fenced, at) = {
                 let mut state = self.state();
+                let at = *epoch.get_or_insert(state.epoch);
                 let holder = match state.held(lease) {
                     Ok(holder) => holder,
                     Err(lost) => {
@@ -876,23 +1048,30 @@ impl SessionControl {
                     for button in &buttons {
                         holder.held.remove(button);
                     }
-                    Some(buttons)
+                    (Some(buttons), at)
                 } else {
                     track(&mut holder.held, &event);
                     let now = Instant::now();
                     holder.last_input = now;
                     holder.last_heartbeat = now;
                     state.touch_human();
-                    None
+                    (None, at)
                 }
             };
             if let Some(buttons) = fenced {
                 report.dropped.geometry += 1;
-                self.send_releases(buttons).await;
+                self.send_releases(buttons, at).await;
                 continue;
             }
-            match tokio::time::timeout(INPUT_SEND_TIMEOUT, input.send(vec![event])).await {
+            match tokio::time::timeout(INPUT_SEND_TIMEOUT, input.send(vec![event], at)).await {
                 Ok(Ok(())) => report.applied += 1,
+                Ok(Err(DaemonError::Sdk(rdpilot::Error::StaleInput { .. }))) => {
+                    // The lease ended after its check: the loop refused
+                    // this event and released what the old epoch held.
+                    report.dropped.stale += remaining + 1;
+                    report.lost = self.check_lease(lease).err();
+                    return Ok(report);
+                }
                 _ => return Err(InputError::Unavailable),
             }
         }
@@ -916,6 +1095,14 @@ impl Drop for PendingTake<'_> {
         if matches!(&state.lease, Some(lease) if lease.id == self.id && !lease.granted) {
             state.lease = None;
         }
+    }
+}
+
+/// Why the pending take `id` is no longer the lease.
+fn lost_take(state: &State, id: &str) -> TakeError {
+    match state.loss_of(id) {
+        NotHeld::Lost(loss) => TakeError::Lost(loss),
+        NotHeld::Unknown => TakeError::Lost(Loss::by(ControllerRef::Agent)),
     }
 }
 
@@ -996,7 +1183,8 @@ fn releases_held_button(held: &BTreeSet<Held>, event: &RawInput) -> bool {
     matches!(*event, RawInput::Button { button, down: false } if held.contains(&Held::Button(button)))
 }
 
-fn track(held: &mut BTreeSet<Held>, event: &RawInput) {
+/// Track the keys and buttons `event` presses or releases.
+pub(crate) fn track(held: &mut BTreeSet<Held>, event: &RawInput) {
     match *event {
         RawInput::Button { button, down } => {
             if down {

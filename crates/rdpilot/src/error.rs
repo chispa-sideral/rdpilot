@@ -116,6 +116,18 @@ pub enum Error {
         /// The actual computed SHA-256 digest, hex-encoded.
         actual: String,
     },
+
+    /// The session loop refused an input because its
+    /// [`InputEpoch`](crate::InputEpoch) is older than the current one: the
+    /// input epoch changed after the caller captured it. Nothing of the
+    /// refused input reached the server.
+    #[error("input of epoch {sent} was refused: the current input epoch is {current}")]
+    StaleInput {
+        /// The epoch the refused input carried.
+        sent: crate::InputEpoch,
+        /// The current input epoch of the session loop.
+        current: crate::InputEpoch,
+    },
 }
 
 /// Convenience alias for results returned by the `rdpilot` public API.
@@ -221,6 +233,7 @@ impl Error {
             Error::BridgeRejected(_) => "bridge_rejected",
             Error::PathTraversal(_) => "path_traversal",
             Error::ChecksumMismatch { .. } => "checksum_mismatch",
+            Error::StaleInput { .. } => "stale_input",
         }
     }
 }

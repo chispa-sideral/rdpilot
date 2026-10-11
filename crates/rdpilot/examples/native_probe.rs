@@ -1,5 +1,5 @@
 //! Native recovery diagnostic: connect, open Run, type notepad, capture each stage.
-use rdpilot::{ConnectionConfig, Key, KeyAction, Session};
+use rdpilot::{ConnectionConfig, InputEpoch, Key, KeyAction, Session};
 use std::{path::PathBuf, time::Duration};
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -26,18 +26,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let s = Session::connect(&cfg).await?;
     tokio::time::sleep(Duration::from_secs(10)).await;
     capture(&s, &output, "ready").await?;
-    s.send_key(KeyAction::Combo(vec![Key::Win, Key::R])).await?;
+    s.send_key(
+        KeyAction::Combo(vec![Key::Win, Key::R]),
+        InputEpoch::INITIAL,
+    )
+    .await?;
     tokio::time::sleep(Duration::from_secs(2)).await;
     capture(&s, &output, "run").await?;
-    s.send_key(KeyAction::Combo(vec![Key::Ctrl, Key::A]))
-        .await?;
+    s.send_key(
+        KeyAction::Combo(vec![Key::Ctrl, Key::A]),
+        InputEpoch::INITIAL,
+    )
+    .await?;
     for c in "notepad".chars() {
-        s.send_key(KeyAction::Type(c.to_string())).await?;
+        s.send_key(KeyAction::Type(c.to_string()), InputEpoch::INITIAL)
+            .await?;
         tokio::time::sleep(Duration::from_millis(150)).await;
     }
     tokio::time::sleep(Duration::from_secs(2)).await;
     capture(&s, &output, "typed").await?;
-    s.send_key(KeyAction::Combo(vec![Key::Enter])).await?;
+    s.send_key(KeyAction::Combo(vec![Key::Enter]), InputEpoch::INITIAL)
+        .await?;
     tokio::time::sleep(Duration::from_secs(3)).await;
     capture(&s, &output, "entered").await?;
     s.close().await?;

@@ -40,7 +40,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use rdpilot::ConnectionConfig;
+use rdpilot::{ConnectionConfig, InputEpoch};
 use rdpilot_ipc::{SessionId, SessionStatus};
 use rdpilot_vocab::RawInput;
 use tokio::sync::oneshot;
@@ -174,14 +174,47 @@ pub struct Registry {
     bundles: Arc<dyn BundleSource>,
     next_generation: AtomicU64,
     recordings: Arc<RecordingService>,
+    /// Longest wait of a session's control for an input epoch change.
+    epoch_confirm_wait: std::time::Duration,
 }
 
 /// Private ownership handle retained until the `Connected` IPC response is
 /// written. A public session id alone cannot safely reclaim a reused name.
-#[derive(Debug, Clone)]
+/// A clone carries no bootstrap mark.
+#[derive(Debug)]
 pub(crate) struct ConnectLease {
     pub(crate) id: SessionId,
     generation: u64,
+    /// The bootstrap-in-progress mark of a session opened with a bootstrap.
+    bootstrap: Option<BootstrapMark>,
+}
+
+impl Clone for ConnectLease {
+    fn clone(&self) -> Self {
+        ConnectLease {
+            id: self.id.clone(),
+            generation: self.generation,
+            bootstrap: None,
+        }
+    }
+}
+
+impl ConnectLease {
+    /// The bootstrap-in-progress mark, once. Dropping it clears the mark.
+    pub(crate) fn take_bootstrap_mark(&mut self) -> Option<BootstrapMark> {
+        self.bootstrap.take()
+    }
+}
+
+/// While set, a human take of the session is refused as busy at once: the
+/// bridge bootstrap types its launch keys. Dropping the mark clears it.
+#[derive(Debug)]
+pub(crate) struct BootstrapMark(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for BootstrapMark {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 
 /// Why [`Registry::expire_retained`] removes entries; it names the cause in
@@ -309,7 +342,16 @@ impl Registry {
             bundles: Arc::new(NoBundleSource),
             next_generation: AtomicU64::new(1),
             recordings,
+            epoch_confirm_wait: crate::control::EPOCH_CONFIRM_WAIT,
         }
+    }
+
+    /// Wait at most `wait` for a session loop to confirm an input epoch
+    /// change (builder).
+    #[must_use]
+    pub(crate) fn with_epoch_confirm_wait(mut self, wait: std::time::Duration) -> Self {
+        self.epoch_confirm_wait = wait;
+        self
     }
 
     /// The recording service.
@@ -477,18 +519,23 @@ impl Registry {
         host: String,
         cfg: ConnectionConfig,
     ) -> Result<SessionId, DaemonError> {
-        Ok(self.open_tracked(name, host, cfg).await?.id)
+        Ok(self.open_tracked(name, host, cfg, false).await?.id)
     }
 
     /// Like [`Registry::open`], but returns an internal exact-generation
     /// ownership handle for the IPC response path. It does not await after
     /// the session is inserted and recorded, so a dropped future leaves either
     /// no entry or an entry whose lease the caller holds.
+    ///
+    /// With `bootstrap`, the session is inserted with its
+    /// bootstrap-in-progress mark set, and the lease carries the mark: the
+    /// caller drops it when the bootstrap ends.
     pub(crate) async fn open_tracked(
         &self,
         name: Option<String>,
         host: String,
         cfg: ConnectionConfig,
+        bootstrap: bool,
     ) -> Result<ConnectLease, DaemonError> {
         let (id, attempt, mut cancel_rx) = match &name {
             Some(n) => {
@@ -509,9 +556,10 @@ impl Registry {
             None => self.claim_with_auto_id()?,
         }; // claim() has already released the lock by this point — nothing
            // is held across the `.await` below.
-        let lease = ConnectLease {
+        let mut lease = ConnectLease {
             id: id.clone(),
             generation: attempt,
+            bootstrap: None,
         };
 
         // The connect runs on its own task so that removing the placeholder
@@ -574,8 +622,10 @@ impl Registry {
             Arc::clone(&events),
             frame.clone(),
             session.human_input(),
+            self.epoch_confirm_wait,
         ));
         let lifecycle = session.lifecycle();
+        let bootstrapping = Arc::new(std::sync::atomic::AtomicBool::new(bootstrap));
         // A single wall-clock capture shared by the entry's
         // `connected_since_wall`/`last_activity_wall` and the
         // reconciliation record — avoids two independent
@@ -625,6 +675,7 @@ impl Registry {
                         control,
                         last_activity_wall: now_wall.clone(),
                         ended_seen: None,
+                        bootstrapping: Arc::clone(&bootstrapping),
                     },
                 );
                 None
@@ -648,6 +699,9 @@ impl Registry {
                 Ok(cause) => cancelled_by(cause),
                 Err(_) => connect_cancelled(),
             });
+        }
+        if bootstrap {
+            lease.bootstrap = Some(BootstrapMark(bootstrapping));
         }
         Ok(lease)
     }
@@ -772,8 +826,11 @@ impl Registry {
         drop(end_hook);
         if ended {
             self.records.closed(id, generation);
+            // The session loop is gone: nothing to confirm.
+            end_lease_of_ended(&control).await;
+        } else {
+            end_lease(&control, EndReason::SessionEnded).await;
         }
-        end_lease(&control, EndReason::SessionEnded).await;
         self.recordings.session_closed(&events, reason);
         // Take the SIZED `Box` out of the `Option` (never the unsized
         // `dyn ManagedSession` itself, which does not compile out of an
@@ -906,7 +963,9 @@ impl Registry {
     /// viewer holds (or is taking) the control lease, and waits for the
     /// releases of an ended lease to be sent. Checking under the
     /// per-session lock is what orders it with a human take, which marks
-    /// the lease first and then waits for this lock.
+    /// the lease first and then waits for this lock. `op` sends with the
+    /// input epoch captured at admission; input refused as stale while a
+    /// human holds or takes the lease is that human's control.
     ///
     /// # Errors
     ///
@@ -914,7 +973,10 @@ impl Registry {
     pub(crate) async fn call_acting<T>(
         &self,
         id: &SessionId,
-        op: impl for<'a> FnOnce(&'a dyn ManagedSession) -> BoxFuture<'a, Result<T, DaemonError>>,
+        op: impl for<'a> FnOnce(
+            &'a dyn ManagedSession,
+            InputEpoch,
+        ) -> BoxFuture<'a, Result<T, DaemonError>>,
     ) -> Result<T, DaemonError> {
         let (entry, control) = {
             #[allow(clippy::expect_used)] // A poisoned registry mutex is unrecoverable.
@@ -934,9 +996,11 @@ impl Registry {
             }
         };
         let guard = entry.lock().await;
-        control.admit_agent().await?;
+        let epoch = control.admit_agent().await?;
         match guard.as_deref() {
-            Some(session) => op(session).await,
+            Some(session) => op(session, epoch)
+                .await
+                .map_err(|error| control.stale_error(error)),
             None => Err(DaemonError::SessionNotFound(id.as_str().to_owned())),
         }
     }
@@ -1009,17 +1073,33 @@ impl Registry {
 
     /// The per-session lock of `id` plus its control, for a human take: the
     /// take waits on the lock to let an in-flight native operation finish.
-    /// `None` once the session has ended.
-    pub(crate) fn take_parts(&self, id: &SessionId) -> Option<(SessionSlot, Arc<SessionControl>)> {
+    ///
+    /// # Errors
+    ///
+    /// [`ControlRefusal::NoSession`] when `id` is not a live session with an
+    /// input path (or has ended); [`TakeError::Busy`] at once while its bridge
+    /// bootstrap types its launch keys.
+    pub(crate) fn take_parts(
+        &self,
+        id: &SessionId,
+    ) -> Result<(SessionSlot, Arc<SessionControl>), ControlRefusal> {
         #[allow(clippy::expect_used)] // A poisoned registry mutex is unrecoverable.
         let guard = self.sessions.lock().expect("registry mutex poisoned");
         match guard.get(id) {
             Some(
                 entry @ SessionEntry::Live {
-                    session, control, ..
+                    session,
+                    control,
+                    bootstrapping,
+                    ..
                 },
-            ) if entry.end_cause().is_none() => Some((Arc::clone(session), Arc::clone(control))),
-            _ => None,
+            ) if entry.end_cause().is_none() && control.has_input() => {
+                if bootstrapping.load(Ordering::Acquire) {
+                    return Err(ControlRefusal::Take(TakeError::Busy));
+                }
+                Ok((Arc::clone(session), Arc::clone(control)))
+            }
+            _ => Err(ControlRefusal::NoSession),
         }
     }
 
@@ -1267,9 +1347,18 @@ impl Registry {
 /// The per-session lock around a live session.
 pub(crate) type SessionSlot = Arc<tokio::sync::Mutex<Option<Box<dyn ManagedSession>>>>;
 
-/// End `control`'s human lease (if any) for `reason` and send its releases.
+/// End `control`'s human lease (if any) for `reason` and send its epoch
+/// change (or its releases).
 pub(crate) async fn end_lease(control: &SessionControl, reason: EndReason) {
     if let Some(transition) = control.end_human(reason) {
+        control.discharge(transition).await;
+    }
+}
+
+/// End `control`'s human lease (if any) because its session ended. Nothing is
+/// sent and no epoch change is waited for: the session loop is gone.
+pub(crate) async fn end_lease_of_ended(control: &SessionControl) {
+    if let Some(transition) = control.end_human_ended() {
         control.discharge(transition).await;
     }
 }
@@ -1468,11 +1557,7 @@ impl ViewerControl {
         id: &SessionId,
         address: std::net::IpAddr,
     ) -> Result<(Grant, Option<(u32, u32)>), ControlRefusal> {
-        let (slot, control) = self
-            .inner
-            .take_parts(id)
-            .filter(|(_, control)| control.has_input())
-            .ok_or(ControlRefusal::NoSession)?;
+        let (slot, control) = self.inner.take_parts(id)?;
         let agent_idle = async move {
             drop(slot.lock().await);
         };
@@ -1709,10 +1794,15 @@ mod tests {
         fn send_mouse(
             &self,
             _action: rdpilot::MouseAction,
+            _epoch: rdpilot::InputEpoch,
         ) -> BoxFuture<'_, Result<(), DaemonError>> {
             Box::pin(async { Ok(()) })
         }
-        fn send_key(&self, _action: rdpilot::KeyAction) -> BoxFuture<'_, Result<(), DaemonError>> {
+        fn send_key(
+            &self,
+            _action: rdpilot::KeyAction,
+            _epoch: rdpilot::InputEpoch,
+        ) -> BoxFuture<'_, Result<(), DaemonError>> {
             Box::pin(async { Ok(()) })
         }
 
@@ -1753,7 +1843,10 @@ mod tests {
         fn desktop_size(&self) -> (u32, u32) {
             (1920, 1080)
         }
-        fn deploy_and_launch(&self) -> BoxFuture<'_, Result<std::time::Duration, DaemonError>> {
+        fn deploy_and_launch(
+            &self,
+            _epoch: rdpilot::InputEpoch,
+        ) -> BoxFuture<'_, Result<std::time::Duration, DaemonError>> {
             Box::pin(async move { Ok(std::time::Duration::from_millis(0)) })
         }
     }
@@ -2263,8 +2356,9 @@ mod tests {
         registry: &'a Registry,
         name: &str,
     ) -> Pin<Box<dyn Future<Output = Opened> + Send + 'a>> {
-        let mut open: Pin<Box<dyn Future<Output = Opened> + Send + 'a>> =
-            Box::pin(registry.open_tracked(Some(name.to_owned()), "h".to_owned(), test_cfg()));
+        let mut open: Pin<Box<dyn Future<Output = Opened> + Send + 'a>> = Box::pin(
+            registry.open_tracked(Some(name.to_owned()), "h".to_owned(), test_cfg(), false),
+        );
         tokio::select! {
             biased;
             _ = &mut open => panic!("the gated connect cannot have finished"),
@@ -2309,6 +2403,7 @@ mod tests {
         ConnectLease {
             id: SessionId::from_str(name).expect("non-empty literal"),
             generation: attempt,
+            bootstrap: None,
         }
     }
 
@@ -2593,7 +2688,7 @@ mod tests {
         let began = tokio::time::Instant::now();
 
         let error = registry
-            .open_tracked(Some("s".to_owned()), "h".to_owned(), test_cfg())
+            .open_tracked(Some("s".to_owned()), "h".to_owned(), test_cfg(), false)
             .await
             .expect_err("a connect that is never released times out");
 
@@ -2617,7 +2712,7 @@ mod tests {
         // The name is free again.
         calls[1].gate.add_permits(1);
         let lease = registry
-            .open_tracked(Some("s".to_owned()), "h".to_owned(), test_cfg())
+            .open_tracked(Some("s".to_owned()), "h".to_owned(), test_cfg(), false)
             .await
             .expect("the name connects again");
         assert_eq!(live_generation(&registry, "s"), Some(lease.generation));
@@ -2643,6 +2738,7 @@ mod tests {
             lease: ConnectLease {
                 id,
                 generation: attempt,
+                bootstrap: None,
             },
             rx,
             armed: true,
@@ -2812,7 +2908,7 @@ mod tests {
 
     async fn open_named(registry: &Registry, name: &str) -> ConnectLease {
         registry
-            .open_tracked(Some(name.to_owned()), "h".to_owned(), test_cfg())
+            .open_tracked(Some(name.to_owned()), "h".to_owned(), test_cfg(), false)
             .await
             .expect("open")
     }
@@ -2958,8 +3054,8 @@ mod tests {
         );
         assert_ended_refusal(
             registry
-                .call_acting(&id, |session| {
-                    session.send_key(rdpilot::KeyAction::Combo(vec![rdpilot::Key::Enter]))
+                .call_acting(&id, |session, epoch| {
+                    session.send_key(rdpilot::KeyAction::Combo(vec![rdpilot::Key::Enter]), epoch)
                 })
                 .await
                 .expect_err("key"),
@@ -2978,7 +3074,10 @@ mod tests {
                 .expect("recording start"),
         );
         assert!(registry.control(&id).is_none());
-        assert!(registry.take_parts(&id).is_none());
+        assert!(matches!(
+            registry.take_parts(&id),
+            Err(ControlRefusal::NoSession)
+        ));
         let control = ViewerControl::new(Arc::clone(&registry));
         assert!(matches!(
             control.heartbeat(&id, "lease"),

@@ -350,10 +350,15 @@ mod tests {
         fn send_mouse(
             &self,
             _action: rdpilot::MouseAction,
+            _epoch: rdpilot::InputEpoch,
         ) -> BoxFuture<'_, Result<(), DaemonError>> {
             Box::pin(async { Ok(()) })
         }
-        fn send_key(&self, _action: rdpilot::KeyAction) -> BoxFuture<'_, Result<(), DaemonError>> {
+        fn send_key(
+            &self,
+            _action: rdpilot::KeyAction,
+            _epoch: rdpilot::InputEpoch,
+        ) -> BoxFuture<'_, Result<(), DaemonError>> {
             Box::pin(async { Ok(()) })
         }
 
@@ -387,7 +392,10 @@ mod tests {
         fn desktop_size(&self) -> (u32, u32) {
             (1920, 1080)
         }
-        fn deploy_and_launch(&self) -> BoxFuture<'_, Result<std::time::Duration, DaemonError>> {
+        fn deploy_and_launch(
+            &self,
+            _epoch: rdpilot::InputEpoch,
+        ) -> BoxFuture<'_, Result<std::time::Duration, DaemonError>> {
             Box::pin(async move { Ok(std::time::Duration::from_millis(0)) })
         }
     }

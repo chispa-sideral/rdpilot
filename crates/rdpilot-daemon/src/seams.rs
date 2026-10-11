@@ -28,7 +28,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use rdpilot::{ConnectionConfig, Session};
+use rdpilot::{ConnectionConfig, InputEpoch, Session};
 use rdpilot_ipc::{SessionId, SessionLifecycle, SessionStatus};
 use rdpilot_vocab::RawInput;
 
@@ -95,19 +95,31 @@ pub trait ManagedSession: Send + Sync + 'static {
     /// Returns [`DaemonError::Sdk`] on any underlying SDK failure.
     fn screenshot(&self) -> BoxFuture<'_, Result<rdpilot::Screenshot, DaemonError>>;
 
-    /// Inject a mouse action (mirrors [`rdpilot::Session::send_mouse`]).
+    /// Inject a mouse action as input of `epoch` (mirrors
+    /// [`rdpilot::Session::send_mouse`]).
     ///
     /// # Errors
     ///
-    /// Returns [`DaemonError::Sdk`] on any underlying SDK failure.
-    fn send_mouse(&self, action: rdpilot::MouseAction) -> BoxFuture<'_, Result<(), DaemonError>>;
+    /// Returns [`DaemonError::Sdk`] on any underlying SDK failure, including
+    /// [`rdpilot::Error::StaleInput`] for an epoch older than the session's.
+    fn send_mouse(
+        &self,
+        action: rdpilot::MouseAction,
+        epoch: InputEpoch,
+    ) -> BoxFuture<'_, Result<(), DaemonError>>;
 
-    /// Inject a keyboard action (mirrors [`rdpilot::Session::send_key`]).
+    /// Inject a keyboard action as input of `epoch` (mirrors
+    /// [`rdpilot::Session::send_key`]).
     ///
     /// # Errors
     ///
-    /// Returns [`DaemonError::Sdk`] on any underlying SDK failure.
-    fn send_key(&self, action: rdpilot::KeyAction) -> BoxFuture<'_, Result<(), DaemonError>>;
+    /// Returns [`DaemonError::Sdk`] on any underlying SDK failure, including
+    /// [`rdpilot::Error::StaleInput`] for an epoch older than the session's.
+    fn send_key(
+        &self,
+        action: rdpilot::KeyAction,
+        epoch: InputEpoch,
+    ) -> BoxFuture<'_, Result<(), DaemonError>>;
 
     /// Upload a local file to the remote transfer root (mirrors [`rdpilot::Session::upload_file`]).
     ///
@@ -144,9 +156,13 @@ pub trait ManagedSession: Send + Sync + 'static {
     /// `.await`/`BoxFuture` needed.
     fn desktop_size(&self) -> (u32, u32);
 
-    /// Deploy the configured bundle and start the bridge in the interactive session.
+    /// Deploy the configured bundle and start the bridge in the interactive session,
+    /// with launch keys of `epoch`.
     /// Returns only after bridge readiness or a bounded bootstrap error.
-    fn deploy_and_launch(&self) -> BoxFuture<'_, Result<std::time::Duration, DaemonError>>;
+    fn deploy_and_launch(
+        &self,
+        epoch: InputEpoch,
+    ) -> BoxFuture<'_, Result<std::time::Duration, DaemonError>>;
 
     /// Fixed, redacted bootstrap milestones observed by this session. The
     /// default keeps existing fake sessions source-compatible.
@@ -170,12 +186,111 @@ pub trait ManagedSession: Send + Sync + 'static {
 }
 
 /// Sends human input events to one session without the per-session lock.
-/// Implementations apply them through the same input state as the agent's
-/// native input.
+/// Implementations apply them through the same input state and input epoch
+/// as the agent's native input.
 pub trait HumanInput: Send + Sync + 'static {
-    /// Send `events` in order; resolves once the session's input channel
-    /// took them.
-    fn send(&self, events: Vec<RawInput>) -> BoxFuture<'_, Result<(), DaemonError>>;
+    /// Send `events` in order as input of `epoch`; resolves once the
+    /// session loop accepted or refused them.
+    ///
+    /// # Errors
+    ///
+    /// [`DaemonError::Sdk`] with [`rdpilot::Error::StaleInput`] for an epoch
+    /// older than the session's; another error when the session is gone.
+    fn send(
+        &self,
+        events: Vec<RawInput>,
+        epoch: InputEpoch,
+    ) -> BoxFuture<'_, Result<(), DaemonError>>;
+
+    /// Change the session's input epoch to `epoch` (when newer, after the
+    /// releases of every key and button still pressed are written).
+    ///
+    /// # Errors
+    ///
+    /// An error when the session is gone.
+    fn set_epoch(&self, epoch: InputEpoch) -> BoxFuture<'_, Result<(), DaemonError>>;
+}
+
+/// The input epoch and the pressed keys and buttons as the session loop
+/// keeps them, for session fakes: input of an older epoch is refused as
+/// stale, and a change to a newer epoch releases everything still pressed,
+/// buttons before keys.
+#[derive(Debug)]
+pub(crate) struct LoopInputModel {
+    epoch: InputEpoch,
+    held: std::collections::BTreeSet<crate::control::Held>,
+}
+
+impl Default for LoopInputModel {
+    fn default() -> Self {
+        LoopInputModel {
+            epoch: InputEpoch::INITIAL,
+            held: std::collections::BTreeSet::new(),
+        }
+    }
+}
+
+impl LoopInputModel {
+    /// Accept `events` of `epoch`: the releases of an implicit change to a
+    /// newer epoch (sent before `events`), or the stale error of an older
+    /// epoch.
+    ///
+    /// # Errors
+    ///
+    /// [`DaemonError::Sdk`] with [`rdpilot::Error::StaleInput`] for an epoch
+    /// older than the current one.
+    pub(crate) fn accept(
+        &mut self,
+        epoch: InputEpoch,
+        events: &[RawInput],
+    ) -> Result<Vec<RawInput>, DaemonError> {
+        if epoch < self.epoch {
+            return Err(DaemonError::Sdk(rdpilot::Error::StaleInput {
+                sent: epoch,
+                current: self.epoch,
+            }));
+        }
+        let releases = self.set_epoch(epoch);
+        for event in events {
+            crate::control::track(&mut self.held, event);
+        }
+        Ok(releases)
+    }
+
+    /// What the session sends for `events` of `epoch`: the releases of an
+    /// implicit epoch change, then `events`.
+    ///
+    /// # Errors
+    ///
+    /// As for [`LoopInputModel::accept`].
+    #[cfg(test)]
+    pub(crate) fn send(
+        &mut self,
+        epoch: InputEpoch,
+        events: Vec<RawInput>,
+    ) -> Result<Vec<RawInput>, DaemonError> {
+        let mut sent = self.accept(epoch, &events)?;
+        sent.extend(events);
+        Ok(sent)
+    }
+
+    /// Change to `epoch` if it is newer and return the releases of every
+    /// key and button still pressed; nothing when it is not newer.
+    pub(crate) fn set_epoch(&mut self, epoch: InputEpoch) -> Vec<RawInput> {
+        if epoch <= self.epoch {
+            return Vec::new();
+        }
+        self.epoch = epoch;
+        std::mem::take(&mut self.held)
+            .into_iter()
+            .map(crate::control::Held::release)
+            .collect()
+    }
+
+    /// The keys and buttons still pressed.
+    pub(crate) fn held(&self) -> usize {
+        self.held.len()
+    }
 }
 
 /// Read-only access to one session's latest framebuffer for the live viewer.
@@ -212,9 +327,21 @@ impl ViewFrameSource for rdpilot::FrameWatch {
 }
 
 impl HumanInput for rdpilot::InputHandle {
-    fn send(&self, events: Vec<RawInput>) -> BoxFuture<'_, Result<(), DaemonError>> {
+    fn send(
+        &self,
+        events: Vec<RawInput>,
+        epoch: InputEpoch,
+    ) -> BoxFuture<'_, Result<(), DaemonError>> {
         Box::pin(async move {
-            rdpilot::InputHandle::send(self, events)
+            rdpilot::InputHandle::send(self, events, epoch)
+                .await
+                .map_err(DaemonError::Sdk)
+        })
+    }
+
+    fn set_epoch(&self, epoch: InputEpoch) -> BoxFuture<'_, Result<(), DaemonError>> {
+        Box::pin(async move {
+            rdpilot::InputHandle::set_epoch(self, epoch)
                 .await
                 .map_err(DaemonError::Sdk)
         })
@@ -240,12 +367,24 @@ impl ManagedSession for Session {
         Box::pin(async move { self.screenshot().await.map_err(DaemonError::Sdk) })
     }
 
-    fn send_mouse(&self, action: rdpilot::MouseAction) -> BoxFuture<'_, Result<(), DaemonError>> {
-        Box::pin(async move { self.send_mouse(action).await.map_err(DaemonError::Sdk) })
+    fn send_mouse(
+        &self,
+        action: rdpilot::MouseAction,
+        epoch: InputEpoch,
+    ) -> BoxFuture<'_, Result<(), DaemonError>> {
+        Box::pin(async move {
+            self.send_mouse(action, epoch)
+                .await
+                .map_err(DaemonError::Sdk)
+        })
     }
 
-    fn send_key(&self, action: rdpilot::KeyAction) -> BoxFuture<'_, Result<(), DaemonError>> {
-        Box::pin(async move { self.send_key(action).await.map_err(DaemonError::Sdk) })
+    fn send_key(
+        &self,
+        action: rdpilot::KeyAction,
+        epoch: InputEpoch,
+    ) -> BoxFuture<'_, Result<(), DaemonError>> {
+        Box::pin(async move { self.send_key(action, epoch).await.map_err(DaemonError::Sdk) })
     }
 
     fn upload_file(
@@ -280,8 +419,15 @@ impl ManagedSession for Session {
         self.desktop_size()
     }
 
-    fn deploy_and_launch(&self) -> BoxFuture<'_, Result<std::time::Duration, DaemonError>> {
-        Box::pin(async move { self.deploy_and_launch().await.map_err(DaemonError::Sdk) })
+    fn deploy_and_launch(
+        &self,
+        epoch: InputEpoch,
+    ) -> BoxFuture<'_, Result<std::time::Duration, DaemonError>> {
+        Box::pin(async move {
+            self.deploy_and_launch(epoch)
+                .await
+                .map_err(DaemonError::Sdk)
+        })
     }
 
     fn bootstrap_stages(&self) -> Vec<rdpilot::BootstrapStage> {
@@ -523,6 +669,11 @@ pub enum SessionEntry {
         /// while it is live or not yet seen. The entry is removed one
         /// retention period after it.
         ended_seen: Option<Instant>,
+        /// Set while the bridge bootstrap of a Connect types its launch
+        /// keys: a human take is then refused as busy at once. Set at insert
+        /// when a bundle is configured; the Connect clears it when the
+        /// bootstrap ends.
+        bootstrapping: Arc<std::sync::atomic::AtomicBool>,
     },
     /// A possibly-still-live remote Windows session surfaced after a
     /// crash-restart (DAEMON-04). The remote session is never torn down; the

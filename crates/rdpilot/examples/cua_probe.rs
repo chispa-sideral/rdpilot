@@ -3,7 +3,7 @@
 //! BUNDLE_DIR is a prepared bundle directory (rdpilot-bridge.exe, the Cua archive and
 //! manifest.json), for example a per-connect directory under the daemon's cache.
 //! REQUESTS_JSONL contains native Cua requests; initialize is performed automatically.
-use rdpilot::{ConnectionConfig, Session};
+use rdpilot::{ConnectionConfig, InputEpoch, Session};
 use serde_json::json;
 use std::{io::Write, path::PathBuf, time::Duration};
 #[tokio::main]
@@ -42,7 +42,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let session = Session::connect(&cfg).await?;
     eprintln!("RDP connected; deploying bundle");
     {
-        let deploy = session.deploy_and_launch();
+        let deploy = session.deploy_and_launch(InputEpoch::INITIAL);
         tokio::pin!(deploy);
         let mut snapshots = tokio::time::interval(Duration::from_secs(3));
         let mut count = 0;

@@ -12,15 +12,34 @@ use super::*;
 use crate::events::{EventKind, SessionEvents};
 use crate::seams::{BoxFuture, HumanInput, ViewFrameSource};
 
-/// Records every event it is sent, in order.
+/// Records every event the session loop would send, in order (the releases
+/// of an epoch change included), and every epoch change it is sent.
 #[derive(Default)]
 pub(crate) struct Sink {
     pub(crate) sent: Mutex<Vec<RawInput>>,
+    model: Mutex<crate::seams::LoopInputModel>,
+    epochs: Mutex<Vec<InputEpoch>>,
+    /// The epochs of the agent's native actions.
+    agent: Mutex<Vec<InputEpoch>>,
 }
 
 impl HumanInput for Sink {
-    fn send(&self, events: Vec<RawInput>) -> BoxFuture<'_, Result<(), DaemonError>> {
-        self.sent.lock().unwrap().extend(events);
+    fn send(
+        &self,
+        events: Vec<RawInput>,
+        epoch: InputEpoch,
+    ) -> BoxFuture<'_, Result<(), DaemonError>> {
+        let sent = self.model.lock().unwrap().send(epoch, events);
+        Box::pin(async move {
+            self.sent.lock().unwrap().extend(sent?);
+            Ok(())
+        })
+    }
+
+    fn set_epoch(&self, epoch: InputEpoch) -> BoxFuture<'_, Result<(), DaemonError>> {
+        self.epochs.lock().unwrap().push(epoch);
+        let releases = self.model.lock().unwrap().set_epoch(epoch);
+        self.sent.lock().unwrap().extend(releases);
         Box::pin(async { Ok(()) })
     }
 }
@@ -28,6 +47,11 @@ impl HumanInput for Sink {
 impl Sink {
     fn take(&self) -> Vec<RawInput> {
         std::mem::take(&mut *self.sent.lock().unwrap())
+    }
+
+    /// The epoch changes sent so far, emptied.
+    fn epochs(&self) -> Vec<InputEpoch> {
+        std::mem::take(&mut *self.epochs.lock().unwrap())
     }
 }
 
@@ -66,6 +90,7 @@ fn fixture() -> Fixture {
         Arc::clone(&events),
         Some(Arc::clone(&frames) as Arc<dyn ViewFrameSource>),
         Some(Arc::clone(&sink) as Arc<dyn HumanInput>),
+        EPOCH_CONFIRM_WAIT,
     );
     Fixture {
         control,
@@ -188,8 +213,8 @@ async fn agent_takeover_releases_held_keys_and_is_a_no_op_under_agent_control() 
     let (previous, transition) = f.control.agent_takeover(EventSource::Cli);
     assert_eq!(previous.address.as_deref(), Some("100.64.0.3"));
     let transition = transition.expect("a human held the lease");
-    assert_eq!(transition.releases(), 2);
-    f.control.discharge(transition).await;
+    assert_eq!(transition.epoch(), Some(InputEpoch::INITIAL.next().next()));
+    assert!(f.control.discharge(transition).await);
     let sent = f.sink.take();
     assert!(sent.contains(&key(SHIFT, false)));
     assert!(sent.contains(&RawInput::Button {
@@ -582,6 +607,7 @@ async fn geometry_fencing_never_leaves_a_button_down() {
     let transition = f.control.release(&grant.lease).unwrap();
     assert_eq!(transition.releases(), 0);
     f.control.discharge(transition).await;
+    assert!(f.sink.take().is_empty());
 }
 
 #[tokio::test]
@@ -612,13 +638,18 @@ wait and retry, or take over with: rdpilot takeover --session notepad"
     );
 }
 
-/// Human input that also hears when the agent's native action reaches an
-/// [`InputSession`].
+/// Human input that also hears when the agent's native action of `epoch`
+/// reaches an [`InputSession`], and checks its epoch as the loop does.
 trait AgentLog: HumanInput {
-    fn agent_acted(&self) {}
+    fn agent_acted(&self, epoch: InputEpoch) -> BoxFuture<'_, Result<(), DaemonError>>;
 }
 
-impl AgentLog for Sink {}
+impl AgentLog for Sink {
+    fn agent_acted(&self, epoch: InputEpoch) -> BoxFuture<'_, Result<(), DaemonError>> {
+        self.agent.lock().unwrap().push(epoch);
+        self.send(Vec::new(), epoch)
+    }
+}
 
 /// A registry session whose human input goes to a shared sink.
 struct InputSession<S>(Arc<S>);
@@ -633,20 +664,16 @@ impl<S: AgentLog> crate::seams::ManagedSession for InputSession<S> {
     fn send_mouse(
         &self,
         _: rdpilot::MouseAction,
+        epoch: rdpilot::InputEpoch,
     ) -> crate::seams::BoxFuture<'_, Result<(), DaemonError>> {
-        Box::pin(async {
-            self.0.agent_acted();
-            Ok(())
-        })
+        self.0.agent_acted(epoch)
     }
     fn send_key(
         &self,
         _: rdpilot::KeyAction,
+        epoch: rdpilot::InputEpoch,
     ) -> crate::seams::BoxFuture<'_, Result<(), DaemonError>> {
-        Box::pin(async {
-            self.0.agent_acted();
-            Ok(())
-        })
+        self.0.agent_acted(epoch)
     }
     fn upload_file(
         &self,
@@ -668,7 +695,10 @@ impl<S: AgentLog> crate::seams::ManagedSession for InputSession<S> {
     fn desktop_size(&self) -> (u32, u32) {
         (1, 1)
     }
-    fn deploy_and_launch(&self) -> crate::seams::BoxFuture<'_, Result<Duration, DaemonError>> {
+    fn deploy_and_launch(
+        &self,
+        _epoch: rdpilot::InputEpoch,
+    ) -> crate::seams::BoxFuture<'_, Result<Duration, DaemonError>> {
         Box::pin(async { Ok(Duration::ZERO) })
     }
     fn human_input(&self) -> Option<Arc<dyn HumanInput>> {
@@ -747,19 +777,30 @@ enum Rec {
     Agent,
 }
 
-/// A human input sink that holds every send until the gate opens, and
-/// records human events and agent actions in one sequence.
+/// A session input that, while shut, holds every send, epoch change and
+/// agent action at a FIFO gate (the order of the session loop's queue), and
+/// records human events, releases and agent actions in one sequence, as the
+/// loop would send them. It starts open.
 struct GatedSink {
     log: Mutex<Vec<Rec>>,
     gate: tokio::sync::Semaphore,
+    model: Mutex<crate::seams::LoopInputModel>,
+    /// The epochs of the agent's actions.
+    agent_epochs: Mutex<Vec<InputEpoch>>,
 }
 
 impl GatedSink {
     fn new() -> Self {
         GatedSink {
             log: Mutex::new(Vec::new()),
-            gate: tokio::sync::Semaphore::new(0),
+            gate: tokio::sync::Semaphore::new(1),
+            model: Mutex::new(crate::seams::LoopInputModel::default()),
+            agent_epochs: Mutex::new(Vec::new()),
         }
+    }
+
+    fn shut(&self) {
+        self.gate.try_acquire().unwrap().forget();
     }
 
     fn open(&self) {
@@ -769,24 +810,51 @@ impl GatedSink {
     fn log(&self) -> Vec<Rec> {
         self.log.lock().unwrap().clone()
     }
+
+    /// Pass the gate, then apply `events` of `epoch` and log what is sent.
+    async fn pass(
+        &self,
+        epoch: InputEpoch,
+        events: Vec<RawInput>,
+        agent: bool,
+    ) -> Result<(), DaemonError> {
+        drop(self.gate.acquire().await.unwrap());
+        let sent = self.model.lock().unwrap().send(epoch, events)?;
+        let mut log = self.log.lock().unwrap();
+        log.extend(sent.into_iter().map(Rec::Human));
+        if agent {
+            log.push(Rec::Agent);
+            self.agent_epochs.lock().unwrap().push(epoch);
+        }
+        Ok(())
+    }
 }
 
 impl HumanInput for GatedSink {
-    fn send(&self, events: Vec<RawInput>) -> BoxFuture<'_, Result<(), DaemonError>> {
+    fn send(
+        &self,
+        events: Vec<RawInput>,
+        epoch: InputEpoch,
+    ) -> BoxFuture<'_, Result<(), DaemonError>> {
+        Box::pin(self.pass(epoch, events, false))
+    }
+
+    fn set_epoch(&self, epoch: InputEpoch) -> BoxFuture<'_, Result<(), DaemonError>> {
         Box::pin(async move {
             drop(self.gate.acquire().await.unwrap());
+            let releases = self.model.lock().unwrap().set_epoch(epoch);
             self.log
                 .lock()
                 .unwrap()
-                .extend(events.into_iter().map(Rec::Human));
+                .extend(releases.into_iter().map(Rec::Human));
             Ok(())
         })
     }
 }
 
 impl AgentLog for GatedSink {
-    fn agent_acted(&self) {
-        self.log.lock().unwrap().push(Rec::Agent);
+    fn agent_acted(&self, epoch: InputEpoch) -> BoxFuture<'_, Result<(), DaemonError>> {
+        Box::pin(self.pass(epoch, Vec::new(), true))
     }
 }
 
@@ -845,6 +913,7 @@ async fn native_action_after(path: EndPath) -> Vec<Rec> {
         id,
     } = gated().await;
     let (grant, _) = viewer.take(&id, tab(1)).await.unwrap();
+    sink.shut();
     let control = registry.control(&id).unwrap();
 
     // 1. The holder presses Shift; the send waits at the gate.
@@ -877,7 +946,9 @@ async fn native_action_after(path: EndPath) -> Vec<Rec> {
     let agent = async {
         tokio::time::sleep(Duration::from_millis(2)).await;
         registry
-            .call_acting(&id, |s| s.send_key(rdpilot::KeyAction::Type("a".into())))
+            .call_acting(&id, |s, epoch| {
+                s.send_key(rdpilot::KeyAction::Type("a".into()), epoch)
+            })
             .await
     };
     // 4. The input channel takes events again.
@@ -959,6 +1030,7 @@ async fn another_tab_acts_only_after_the_first_tabs_releases() {
         sink, viewer, id, ..
     } = gated().await;
     let (first, _) = viewer.take(&id, tab(1)).await.unwrap();
+    sink.shut();
     let first_input = viewer.input(
         &id,
         &first.lease,
@@ -996,4 +1068,469 @@ async fn another_tab_acts_only_after_the_first_tabs_releases() {
             Rec::Human(key(0x1E, false)),
         ]
     );
+}
+
+/// Advance `epoch` by one: that epoch change is the only one the sink saw
+/// since the last check, and it is the control's epoch now.
+fn one_change(f: &Fixture, epoch: &mut InputEpoch) {
+    *epoch = epoch.next();
+    assert_eq!(f.sink.epochs(), vec![*epoch]);
+    assert_eq!(f.control.input_epoch(), *epoch);
+}
+
+fn no_change(f: &Fixture, epoch: InputEpoch) {
+    assert_eq!(f.sink.epochs(), Vec::<InputEpoch>::new());
+    assert_eq!(f.control.input_epoch(), epoch);
+}
+
+/// Every controller change (a granted lease that ends or moves) sends one
+/// epoch change before the next controller acts; a blur, a geometry fence,
+/// an ended session and Cua acting calls under agent control send none.
+#[tokio::test]
+async fn every_controller_change_advances_the_epoch_once_and_blur_does_not() {
+    let f = fixture();
+    let mut epoch = InputEpoch::INITIAL;
+    // Take from the agent.
+    let a = take(&f, 1).await;
+    one_change(&f, &mut epoch);
+    // Blur and a geometry fence release without a change.
+    f.control
+        .input(&a.lease, 7, (800, 600), vec![left(true), key(SHIFT, true)])
+        .await
+        .unwrap();
+    let transition = f.control.blur(&a.lease).unwrap();
+    assert!(f.control.discharge(transition).await);
+    f.control
+        .input(&a.lease, 7, (800, 600), vec![left(true)])
+        .await
+        .unwrap();
+    let report = f
+        .control
+        .input(
+            &a.lease,
+            7,
+            (800, 600),
+            vec![RawInput::PointerMove { x: 900, y: 1 }],
+        )
+        .await
+        .unwrap();
+    assert_eq!(report.dropped.geometry, 1);
+    no_change(&f, epoch);
+    // Take from another tab, then release.
+    let b = take(&f, 2).await;
+    one_change(&f, &mut epoch);
+    let transition = f.control.release(&b.lease).unwrap();
+    assert!(f.control.discharge(transition).await);
+    one_change(&f, &mut epoch);
+    // Heartbeat loss and idle timeout.
+    for (later, idle) in [
+        (
+            Instant::now() + Duration::from_secs(6),
+            DEFAULT_IDLE_TIMEOUT,
+        ),
+        (Instant::now(), Duration::ZERO),
+    ] {
+        take(&f, 3).await;
+        one_change(&f, &mut epoch);
+        let transition = f.control.expire(later, idle).unwrap();
+        assert!(f.control.discharge(transition).await);
+        one_change(&f, &mut epoch);
+    }
+    // Viewer stop, daemon stop, close of a live session.
+    for reason in [
+        EndReason::ViewerStopped,
+        EndReason::DaemonStopped,
+        EndReason::SessionEnded,
+    ] {
+        take(&f, 4).await;
+        one_change(&f, &mut epoch);
+        let transition = f.control.end_human(reason).unwrap();
+        assert!(f.control.discharge(transition).await);
+        one_change(&f, &mut epoch);
+    }
+    // The takeover verb and a Cua takeover.
+    take(&f, 5).await;
+    one_change(&f, &mut epoch);
+    let (_, transition) = f.control.agent_takeover(EventSource::Cli);
+    assert!(f.control.discharge(transition.unwrap()).await);
+    one_change(&f, &mut epoch);
+    take(&f, 5).await;
+    one_change(&f, &mut epoch);
+    let transition = f.control.admit_cua(1, true).unwrap().unwrap();
+    assert!(f.control.discharge(transition).await);
+    one_change(&f, &mut epoch);
+    f.control.cua_finished(1);
+    // Cua acting calls under agent control.
+    assert!(f.control.admit_cua(2, false).unwrap().is_none());
+    f.control.cua_finished(2);
+    no_change(&f, epoch);
+    // The session ended: nothing is sent or waited for.
+    take(&f, 6).await;
+    one_change(&f, &mut epoch);
+    let transition = f.control.end_human_ended().unwrap();
+    assert_eq!(transition.epoch(), None);
+    assert!(f.control.discharge(transition).await);
+    no_change(&f, epoch);
+    assert_eq!(f.control.admit_agent().await.unwrap(), epoch);
+}
+
+/// Ending or taking over a take from the agent that is still pending is no
+/// controller change: the agent keeps its epoch, so its native operation in
+/// flight completes.
+#[tokio::test(start_paused = true)]
+async fn ending_a_pending_take_keeps_the_agents_epoch() {
+    for takeover in [false, true] {
+        let f = Arc::new(fixture());
+        let epoch = f.control.admit_agent().await.unwrap();
+        // The agent presses a button (a drag in flight holds the lock).
+        f.sink.send(vec![left(true)], epoch).await.unwrap();
+        let taking = {
+            let f = Arc::clone(&f);
+            tokio::spawn(async move { f.control.take(tab(9), std::future::pending::<()>()).await })
+        };
+        tokio::task::yield_now().await;
+        assert!(f.control.human_active());
+        let transition = if takeover {
+            f.control.agent_takeover(EventSource::Cli).1.unwrap()
+        } else {
+            f.control.end_human(EndReason::ViewerStopped).unwrap()
+        };
+        assert_eq!(transition.epoch(), None);
+        assert!(f.control.discharge(transition).await);
+        assert!(taking.await.unwrap().is_err());
+        no_change(&f, epoch);
+        // The drag completes at its epoch: nothing was released.
+        f.sink.send(vec![left(false)], epoch).await.unwrap();
+        assert_eq!(f.sink.take(), vec![left(true), left(false)]);
+    }
+}
+
+/// A session input whose first send waits at a barrier before the epoch
+/// check: the window between a viewer's lease check and the session loop.
+struct BarrierSink {
+    inner: Sink,
+    armed: std::sync::atomic::AtomicBool,
+    barrier: tokio::sync::Semaphore,
+}
+
+impl BarrierSink {
+    fn new() -> Self {
+        BarrierSink {
+            inner: Sink::default(),
+            armed: std::sync::atomic::AtomicBool::new(false),
+            barrier: tokio::sync::Semaphore::new(0),
+        }
+    }
+
+    fn arm(&self) {
+        self.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn open(&self) {
+        self.barrier.add_permits(1);
+    }
+}
+
+impl HumanInput for BarrierSink {
+    fn send(
+        &self,
+        events: Vec<RawInput>,
+        epoch: InputEpoch,
+    ) -> BoxFuture<'_, Result<(), DaemonError>> {
+        Box::pin(async move {
+            if self.armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                drop(self.barrier.acquire().await.unwrap());
+            }
+            self.inner.send(events, epoch).await
+        })
+    }
+
+    fn set_epoch(&self, epoch: InputEpoch) -> BoxFuture<'_, Result<(), DaemonError>> {
+        self.inner.set_epoch(epoch)
+    }
+}
+
+impl AgentLog for BarrierSink {
+    fn agent_acted(&self, epoch: InputEpoch) -> BoxFuture<'_, Result<(), DaemonError>> {
+        self.inner.agent_acted(epoch)
+    }
+}
+
+/// Tab A's event passes its lease check and waits before the session loop;
+/// tab B takes the lease meanwhile. The take does not wait for A's request:
+/// the loop refuses A's event as stale, nothing of it is sent, and B's first
+/// event follows the epoch change.
+#[tokio::test(start_paused = true)]
+async fn the_old_tabs_input_after_a_take_is_rejected_stale() {
+    let sink = Arc::new(BarrierSink::new());
+    let events = Arc::new(SessionEvents::new(&"web".parse().unwrap(), 7, None));
+    let control = Arc::new(SessionControl::new(
+        "web",
+        7,
+        events,
+        None,
+        Some(Arc::clone(&sink) as Arc<dyn HumanInput>),
+        EPOCH_CONFIRM_WAIT,
+    ));
+    let a = control.take(tab(1), async {}).await.unwrap();
+    sink.arm();
+    let a_input = {
+        let control = Arc::clone(&control);
+        let lease = a.lease.clone();
+        tokio::spawn(async move {
+            control
+                .input(&lease, 7, (1, 1), vec![key(SHIFT, true)])
+                .await
+        })
+    };
+    tokio::task::yield_now().await;
+    let started = tokio::time::Instant::now();
+    let b = control.take(tab(2), async {}).await.unwrap();
+    assert_eq!(started.elapsed(), Duration::ZERO, "no wait for tab A");
+    sink.open();
+    let report = a_input.await.unwrap().unwrap();
+    assert_eq!(report.applied, 0);
+    assert_eq!(report.dropped.stale, 1);
+    assert_eq!(report.lost, Some(NotHeld::Lost(Loss::by(human(2)))));
+    assert!(sink.inner.take().is_empty(), "nothing of tab A was sent");
+    control
+        .input(&b.lease, 7, (1, 1), vec![key(0x1E, true)])
+        .await
+        .unwrap();
+    assert_eq!(sink.inner.take(), vec![key(0x1E, true)]);
+    assert_eq!(control.input_epoch(), InputEpoch::INITIAL.next().next());
+}
+
+/// A human's event waits before the session loop while the agent takes
+/// over with `rdpilot takeover`: it is refused as stale, nothing stays
+/// held, and the agent's next native action carries the new epoch.
+#[tokio::test(start_paused = true)]
+async fn a_humans_input_after_the_takeover_verb_is_rejected_stale() {
+    let sink = Arc::new(BarrierSink::new());
+    let registry = Arc::new(crate::registry::Registry::new(
+        Arc::new(InputConnector(Arc::clone(&sink))),
+        Arc::new(crate::seams::NoopReconciliationSink),
+    ));
+    let id = registry
+        .open(
+            Some("web".into()),
+            "h".into(),
+            rdpilot::ConnectionConfig::new("h", "u", "p"),
+        )
+        .await
+        .unwrap();
+    let viewer = crate::registry::ViewerControl::new(Arc::clone(&registry));
+    let (grant, _) = viewer.take(&id, tab(1)).await.unwrap();
+    assert_eq!(sink.inner.epochs(), vec![InputEpoch::INITIAL.next()]);
+    sink.arm();
+    let human_input = {
+        let viewer = viewer.clone();
+        let id = id.clone();
+        let lease = grant.lease.clone();
+        tokio::spawn(async move {
+            viewer
+                .input(
+                    &id,
+                    &lease,
+                    grant.generation,
+                    (1, 1),
+                    vec![key(SHIFT, true)],
+                )
+                .await
+        })
+    };
+    tokio::task::yield_now().await;
+    let (_, changed) = registry.takeover(&id, EventSource::Cli).await.unwrap();
+    assert!(changed);
+    let current = InputEpoch::INITIAL.next().next();
+    assert_eq!(sink.inner.epochs(), vec![current]);
+    registry
+        .call_acting(&id, |s, epoch| {
+            s.send_key(rdpilot::KeyAction::Type("a".into()), epoch)
+        })
+        .await
+        .unwrap();
+    assert_eq!(*sink.inner.agent.lock().unwrap(), vec![current]);
+    sink.open();
+    let report = human_input.await.unwrap().unwrap();
+    assert_eq!(report.dropped.stale, 1);
+    assert_eq!(
+        report.lost,
+        Some(NotHeld::Lost(Loss::by(ControllerRef::Agent)))
+    );
+    assert!(sink.inner.take().is_empty());
+    assert_eq!(sink.inner.model.lock().unwrap().held(), 0);
+}
+
+/// A session input whose epoch changes can be held unanswered.
+#[derive(Default)]
+struct StallingSink {
+    inner: Sink,
+    stall: std::sync::atomic::AtomicBool,
+}
+
+impl HumanInput for StallingSink {
+    fn send(
+        &self,
+        events: Vec<RawInput>,
+        epoch: InputEpoch,
+    ) -> BoxFuture<'_, Result<(), DaemonError>> {
+        self.inner.send(events, epoch)
+    }
+
+    fn set_epoch(&self, epoch: InputEpoch) -> BoxFuture<'_, Result<(), DaemonError>> {
+        if self.stall.load(std::sync::atomic::Ordering::SeqCst) {
+            return Box::pin(std::future::pending());
+        }
+        self.inner.set_epoch(epoch)
+    }
+}
+
+/// An epoch change the session loop does not confirm within the confirm
+/// wait refuses a take as busy (from the agent and from another tab) and
+/// still ends a released lease; the epoch is never rolled back.
+#[tokio::test(start_paused = true)]
+async fn an_unconfirmed_epoch_change_refuses_the_take_and_still_ends_the_lease() {
+    let wait = Duration::from_secs(1);
+    let sink = Arc::new(StallingSink::default());
+    let events = Arc::new(SessionEvents::new(&"web".parse().unwrap(), 7, None));
+    let control = SessionControl::new(
+        "web",
+        7,
+        events,
+        None,
+        Some(Arc::clone(&sink) as Arc<dyn HumanInput>),
+        wait,
+    );
+    let n = InputEpoch::INITIAL;
+    // From the agent.
+    sink.stall.store(true, std::sync::atomic::Ordering::SeqCst);
+    let started = tokio::time::Instant::now();
+    assert_eq!(
+        control.take(tab(1), async {}).await.unwrap_err(),
+        TakeError::Busy
+    );
+    assert_eq!(started.elapsed(), wait);
+    assert!(!control.human_active());
+    assert_eq!(control.admit_agent().await.unwrap(), n.next());
+    // From another tab.
+    sink.stall.store(false, std::sync::atomic::Ordering::SeqCst);
+    let first = control.take(tab(1), async {}).await.unwrap();
+    sink.stall.store(true, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        control.take(tab(2), async {}).await.unwrap_err(),
+        TakeError::Busy
+    );
+    assert!(!control.human_active());
+    assert_eq!(
+        control.heartbeat(&first.lease),
+        Err(NotHeld::Lost(Loss::by(human(2))))
+    );
+    assert_eq!(control.admit_agent().await.unwrap(), n.next().next().next());
+    // A release.
+    sink.stall.store(false, std::sync::atomic::Ordering::SeqCst);
+    let held = control.take(tab(3), async {}).await.unwrap();
+    sink.stall.store(true, std::sync::atomic::Ordering::SeqCst);
+    let transition = control.release(&held.lease).unwrap();
+    let started = tokio::time::Instant::now();
+    assert!(!control.discharge(transition).await);
+    assert_eq!(started.elapsed(), wait);
+    assert!(!control.human_active());
+    assert_eq!(
+        control.admit_agent().await.unwrap(),
+        n.next().next().next().next().next()
+    );
+}
+
+/// A session input whose agent actions wait at `gate` and are then refused
+/// as stale; human input and epoch changes go to `inner`.
+struct StaleAgent {
+    inner: Sink,
+    gate: tokio::sync::Semaphore,
+}
+
+impl HumanInput for StaleAgent {
+    fn send(
+        &self,
+        events: Vec<RawInput>,
+        epoch: InputEpoch,
+    ) -> BoxFuture<'_, Result<(), DaemonError>> {
+        self.inner.send(events, epoch)
+    }
+
+    fn set_epoch(&self, epoch: InputEpoch) -> BoxFuture<'_, Result<(), DaemonError>> {
+        self.inner.set_epoch(epoch)
+    }
+}
+
+impl AgentLog for StaleAgent {
+    fn agent_acted(&self, epoch: InputEpoch) -> BoxFuture<'_, Result<(), DaemonError>> {
+        Box::pin(async move {
+            drop(self.gate.acquire().await.unwrap());
+            Err(DaemonError::Sdk(rdpilot::Error::StaleInput {
+                sent: epoch,
+                current: epoch.next(),
+            }))
+        })
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn stale_agent_input_maps_to_human_control_only_with_a_current_lease() {
+    use rdpilot_ipc::{Request, WireErrorCode, WireResponse};
+    let sink = Arc::new(StaleAgent {
+        inner: Sink::default(),
+        gate: tokio::sync::Semaphore::new(0),
+    });
+    let registry = Arc::new(crate::registry::Registry::new(
+        Arc::new(InputConnector(Arc::clone(&sink))),
+        Arc::new(crate::seams::NoopReconciliationSink),
+    ));
+    let id = registry
+        .open(
+            Some("web".into()),
+            "h".into(),
+            rdpilot::ConnectionConfig::new("h", "u", "p"),
+        )
+        .await
+        .unwrap();
+    let key_request = || Request::Key {
+        session: id.clone(),
+        action: rdpilot::KeyAction::Type("a".into()),
+    };
+    // A take starts while the agent's key is in flight: the take is
+    // pending (a lease exists) when the stale answer arrives.
+    let agent = {
+        let registry = Arc::clone(&registry);
+        let request = key_request();
+        tokio::spawn(async move { crate::dispatch::dispatch(&registry, request).await })
+    };
+    tokio::task::yield_now().await;
+    let viewer = crate::registry::ViewerControl::new(Arc::clone(&registry));
+    let taking = {
+        let viewer = viewer.clone();
+        let id = id.clone();
+        tokio::spawn(async move { viewer.take(&id, tab(1)).await })
+    };
+    tokio::task::yield_now().await;
+    assert!(registry.control(&id).unwrap().human_active());
+    sink.gate.add_permits(1);
+    match agent.await.unwrap() {
+        WireResponse::Error(error) => {
+            assert_eq!(error.code, WireErrorCode::HumanControl);
+            assert_eq!(
+                error.controller.and_then(|c| c.address).as_deref(),
+                Some("100.64.0.1")
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+    let (grant, _) = taking.await.unwrap().unwrap();
+    viewer.release(&id, &grant.lease).await.unwrap();
+    // No lease: the stale answer is internal.
+    sink.gate.add_permits(1);
+    match crate::dispatch::dispatch(&registry, key_request()).await {
+        WireResponse::Error(error) => assert_eq!(error.code, WireErrorCode::Internal),
+        other => panic!("{other:?}"),
+    }
 }

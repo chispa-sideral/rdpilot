@@ -15,12 +15,26 @@ use crate::control::TakeError;
 use crate::events::{EventKind, EventSource, SessionEvents};
 use crate::seams::{BoxFuture, DaemonError, HumanInput};
 
+/// Records what the session loop would send, with its input epoch.
 #[derive(Default)]
-struct Sink(Mutex<Vec<RawInput>>);
+struct Sink(Mutex<Vec<RawInput>>, Mutex<crate::seams::LoopInputModel>);
 
 impl HumanInput for Sink {
-    fn send(&self, events: Vec<RawInput>) -> BoxFuture<'_, Result<(), DaemonError>> {
-        self.0.lock().unwrap().extend(events);
+    fn send(
+        &self,
+        events: Vec<RawInput>,
+        epoch: rdpilot::InputEpoch,
+    ) -> BoxFuture<'_, Result<(), DaemonError>> {
+        let sent = self.1.lock().unwrap().send(epoch, events);
+        Box::pin(async move {
+            self.0.lock().unwrap().extend(sent?);
+            Ok(())
+        })
+    }
+
+    fn set_epoch(&self, epoch: rdpilot::InputEpoch) -> BoxFuture<'_, Result<(), DaemonError>> {
+        let releases = self.1.lock().unwrap().set_epoch(epoch);
+        self.0.lock().unwrap().extend(releases);
         Box::pin(async { Ok(()) })
     }
 }
@@ -41,6 +55,7 @@ fn fixture() -> Fixture {
         Arc::clone(&events),
         None,
         Some(Arc::clone(&sink) as Arc<dyn HumanInput>),
+        crate::control::EPOCH_CONFIRM_WAIT,
     ));
     Fixture {
         gate: CuaGate::new(Arc::clone(&control)),
