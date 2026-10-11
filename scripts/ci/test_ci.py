@@ -48,9 +48,9 @@ class AggregateTests(unittest.TestCase):
 
     def test_aggregate_names_cover_every_other_job(self):
         jobs = self.workflow.split("\njobs:\n", 1)[1]
-        names = set(re.findall(r"^  ([\w-]+):$", jobs, re.MULTILINE)) - {"success"}
+        names = set(re.findall(r"^  ([\w-]+):$", jobs, re.MULTILINE)) - {"success", "evidence-matrix"}
         self.assertEqual(set(self.names), names)
-        needs = re.search(r"^    needs: \[([^\]]+)\]$", jobs, re.MULTILINE)
+        needs = re.search(r"^    needs: \[([^\]]+)\]$", jobs.split("\n  success:\n", 1)[1], re.MULTILINE)
         self.assertEqual(set(part.strip() for part in needs.group(1).split(",")), names)
 
     def test_release_calls_read_only_checks_and_requires_success(self):
@@ -63,8 +63,8 @@ class AggregateTests(unittest.TestCase):
         self.assertIn("needs: [checks]", text)
         self.assertIn("if: ${{ needs.checks.result == 'success' }}", text)
         self.assertIn("workflow_call:", self.workflow)
-        self.assertEqual(self.workflow.count("persist-credentials: false"), len(self.names) + 1)
-        self.assertEqual(self.workflow.count("ref: ${{ github.sha }}"), len(self.names) + 1)
+        self.assertEqual(self.workflow.count("persist-credentials: false"), len(self.names) + 2)
+        self.assertEqual(self.workflow.count("ref: ${{ github.sha }}"), len(self.names) + 2)
 
 
 class EvidenceTests(unittest.TestCase):

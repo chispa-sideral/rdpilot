@@ -1,0 +1,241 @@
+# Rules for scripts/ci/evidence-matrix.py.
+#
+# The generator lists every assertion selector in the tree and gives each one the tier,
+# mode and cadence of the first rule of its kind whose `match` glob fits it. A selector
+# without a rule, a rule without a selector and a run that names a missing ci.yml job or
+# step fail the mapping check in the unit tests. Keep rules at pattern level: one rule per
+# group of selectors, never one per selector.
+#
+# Selectors, by kind (the part after the kind prefix of a row ID):
+#   offline-check  <proof>/<label>                   CHECKS of scripts/ci/run-offline-proof.py
+#   e2e            <script>/<site>                   check() sites of scripts/e2e/*.py; {} is a generated part
+#   cargo          <package>/lib | lib/<module> | bin/<name> | test/<name>
+#   ignored        <repo path>::<fn>                 #[ignore] tests
+#   file           <repo path>                       scripts/ci/test_*.py and scripts/e2e/*.sh
+#
+# A package in split_packages has one cargo selector per top-level module of its library.
+# A run is a ci.yml job id and the `- name:` of one step of that job. offline-check and e2e
+# runs also name the proof whose result file carries the check names.
+
+schema = 1
+split_packages = ["rdpilot-daemon", "rdpilot-bridge"]
+
+# Placement rules, one string each.
+placement = [
+    "Offline first. A selector is offline when it needs no RDP target.",
+    "A selector is hosted-live only when it needs a real Windows RDP server, the bridge or Cua, and a hosted runner can host it.",
+    "A selector is local-live only when a hosted runner cannot host it: a domain controller, cross-machine networking, a Windows version other than windows-latest, or a setting that needs a reboot.",
+    "Every rule outside the offline tier states why.",
+    "Domain authentication stays out of hosted CI. Tailnet viewer access is not a product assertion, and CI has no Tailscale.",
+]
+
+[tiers]
+offline = "No RDP target. The jobs linux, windows, windows-dacl and offline run fakes, synthetic frames, in-process tests and the local OS."
+hosted-live = "The desktop job on windows-latest: its own RDP listener on 127.0.0.1:3389, disposable local standard users, NLA, a self-signed certificate and a source-built bridge. Jobs that consume its artifacts are also hosted-live."
+local-live = "A CrabBox Azure Windows lease, started by hand. It runs on demand and is not a gate of a push."
+
+[modes]
+synthetic = "No RDP server. The proof uses fakes, synthetic frames, in-process code or the local OS."
+live = "A real Windows RDP server session."
+
+[cadences]
+every-push = "Runs in every run of ci.yml."
+on-demand = "Runs only when someone starts it: an ignored test, a script that no ci.yml step calls, or a lease."
+per-release = "Runs in the release workflow."
+
+# Limits for the durations that the matrix reports. The matrix reports them and never fails on them.
+[budget]
+offline_jobs = ["linux", "windows", "windows-dacl", "offline"]
+offline_minutes = 20
+desktop_jobs = ["desktop"]
+desktop_minutes = 90
+
+# --- offline proofs: the CHECKS of run-offline-proof.py --------------------------------
+
+[[rule]]
+kind = "offline-check"
+match = "viewer/*"
+mode = "synthetic"
+tier = "offline"
+cadence = "every-push"
+runs = [{ job = "offline", step = "Offline viewer proof", proof = "viewer" }]
+
+[[rule]]
+kind = "offline-check"
+match = "recording/*"
+mode = "synthetic"
+tier = "offline"
+cadence = "every-push"
+runs = [{ job = "offline", step = "Offline recording proof", proof = "recording" }]
+
+[[rule]]
+kind = "offline-check"
+match = "takeover/*"
+mode = "synthetic"
+tier = "offline"
+cadence = "every-push"
+runs = [{ job = "offline", step = "Offline takeover proof", proof = "takeover" }]
+
+# --- live proofs: the check() sites of scripts/e2e ---------------------------------------
+
+[[rule]]
+kind = "e2e"
+match = "run-cua-e2e.py/*"
+mode = "live"
+tier = "hosted-live"
+cadence = "every-push"
+why = "needs a real Windows RDP server, the source bridge and Cua"
+runs = [{ job = "desktop", step = "Live Cua proof", proof = "cua" }]
+
+# The takeover proof subclasses the viewer proof, so its summary can hold viewer sites.
+[[rule]]
+kind = "e2e"
+match = "run-viewer-proof.py/*"
+mode = "live"
+tier = "hosted-live"
+cadence = "every-push"
+why = "needs a real Windows RDP server, the source bridge and Cua"
+runs = [
+    { job = "desktop", step = "Live viewer proof", proof = "viewer" },
+    { job = "desktop", step = "Live takeover proof", proof = "takeover" },
+]
+
+[[rule]]
+kind = "e2e"
+match = "run-takeover-proof.py/*"
+mode = "live"
+tier = "hosted-live"
+cadence = "every-push"
+why = "needs a real Windows RDP server, the source bridge and Cua"
+runs = [{ job = "desktop", step = "Live takeover proof", proof = "takeover" }]
+
+[[rule]]
+kind = "e2e"
+match = "run-recording-proof.py/*"
+mode = "live"
+tier = "hosted-live"
+cadence = "on-demand"
+why = "needs a real Windows RDP server for the recorded sessions, and no ci.yml step runs the live recording proof"
+runs = []
+
+# --- Cargo test targets ------------------------------------------------------------------
+# Order matters: the first match wins, so a target that only one OS compiles comes first.
+
+# cfg(windows) module: only the Windows job compiles it.
+[[rule]]
+kind = "cargo"
+match = "rdpilot-bridge/lib/guest"
+mode = "synthetic"
+tier = "offline"
+cadence = "every-push"
+runs = [{ job = "windows-dacl", step = "Windows bridge and containment tests" }]
+
+# #![cfg(unix)] test target.
+[[rule]]
+kind = "cargo"
+match = "rdpilot-bridge/test/child_stream"
+mode = "synthetic"
+tier = "offline"
+cadence = "every-push"
+runs = [{ job = "linux", step = "Rust workspace tests" }]
+
+# #![cfg(windows)] test target; its tests are ignored and the script runs them with --ignored.
+[[rule]]
+kind = "cargo"
+match = "rdpilot-daemon/test/live_daemon_windows_dacl"
+mode = "synthetic"
+tier = "offline"
+cadence = "every-push"
+runs = [{ job = "windows-dacl", step = "Live daemon DACL tests" }]
+
+# Its only test is ignored, so compiling the target proves nothing.
+[[rule]]
+kind = "cargo"
+match = "rdpilot-daemon/test/autostart_lifecycle"
+mode = "synthetic"
+tier = "offline"
+cadence = "on-demand"
+why = "its only test is ignored and runs only with --ignored or --include-ignored"
+runs = []
+
+[[rule]]
+kind = "cargo"
+match = "rdpilot-bridge/*"
+mode = "synthetic"
+tier = "offline"
+cadence = "every-push"
+runs = [
+    { job = "linux", step = "Rust workspace tests" },
+    { job = "windows-dacl", step = "Windows bridge and containment tests" },
+]
+
+[[rule]]
+kind = "cargo"
+match = "rdpilot-config/lib"
+mode = "synthetic"
+tier = "offline"
+cadence = "every-push"
+runs = [
+    { job = "linux", step = "Rust workspace tests" },
+    { job = "windows", step = "Config unit tests" },
+]
+
+[[rule]]
+kind = "cargo"
+match = "rdpilot-cli/bin/*"
+mode = "synthetic"
+tier = "offline"
+cadence = "every-push"
+runs = [
+    { job = "linux", step = "Rust workspace tests" },
+    { job = "windows", step = "CLI unit tests" },
+]
+
+[[rule]]
+kind = "cargo"
+match = "*"
+mode = "synthetic"
+tier = "offline"
+cadence = "every-push"
+runs = [{ job = "linux", step = "Rust workspace tests" }]
+
+# --- ignored tests -----------------------------------------------------------------------
+
+[[rule]]
+kind = "ignored"
+match = "crates/rdpilot-daemon/tests/live_daemon_windows_dacl.rs::*"
+mode = "synthetic"
+tier = "offline"
+cadence = "every-push"
+runs = [{ job = "windows-dacl", step = "Live daemon DACL tests" }]
+
+[[rule]]
+kind = "ignored"
+match = "*"
+mode = "synthetic"
+tier = "offline"
+cadence = "on-demand"
+why = "runs only with --ignored or --include-ignored"
+runs = []
+
+# --- CI test files -----------------------------------------------------------------------
+
+[[rule]]
+kind = "file"
+match = "scripts/ci/test_*.py"
+mode = "synthetic"
+tier = "offline"
+cadence = "every-push"
+runs = [
+    { job = "linux", step = "CI and publisher failure-injection tests" },
+    { job = "windows-dacl", step = "CI and publisher failure-injection tests" },
+]
+
+[[rule]]
+kind = "file"
+match = "scripts/e2e/*.sh"
+mode = "synthetic"
+tier = "offline"
+cadence = "on-demand"
+why = "no ci.yml step calls the script"
+runs = []

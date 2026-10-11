@@ -164,9 +164,7 @@ class Proof(viewer_proof.Proof):
             for t in LIVE_TARGETS})
 
     async def connect_with(self, target, *flags):
-        hosts = self.hosts_for_targets()
-        result = await self.cli("connect", target, "-F", str(hosts), "--name", target, *flags, target=target,
-                                timeout=self.args.connect_timeout)
+        result = await self.connect_cli(target, *flags)
         require(result.get("session") == target, f"connect {target}: {result}")
         if not self.fake and "CuaEnabled=no" not in flags:
             require(result.get("bridge_live"), f"{target}: Cua bridge not live")
